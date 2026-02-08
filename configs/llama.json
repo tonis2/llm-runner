@@ -1,0 +1,29 @@
+{
+    "name": "llama",
+    "norm": "rmsnorm",
+    "ffn": "swiglu",
+    "params": {
+        "dim": { "key": "llama.embedding_length", "default": 2048 },
+        "n_heads": { "key": "llama.attention.head_count", "default": 32 },
+        "n_kv_heads": { "key": "llama.attention.head_count_kv", "default": 4 },
+        "n_layers": { "key": "llama.block_count", "default": 22 },
+        "ffn_dim": { "key": "llama.feed_forward_length", "default": 5632 },
+        "rope_theta": { "key": "llama.rope.freq_base", "default": 10000.0 },
+        "rms_eps": { "key": "llama.attention.layer_norm_rms_epsilon", "default": 1e-5 }
+    },
+    "weights": {
+        "embedding": "token_embd.weight",
+        "output_norm": "output_norm.weight",
+        "output": "output.weight",
+        "layer_prefix": "blk",
+        "attn_norm": "attn_norm.weight",
+        "attn_q": "attn_q.weight",
+        "attn_k": "attn_k.weight",
+        "attn_v": "attn_v.weight",
+        "attn_output": "attn_output.weight",
+        "ffn_norm": "ffn_norm.weight",
+        "ffn_gate": "ffn_gate.weight",
+        "ffn_up": "ffn_up.weight",
+        "ffn_down": "ffn_down.weight"
+    }
+}

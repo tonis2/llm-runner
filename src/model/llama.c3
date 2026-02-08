@@ -10,19 +10,10 @@ const MAX_SEQ_LEN = 2048;
 // Embedded SPIR-V shader (single module with all entry points)
 const char[*] LLM_SPV = $embed("../../shaders/llm.spv");
 
-struct LlamaConfig {
-    uint n_layers;
-    uint n_heads;
-    uint n_kv_heads;
-    uint dim;
-    uint ffn_dim;
-    uint vocab_size;
-    uint head_dim;
-    float rope_theta;
-    float rms_eps;
-}
+// Embedded architecture config
+const char[*] LLAMA_CONFIG_JSON = $embed("../../configs/llama.json");
 
-struct LlamaLayerWeights {
+struct LayerWeights {
     Tensor attn_norm;
     Tensor wq;
     Tensor wk;
@@ -34,14 +25,14 @@ struct LlamaLayerWeights {
     Tensor ffn_down;
 }
 
-struct LlamaWeights {
+struct ModelWeights {
     Tensor token_embedding;
     Tensor output_norm;
     Tensor output;
-    LlamaLayerWeights[] layers;
+    LayerWeights[] layers;
 }
 
-struct LlamaActivations {
+struct ModelActivations {
     Tensor hidden;
     Tensor residual;
     Tensor norm_out;
@@ -56,12 +47,12 @@ struct LlamaActivations {
     Tensor attn_scores;
 }
 
-struct LlamaKVCache {
+struct KVCache {
     Tensor[] k_cache;
     Tensor[] v_cache;
 }
 
-struct LlamaKernels {
+struct ModelKernels {
     ComputeKernel embedding;
     ComputeKernel rmsnorm;
     ComputeKernel silu;
@@ -78,12 +69,12 @@ struct LlamaKernels {
     ComputeKernel elemwise_mul;
 }
 
-struct LlamaModel {
-    LlamaConfig config;
-    LlamaWeights weights;
-    LlamaActivations acts;
-    LlamaKVCache kv;
-    LlamaKernels kernels;
+struct Model {
+    ModelConfig config;
+    ModelWeights weights;
+    ModelActivations acts;
+    KVCache kv;
+    ModelKernels kernels;
     DeviceContext* ctx;
 }
 
@@ -97,48 +88,6 @@ struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_le
 struct ResidualPC { uint n; }
 struct ElemwisePC { uint n; }
 
-fn LlamaConfig extract_config(GGUFFile* gf) {
-    uint dim = gf.get_u32("llama.embedding_length") ?? 2048;
-    uint n_heads = gf.get_u32("llama.attention.head_count") ?? 32;
-    uint n_kv_heads = gf.get_u32("llama.attention.head_count_kv") ?? 4;
-    uint n_layers = gf.get_u32("llama.block_count") ?? 22;
-    uint ffn_dim = gf.get_u32("llama.feed_forward_length") ?? 5632;
-    uint vocab_size = 0;
-
-    // Vocab size comes from tokenizer.ggml.tokens array or the embedding tensor
-    if (try emb = gf.find_tensor("token_embd.weight")) {
-        vocab_size = (uint)emb.shape[1];
-    }
-
-    float rope_theta = gf.get_f32("llama.rope.freq_base") ?? 10000.0;
-    float rms_eps = gf.get_f32("llama.attention.layer_norm_rms_epsilon") ?? 1e-5;
-
-    LlamaConfig config = {
-        .n_layers = n_layers,
-        .n_heads = n_heads,
-        .n_kv_heads = n_kv_heads,
-        .dim = dim,
-        .ffn_dim = ffn_dim,
-        .vocab_size = vocab_size,
-        .head_dim = dim / n_heads,
-        .rope_theta = rope_theta,
-        .rms_eps = rms_eps,
-    };
-
-    io::printfn("\n=== LLaMA Config ===");
-    io::printfn("  dim: %d", config.dim);
-    io::printfn("  n_layers: %d", config.n_layers);
-    io::printfn("  n_heads: %d", config.n_heads);
-    io::printfn("  n_kv_heads: %d", config.n_kv_heads);
-    io::printfn("  ffn_dim: %d", config.ffn_dim);
-    io::printfn("  vocab_size: %d", config.vocab_size);
-    io::printfn("  head_dim: %d", config.head_dim);
-    io::printfn("  rope_theta: %f", config.rope_theta);
-    io::printfn("  rms_eps: %f", config.rms_eps);
-
-    return config;
-}
-
 fn Tensor load_tensor_by_name(DeviceContext* ctx, GGUFFile* gf, String name) {
     GGUFTensorInfo* info = gf.find_tensor(name)!!;
     return upload_weight(ctx, info, gf.tensor_data_base)!!;
@@ -149,37 +98,35 @@ fn Tensor load_tensor_as_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
     return upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
 }
 
-fn LlamaWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, LlamaConfig* config) {
+fn ModelWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* config, WeightNames* names) {
     io::printfn("\nLoading weights...");
 
     // Embedding must be F32 for the embedding lookup shader
-    Tensor token_embedding = load_tensor_as_f32(ctx, gf, "token_embd.weight");
-    Tensor output_norm = load_tensor_by_name(ctx, gf, "output_norm.weight");
+    Tensor token_embedding = load_tensor_as_f32(ctx, gf, names.embedding);
+    Tensor output_norm = load_tensor_by_name(ctx, gf, names.output_norm);
 
     // Output weight - may be same as embedding (tied weights) or separate
     Tensor output_weight;
-    if (try output_info = gf.find_tensor("output.weight")) {
+    if (try output_info = gf.find_tensor(names.output)) {
         output_weight = upload_weight(ctx, output_info, gf.tensor_data_base)!!;
     } else {
         // Tied weights - use embedding
         output_weight = token_embedding;
     }
 
-    LlamaLayerWeights[] layers = mem::new_array(LlamaLayerWeights, config.n_layers);
+    LayerWeights[] layers = mem::new_array(LayerWeights, config.n_layers);
 
     for (uint l = 0; l < config.n_layers; l++) {
-        // Format: blk.{l}.attn_norm.weight, etc.
-        // We'll build the name string manually
         layers[l] = {
-            .attn_norm = load_layer_tensor(ctx, gf, l, "attn_norm.weight"),
-            .wq = load_layer_tensor(ctx, gf, l, "attn_q.weight"),
-            .wk = load_layer_tensor(ctx, gf, l, "attn_k.weight"),
-            .wv = load_layer_tensor(ctx, gf, l, "attn_v.weight"),
-            .wo = load_layer_tensor(ctx, gf, l, "attn_output.weight"),
-            .ffn_norm = load_layer_tensor(ctx, gf, l, "ffn_norm.weight"),
-            .ffn_gate = load_layer_tensor(ctx, gf, l, "ffn_gate.weight"),
-            .ffn_up = load_layer_tensor(ctx, gf, l, "ffn_up.weight"),
-            .ffn_down = load_layer_tensor(ctx, gf, l, "ffn_down.weight"),
+            .attn_norm = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.attn_norm),
+            .wq = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wq),
+            .wk = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wk),
+            .wv = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wv),
+            .wo = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wo),
+            .ffn_norm = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_norm),
+            .ffn_gate = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_gate),
+            .ffn_up = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_up),
+            .ffn_down = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_down),
         };
 
         if ((l + 1) % 4 == 0 || l == config.n_layers - 1) {
@@ -195,26 +142,36 @@ fn LlamaWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, LlamaConfig* con
     };
 }
 
-fn Tensor load_layer_tensor(DeviceContext* ctx, GGUFFile* gf, uint layer, String suffix) {
-    // Build "blk.{layer}.{suffix}" name
-    // Layer numbers are small (< 100), so a small buffer suffices
+fn Tensor load_layer_tensor(DeviceContext* ctx, GGUFFile* gf, String prefix, uint layer, String suffix) {
     char[64] buf;
-    usz len = format_layer_name(&buf, layer, suffix);
+    usz len = format_layer_name(&buf, prefix, layer, suffix);
     String name = (String)buf[0..len - 1];
 
     GGUFTensorInfo* info = gf.find_tensor(name)!!;
     return upload_weight(ctx, info, gf.tensor_data_base)!!;
 }
 
-fn usz format_layer_name(char[64]* buf, uint layer, String suffix) {
-    // "blk." = 4 chars
+fn usz format_layer_name(char[64]* buf, String prefix, uint layer, String suffix) {
     char* p = &(*buf)[0];
-    p[0] = 'b'; p[1] = 'l'; p[2] = 'k'; p[3] = '.';
-    usz pos = 4;
+    usz pos = 0;
+
+    // Write prefix (e.g. "blk")
+    for (usz i = 0; i < prefix.len; i++) {
+        p[pos + i] = prefix[i];
+    }
+    pos += prefix.len;
+
+    // Write "."
+    p[pos] = '.';
+    pos++;
 
     // Write layer number
+    if (layer >= 100) {
+        p[pos] = (char)('0' + layer / 100);
+        pos++;
+    }
     if (layer >= 10) {
-        p[pos] = (char)('0' + layer / 10);
+        p[pos] = (char)('0' + (layer / 10) % 10);
         pos++;
     }
     p[pos] = (char)('0' + layer % 10);
@@ -233,7 +190,7 @@ fn usz format_layer_name(char[64]* buf, uint layer, String suffix) {
     return pos;
 }
 
-fn LlamaActivations? allocate_activations(DeviceContext* ctx, LlamaConfig* config) {
+fn ModelActivations? allocate_activations(DeviceContext* ctx, ModelConfig* config) {
     io::printfn("Allocating activation buffers...");
 
     ulong dim = config.dim;
@@ -263,7 +220,7 @@ fn LlamaActivations? allocate_activations(DeviceContext* ctx, LlamaConfig* confi
     };
 }
 
-fn LlamaKVCache? allocate_kv_cache(DeviceContext* ctx, LlamaConfig* config) {
+fn KVCache? allocate_kv_cache(DeviceContext* ctx, ModelConfig* config) {
     io::printfn("Allocating KV cache...");
 
     Tensor[] k_cache = mem::new_array(Tensor, config.n_layers);
@@ -283,7 +240,7 @@ fn LlamaKVCache? allocate_kv_cache(DeviceContext* ctx, LlamaConfig* config) {
     };
 }
 
-fn LlamaKernels? create_kernels(DeviceContext* ctx) {
+fn ModelKernels? create_kernels(DeviceContext* ctx) {
     io::printfn("Creating compute kernels...");
     char[] spv = &LLM_SPV;
     ShaderModule shader = vk::shaderModuleCreateInfo()
@@ -291,7 +248,7 @@ fn LlamaKernels? create_kernels(DeviceContext* ctx) {
         .setCode((uint*)&spv[0])
         .build(ctx.device)!!;
 
-    LlamaKernels kernels = {
+    ModelKernels kernels = {
         .embedding    = create_kernel(ctx, shader, 2, EmbeddingPC.sizeof, "embedding")!!,
         .rmsnorm      = create_kernel(ctx, shader, 3, RMSNormPC.sizeof, "rmsnorm")!!,
         .silu         = create_kernel(ctx, shader, 1, SiluPC.sizeof, "silu")!!,
@@ -318,7 +275,7 @@ fn uint ceil_div(uint a, uint b) {
 
 fn void dispatch_matmul(
     CommandBuffer cmd,
-    LlamaKernels* k,
+    ModelKernels* k,
     Tensor* weight,
     Tensor* input,
     Tensor* output,
@@ -346,18 +303,17 @@ fn void dispatch_matmul(
         &pc, out_dim);
 }
 
-fn LlamaModel? load_model(DeviceContext* ctx, GGUFFile* gf) {
-    LlamaConfig config = extract_config(gf);
-    LlamaWeights weights = load_weights(ctx, gf, &config)!!;
-    LlamaActivations acts = allocate_activations(ctx, &config)!!;
-    LlamaKVCache kv = allocate_kv_cache(ctx, &config)!!;
-    LlamaKernels kernels = create_kernels(ctx)!!;
+fn Model? load_model(DeviceContext* ctx, GGUFFile* gf, ModelConfig* config, WeightNames* names) {
+    ModelWeights weights = load_weights(ctx, gf, config, names)!!;
+    ModelActivations acts = allocate_activations(ctx, config)!!;
+    KVCache kv = allocate_kv_cache(ctx, config)!!;
+    ModelKernels kernels = create_kernels(ctx)!!;
 
     io::printfn("\nModel loaded successfully!");
     io::printfn("GPU memory used: %d MB", ctx.allocator.total_used() / (1024 * 1024));
 
     return {
-        .config = config,
+        .config = *config,
         .weights = weights,
         .acts = acts,
         .kv = kv,
@@ -366,14 +322,14 @@ fn LlamaModel? load_model(DeviceContext* ctx, GGUFFile* gf) {
     };
 }
 
-fn void? LlamaModel.forward(&self, uint token, uint position) {
+fn void? Model.forward(&self, uint token, uint position) {
     DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    LlamaConfig* c = &self.config;
-    LlamaWeights* w = &self.weights;
-    LlamaActivations* a = &self.acts;
-    LlamaKVCache* kv = &self.kv;
-    LlamaKernels* k = &self.kernels;
+    ModelConfig* c = &self.config;
+    ModelWeights* w = &self.weights;
+    ModelActivations* a = &self.acts;
+    KVCache* kv = &self.kv;
+    ModelKernels* k = &self.kernels;
 
     begin_compute(cmd)!!;
 
@@ -388,7 +344,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
 
     // 2. For each transformer layer
     for (uint l = 0; l < c.n_layers; l++) {
-        LlamaLayerWeights* lw = &w.layers[l];
+        LayerWeights* lw = &w.layers[l];
 
         // 2a. Copy hidden -> residual (via buffer copy)
         vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.residual.gpu_buffer.buffer, 1,
@@ -460,7 +416,6 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
         compute_barrier(cmd);
 
         // 2h. Residual add: hidden = residual + attn_output
-        // First copy residual back to hidden
         vk::cmdCopyBuffer(cmd, a.residual.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
         compute_barrier(cmd);
@@ -535,7 +490,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
     submit_and_wait(ctx)!!;
 }
 
-fn void LlamaModel.free(&self) {
+fn void Model.free(&self) {
     // Free kernels
     self.kernels.embedding.free(self.ctx.device);
     self.kernels.rmsnorm.free(self.ctx.device);
@@ -582,7 +537,7 @@ fn void LlamaModel.free(&self) {
         self.weights.output.free();
     }
     for (uint l = 0; l < self.config.n_layers; l++) {
-        LlamaLayerWeights* lw = &self.weights.layers[l];
+        LayerWeights* lw = &self.weights.layers[l];
         lw.attn_norm.free();
         lw.wq.free();
         lw.wk.free();

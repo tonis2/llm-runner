@@ -8,16 +8,18 @@ import std::math::random;
 
 fn int main(String[] args) {
     if (args.len < 2) {
-        io::printfn("Usage: llm <model.gguf> [prompt] [--temp T] [--top-k K] [--top-p P]");
+        io::printfn("Usage: llm <model.gguf> [prompt] [--temp T] [--top-k K] [--top-p P] [--arch config.json]");
         io::printfn("  --temp   Temperature (0 = greedy, default 0.7)");
         io::printfn("  --top-k  Top-k filtering (default 40)");
         io::printfn("  --top-p  Nucleus sampling threshold (default 0.9)");
+        io::printfn("  --arch   Path to architecture config JSON (auto-detected if omitted)");
         return 1;
     }
 
     // Parse arguments: positional (model, prompt) + flags
     String model_path = "";
     String prompt = "";
+    String arch_path = "";
     SamplingParams sampling = { .temperature = 0.7f, .top_k = 40, .top_p = 0.9f };
 
     usz i = 1;
@@ -32,6 +34,9 @@ fn int main(String[] args) {
                 i += 2;
             } else if (args[i] == "--top-p") {
                 sampling.top_p = args[i + 1].to_float() ?? 0.9f;
+                i += 2;
+            } else if (args[i] == "--arch") {
+                arch_path = args[i + 1];
                 i += 2;
             } else {
                 i++;
@@ -63,10 +68,29 @@ fn int main(String[] args) {
     defer gf.free();
     gguf_print_info(&gf);
 
+    // Detect architecture and load config
+    String arch_name = detect_architecture(&gf);
+    io::printfn("Architecture: %s", arch_name);
+
+    String config_json;
+    if (arch_path.len > 0) {
+        // Load custom config from file
+        io::printfn("Loading config from: %s", arch_path);
+        config_json = (String)file::load(mem, arch_path)!!;
+    } else if (arch_name == "llama") {
+        config_json = (String)&LLAMA_CONFIG_JSON;
+    } else {
+        io::printfn("Error: unsupported architecture '%s'. Use --arch to provide a config.", arch_name);
+        return 1;
+    }
+
+    ModelConfig config = load_arch_config(config_json, &gf)!!;
+    WeightNames names = load_weight_names(config_json)!!;
+
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    LlamaModel model = load_model(&ctx, &gf)!!;
+    Model model = load_model(&ctx, &gf, &config, &names)!!;
     defer model.free();
 
     Tokenizer tok = load_tokenizer(&gf)!!;
