@@ -68,6 +68,69 @@ void rmsnorm(uint3 tid: SV_DispatchThreadID, uint gi: SV_GroupIndex) {
 }
 
 // ============================================================
+// Layer Normalization
+// ============================================================
+
+struct LayerNormParams {
+    uint dim;
+    float eps;
+};
+
+[vk_push_constant] const LayerNormParams layernorm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> layernorm_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> layernorm_weight;
+[vk_binding(2, 0)] RWStructuredBuffer<float> layernorm_bias;
+[vk_binding(3, 0)] RWStructuredBuffer<float> layernorm_output;
+
+groupshared float layernorm_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void layernorm(uint3 tid: SV_DispatchThreadID, uint gi: SV_GroupIndex) {
+    uint num_threads = 256;
+
+    // Compute mean
+    float sum = 0.0;
+    for (uint i = gi; i < layernorm_pc.dim; i += num_threads) {
+        sum += layernorm_input[i];
+    }
+    layernorm_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = num_threads / 2; s > 0; s >>= 1) {
+        if (gi < s) {
+            layernorm_shared[gi] += layernorm_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float mean = layernorm_shared[0] / float(layernorm_pc.dim);
+    GroupMemoryBarrierWithGroupSync();
+
+    // Compute variance
+    float var_sum = 0.0;
+    for (uint i = gi; i < layernorm_pc.dim; i += num_threads) {
+        float diff = layernorm_input[i] - mean;
+        var_sum += diff * diff;
+    }
+    layernorm_shared[gi] = var_sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = num_threads / 2; s > 0; s >>= 1) {
+        if (gi < s) {
+            layernorm_shared[gi] += layernorm_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float inv_std = 1.0 / sqrt(layernorm_shared[0] / float(layernorm_pc.dim) + layernorm_pc.eps);
+
+    // Normalize: (x - mean) * inv_std * weight + bias
+    for (uint i = gi; i < layernorm_pc.dim; i += num_threads) {
+        layernorm_output[i] = (layernorm_input[i] - mean) * inv_std * layernorm_weight[i] + layernorm_bias[i];
+    }
+}
+
+// ============================================================
 // SiLU activation (in-place)
 // ============================================================
 
@@ -85,6 +148,28 @@ void silu(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= silu_pc.n) return;
     float x = silu_data[tid.x];
     silu_data[tid.x] = x / (1.0 + exp(-x));
+}
+
+// ============================================================
+// GELU activation (in-place)
+// ============================================================
+
+struct GeluParams {
+    uint n;
+};
+
+[vk_push_constant] const GeluParams gelu_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> gelu_data;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void gelu(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= gelu_pc.n) return;
+    float x = gelu_data[tid.x];
+    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    float c = 0.7978845608; // sqrt(2/pi)
+    gelu_data[tid.x] = 0.5 * x * (1.0 + tanh(c * (x + 0.044715 * x * x * x)));
 }
 
 // ============================================================

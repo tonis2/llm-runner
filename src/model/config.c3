@@ -26,14 +26,17 @@ struct ModelConfig {
 struct WeightNames {
     String embedding;
     String output_norm;
+    String output_norm_bias;
     String output;
     String layer_prefix;
     String attn_norm;
+    String attn_norm_bias;
     String wq;
     String wk;
     String wv;
     String wo;
     String ffn_norm;
+    String ffn_norm_bias;
     String ffn_gate;
     String ffn_up;
     String ffn_down;
@@ -143,14 +146,17 @@ fn WeightNames? load_weight_names(String json_text) {
     WeightNames names = {
         .embedding = w.get_string("embedding") ?? "token_embd.weight",
         .output_norm = w.get_string("output_norm") ?? "output_norm.weight",
+        .output_norm_bias = w.get_string("output_norm_bias") ?? "",
         .output = w.get_string("output") ?? "output.weight",
         .layer_prefix = w.get_string("layer_prefix") ?? "blk",
         .attn_norm = w.get_string("attn_norm") ?? "attn_norm.weight",
+        .attn_norm_bias = w.get_string("attn_norm_bias") ?? "",
         .wq = w.get_string("attn_q") ?? "attn_q.weight",
         .wk = w.get_string("attn_k") ?? "attn_k.weight",
         .wv = w.get_string("attn_v") ?? "attn_v.weight",
         .wo = w.get_string("attn_output") ?? "attn_output.weight",
         .ffn_norm = w.get_string("ffn_norm") ?? "ffn_norm.weight",
+        .ffn_norm_bias = w.get_string("ffn_norm_bias") ?? "",
         .ffn_gate = w.get_string("ffn_gate") ?? "ffn_gate.weight",
         .ffn_up = w.get_string("ffn_up") ?? "ffn_up.weight",
         .ffn_down = w.get_string("ffn_down") ?? "ffn_down.weight",

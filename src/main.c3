@@ -79,6 +79,10 @@ fn int main(String[] args) {
         config_json = (String)file::load(mem, arch_path)!!;
     } else if (arch_name == "llama") {
         config_json = (String)&LLAMA_CONFIG_JSON;
+    } else if (arch_name == "qwen2") {
+        config_json = (String)&QWEN2_CONFIG_JSON;
+    } else if (arch_name == "phi3") {
+        config_json = (String)&PHI3_CONFIG_JSON;
     } else {
         io::printfn("Error: unsupported architecture '%s'. Use --arch to provide a config.", arch_name);
         return 1;

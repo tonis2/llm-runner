@@ -10,16 +10,20 @@ const MAX_SEQ_LEN = 2048;
 // Embedded SPIR-V shader (single module with all entry points)
 const char[*] LLM_SPV = $embed("../../shaders/llm.spv");
 
-// Embedded architecture config
+// Embedded architecture configs
 const char[*] LLAMA_CONFIG_JSON = $embed("../../configs/llama.json");
+const char[*] QWEN2_CONFIG_JSON = $embed("../../configs/qwen2.json");
+const char[*] PHI3_CONFIG_JSON = $embed("../../configs/phi3.json");
 
 struct LayerWeights {
     Tensor attn_norm;
+    Tensor attn_norm_bias;
     Tensor wq;
     Tensor wk;
     Tensor wv;
     Tensor wo;
     Tensor ffn_norm;
+    Tensor ffn_norm_bias;
     Tensor ffn_gate;
     Tensor ffn_up;
     Tensor ffn_down;
@@ -28,6 +32,7 @@ struct LayerWeights {
 struct ModelWeights {
     Tensor token_embedding;
     Tensor output_norm;
+    Tensor output_norm_bias;
     Tensor output;
     LayerWeights[] layers;
 }
@@ -55,7 +60,9 @@ struct KVCache {
 struct ModelKernels {
     ComputeKernel embedding;
     ComputeKernel rmsnorm;
+    ComputeKernel layernorm;
     ComputeKernel silu;
+    ComputeKernel gelu;
     ComputeKernel matmul;
     ComputeKernel matmul_q8;
     ComputeKernel matmul_q4_0;
@@ -80,7 +87,9 @@ struct Model {
 
 struct EmbeddingPC { uint token_id; uint dim; }
 struct RMSNormPC { uint dim; float eps; }
+struct LayerNormPC { uint dim; float eps; }
 struct SiluPC { uint n; }
+struct GeluPC { uint n; }
 struct MatMulPC { uint out_dim; uint in_dim; }
 struct RoPEPC { uint dim; uint n_heads; uint position; float theta; }
 struct SoftmaxPC { uint n; uint offset; }
@@ -105,6 +114,12 @@ fn ModelWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* con
     Tensor token_embedding = load_tensor_as_f32(ctx, gf, names.embedding);
     Tensor output_norm = load_tensor_by_name(ctx, gf, names.output_norm);
 
+    // Load output norm bias for LayerNorm architectures
+    Tensor output_norm_bias;
+    if (config.norm_type == LAYERNORM && names.output_norm_bias.len > 0) {
+        output_norm_bias = load_tensor_by_name(ctx, gf, names.output_norm_bias);
+    }
+
     // Output weight - may be same as embedding (tied weights) or separate
     Tensor output_weight;
     if (try output_info = gf.find_tensor(names.output)) {
@@ -124,10 +139,24 @@ fn ModelWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* con
             .wv = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wv),
             .wo = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wo),
             .ffn_norm = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_norm),
-            .ffn_gate = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_gate),
             .ffn_up = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_up),
             .ffn_down = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_down),
         };
+
+        // Load gate weight only for SwiGLU FFN
+        if (config.ffn_type == SWIGLU) {
+            layers[l].ffn_gate = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_gate);
+        }
+
+        // Load norm biases for LayerNorm architectures
+        if (config.norm_type == LAYERNORM) {
+            if (names.attn_norm_bias.len > 0) {
+                layers[l].attn_norm_bias = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.attn_norm_bias);
+            }
+            if (names.ffn_norm_bias.len > 0) {
+                layers[l].ffn_norm_bias = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_norm_bias);
+            }
+        }
 
         if ((l + 1) % 4 == 0 || l == config.n_layers - 1) {
             io::printfn("  Loaded layer %d / %d", l + 1, config.n_layers);
@@ -137,6 +166,7 @@ fn ModelWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* con
     return {
         .token_embedding = token_embedding,
         .output_norm = output_norm,
+        .output_norm_bias = output_norm_bias,
         .output = output_weight,
         .layers = layers,
     };
@@ -251,7 +281,9 @@ fn ModelKernels? create_kernels(DeviceContext* ctx) {
     ModelKernels kernels = {
         .embedding    = create_kernel(ctx, shader, 2, EmbeddingPC.sizeof, "embedding")!!,
         .rmsnorm      = create_kernel(ctx, shader, 3, RMSNormPC.sizeof, "rmsnorm")!!,
+        .layernorm    = create_kernel(ctx, shader, 4, LayerNormPC.sizeof, "layernorm")!!,
         .silu         = create_kernel(ctx, shader, 1, SiluPC.sizeof, "silu")!!,
+        .gelu         = create_kernel(ctx, shader, 1, GeluPC.sizeof, "gelu")!!,
         .matmul       = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul")!!,
         .matmul_q8    = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q8")!!,
         .matmul_q4_0  = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q4_0")!!,
@@ -351,12 +383,20 @@ fn void? Model.forward(&self, uint token, uint position) {
             (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
         compute_barrier(cmd);
 
-        // 2b. RMSNorm(hidden, attn_norm) -> norm_out
-        RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &k.rmsnorm,
-            { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, lw.attn_norm.size_bytes, a.norm_out.size_bytes },
-            &rms_pc, 1);
+        // 2b. Norm(hidden, attn_norm) -> norm_out
+        if (c.norm_type == RMSNORM) {
+            RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
+            dispatch_kernel(cmd, &k.rmsnorm,
+                { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
+                { a.hidden.size_bytes, lw.attn_norm.size_bytes, a.norm_out.size_bytes },
+                &rms_pc, 1);
+        } else {
+            LayerNormPC ln_pc = { .dim = c.dim, .eps = c.rms_eps };
+            dispatch_kernel(cmd, &k.layernorm,
+                { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, lw.attn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
+                { a.hidden.size_bytes, lw.attn_norm.size_bytes, lw.attn_norm_bias.size_bytes, a.norm_out.size_bytes },
+                &ln_pc, 1);
+        }
         compute_barrier(cmd);
 
         // 2c. Q/K/V projections
@@ -432,35 +472,58 @@ fn void? Model.forward(&self, uint token, uint position) {
             (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
         compute_barrier(cmd);
 
-        // 2j. RMSNorm for FFN
-        dispatch_kernel(cmd, &k.rmsnorm,
-            { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, lw.ffn_norm.size_bytes, a.norm_out.size_bytes },
-            &rms_pc, 1);
+        // 2j. Norm for FFN
+        if (c.norm_type == RMSNORM) {
+            RMSNormPC rms_pc2 = { .dim = c.dim, .eps = c.rms_eps };
+            dispatch_kernel(cmd, &k.rmsnorm,
+                { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
+                { a.hidden.size_bytes, lw.ffn_norm.size_bytes, a.norm_out.size_bytes },
+                &rms_pc2, 1);
+        } else {
+            LayerNormPC ln_pc2 = { .dim = c.dim, .eps = c.rms_eps };
+            dispatch_kernel(cmd, &k.layernorm,
+                { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, lw.ffn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
+                { a.hidden.size_bytes, lw.ffn_norm.size_bytes, lw.ffn_norm_bias.size_bytes, a.norm_out.size_bytes },
+                &ln_pc2, 1);
+        }
         compute_barrier(cmd);
 
-        // 2k. FFN: gate and up projections
-        dispatch_matmul(cmd, k, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
-        dispatch_matmul(cmd, k, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
-        compute_barrier(cmd);
+        // 2k. FFN
+        if (c.ffn_type == SWIGLU) {
+            // SwiGLU: gate+up → SiLU(gate) → gate*up → down
+            dispatch_matmul(cmd, k, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
+            dispatch_matmul(cmd, k, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
+            compute_barrier(cmd);
 
-        // 2l. SiLU(gate) then gate *= up (SwiGLU)
-        SiluPC silu_pc = { .n = c.ffn_dim };
-        dispatch_kernel(cmd, &k.silu,
-            { a.ffn_gate_out.gpu_buffer.buffer },
-            { a.ffn_gate_out.size_bytes },
-            &silu_pc, ceil_div(c.ffn_dim, 256));
-        compute_barrier(cmd);
+            SiluPC silu_pc = { .n = c.ffn_dim };
+            dispatch_kernel(cmd, &k.silu,
+                { a.ffn_gate_out.gpu_buffer.buffer },
+                { a.ffn_gate_out.size_bytes },
+                &silu_pc, ceil_div(c.ffn_dim, 256));
+            compute_barrier(cmd);
 
-        ElemwisePC emul_pc = { .n = c.ffn_dim };
-        dispatch_kernel(cmd, &k.elemwise_mul,
-            { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
-            { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
-            &emul_pc, ceil_div(c.ffn_dim, 256));
-        compute_barrier(cmd);
+            ElemwisePC emul_pc = { .n = c.ffn_dim };
+            dispatch_kernel(cmd, &k.elemwise_mul,
+                { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
+                { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
+                &emul_pc, ceil_div(c.ffn_dim, 256));
+            compute_barrier(cmd);
 
-        // 2m. Down projection
-        dispatch_matmul(cmd, k, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+            dispatch_matmul(cmd, k, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+        } else {
+            // GELU MLP: up → GELU → down
+            dispatch_matmul(cmd, k, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
+            compute_barrier(cmd);
+
+            GeluPC gelu_pc = { .n = c.ffn_dim };
+            dispatch_kernel(cmd, &k.gelu,
+                { a.ffn_up_out.gpu_buffer.buffer },
+                { a.ffn_up_out.size_bytes },
+                &gelu_pc, ceil_div(c.ffn_dim, 256));
+            compute_barrier(cmd);
+
+            dispatch_matmul(cmd, k, &lw.ffn_down, &a.ffn_up_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+        }
         compute_barrier(cmd);
 
         // 2n. Residual add
@@ -475,12 +538,20 @@ fn void? Model.forward(&self, uint token, uint position) {
         compute_barrier(cmd);
     }
 
-    // 3. Final RMSNorm
-    RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
-    dispatch_kernel(cmd, &k.rmsnorm,
-        { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-        { a.hidden.size_bytes, w.output_norm.size_bytes, a.norm_out.size_bytes },
-        &final_rms, 1);
+    // 3. Final norm
+    if (c.norm_type == RMSNORM) {
+        RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
+        dispatch_kernel(cmd, &k.rmsnorm,
+            { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
+            { a.hidden.size_bytes, w.output_norm.size_bytes, a.norm_out.size_bytes },
+            &final_rms, 1);
+    } else {
+        LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
+        dispatch_kernel(cmd, &k.layernorm,
+            { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, w.output_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
+            { a.hidden.size_bytes, w.output_norm.size_bytes, w.output_norm_bias.size_bytes, a.norm_out.size_bytes },
+            &final_ln, 1);
+    }
     compute_barrier(cmd);
 
     // 4. Output projection -> logits
@@ -494,7 +565,9 @@ fn void Model.free(&self) {
     // Free kernels
     self.kernels.embedding.free(self.ctx.device);
     self.kernels.rmsnorm.free(self.ctx.device);
+    self.kernels.layernorm.free(self.ctx.device);
     self.kernels.silu.free(self.ctx.device);
+    self.kernels.gelu.free(self.ctx.device);
     self.kernels.matmul.free(self.ctx.device);
     self.kernels.matmul_q8.free(self.ctx.device);
     self.kernels.matmul_q4_0.free(self.ctx.device);
@@ -532,6 +605,7 @@ fn void Model.free(&self) {
     // Free weights
     self.weights.token_embedding.free();
     self.weights.output_norm.free();
+    if (self.weights.output_norm_bias.size_bytes > 0) self.weights.output_norm_bias.free();
     // Only free output if it's not the same as embedding (tied weights)
     if (self.weights.output.gpu_buffer.buffer != self.weights.token_embedding.gpu_buffer.buffer) {
         self.weights.output.free();
@@ -539,12 +613,14 @@ fn void Model.free(&self) {
     for (uint l = 0; l < self.config.n_layers; l++) {
         LayerWeights* lw = &self.weights.layers[l];
         lw.attn_norm.free();
+        if (lw.attn_norm_bias.size_bytes > 0) lw.attn_norm_bias.free();
         lw.wq.free();
         lw.wk.free();
         lw.wv.free();
         lw.wo.free();
         lw.ffn_norm.free();
-        lw.ffn_gate.free();
+        if (lw.ffn_norm_bias.size_bytes > 0) lw.ffn_norm_bias.free();
+        if (lw.ffn_gate.size_bytes > 0) lw.ffn_gate.free();
         lw.ffn_up.free();
         lw.ffn_down.free();
     }
