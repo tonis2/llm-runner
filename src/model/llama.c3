@@ -15,6 +15,7 @@ const char[*] RMSNORM_SPV     = $embed("../../shaders/rmsnorm.spv");
 const char[*] SILU_SPV        = $embed("../../shaders/silu.spv");
 const char[*] MATMUL_SPV      = $embed("../../shaders/matmul.spv");
 const char[*] MATMUL_Q8_SPV   = $embed("../../shaders/matmul_q8.spv");
+const char[*] MATMUL_Q4K_SPV  = $embed("../../shaders/matmul_q4k.spv");
 const char[*] MATMUL_Q5K_SPV  = $embed("../../shaders/matmul_q5k.spv");
 const char[*] MATMUL_Q6K_SPV  = $embed("../../shaders/matmul_q6k.spv");
 const char[*] ROPE_SPV        = $embed("../../shaders/rope.spv");
@@ -80,6 +81,7 @@ struct LlamaKernels {
     ComputeKernel silu;
     ComputeKernel matmul;
     ComputeKernel matmul_q8;
+    ComputeKernel matmul_q4k;
     ComputeKernel matmul_q5k;
     ComputeKernel matmul_q6k;
     ComputeKernel rope;
@@ -304,6 +306,7 @@ fn LlamaKernels? create_kernels(DeviceContext* ctx) {
         .silu        = create_kernel(ctx, &SILU_SPV, 1, SiluPC.sizeof)!!,
         .matmul      = create_kernel(ctx, &MATMUL_SPV, 3, MatMulPC.sizeof)!!,
         .matmul_q8   = create_kernel(ctx, &MATMUL_Q8_SPV, 3, MatMulPC.sizeof)!!,
+        .matmul_q4k  = create_kernel(ctx, &MATMUL_Q4K_SPV, 3, MatMulPC.sizeof)!!,
         .matmul_q5k  = create_kernel(ctx, &MATMUL_Q5K_SPV, 3, MatMulPC.sizeof)!!,
         .matmul_q6k  = create_kernel(ctx, &MATMUL_Q6K_SPV, 3, MatMulPC.sizeof)!!,
         .rope        = create_kernel(ctx, &ROPE_SPV, 1, RoPEPC.sizeof)!!,
@@ -331,6 +334,8 @@ fn void dispatch_matmul(
     ComputeKernel* kernel;
     if (weight.dtype == GGML_Q8_0) {
         kernel = &k.matmul_q8;
+    } else if (weight.dtype == GGML_Q4_K) {
+        kernel = &k.matmul_q4k;
     } else if (weight.dtype == GGML_Q5_K) {
         kernel = &k.matmul_q5k;
     } else if (weight.dtype == GGML_Q6_K) {
@@ -550,6 +555,7 @@ fn void LlamaModel.free(&self) {
     self.kernels.silu.free(self.ctx.device);
     self.kernels.matmul.free(self.ctx.device);
     self.kernels.matmul_q8.free(self.ctx.device);
+    self.kernels.matmul_q4k.free(self.ctx.device);
     self.kernels.matmul_q5k.free(self.ctx.device);
     self.kernels.matmul_q6k.free(self.ctx.device);
     self.kernels.rope.free(self.ctx.device);
