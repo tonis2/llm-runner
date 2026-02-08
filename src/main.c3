@@ -5,6 +5,7 @@ import std::io::file;
 import std::io::file::mmap;
 import std::core::mem;
 import std::math::random;
+import std::time::clock;
 
 fn int main(String[] args) {
     if (args.len < 2) {
@@ -124,16 +125,20 @@ fn int main(String[] args) {
     }
 
     // Prefill: BOS + prompt tokens
+    Clock prefill_start = clock::now();
     model.forward(tok.bos_id, 0)!!;  // BOS at position 0
     for (usz pi = 0; pi < n_prompt; pi++) {
         model.forward(prompt_tokens[pi], (uint)(pi + 1))!!;
     }
+    double prefill_sec = prefill_start.to_now().to_sec();
 
     // Decode: sample and generate
     random::Sfc64Random rng;
     random::seed(&rng, (ulong)42);
     uint next_pos = (uint)(n_prompt + 1);
+    uint n_decoded = 0;
     char[256] decode_buf;
+    Clock decode_start = clock::now();
     for (uint g = 0; g < max_tokens; g++) {
         uint token = sample_token(&ctx, &model.acts.logits, model.config.vocab_size, &sampling, &rng)!!;
         if (token == tok.eos_id) break;
@@ -143,8 +148,19 @@ fn int main(String[] args) {
         }
         model.forward(token, next_pos)!!;
         next_pos++;
+        n_decoded++;
     }
+    double decode_sec = decode_start.to_now().to_sec();
     io::printfn("");
+
+    // Performance stats
+    uint n_prefill = (uint)n_prompt + 1;  // BOS + prompt tokens
+    io::printfn("\n--- Performance ---");
+    io::printfn("Prefill: %d tokens in %.2f s (%.1f tok/s)", n_prefill, prefill_sec,
+        (double)n_prefill / prefill_sec);
+    io::printfn("Decode:  %d tokens in %.2f s (%.1f tok/s)", n_decoded, decode_sec,
+        (double)n_decoded / decode_sec);
+    io::printfn("Total:   %.2f s", prefill_sec + decode_sec);
 
     if (n_prompt > 0) mem::free(prompt_tokens);
 

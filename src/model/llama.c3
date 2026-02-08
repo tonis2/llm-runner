@@ -39,7 +39,6 @@ struct ModelWeights {
 
 struct ModelActivations {
     Tensor hidden;
-    Tensor residual;
     Tensor norm_out;
     Tensor q;
     Tensor k;
@@ -236,7 +235,6 @@ fn ModelActivations? allocate_activations(DeviceContext* ctx, ModelConfig* confi
 
     return {
         .hidden = create_f32_tensor(ctx, dim_shape, 1)!!,
-        .residual = create_f32_tensor(ctx, dim_shape, 1)!!,
         .norm_out = create_f32_tensor(ctx, dim_shape, 1)!!,
         .q = create_f32_tensor(ctx, qkv_shape, 1)!!,
         .k = create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
@@ -378,11 +376,6 @@ fn void? Model.forward(&self, uint token, uint position) {
     for (uint l = 0; l < c.n_layers; l++) {
         LayerWeights* lw = &w.layers[l];
 
-        // 2a. Copy hidden -> residual (via buffer copy)
-        vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.residual.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
-        compute_barrier(cmd);
-
         // 2b. Norm(hidden, attn_norm) -> norm_out
         if (c.norm_type == RMSNORM) {
             RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
@@ -455,21 +448,12 @@ fn void? Model.forward(&self, uint token, uint position) {
         dispatch_matmul(cmd, k, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
         compute_barrier(cmd);
 
-        // 2h. Residual add: hidden = residual + attn_output
-        vk::cmdCopyBuffer(cmd, a.residual.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
-        compute_barrier(cmd);
-
+        // 2h. Residual add: hidden += attn_output (hidden still has original value)
         ResidualPC res_pc = { .n = c.dim };
         dispatch_kernel(cmd, &k.residual_add,
             { a.hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, a.norm_out.size_bytes },
             &res_pc, ceil_div(c.dim, 256));
-        compute_barrier(cmd);
-
-        // 2i. Copy hidden -> residual for FFN
-        vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.residual.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
         compute_barrier(cmd);
 
         // 2j. Norm for FFN
@@ -526,11 +510,7 @@ fn void? Model.forward(&self, uint token, uint position) {
         }
         compute_barrier(cmd);
 
-        // 2n. Residual add
-        vk::cmdCopyBuffer(cmd, a.residual.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4}});
-        compute_barrier(cmd);
-
+        // 2n. Residual add: hidden += ffn_down_out
         dispatch_kernel(cmd, &k.residual_add,
             { a.hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, a.ffn_down_out.size_bytes },
@@ -582,7 +562,6 @@ fn void Model.free(&self) {
 
     // Free activations
     self.acts.hidden.free();
-    self.acts.residual.free();
     self.acts.norm_out.free();
     self.acts.q.free();
     self.acts.k.free();
