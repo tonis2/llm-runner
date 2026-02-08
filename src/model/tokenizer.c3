@@ -9,13 +9,18 @@ const uint TOKEN_BYTE    = 6;
 
 // --- Vocab hash map (string -> id + score) ---
 
-const usz VOCAB_MAP_CAPACITY = 65536;
+fn usz next_pow2(usz n) {
+    usz p = 1;
+    while (p < n) p *= 2;
+    return p;
+}
 
 struct VocabMap {
     String[] keys;
     uint[] ids;
     float[] scores;
     bool[] occupied;
+    usz capacity;
 }
 
 fn usz str_hash(String s) {
@@ -29,21 +34,24 @@ fn usz str_hash(String s) {
 
 fn VocabMap create_vocab_map(String[] vocab, float[] scores, uint[] token_types) {
     VocabMap map;
-    map.keys = mem::new_array(String, VOCAB_MAP_CAPACITY);
-    map.ids = mem::new_array(uint, VOCAB_MAP_CAPACITY);
-    map.scores = mem::new_array(float, VOCAB_MAP_CAPACITY);
-    map.occupied = mem::new_array(bool, VOCAB_MAP_CAPACITY);
+    usz cap = next_pow2(vocab.len * 2);
+    map.capacity = cap;
+    map.keys = mem::new_array(String, cap);
+    map.ids = mem::new_array(uint, cap);
+    map.scores = mem::new_array(float, cap);
+    map.occupied = mem::new_array(bool, cap);
 
-    for (usz i = 0; i < VOCAB_MAP_CAPACITY; i++) {
+    for (usz i = 0; i < cap; i++) {
         map.occupied[i] = false;
     }
 
+    usz mask = cap - 1;
     for (usz i = 0; i < vocab.len; i++) {
         // Only index NORMAL tokens for BPE lookups
         if (token_types[i] == TOKEN_CONTROL || token_types[i] == TOKEN_BYTE) continue;
-        usz idx = str_hash(vocab[i]) & (VOCAB_MAP_CAPACITY - 1);
+        usz idx = str_hash(vocab[i]) & mask;
         while (map.occupied[idx]) {
-            idx = (idx + 1) & (VOCAB_MAP_CAPACITY - 1);
+            idx = (idx + 1) & mask;
         }
         map.keys[idx] = vocab[i];
         map.ids[idx] = (uint)i;
@@ -55,7 +63,8 @@ fn VocabMap create_vocab_map(String[] vocab, float[] scores, uint[] token_types)
 }
 
 fn bool VocabMap.lookup(&self, String key, uint* out_id, float* out_score) {
-    usz idx = str_hash(key) & (VOCAB_MAP_CAPACITY - 1);
+    usz mask = self.capacity - 1;
+    usz idx = str_hash(key) & mask;
     usz start = idx;
     while (self.occupied[idx]) {
         if (str_eq(self.keys[idx], key)) {
@@ -63,7 +72,7 @@ fn bool VocabMap.lookup(&self, String key, uint* out_id, float* out_score) {
             *out_score = self.scores[idx];
             return true;
         }
-        idx = (idx + 1) & (VOCAB_MAP_CAPACITY - 1);
+        idx = (idx + 1) & mask;
         if (idx == start) break;
     }
     return false;
@@ -84,7 +93,6 @@ fn void VocabMap.free_map(&self) {
 
 // --- Merge map for BPE (pair of strings -> rank) ---
 
-const usz MERGE_MAP_CAPACITY = 262144;
 const uint MERGE_NOT_FOUND = 0xFFFFFFFF;
 
 struct MergeMap {
@@ -92,6 +100,7 @@ struct MergeMap {
     String[] keys_b;
     uint[] ranks;
     bool[] occupied;
+    usz capacity;
 }
 
 fn usz merge_hash(String a, String b) {
@@ -109,22 +118,26 @@ fn usz merge_hash(String a, String b) {
     return h;
 }
 
-fn MergeMap create_merge_map() {
+fn MergeMap create_merge_map(usz expected_count) {
     MergeMap map;
-    map.keys_a = mem::new_array(String, MERGE_MAP_CAPACITY);
-    map.keys_b = mem::new_array(String, MERGE_MAP_CAPACITY);
-    map.ranks = mem::new_array(uint, MERGE_MAP_CAPACITY);
-    map.occupied = mem::new_array(bool, MERGE_MAP_CAPACITY);
-    for (usz i = 0; i < MERGE_MAP_CAPACITY; i++) {
+    usz cap = next_pow2(expected_count * 2);
+    if (cap < 1024) cap = 1024;
+    map.capacity = cap;
+    map.keys_a = mem::new_array(String, cap);
+    map.keys_b = mem::new_array(String, cap);
+    map.ranks = mem::new_array(uint, cap);
+    map.occupied = mem::new_array(bool, cap);
+    for (usz i = 0; i < cap; i++) {
         map.occupied[i] = false;
     }
     return map;
 }
 
 fn void MergeMap.insert(&self, String a, String b, uint rank) {
-    usz idx = merge_hash(a, b) & (MERGE_MAP_CAPACITY - 1);
+    usz mask = self.capacity - 1;
+    usz idx = merge_hash(a, b) & mask;
     while (self.occupied[idx]) {
-        idx = (idx + 1) & (MERGE_MAP_CAPACITY - 1);
+        idx = (idx + 1) & mask;
     }
     self.keys_a[idx] = a;
     self.keys_b[idx] = b;
@@ -133,13 +146,14 @@ fn void MergeMap.insert(&self, String a, String b, uint rank) {
 }
 
 fn uint MergeMap.lookup(&self, String a, String b) {
-    usz idx = merge_hash(a, b) & (MERGE_MAP_CAPACITY - 1);
+    usz mask = self.capacity - 1;
+    usz idx = merge_hash(a, b) & mask;
     usz start = idx;
     while (self.occupied[idx]) {
         if (str_eq(self.keys_a[idx], a) && str_eq(self.keys_b[idx], b)) {
             return self.ranks[idx];
         }
-        idx = (idx + 1) & (MERGE_MAP_CAPACITY - 1);
+        idx = (idx + 1) & mask;
         if (idx == start) break;
     }
     return MERGE_NOT_FOUND;
@@ -219,10 +233,10 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
     MergeMap merge_map;
     bool ignore_merges = false;
     if (is_bpe) {
-        merge_map = create_merge_map();
         String[]? merges_result = gf.read_string_array("tokenizer.ggml.merges");
         if (try merges_result) {
             String[] merges = merges_result;
+            merge_map = create_merge_map(merges.len);
             for (usz i = 0; i < merges.len; i++) {
                 // Each merge line is "token_a token_b" separated by space
                 String line = merges[i];
@@ -238,6 +252,8 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
             }
             io::printfn("  Loaded %d BPE merges", merges.len);
             mem::free(merges);
+        } else {
+            merge_map = create_merge_map(0);
         }
 
         // Check ignore_merges flag (LLaMA 3 sets this)
@@ -266,6 +282,23 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
 
 // --- Decode (token ID -> text) ---
 
+// GPT-2 byte encoding: maps 256 byte values to unicode codepoints.
+// Pass-through: 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF map to themselves.
+// Remapped: 0x00-0x20, 0x7F-0xA0, 0xAD map to U+0100..U+0143.
+// This reverses: codepoint -> original byte value, or -1 if unknown.
+fn int gpt2_byte_decode(uint cp) {
+    if (cp >= 0x21 && cp <= 0x7E) return (int)cp;
+    if (cp >= 0xA1 && cp <= 0xAC) return (int)cp;
+    if (cp >= 0xAE && cp <= 0xFF) return (int)cp;
+    if (cp >= 0x100 && cp <= 0x143) {
+        uint n = cp - 0x100;
+        if (n <= 32) return (int)n;           // 0x00..0x20
+        if (n <= 66) return (int)(n - 33 + 0x7F); // 0x7F..0xA0
+        return 0xAD;                          // n == 67
+    }
+    return -1;
+}
+
 fn String Tokenizer.decode_token(&self, uint token_id, char[] buf) {
     if (token_id >= self.vocab_size) return "";
 
@@ -286,9 +319,38 @@ fn String Tokenizer.decode_token(&self, uint token_id, char[] buf) {
         return "";
     }
 
-    // BPE tokens are literal — no ▁ replacement needed
+    // BPE tokens use GPT-2 byte encoding — decode back to raw bytes
     if (self.is_bpe) {
-        return piece;
+        usz out = 0;
+        usz i = 0;
+        while (i < piece.len) {
+            // Decode UTF-8 codepoint
+            uint cp;
+            usz cplen;
+            char b0 = piece[i];
+            if ((b0 & 0x80) == 0) {
+                cp = (uint)b0;
+                cplen = 1;
+            } else if ((b0 & 0xE0) == 0xC0 && i + 1 < piece.len) {
+                cp = ((uint)(b0 & 0x1F) << 6) | (uint)(piece[i + 1] & 0x3F);
+                cplen = 2;
+            } else if ((b0 & 0xF0) == 0xE0 && i + 2 < piece.len) {
+                cp = ((uint)(b0 & 0x0F) << 12) | ((uint)(piece[i + 1] & 0x3F) << 6) | (uint)(piece[i + 2] & 0x3F);
+                cplen = 3;
+            } else {
+                cp = (uint)b0;
+                cplen = 1;
+            }
+            // Map GPT-2 unicode codepoint back to original byte
+            int byte_val = gpt2_byte_decode(cp);
+            if (byte_val >= 0) {
+                buf[out] = (char)byte_val;
+                out++;
+            }
+            i += cplen;
+        }
+        if (out == 0) return "";
+        return (String)buf[0..out - 1];
     }
 
     // SPM tokens: replace ▁ (U+2581, bytes E2 96 81) with space

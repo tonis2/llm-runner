@@ -41,7 +41,8 @@ fn int main(String[] args) {
         io::printfn("Prompt encoded to %d tokens", n_prompt);
     }
 
-    io::printfn("\nGenerating (greedy, max 256 tokens)...\n");
+    uint max_tokens = MAX_SEQ_LEN - (uint)n_prompt - 1;  // -1 for BOS
+    io::printfn("\nGenerating (greedy, max %d tokens)...\n", max_tokens);
 
     // Echo prompt text
     if (args.len >= 3) {
@@ -57,7 +58,7 @@ fn int main(String[] args) {
     // Decode: sample and generate
     uint next_pos = (uint)(n_prompt + 1);
     char[256] decode_buf;
-    for (uint g = 0; g < 256; g++) {
+    for (uint g = 0; g < max_tokens; g++) {
         uint token = argmax_sample(&ctx, &model.acts.logits, model.config.vocab_size)!!;
         if (token == tok.eos_id) break;  // EOS
         String text = tok.decode_token(token, &decode_buf);
