@@ -285,8 +285,12 @@ fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* 
         for (usz b = 0; b < n_blocks; b++) {
             dequant_q6k_block(data_ptr + b * 210, f32_data + b * 256);
         }
+    } else if (info.type == GGML_F16) {
+        for (usz j = 0; j < n_elements; j++) {
+            f32_data[j] = cpu_f16_to_f32(data_ptr + j * 2);
+        }
     } else {
-        // Copy raw for F32/F16
+        // Copy raw for F32
         mem::copy(f32_data, data_ptr, f32_size);
     }
 

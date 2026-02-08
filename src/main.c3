@@ -7,13 +7,37 @@ import std::core::mem;
 import std::math::random;
 import std::time::clock;
 
+enum RunMode : char { LLM, TXT2IMG, IMG2IMG }
+
+fn bool is_diffusion_model(GGUFFile* gf) {
+    // Check for diffusion tensor name prefixes
+    foreach (&t : gf.tensors) {
+        if (t.name.starts_with("model.diffusion_model.") ||
+            t.name.starts_with("cond_stage_model.") ||
+            t.name.starts_with("first_stage_model.")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn int main(String[] args) {
     if (args.len < 2) {
-        io::printfn("Usage: llm <model.gguf> [prompt] [--temp T] [--top-k K] [--top-p P] [--arch config.json]");
+        io::printfn("Usage: llm <model.gguf> [prompt] [options]");
+        io::printfn("");
+        io::printfn("LLM options:");
         io::printfn("  --temp   Temperature (0 = greedy, default 0.7)");
         io::printfn("  --top-k  Top-k filtering (default 40)");
         io::printfn("  --top-p  Nucleus sampling threshold (default 0.9)");
-        io::printfn("  --arch   Path to architecture config JSON (auto-detected if omitted)");
+        io::printfn("  --arch   Path to architecture config JSON");
+        io::printfn("");
+        io::printfn("Diffusion options:");
+        io::printfn("  --mode     txt2img|img2img (auto-detected from model)");
+        io::printfn("  --steps    Number of diffusion steps (default 1)");
+        io::printfn("  --cfg-scale  Classifier-free guidance scale (default 1.0)");
+        io::printfn("  --seed     Random seed (default 42)");
+        io::printfn("  --output   Output image path (default output.ppm)");
+        io::printfn("  --input    Input image for img2img mode");
         return 1;
     }
 
@@ -22,6 +46,15 @@ fn int main(String[] args) {
     String prompt = "";
     String arch_path = "";
     SamplingParams sampling = { .temperature = 0.7f, .top_k = 40, .top_p = 0.9f };
+
+    // Diffusion params
+    RunMode run_mode = LLM;
+    bool mode_forced = false;
+    uint diff_steps = 1;
+    float cfg_scale = 1.0f;
+    ulong seed = 42;
+    String output_path = "output.ppm";
+    String input_path = "";
 
     usz i = 1;
     while (i < args.len) {
@@ -38,6 +71,30 @@ fn int main(String[] args) {
                 i += 2;
             } else if (args[i] == "--arch") {
                 arch_path = args[i + 1];
+                i += 2;
+            } else if (args[i] == "--mode") {
+                if (args[i + 1] == "txt2img") {
+                    run_mode = TXT2IMG;
+                    mode_forced = true;
+                } else if (args[i + 1] == "img2img") {
+                    run_mode = IMG2IMG;
+                    mode_forced = true;
+                }
+                i += 2;
+            } else if (args[i] == "--steps") {
+                diff_steps = args[i + 1].to_uint() ?? 1;
+                i += 2;
+            } else if (args[i] == "--cfg-scale") {
+                cfg_scale = args[i + 1].to_float() ?? 1.0f;
+                i += 2;
+            } else if (args[i] == "--seed") {
+                seed = args[i + 1].to_ulong() ?? 42;
+                i += 2;
+            } else if (args[i] == "--output") {
+                output_path = args[i + 1];
+                i += 2;
+            } else if (args[i] == "--input") {
+                input_path = args[i + 1];
                 i += 2;
             } else {
                 i++;
@@ -69,7 +126,66 @@ fn int main(String[] args) {
     defer gf.free();
     gguf_print_info(&gf);
 
-    // Detect architecture and load config
+    // Detect model type: diffusion or LLM
+    bool is_diffusion = is_diffusion_model(&gf);
+
+    if (is_diffusion && !mode_forced) {
+        run_mode = TXT2IMG;
+    }
+
+    if (run_mode == TXT2IMG || run_mode == IMG2IMG) {
+        io::printfn("Diffusion model detected");
+        io::printfn("Mode: %s, Steps: %d, CFG: %.1f, Seed: %d",
+            run_mode == TXT2IMG ? "txt2img" : "img2img", diff_steps, cfg_scale, seed);
+        io::printfn("Output: %s", output_path);
+
+        if (prompt.len == 0) {
+            io::printfn("Error: a prompt is required for image generation");
+            return 1;
+        }
+
+        DeviceContext ctx = createContext()!!;
+        ctx.allocator.queue = &ctx.compute_queue;  // Fix dangling pointer from createContext
+        defer ctx.free();
+
+        DiffusionPipeline pipeline = load_diffusion_pipeline(&ctx, &gf)!!;
+        pipeline.fixup_pointers();  // Fix dangling kernel pointers from return-by-value
+        defer pipeline.free();
+
+        // Load CLIP tokenizer - SDXS doesn't have tokenizer metadata in GGUF
+        Tokenizer tok;
+        bool has_tokenizer = false;
+        if (try t = load_tokenizer(&gf)) {
+            tok = t;
+            has_tokenizer = true;
+        } else {
+            io::printfn("Warning: No tokenizer in model. Using dummy tokens (prompt will be ignored).");
+        }
+        defer if (has_tokenizer) tok.free();
+
+        DiffusionParams params = {
+            .num_steps = diff_steps,
+            .cfg_scale = cfg_scale,
+            .seed = (uint)seed,
+            .strength = 0.75f,
+            .output_path = output_path,
+        };
+
+        bool ok;
+        if (run_mode == TXT2IMG) {
+            ok = pipeline.txt2img(has_tokenizer ? &tok : null, prompt, &params);
+        } else {
+            if (input_path.len == 0) {
+                io::printfn("Error: --input required for img2img mode");
+                return 1;
+            }
+            ok = pipeline.img2img(has_tokenizer ? &tok : null, prompt, input_path, &params);
+        }
+
+        return ok ? 0 : 1;
+    }
+
+    // LLM path
     String arch_name = detect_architecture(&gf);
     io::printfn("Architecture: %s", arch_name);
 
@@ -93,9 +209,10 @@ fn int main(String[] args) {
     WeightNames names = load_weight_names(config_json)!!;
 
     DeviceContext ctx = createContext()!!;
+    ctx.allocator.queue = &ctx.compute_queue;  // Fix dangling pointer from createContext
     defer ctx.free();
 
-    Model model = load_model(&ctx, &gf, &config, &names)!!;
+    LlmModel model = load_llm_model(&ctx, &gf, &config, &names)!!;
     defer model.free();
 
     Tokenizer tok = load_tokenizer(&gf)!!;

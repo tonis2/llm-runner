@@ -35,7 +35,7 @@ fn void test_stories260k_forward() @test {
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    Model model = load_model(&ctx, &gf, &config, &names)!!;
+    LlmModel model = load_llm_model(&ctx, &gf, &config, &names)!!;
     defer model.free();
 
     Tokenizer tok = load_tokenizer(&gf)!!;
