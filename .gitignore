@@ -1,3 +1,5 @@
 build/*
 assets/*
 compile.sh
+test/models/
+test/data/

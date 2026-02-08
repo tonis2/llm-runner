@@ -195,7 +195,7 @@ fn GGUFFile? gguf_parse(char[] data) {
 
     // Align to tensor data
     usz tensor_data_offset = align_offset(reader.pos, GGUF_ALIGNMENT);
-    char* tensor_data_base = &data[tensor_data_offset];
+    char* tensor_data_base = tensor_data_offset < data.len ? &data[tensor_data_offset] : null;
 
     return {
         .version = version,
