@@ -106,8 +106,7 @@ fn LlamaConfig extract_config(GGUFFile* gf) {
     uint vocab_size = 0;
 
     // Vocab size comes from tokenizer.ggml.tokens array or the embedding tensor
-    GGUFTensorInfo*? emb = gf.find_tensor("token_embd.weight");
-    if (try emb) {
+    if (try emb = gf.find_tensor("token_embd.weight")) {
         vocab_size = (uint)emb.shape[1];
     }
 
@@ -159,8 +158,7 @@ fn LlamaWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, LlamaConfig* con
 
     // Output weight - may be same as embedding (tied weights) or separate
     Tensor output_weight;
-    GGUFTensorInfo*? output_info = gf.find_tensor("output.weight");
-    if (try output_info) {
+    if (try output_info = gf.find_tensor("output.weight")) {
         output_weight = upload_weight(ctx, output_info, gf.tensor_data_base)!!;
     } else {
         // Tied weights - use embedding

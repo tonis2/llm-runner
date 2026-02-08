@@ -4,14 +4,54 @@ import std::io;
 import std::io::file;
 import std::io::file::mmap;
 import std::core::mem;
+import std::math::random;
 
 fn int main(String[] args) {
     if (args.len < 2) {
-        io::printfn("Usage: llm <model.gguf> [prompt]");
+        io::printfn("Usage: llm <model.gguf> [prompt] [--temp T] [--top-k K] [--top-p P]");
+        io::printfn("  --temp   Temperature (0 = greedy, default 0.7)");
+        io::printfn("  --top-k  Top-k filtering (default 40)");
+        io::printfn("  --top-p  Nucleus sampling threshold (default 0.9)");
         return 1;
     }
 
-    String model_path = args[1];
+    // Parse arguments: positional (model, prompt) + flags
+    String model_path = "";
+    String prompt = "";
+    SamplingParams sampling = { .temperature = 0.7f, .top_k = 40, .top_p = 0.9f };
+
+    usz i = 1;
+    while (i < args.len) {
+        if (args[i].len > 2 && args[i][0] == '-' && args[i][1] == '-') {
+            if (i + 1 >= args.len) { i++; continue; }
+            if (args[i] == "--temp") {
+                sampling.temperature = args[i + 1].to_float() ?? 0.7f;
+                i += 2;
+            } else if (args[i] == "--top-k") {
+                sampling.top_k = args[i + 1].to_uint() ?? 40;
+                i += 2;
+            } else if (args[i] == "--top-p") {
+                sampling.top_p = args[i + 1].to_float() ?? 0.9f;
+                i += 2;
+            } else {
+                i++;
+            }
+        } else if (model_path.len == 0) {
+            model_path = args[i];
+            i++;
+        } else if (prompt.len == 0) {
+            prompt = args[i];
+            i++;
+        } else {
+            i++;
+        }
+    }
+
+    if (model_path.len == 0) {
+        io::printfn("Error: no model path provided");
+        return 1;
+    }
+
     io::printfn("Loading model from: %s", model_path);
 
     // Memory map the GGUF file
@@ -35,32 +75,40 @@ fn int main(String[] args) {
     // Encode prompt if provided
     uint[] prompt_tokens;
     usz n_prompt = 0;
-    if (args.len >= 3) {
-        prompt_tokens = tok.encode(args[2])!!;
+    if (prompt.len > 0) {
+        prompt_tokens = tok.encode(prompt)!!;
         n_prompt = prompt_tokens.len;
         io::printfn("Prompt encoded to %d tokens", n_prompt);
     }
 
-    uint max_tokens = MAX_SEQ_LEN - (uint)n_prompt - 1;  // -1 for BOS
-    io::printfn("\nGenerating (greedy, max %d tokens)...\n", max_tokens);
+    uint max_tokens = MAX_SEQ_LEN - (uint)n_prompt - 1;
+
+    if (sampling.temperature <= 0.0f) {
+        io::printfn("\nGenerating (greedy, max %d tokens)...\n", max_tokens);
+    } else {
+        io::printfn("\nGenerating (temp=%.1f, top_k=%d, top_p=%.1f, max %d tokens)...\n",
+            sampling.temperature, sampling.top_k, sampling.top_p, max_tokens);
+    }
 
     // Echo prompt text
-    if (args.len >= 3) {
-        io::printf("%s", args[2]);
+    if (prompt.len > 0) {
+        io::printf("%s", prompt);
     }
 
     // Prefill: BOS + prompt tokens
     model.forward(tok.bos_id, 0)!!;  // BOS at position 0
-    for (usz i = 0; i < n_prompt; i++) {
-        model.forward(prompt_tokens[i], (uint)(i + 1))!!;
+    for (usz pi = 0; pi < n_prompt; pi++) {
+        model.forward(prompt_tokens[pi], (uint)(pi + 1))!!;
     }
 
     // Decode: sample and generate
+    random::Sfc64Random rng;
+    random::seed(&rng, (ulong)42);
     uint next_pos = (uint)(n_prompt + 1);
     char[256] decode_buf;
     for (uint g = 0; g < max_tokens; g++) {
-        uint token = argmax_sample(&ctx, &model.acts.logits, model.config.vocab_size)!!;
-        if (token == tok.eos_id) break;  // EOS
+        uint token = sample_token(&ctx, &model.acts.logits, model.config.vocab_size, &sampling, &rng)!!;
+        if (token == tok.eos_id) break;
         String text = tok.decode_token(token, &decode_buf);
         if (text.len > 0) {
             io::printf("%s", text);

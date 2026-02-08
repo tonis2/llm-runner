@@ -5,13 +5,6 @@ import std::core::mem;
 
 const uint GGUF_MAGIC = 0x46554747;
 
-fn bool str_eq(String a, String b) {
-    if (a.len != b.len) return false;
-    for (usz i = 0; i < a.len; i++) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
 const usz GGUF_ALIGNMENT = 32;
 
 // GGUF metadata value types (0-12, contiguous)
@@ -155,7 +148,7 @@ struct GGUFFile {
 
 fn String? GGUFFile.get_string(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == STRING) {
+        if (kv.key == key && kv.val_type == STRING) {
             return kv.value.str_val;
         }
     }
@@ -164,7 +157,7 @@ fn String? GGUFFile.get_string(&self, String key) {
 
 fn uint? GGUFFile.get_u32(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == UINT32) {
+        if (kv.key == key && kv.val_type == UINT32) {
             return kv.value.u32_val;
         }
     }
@@ -173,7 +166,7 @@ fn uint? GGUFFile.get_u32(&self, String key) {
 
 fn int? GGUFFile.get_i32(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == INT32) {
+        if (kv.key == key && kv.val_type == INT32) {
             return kv.value.i32_val;
         }
     }
@@ -182,7 +175,7 @@ fn int? GGUFFile.get_i32(&self, String key) {
 
 fn float? GGUFFile.get_f32(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == FLOAT32) {
+        if (kv.key == key && kv.val_type == FLOAT32) {
             return kv.value.f32_val;
         }
     }
@@ -191,7 +184,7 @@ fn float? GGUFFile.get_f32(&self, String key) {
 
 fn GGUFTensorInfo*? GGUFFile.find_tensor(&self, String name) {
     foreach (&t : self.tensors) {
-        if (str_eq(t.name, name)) {
+        if (t.name == name) {
             return t;
         }
     }
@@ -200,7 +193,7 @@ fn GGUFTensorInfo*? GGUFFile.find_tensor(&self, String name) {
 
 fn String[]? GGUFFile.read_string_array(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == ARRAY && kv.array_type == STRING) {
+        if (kv.key == key && kv.val_type == ARRAY && kv.array_type == STRING) {
             usz count = (usz)kv.array_len;
             String[] result = mem::new_array(String, count);
             // Create reader at the array data offset
@@ -224,7 +217,7 @@ fn String[]? GGUFFile.read_string_array(&self, String key) {
 
 fn float[]? GGUFFile.read_f32_array(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == ARRAY && kv.array_type == FLOAT32) {
+        if (kv.key == key && kv.val_type == ARRAY && kv.array_type == FLOAT32) {
             usz count = (usz)kv.array_len;
             float[] result = mem::new_array(float, count);
             usz pos = kv.array_data_offset;
@@ -240,7 +233,7 @@ fn float[]? GGUFFile.read_f32_array(&self, String key) {
 
 fn uint[]? GGUFFile.read_u32_array(&self, String key) {
     foreach (&kv : self.metadata) {
-        if (str_eq(kv.key, key) && kv.val_type == ARRAY && (kv.array_type == UINT32 || kv.array_type == INT32)) {
+        if (kv.key == key && kv.val_type == ARRAY && (kv.array_type == UINT32 || kv.array_type == INT32)) {
             usz count = (usz)kv.array_len;
             uint[] result = mem::new_array(uint, count);
             usz pos = kv.array_data_offset;

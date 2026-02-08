@@ -2,6 +2,7 @@ module llm;
 
 import std::io;
 import std::core::mem;
+import std::ascii;
 
 const uint TOKEN_NORMAL  = 1;
 const uint TOKEN_CONTROL = 3;
@@ -23,15 +24,6 @@ struct VocabMap {
     usz capacity;
 }
 
-fn usz str_hash(String s) {
-    usz h = 14695981039346656037;
-    for (usz i = 0; i < s.len; i++) {
-        h ^= (usz)s[i];
-        h *= 1099511628211;
-    }
-    return h;
-}
-
 fn VocabMap create_vocab_map(String[] vocab, float[] scores, uint[] token_types) {
     VocabMap map;
     usz cap = next_pow2(vocab.len * 2);
@@ -49,7 +41,7 @@ fn VocabMap create_vocab_map(String[] vocab, float[] scores, uint[] token_types)
     for (usz i = 0; i < vocab.len; i++) {
         // Only index NORMAL tokens for BPE lookups
         if (token_types[i] == TOKEN_CONTROL || token_types[i] == TOKEN_BYTE) continue;
-        usz idx = str_hash(vocab[i]) & mask;
+        usz idx = vocab[i].hash() & mask;
         while (map.occupied[idx]) {
             idx = (idx + 1) & mask;
         }
@@ -64,10 +56,10 @@ fn VocabMap create_vocab_map(String[] vocab, float[] scores, uint[] token_types)
 
 fn bool VocabMap.lookup(&self, String key, uint* out_id, float* out_score) {
     usz mask = self.capacity - 1;
-    usz idx = str_hash(key) & mask;
+    usz idx = key.hash() & mask;
     usz start = idx;
     while (self.occupied[idx]) {
-        if (str_eq(self.keys[idx], key)) {
+        if (self.keys[idx] == key) {
             *out_id = self.ids[idx];
             *out_score = self.scores[idx];
             return true;
@@ -150,7 +142,7 @@ fn uint MergeMap.lookup(&self, String a, String b) {
     usz idx = merge_hash(a, b) & mask;
     usz start = idx;
     while (self.occupied[idx]) {
-        if (str_eq(self.keys_a[idx], a) && str_eq(self.keys_b[idx], b)) {
+        if (self.keys_a[idx] == a && self.keys_b[idx] == b) {
             return self.ranks[idx];
         }
         idx = (idx + 1) & mask;
@@ -197,12 +189,11 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
 
     // Detect tokenizer type
     String tok_model = gf.get_string("tokenizer.ggml.model") ?? "llama";
-    bool is_bpe = str_eq(tok_model, "gpt2");
+    bool is_bpe = tok_model == "gpt2";
 
     // Read scores (may not exist for BPE models)
     float[] scores;
-    float[]? scores_result = gf.read_f32_array("tokenizer.ggml.scores");
-    if (try scores_result) {
+    if (try scores_result = gf.read_f32_array("tokenizer.ggml.scores")) {
         scores = scores_result;
     } else {
         // BPE models may not have scores; allocate zeros
@@ -233,25 +224,21 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
     MergeMap merge_map;
     bool ignore_merges = false;
     if (is_bpe) {
-        String[]? merges_result = gf.read_string_array("tokenizer.ggml.merges");
-        if (try merges_result) {
-            String[] merges = merges_result;
-            merge_map = create_merge_map(merges.len);
-            for (usz i = 0; i < merges.len; i++) {
+        if (try merges_result = gf.read_string_array("tokenizer.ggml.merges")) {
+            merge_map = create_merge_map(merges_result.len);
+            for (usz i = 0; i < merges_result.len; i++) {
                 // Each merge line is "token_a token_b" separated by space
-                String line = merges[i];
-                usz split = 0;
-                for (usz j = 0; j < line.len; j++) {
-                    if (line[j] == ' ') { split = j; break; }
-                }
-                if (split > 0 && split < line.len - 1) {
-                    String a = (String)line[0..split - 1];
-                    String b = (String)line[split + 1..line.len - 1];
-                    merge_map.insert(a, b, (uint)i);
+                String line = merges_result[i];
+                if (try split = line.index_of_char(' ')) {
+                    if (split > 0 && split < line.len - 1) {
+                        String a = (String)line[0..split - 1];
+                        String b = (String)line[split + 1..line.len - 1];
+                        merge_map.insert(a, b, (uint)i);
+                    }
                 }
             }
-            io::printfn("  Loaded %d BPE merges", merges.len);
-            mem::free(merges);
+            io::printfn("  Loaded %d BPE merges", merges_result.len);
+            mem::free(merges_result);
         } else {
             merge_map = create_merge_map(0);
         }
@@ -541,18 +528,6 @@ fn uint[]? Tokenizer.encode_spm(&self, String text) {
 //   4. Punctuation sequences
 //   5. Whitespace sequences
 
-fn bool is_letter(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-fn bool is_digit(char c) {
-    return c >= '0' && c <= '9';
-}
-
-fn bool is_space(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
-}
-
 fn bool is_utf8_cont(char c) {
     return (c & 0xC0) == 0x80;
 }
@@ -607,12 +582,12 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
         char c = text[pos];
 
         // Letters (including UTF-8 multi-byte sequences)
-        if (is_letter(c) || (c & 0x80) != 0) {
+        if (ascii::is_alpha_m(c) || (c & 0x80) != 0) {
             usz start = pos;
             pos++;
             while (pos < text.len) {
                 char nc = text[pos];
-                if (is_letter(nc) || is_utf8_cont(nc) || (nc & 0x80) != 0) {
+                if (ascii::is_alpha_m(nc) || is_utf8_cont(nc) || (nc & 0x80) != 0) {
                     pos++;
                 } else {
                     break;
@@ -624,10 +599,10 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
         }
 
         // Digits (1-3 at a time)
-        if (is_digit(c)) {
+        if (ascii::is_digit_m(c)) {
             usz start = pos;
             usz count = 0;
-            while (pos < text.len && is_digit(text[pos]) && count < 3) {
+            while (pos < text.len && ascii::is_digit_m(text[pos]) && count < 3) {
                 pos++;
                 count++;
             }
@@ -637,9 +612,9 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
         }
 
         // Whitespace
-        if (is_space(c)) {
+        if (ascii::is_space_m(c)) {
             usz start = pos;
-            while (pos < text.len && is_space(text[pos])) {
+            while (pos < text.len && ascii::is_space_m(text[pos])) {
                 pos++;
             }
             words[n_words] = { .start = start, .len = pos - start };
