@@ -1,6 +1,7 @@
 module llm;
 
 import std::io;
+import std::core::mem;
 
 const uint GGUF_MAGIC = 0x46554747;
 
@@ -130,6 +131,7 @@ struct GGUFMetaKV {
     // For arrays
     GGUFType array_type;
     ulong array_len;
+    usz array_data_offset;
 }
 
 struct GGUFTensorInfo {
@@ -148,6 +150,7 @@ struct GGUFFile {
     GGUFMetaKV[] metadata;
     GGUFTensorInfo[] tensors;
     char* tensor_data_base;
+    char[] raw_data;
 }
 
 fn String? GGUFFile.get_string(&self, String key) {
@@ -190,6 +193,62 @@ fn GGUFTensorInfo*? GGUFFile.find_tensor(&self, String name) {
     foreach (&t : self.tensors) {
         if (str_eq(t.name, name)) {
             return t;
+        }
+    }
+    return FILE_NOT_FOUND~;
+}
+
+fn String[]? GGUFFile.read_string_array(&self, String key) {
+    foreach (&kv : self.metadata) {
+        if (str_eq(kv.key, key) && kv.val_type == ARRAY && kv.array_type == STRING) {
+            usz count = (usz)kv.array_len;
+            String[] result = mem::new_array(String, count);
+            // Create reader at the array data offset
+            usz pos = kv.array_data_offset;
+            for (usz i = 0; i < count; i++) {
+                ulong len = bitcast(*(char[8]*)self.raw_data[pos..], ulong);
+                pos += 8;
+                usz slen = (usz)len;
+                if (slen > 0) {
+                    result[i] = (String)self.raw_data[pos .. pos + slen - 1];
+                } else {
+                    result[i] = "";
+                }
+                pos += slen;
+            }
+            return result;
+        }
+    }
+    return FILE_NOT_FOUND~;
+}
+
+fn float[]? GGUFFile.read_f32_array(&self, String key) {
+    foreach (&kv : self.metadata) {
+        if (str_eq(kv.key, key) && kv.val_type == ARRAY && kv.array_type == FLOAT32) {
+            usz count = (usz)kv.array_len;
+            float[] result = mem::new_array(float, count);
+            usz pos = kv.array_data_offset;
+            for (usz i = 0; i < count; i++) {
+                result[i] = bitcast(*(char[4]*)self.raw_data[pos..], float);
+                pos += 4;
+            }
+            return result;
+        }
+    }
+    return FILE_NOT_FOUND~;
+}
+
+fn uint[]? GGUFFile.read_u32_array(&self, String key) {
+    foreach (&kv : self.metadata) {
+        if (str_eq(kv.key, key) && kv.val_type == ARRAY && (kv.array_type == UINT32 || kv.array_type == INT32)) {
+            usz count = (usz)kv.array_len;
+            uint[] result = mem::new_array(uint, count);
+            usz pos = kv.array_data_offset;
+            for (usz i = 0; i < count; i++) {
+                result[i] = bitcast(*(char[4]*)self.raw_data[pos..], uint);
+                pos += 4;
+            }
+            return result;
         }
     }
     return FILE_NOT_FOUND~;

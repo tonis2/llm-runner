@@ -116,6 +116,7 @@ fn GGUFMetaKV GGUFReader.read_meta_kv(&self) {
         case ARRAY: {
             kv.array_type = (GGUFType)self.read_u32();
             kv.array_len = self.read_u64();
+            kv.array_data_offset = self.pos;
             // Skip array contents for now - we read scalars by key
             for (ulong i = 0; i < kv.array_len; i++) {
                 self.skip_value(kv.array_type);
@@ -203,6 +204,7 @@ fn GGUFFile? gguf_parse(char[] data) {
         .metadata = metadata,
         .tensors = tensors,
         .tensor_data_base = tensor_data_base,
+        .raw_data = data,
     };
 }
 

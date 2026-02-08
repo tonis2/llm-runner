@@ -2,8 +2,6 @@ module llm;
 
 import vk;
 import std::io;
-import std::io::file;
-import std::io::file::mmap;
 import std::math;
 import std::core::mem;
 
@@ -349,19 +347,9 @@ fn void dispatch_matmul(
         &pc, out_dim);
 }
 
-fn LlamaModel? load_model(DeviceContext* ctx, String model_path) {
-    io::printfn("Loading model from: %s", model_path);
-
-    // Memory map the GGUF file
-    mmap::FileMmap mm = file::mmap_open(model_path, "rb")!!;
-    char[] data = mm.bytes();
-    io::printfn("File mapped: %d bytes", data.len);
-
-    GGUFFile gf = gguf_parse(data)!!;
-    gguf_print_info(&gf);
-
-    LlamaConfig config = extract_config(&gf);
-    LlamaWeights weights = load_weights(ctx, &gf, &config)!!;
+fn LlamaModel? load_model(DeviceContext* ctx, GGUFFile* gf) {
+    LlamaConfig config = extract_config(gf);
+    LlamaWeights weights = load_weights(ctx, gf, &config)!!;
     LlamaActivations acts = allocate_activations(ctx, &config)!!;
     LlamaKVCache kv = allocate_kv_cache(ctx, &config)!!;
     LlamaKernels kernels = create_kernels(ctx)!!;
