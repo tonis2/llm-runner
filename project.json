@@ -9,11 +9,18 @@
   "sources": [ "src/**"],
   "test-sources": [ "test/**" ],
   "build-dir": "build",
+  "script-dir": "./",
   "output": "build",
   "targets": {
     "llm": {
       "type": "executable",
-    }
+    },
+    "shaders": {
+			"type": "prepare",
+			"exec": [
+				"slangc ./shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/llm.spv"
+			]
+		}
   },
   "cpu": "generic",
   "opt": "O0"
