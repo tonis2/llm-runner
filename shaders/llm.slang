@@ -398,27 +398,15 @@ void matmul_q5k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         uint input_base = block_idx * 256;
 
         // Read d and dmin (f16 at bytes 0 and 2)
+        // bb is always 4-aligned (176 is multiple of 4)
         uint dm_word = q5k_weight[bb / 4];
-        uint byte_off = bb % 4;
-        uint d_bits, dmin_bits;
-        if (byte_off == 0) {
-            d_bits = dm_word & 0xFFFFu;
-            dmin_bits = (dm_word >> 16) & 0xFFFFu;
-        } else if (byte_off == 2) {
-            d_bits = (dm_word >> 16) & 0xFFFFu;
-            uint next = q5k_weight[bb / 4 + 1];
-            dmin_bits = next & 0xFFFFu;
-        } else {
-            // Unaligned - read bytes
-            d_bits = (read_byte(q5k_weight, bb) | (read_byte(q5k_weight, bb + 1) << 8));
-            dmin_bits = (read_byte(q5k_weight, bb + 2) | (read_byte(q5k_weight, bb + 3) << 8));
-        }
-        float d = unpack_f16(d_bits);
-        float dmin = unpack_f16(dmin_bits);
+        float d = unpack_f16(dm_word & 0xFFFFu);
+        float dmin = unpack_f16((dm_word >> 16) & 0xFFFFu);
 
         // Process 4 chunks of 64 elements each (8 sub-blocks of 32)
+        // bb is always 4-aligned (176 is multiple of 4), so qh (offset 16)
+        // and qs (offset 48) are word-aligned — use direct uint reads
         for (uint j = 0; j < 4; j++) {
-            // Get scales for sub-blocks 2*j and 2*j+1
             uint sc1, m1, sc2, m2;
             get_scale_min_k4(2 * j, bb, q5k_weight, sc1, m1);
             get_scale_min_k4(2 * j + 1, bb, q5k_weight, sc2, m2);
@@ -428,27 +416,37 @@ void matmul_q5k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
             float d2 = d * float(sc2);
             float dm2 = dmin * float(m2);
 
-            uint qs_base = bb + 48 + j * 32; // qs starts at offset 48
-            uint qh_base = bb + 16;           // qh starts at offset 16
+            uint qs_base = bb + 48 + j * 32;
+            uint qh_base = bb + 16;
+            uint qh_shift_lo = 2 * j;
+            uint qh_shift_hi = 2 * j + 1;
 
-            // First 32 elements: low nibble + high bit
-            for (uint l = 0; l < 32; l++) {
-                uint ql_byte = read_byte(q5k_weight, qs_base + l);
-                uint qh_byte = read_byte(q5k_weight, qh_base + l);
-                uint q_low = ql_byte & 0xFu;
-                uint q_high = (qh_byte >> (2 * j)) & 1u;
-                float val = d1 * float(q_low + q_high * 16u) - dm1;
-                sum += val * q5k_input[input_base + j * 64 + l];
-            }
+            // Read 4 bytes at a time, process both low+high nibbles together
+            for (uint l = 0; l < 32; l += 4) {
+                uint qs_word = q5k_weight[(qs_base + l) / 4];
+                uint qh_word = q5k_weight[(qh_base + l) / 4];
 
-            // Next 32 elements: high nibble + high bit
-            for (uint l = 0; l < 32; l++) {
-                uint ql_byte = read_byte(q5k_weight, qs_base + l);
-                uint qh_byte = read_byte(q5k_weight, qh_base + l);
-                uint q_low = (ql_byte >> 4) & 0xFu;
-                uint q_high = (qh_byte >> (2 * j + 1)) & 1u;
-                float val = d2 * float(q_low + q_high * 16u) - dm2;
-                sum += val * q5k_input[input_base + j * 64 + 32 + l];
+                uint ql0 = qs_word & 0xFFu;
+                uint ql1 = (qs_word >> 8) & 0xFFu;
+                uint ql2 = (qs_word >> 16) & 0xFFu;
+                uint ql3 = (qs_word >> 24) & 0xFFu;
+
+                uint qh0 = qh_word & 0xFFu;
+                uint qh1 = (qh_word >> 8) & 0xFFu;
+                uint qh2 = (qh_word >> 16) & 0xFFu;
+                uint qh3 = (qh_word >> 24) & 0xFFu;
+
+                // Low nibble + high bit -> first 32 elements
+                sum += (d1 * float((ql0 & 0xFu) + (((qh0 >> qh_shift_lo) & 1u) << 4)) - dm1) * q5k_input[input_base + j * 64 + l];
+                sum += (d1 * float((ql1 & 0xFu) + (((qh1 >> qh_shift_lo) & 1u) << 4)) - dm1) * q5k_input[input_base + j * 64 + l + 1];
+                sum += (d1 * float((ql2 & 0xFu) + (((qh2 >> qh_shift_lo) & 1u) << 4)) - dm1) * q5k_input[input_base + j * 64 + l + 2];
+                sum += (d1 * float((ql3 & 0xFu) + (((qh3 >> qh_shift_lo) & 1u) << 4)) - dm1) * q5k_input[input_base + j * 64 + l + 3];
+
+                // High nibble + high bit -> next 32 elements
+                sum += (d2 * float(((ql0 >> 4) & 0xFu) + (((qh0 >> qh_shift_hi) & 1u) << 4)) - dm2) * q5k_input[input_base + j * 64 + 32 + l];
+                sum += (d2 * float(((ql1 >> 4) & 0xFu) + (((qh1 >> qh_shift_hi) & 1u) << 4)) - dm2) * q5k_input[input_base + j * 64 + 32 + l + 1];
+                sum += (d2 * float(((ql2 >> 4) & 0xFu) + (((qh2 >> qh_shift_hi) & 1u) << 4)) - dm2) * q5k_input[input_base + j * 64 + 32 + l + 2];
+                sum += (d2 * float(((ql3 >> 4) & 0xFu) + (((qh3 >> qh_shift_hi) & 1u) << 4)) - dm2) * q5k_input[input_base + j * 64 + 32 + l + 3];
             }
         }
     }
@@ -500,25 +498,13 @@ void matmul_q4k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         uint input_base = block_idx * 256;
 
         // Read d and dmin (f16 at bytes 0 and 2)
+        // bb is always 4-aligned (144 is multiple of 4)
         uint dm_word = q4k_weight[bb / 4];
-        uint byte_off = bb % 4;
-        uint d_bits, dmin_bits;
-        if (byte_off == 0) {
-            d_bits = dm_word & 0xFFFFu;
-            dmin_bits = (dm_word >> 16) & 0xFFFFu;
-        } else if (byte_off == 2) {
-            d_bits = (dm_word >> 16) & 0xFFFFu;
-            uint next = q4k_weight[bb / 4 + 1];
-            dmin_bits = next & 0xFFFFu;
-        } else {
-            d_bits = (read_byte(q4k_weight, bb) | (read_byte(q4k_weight, bb + 1) << 8));
-            dmin_bits = (read_byte(q4k_weight, bb + 2) | (read_byte(q4k_weight, bb + 3) << 8));
-        }
-        float d = unpack_f16(d_bits);
-        float dmin = unpack_f16(dmin_bits);
+        float d = unpack_f16(dm_word & 0xFFFFu);
+        float dmin = unpack_f16((dm_word >> 16) & 0xFFFFu);
 
         // Process 4 chunks of 64 elements (8 sub-blocks of 32)
-        // scales at offset 4, qs at offset 16
+        // scales at offset 4, qs at offset 16 (both 4-aligned)
         uint qs_off = bb + 16;
 
         for (uint j = 0; j < 4; j++) {
@@ -533,18 +519,26 @@ void matmul_q4k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
             uint qs_base = qs_off + j * 32;
 
-            // First 32: low nibble
-            for (uint l = 0; l < 32; l++) {
-                uint qs_byte = read_byte(q4k_weight, qs_base + l);
-                float val = d1 * float(qs_byte & 0xFu) - dm1;
-                sum += val * q4k_input[input_base + j * 64 + l];
-            }
+            // Read 4 bytes at a time, process both low+high nibbles together
+            for (uint l = 0; l < 32; l += 4) {
+                uint qs_word = q4k_weight[(qs_base + l) / 4];
 
-            // Next 32: high nibble
-            for (uint l = 0; l < 32; l++) {
-                uint qs_byte = read_byte(q4k_weight, qs_base + l);
-                float val = d2 * float((qs_byte >> 4) & 0xFu) - dm2;
-                sum += val * q4k_input[input_base + j * 64 + 32 + l];
+                uint b0 = qs_word & 0xFFu;
+                uint b1 = (qs_word >> 8) & 0xFFu;
+                uint b2 = (qs_word >> 16) & 0xFFu;
+                uint b3 = (qs_word >> 24) & 0xFFu;
+
+                // Low nibble -> first 32 elements
+                sum += (d1 * float(b0 & 0xFu) - dm1) * q4k_input[input_base + j * 64 + l];
+                sum += (d1 * float(b1 & 0xFu) - dm1) * q4k_input[input_base + j * 64 + l + 1];
+                sum += (d1 * float(b2 & 0xFu) - dm1) * q4k_input[input_base + j * 64 + l + 2];
+                sum += (d1 * float(b3 & 0xFu) - dm1) * q4k_input[input_base + j * 64 + l + 3];
+
+                // High nibble -> next 32 elements
+                sum += (d2 * float((b0 >> 4) & 0xFu) - dm2) * q4k_input[input_base + j * 64 + 32 + l];
+                sum += (d2 * float((b1 >> 4) & 0xFu) - dm2) * q4k_input[input_base + j * 64 + 32 + l + 1];
+                sum += (d2 * float((b2 >> 4) & 0xFu) - dm2) * q4k_input[input_base + j * 64 + 32 + l + 2];
+                sum += (d2 * float((b3 >> 4) & 0xFu) - dm2) * q4k_input[input_base + j * 64 + 32 + l + 3];
             }
         }
     }
@@ -596,8 +590,16 @@ void matmul_q6k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         uint input_base = block_idx * 256;
 
         // Read d (f16 at offset 208)
+        // 210 mod 4 = 2, so bb is always even. d_byte = bb+208 is always even.
         uint d_byte = bb + 208;
-        uint d_bits = read_byte(q6k_weight, d_byte) | (read_byte(q6k_weight, d_byte + 1) << 8);
+        uint d_word = q6k_weight[d_byte / 4];
+        uint d_byte_off = d_byte % 4;
+        uint d_bits;
+        if (d_byte_off == 0) {
+            d_bits = d_word & 0xFFFFu;
+        } else {
+            d_bits = (d_word >> 16) & 0xFFFFu;
+        }
         float d = unpack_f16(d_bits);
 
         uint ql_base = bb;         // ql[128] at offset 0
@@ -605,34 +607,78 @@ void matmul_q6k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         uint sc_base = bb + 192;   // scales[16] at offset 192
 
         // Process 2 halves of 128 elements each
-        // Matches ggml reference: ql advances by 64 per half, qh by 32, scales by 8
-        for (uint half = 0; half < 2; half++) {
-            uint ql_off = ql_base + half * 64;
-            uint qh_off = qh_base + half * 32;
-            uint sc_off = half * 8;
-            uint elem_off = half * 128;
+        for (uint half_idx = 0; half_idx < 2; half_idx++) {
+            uint ql_off = ql_base + half_idx * 64;
+            uint qh_off = qh_base + half_idx * 32;
+            uint sc_off = half_idx * 8;
+            uint elem_off = half_idx * 128;
 
-            for (uint l = 0; l < 32; l++) {
-                uint is_idx = l / 16;
+            // Pre-read 8 scale values for this half (only 8 read_byte calls vs 128)
+            int sc_0_0 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 0));
+            int sc_0_2 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 2));
+            int sc_0_4 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 4));
+            int sc_0_6 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 6));
+            int sc_1_0 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 1));
+            int sc_1_2 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 3));
+            int sc_1_4 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 5));
+            int sc_1_6 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + 7));
 
-                uint ql0 = read_byte(q6k_weight, ql_off + l);
-                uint ql32 = read_byte(q6k_weight, ql_off + 32 + l);
-                uint qh_val = read_byte(q6k_weight, qh_off + l);
+            // Read 4 bytes at a time using unaligned word reads
+            for (uint l = 0; l < 32; l += 4) {
+                // Select pre-read scales based on l/16
+                int s1, s2, s3, s4;
+                if (l < 16) {
+                    s1 = sc_0_0; s2 = sc_0_2; s3 = sc_0_4; s4 = sc_0_6;
+                } else {
+                    s1 = sc_1_0; s2 = sc_1_2; s3 = sc_1_4; s4 = sc_1_6;
+                }
 
-                int q1 = int((ql0 & 0xFu) | (((qh_val >> 0) & 3u) << 4)) - 32;
-                int q2 = int((ql32 & 0xFu) | (((qh_val >> 2) & 3u) << 4)) - 32;
-                int q3 = int(((ql0 >> 4) & 0xFu) | (((qh_val >> 4) & 3u) << 4)) - 32;
-                int q4 = int(((ql32 >> 4) & 0xFu) | (((qh_val >> 6) & 3u) << 4)) - 32;
+                float ds1 = d * float(s1);
+                float ds2 = d * float(s2);
+                float ds3 = d * float(s3);
+                float ds4 = d * float(s4);
 
-                int sc1 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 0));
-                int sc2 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 2));
-                int sc3 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 4));
-                int sc4 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 6));
+                // Read 4 bytes of ql[0..63], ql[32..95], qh
+                uint ql0_pos = ql_off + l;
+                uint ql0_idx = ql0_pos / 4;
+                uint ql0_off = ql0_pos % 4;
+                uint ql0_word = q6k_weight[ql0_idx];
+                if (ql0_off != 0) {
+                    ql0_word = (ql0_word >> (ql0_off * 8)) | (q6k_weight[ql0_idx + 1] << (32 - ql0_off * 8));
+                }
 
-                sum += d * float(sc1) * float(q1) * q6k_input[input_base + elem_off + l + 0];
-                sum += d * float(sc2) * float(q2) * q6k_input[input_base + elem_off + l + 32];
-                sum += d * float(sc3) * float(q3) * q6k_input[input_base + elem_off + l + 64];
-                sum += d * float(sc4) * float(q4) * q6k_input[input_base + elem_off + l + 96];
+                uint ql32_pos = ql_off + 32 + l;
+                uint ql32_idx = ql32_pos / 4;
+                uint ql32_off = ql32_pos % 4;
+                uint ql32_word = q6k_weight[ql32_idx];
+                if (ql32_off != 0) {
+                    ql32_word = (ql32_word >> (ql32_off * 8)) | (q6k_weight[ql32_idx + 1] << (32 - ql32_off * 8));
+                }
+
+                uint qh_pos = qh_off + l;
+                uint qh_idx = qh_pos / 4;
+                uint qh_off2 = qh_pos % 4;
+                uint qh_word = q6k_weight[qh_idx];
+                if (qh_off2 != 0) {
+                    qh_word = (qh_word >> (qh_off2 * 8)) | (q6k_weight[qh_idx + 1] << (32 - qh_off2 * 8));
+                }
+
+                // Process 4 elements
+                for (uint k = 0; k < 4; k++) {
+                    uint ql0_b = (ql0_word >> (k * 8)) & 0xFFu;
+                    uint ql32_b = (ql32_word >> (k * 8)) & 0xFFu;
+                    uint qh_b = (qh_word >> (k * 8)) & 0xFFu;
+
+                    int q1 = int((ql0_b & 0xFu) | (((qh_b >> 0) & 3u) << 4)) - 32;
+                    int q2 = int((ql32_b & 0xFu) | (((qh_b >> 2) & 3u) << 4)) - 32;
+                    int q3 = int(((ql0_b >> 4) & 0xFu) | (((qh_b >> 4) & 3u) << 4)) - 32;
+                    int q4 = int(((ql32_b >> 4) & 0xFu) | (((qh_b >> 6) & 3u) << 4)) - 32;
+
+                    sum += ds1 * float(q1) * q6k_input[input_base + elem_off + l + k];
+                    sum += ds2 * float(q2) * q6k_input[input_base + elem_off + l + k + 32];
+                    sum += ds3 * float(q3) * q6k_input[input_base + elem_off + l + k + 64];
+                    sum += ds4 * float(q4) * q6k_input[input_base + elem_off + l + k + 96];
+                }
             }
         }
     }

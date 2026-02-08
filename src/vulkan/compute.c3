@@ -16,18 +16,12 @@ struct ComputeKernel {
 
 fn ComputeKernel? create_kernel(
     DeviceContext* ctx,
-    char[] spirv,
+    ShaderModule shader_module,
     uint num_storage_buffers,
     uint push_constant_size = 0,
     ZString entry_point = "main"
 ) {
     Device device = ctx.device;
-
-    // Create shader module
-    ShaderModule shader_module = vk::shaderModuleCreateInfo()
-        .setCodeSize(spirv.len)
-        .setCode((uint*)&spirv[0])
-        .build(device)!!;
 
     // Create descriptor set layout with push descriptor flag
     DescriptorSetLayoutBinding[MAX_BINDINGS] bindings;
@@ -73,9 +67,6 @@ fn ComputeKernel? create_kernel(
         .setStage(stage)
         .setLayout(pipeline_layout)
         .build(device)!!;
-
-    // Shader module can be destroyed after pipeline creation
-    shader_module.free(device);
 
     return {
         .pipeline = pipeline,

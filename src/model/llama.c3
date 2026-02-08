@@ -288,22 +288,30 @@ fn LlamaKVCache? allocate_kv_cache(DeviceContext* ctx, LlamaConfig* config) {
 fn LlamaKernels? create_kernels(DeviceContext* ctx) {
     io::printfn("Creating compute kernels...");
     char[] spv = &LLM_SPV;
-    return {
-        .embedding    = create_kernel(ctx, spv, 2, EmbeddingPC.sizeof, "embedding")!!,
-        .rmsnorm      = create_kernel(ctx, spv, 3, RMSNormPC.sizeof, "rmsnorm")!!,
-        .silu         = create_kernel(ctx, spv, 1, SiluPC.sizeof, "silu")!!,
-        .matmul       = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul")!!,
-        .matmul_q8    = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q8")!!,
-        .matmul_q4_0  = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q4_0")!!,
-        .matmul_q4k   = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q4k")!!,
-        .matmul_q5k   = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q5k")!!,
-        .matmul_q6k   = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q6k")!!,
-        .rope         = create_kernel(ctx, spv, 1, RoPEPC.sizeof, "rope")!!,
-        .softmax      = create_kernel(ctx, spv, 1, SoftmaxPC.sizeof, "softmax")!!,
-        .attention    = create_kernel(ctx, spv, 5, AttentionPC.sizeof, "attention")!!,
-        .residual_add = create_kernel(ctx, spv, 2, ResidualPC.sizeof, "residual_add")!!,
-        .elemwise_mul = create_kernel(ctx, spv, 2, ElemwisePC.sizeof, "elemwise_mul")!!,
+    ShaderModule shader = vk::shaderModuleCreateInfo()
+        .setCodeSize(spv.len)
+        .setCode((uint*)&spv[0])
+        .build(ctx.device)!!;
+
+    LlamaKernels kernels = {
+        .embedding    = create_kernel(ctx, shader, 2, EmbeddingPC.sizeof, "embedding")!!,
+        .rmsnorm      = create_kernel(ctx, shader, 3, RMSNormPC.sizeof, "rmsnorm")!!,
+        .silu         = create_kernel(ctx, shader, 1, SiluPC.sizeof, "silu")!!,
+        .matmul       = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul")!!,
+        .matmul_q8    = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q8")!!,
+        .matmul_q4_0  = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q4_0")!!,
+        .matmul_q4k   = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q4k")!!,
+        .matmul_q5k   = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q5k")!!,
+        .matmul_q6k   = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q6k")!!,
+        .rope         = create_kernel(ctx, shader, 1, RoPEPC.sizeof, "rope")!!,
+        .softmax      = create_kernel(ctx, shader, 1, SoftmaxPC.sizeof, "softmax")!!,
+        .attention    = create_kernel(ctx, shader, 5, AttentionPC.sizeof, "attention")!!,
+        .residual_add = create_kernel(ctx, shader, 2, ResidualPC.sizeof, "residual_add")!!,
+        .elemwise_mul = create_kernel(ctx, shader, 2, ElemwisePC.sizeof, "elemwise_mul")!!,
     };
+
+    shader.free(ctx.device);
+    return kernels;
 }
 
 fn uint ceil_div(uint a, uint b) {
