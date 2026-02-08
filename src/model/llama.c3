@@ -7,21 +7,8 @@ import std::core::mem;
 
 const MAX_SEQ_LEN = 2048;
 
-// Embedded SPIR-V shaders
-const char[*] EMBEDDING_SPV   = $embed("../../shaders/embedding.spv");
-const char[*] RMSNORM_SPV     = $embed("../../shaders/rmsnorm.spv");
-const char[*] SILU_SPV        = $embed("../../shaders/silu.spv");
-const char[*] MATMUL_SPV      = $embed("../../shaders/matmul.spv");
-const char[*] MATMUL_Q8_SPV   = $embed("../../shaders/matmul_q8.spv");
-const char[*] MATMUL_Q4_0_SPV = $embed("../../shaders/matmul_q4_0.spv");
-const char[*] MATMUL_Q4K_SPV  = $embed("../../shaders/matmul_q4k.spv");
-const char[*] MATMUL_Q5K_SPV  = $embed("../../shaders/matmul_q5k.spv");
-const char[*] MATMUL_Q6K_SPV  = $embed("../../shaders/matmul_q6k.spv");
-const char[*] ROPE_SPV        = $embed("../../shaders/rope.spv");
-const char[*] SOFTMAX_SPV     = $embed("../../shaders/softmax.spv");
-const char[*] ATTENTION_SPV   = $embed("../../shaders/attention.spv");
-const char[*] RESIDUAL_SPV    = $embed("../../shaders/residual_add.spv");
-const char[*] ELEMWISE_SPV    = $embed("../../shaders/elemwise_mul.spv");
+// Embedded SPIR-V shader (single module with all entry points)
+const char[*] LLM_SPV = $embed("../../shaders/llm.spv");
 
 struct LlamaConfig {
     uint n_layers;
@@ -300,21 +287,22 @@ fn LlamaKVCache? allocate_kv_cache(DeviceContext* ctx, LlamaConfig* config) {
 
 fn LlamaKernels? create_kernels(DeviceContext* ctx) {
     io::printfn("Creating compute kernels...");
+    char[] spv = &LLM_SPV;
     return {
-        .embedding   = create_kernel(ctx, &EMBEDDING_SPV, 2, EmbeddingPC.sizeof)!!,
-        .rmsnorm     = create_kernel(ctx, &RMSNORM_SPV, 3, RMSNormPC.sizeof)!!,
-        .silu        = create_kernel(ctx, &SILU_SPV, 1, SiluPC.sizeof)!!,
-        .matmul      = create_kernel(ctx, &MATMUL_SPV, 3, MatMulPC.sizeof)!!,
-        .matmul_q8   = create_kernel(ctx, &MATMUL_Q8_SPV, 3, MatMulPC.sizeof)!!,
-        .matmul_q4_0 = create_kernel(ctx, &MATMUL_Q4_0_SPV, 3, MatMulPC.sizeof)!!,
-        .matmul_q4k  = create_kernel(ctx, &MATMUL_Q4K_SPV, 3, MatMulPC.sizeof)!!,
-        .matmul_q5k  = create_kernel(ctx, &MATMUL_Q5K_SPV, 3, MatMulPC.sizeof)!!,
-        .matmul_q6k  = create_kernel(ctx, &MATMUL_Q6K_SPV, 3, MatMulPC.sizeof)!!,
-        .rope        = create_kernel(ctx, &ROPE_SPV, 1, RoPEPC.sizeof)!!,
-        .softmax     = create_kernel(ctx, &SOFTMAX_SPV, 1, SoftmaxPC.sizeof)!!,
-        .attention   = create_kernel(ctx, &ATTENTION_SPV, 5, AttentionPC.sizeof)!!,
-        .residual_add = create_kernel(ctx, &RESIDUAL_SPV, 2, ResidualPC.sizeof)!!,
-        .elemwise_mul = create_kernel(ctx, &ELEMWISE_SPV, 2, ElemwisePC.sizeof)!!,
+        .embedding    = create_kernel(ctx, spv, 2, EmbeddingPC.sizeof, "embedding")!!,
+        .rmsnorm      = create_kernel(ctx, spv, 3, RMSNormPC.sizeof, "rmsnorm")!!,
+        .silu         = create_kernel(ctx, spv, 1, SiluPC.sizeof, "silu")!!,
+        .matmul       = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul")!!,
+        .matmul_q8    = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q8")!!,
+        .matmul_q4_0  = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q4_0")!!,
+        .matmul_q4k   = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q4k")!!,
+        .matmul_q5k   = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q5k")!!,
+        .matmul_q6k   = create_kernel(ctx, spv, 3, MatMulPC.sizeof, "matmul_q6k")!!,
+        .rope         = create_kernel(ctx, spv, 1, RoPEPC.sizeof, "rope")!!,
+        .softmax      = create_kernel(ctx, spv, 1, SoftmaxPC.sizeof, "softmax")!!,
+        .attention    = create_kernel(ctx, spv, 5, AttentionPC.sizeof, "attention")!!,
+        .residual_add = create_kernel(ctx, spv, 2, ResidualPC.sizeof, "residual_add")!!,
+        .elemwise_mul = create_kernel(ctx, spv, 2, ElemwisePC.sizeof, "elemwise_mul")!!,
     };
 }
 

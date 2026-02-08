@@ -18,7 +18,8 @@ fn ComputeKernel? create_kernel(
     DeviceContext* ctx,
     char[] spirv,
     uint num_storage_buffers,
-    uint push_constant_size = 0
+    uint push_constant_size = 0,
+    ZString entry_point = "main"
 ) {
     Device device = ctx.device;
 
@@ -66,9 +67,7 @@ fn ComputeKernel? create_kernel(
     PipelineShaderStageCreateInfo stage = vk::pipelineShaderStageCreateInfo()
         .setStage(vk::SHADER_STAGE_COMPUTE_BIT)
         .setMod(shader_module)
-        .setName("main");
-
-        // .setName("vertexMain"),
+        .setName(entry_point);
 
     Pipeline pipeline = vk::computePipelineCreateInfo()
         .setStage(stage)
