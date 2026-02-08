@@ -68,6 +68,8 @@ fn ComputeKernel? create_kernel(
         .setMod(shader_module)
         .setName("main");
 
+        // .setName("vertexMain"),
+
     Pipeline pipeline = vk::computePipelineCreateInfo()
         .setStage(stage)
         .setLayout(pipeline_layout)

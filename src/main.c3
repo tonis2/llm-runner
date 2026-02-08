@@ -49,7 +49,7 @@ fn int main(String[] args) {
     }
 
     // Prefill: BOS + prompt tokens
-    model.forward(1, 0)!!;  // BOS at position 0
+    model.forward(tok.bos_id, 0)!!;  // BOS at position 0
     for (usz i = 0; i < n_prompt; i++) {
         model.forward(prompt_tokens[i], (uint)(i + 1))!!;
     }
@@ -59,7 +59,7 @@ fn int main(String[] args) {
     char[256] decode_buf;
     for (uint g = 0; g < 256; g++) {
         uint token = argmax_sample(&ctx, &model.acts.logits, model.config.vocab_size)!!;
-        if (token == 2) break;  // EOS
+        if (token == tok.eos_id) break;  // EOS
         String text = tok.decode_token(token, &decode_buf);
         if (text.len > 0) {
             io::printf("%s", text);

@@ -223,6 +223,22 @@ fn void dequant_q4k_block(char* block, float* output) {
     }
 }
 
+// Dequantize Q4_0 block (32 elements from 18 bytes) to F32
+// Layout: f16 scale(2) + qs[16] (packed 4-bit nibbles)
+// Low nibble → elements 0-15, high nibble → elements 16-31
+fn void dequant_q4_0_block(char* block, float* output) {
+    float d = cpu_f16_to_f32(block);
+    char* qs = block + 2;
+
+    for (uint i = 0; i < 16; i++) {
+        uint byte_val = (uint)qs[i];
+        int lo = (int)(byte_val & 0xF) - 8;
+        int hi = (int)((byte_val >> 4) & 0xF) - 8;
+        output[i] = d * (float)lo;
+        output[i + 16] = d * (float)hi;
+    }
+}
+
 // Dequantize Q8_0 block (32 elements from 34 bytes) to F32
 fn void dequant_q8_0_block(char* block, float* output) {
     float d = cpu_f16_to_f32(block);
@@ -258,6 +274,11 @@ fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* 
         usz n_blocks = n_elements / 32;
         for (usz b = 0; b < n_blocks; b++) {
             dequant_q8_0_block(data_ptr + b * 34, f32_data + b * 32);
+        }
+    } else if (info.type == GGML_Q4_0) {
+        usz n_blocks = n_elements / 32;
+        for (usz b = 0; b < n_blocks; b++) {
+            dequant_q4_0_block(data_ptr + b * 18, f32_data + b * 32);
         }
     } else if (info.type == GGML_Q6_K) {
         usz n_blocks = n_elements / 256;

@@ -10,6 +10,7 @@ ENTRIES=(
     silu
     matmul
     matmul_q8
+    matmul_q4_0
     matmul_q4k
     matmul_q5k
     matmul_q6k

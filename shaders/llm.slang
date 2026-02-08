@@ -244,6 +244,107 @@ void matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 }
 
 // ============================================================
+// Matrix-vector multiply (Q4_0 quantized weights)
+// ============================================================
+// Q4_0 block: 18 bytes per 32 elements
+// Layout: f16 scale(2) + qs[16] (packed 4-bit nibbles)
+// Low nibble → elements 0-15, high nibble → elements 16-31
+
+[vk_push_constant] const MatMulParams matmul_q4_0_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> q4_0_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> q4_0_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> q4_0_output;
+
+groupshared float q4_0_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void matmul_q4_0(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    uint num_threads = 256;
+
+    if (row >= matmul_q4_0_pc.out_dim) return;
+
+    uint blocks_per_row = matmul_q4_0_pc.in_dim / 32;
+    uint bytes_per_row = blocks_per_row * 18;
+    uint row_byte_offset = row * bytes_per_row;
+
+    float sum = 0.0;
+
+    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += num_threads) {
+        uint block_byte = row_byte_offset + block_idx * 18;
+
+        // Read f16 scale
+        uint scale_uint_idx = block_byte / 4;
+        uint scale_byte_offset = block_byte % 4;
+        uint scale_word = q4_0_weight[scale_uint_idx];
+        uint scale_bits;
+        if (scale_byte_offset == 0) {
+            scale_bits = scale_word & 0xFFFFu;
+        } else if (scale_byte_offset == 2) {
+            scale_bits = (scale_word >> 16) & 0xFFFFu;
+        } else {
+            uint next_word = q4_0_weight[scale_uint_idx + 1];
+            scale_bits = ((scale_word >> (scale_byte_offset * 8)) | (next_word << (32 - scale_byte_offset * 8))) & 0xFFFFu;
+        }
+        float scale = unpack_f16(scale_bits);
+
+        // Read 16 bytes of packed nibbles (32 elements)
+        uint qs_byte = block_byte + 2;
+        uint input_offset = block_idx * 32;
+
+        for (uint j = 0; j < 16; j += 4) {
+            uint byte_pos = qs_byte + j;
+            uint uint_idx = byte_pos / 4;
+            uint byte_off = byte_pos % 4;
+
+            uint word = q4_0_weight[uint_idx];
+            if (byte_off != 0) {
+                uint next_word = q4_0_weight[uint_idx + 1];
+                word = (word >> (byte_off * 8)) | (next_word << (32 - byte_off * 8));
+            }
+
+            // Low nibbles → elements 0-15
+            int q0_lo = int(word & 0xFu) - 8;
+            int q1_lo = int((word >> 8) & 0xFu) - 8;
+            int q2_lo = int((word >> 16) & 0xFu) - 8;
+            int q3_lo = int((word >> 24) & 0xFu) - 8;
+
+            sum += scale * float(q0_lo) * q4_0_input[input_offset + j];
+            sum += scale * float(q1_lo) * q4_0_input[input_offset + j + 1];
+            sum += scale * float(q2_lo) * q4_0_input[input_offset + j + 2];
+            sum += scale * float(q3_lo) * q4_0_input[input_offset + j + 3];
+
+            // High nibbles → elements 16-31
+            int q0_hi = int((word >> 4) & 0xFu) - 8;
+            int q1_hi = int((word >> 12) & 0xFu) - 8;
+            int q2_hi = int((word >> 20) & 0xFu) - 8;
+            int q3_hi = int((word >> 28) & 0xFu) - 8;
+
+            sum += scale * float(q0_hi) * q4_0_input[input_offset + 16 + j];
+            sum += scale * float(q1_hi) * q4_0_input[input_offset + 16 + j + 1];
+            sum += scale * float(q2_hi) * q4_0_input[input_offset + 16 + j + 2];
+            sum += scale * float(q3_hi) * q4_0_input[input_offset + 16 + j + 3];
+        }
+    }
+
+    q4_0_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = num_threads / 2; s > 0; s >>= 1) {
+        if (gi < s) {
+            q4_0_shared[gi] += q4_0_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        q4_0_output[row] = q4_0_shared[0];
+    }
+}
+
+// ============================================================
 // Matrix-vector multiply (Q5_K quantized weights)
 // ============================================================
 // Q5_K block: 176 bytes per 256 elements
