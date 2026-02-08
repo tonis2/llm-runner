@@ -10,6 +10,8 @@ ENTRIES=(
     silu
     matmul
     matmul_q8
+    matmul_q5k
+    matmul_q6k
     rope
     softmax
     attention

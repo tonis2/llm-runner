@@ -244,6 +244,218 @@ void matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 }
 
 // ============================================================
+// Matrix-vector multiply (Q5_K quantized weights)
+// ============================================================
+// Q5_K block: 176 bytes per 256 elements
+// Layout: f16 d(2) + f16 dmin(2) + scales[12] + qh[32] + qs[128]
+
+[vk_push_constant] const MatMulParams matmul_q5k_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> q5k_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> q5k_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> q5k_output;
+
+groupshared float q5k_shared[256];
+
+// Extract 6-bit scale and min for Q5_K sub-block
+void get_scale_min_k4(uint j, uint block_byte, RWStructuredBuffer<uint> w, out uint sc_val, out uint m_val) {
+    // scales are at block_byte + 4, 12 bytes
+    uint sc_base = block_byte + 4;
+    if (j < 4) {
+        uint byte_j = read_byte(w, sc_base + j);
+        uint byte_j4 = read_byte(w, sc_base + j + 4);
+        sc_val = byte_j & 63u;
+        m_val = byte_j4 & 63u;
+    } else {
+        uint byte_j4 = read_byte(w, sc_base + j + 4);
+        uint byte_jm4 = read_byte(w, sc_base + j - 4);
+        uint byte_j0 = read_byte(w, sc_base + j);
+        sc_val = (byte_j4 & 0xFu) | ((byte_jm4 >> 6) << 4);
+        m_val = (byte_j4 >> 4) | ((byte_j0 >> 6) << 4);
+    }
+}
+
+uint read_byte(RWStructuredBuffer<uint> buf, uint byte_idx) {
+    return (buf[byte_idx / 4] >> ((byte_idx % 4) * 8)) & 0xFFu;
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void matmul_q5k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    uint num_threads = 256;
+
+    if (row >= matmul_q5k_pc.out_dim) return;
+
+    uint blocks_per_row = matmul_q5k_pc.in_dim / 256;
+    uint row_byte_offset = row * blocks_per_row * 176;
+
+    float sum = 0.0;
+
+    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += num_threads) {
+        uint bb = row_byte_offset + block_idx * 176;
+        uint input_base = block_idx * 256;
+
+        // Read d and dmin (f16 at bytes 0 and 2)
+        uint dm_word = q5k_weight[bb / 4];
+        uint byte_off = bb % 4;
+        uint d_bits, dmin_bits;
+        if (byte_off == 0) {
+            d_bits = dm_word & 0xFFFFu;
+            dmin_bits = (dm_word >> 16) & 0xFFFFu;
+        } else if (byte_off == 2) {
+            d_bits = (dm_word >> 16) & 0xFFFFu;
+            uint next = q5k_weight[bb / 4 + 1];
+            dmin_bits = next & 0xFFFFu;
+        } else {
+            // Unaligned - read bytes
+            d_bits = (read_byte(q5k_weight, bb) | (read_byte(q5k_weight, bb + 1) << 8));
+            dmin_bits = (read_byte(q5k_weight, bb + 2) | (read_byte(q5k_weight, bb + 3) << 8));
+        }
+        float d = unpack_f16(d_bits);
+        float dmin = unpack_f16(dmin_bits);
+
+        // Process 4 chunks of 64 elements each (8 sub-blocks of 32)
+        for (uint j = 0; j < 4; j++) {
+            // Get scales for sub-blocks 2*j and 2*j+1
+            uint sc1, m1, sc2, m2;
+            get_scale_min_k4(2 * j, bb, q5k_weight, sc1, m1);
+            get_scale_min_k4(2 * j + 1, bb, q5k_weight, sc2, m2);
+
+            float d1 = d * float(sc1);
+            float dm1 = dmin * float(m1);
+            float d2 = d * float(sc2);
+            float dm2 = dmin * float(m2);
+
+            uint qs_base = bb + 48 + j * 32; // qs starts at offset 48
+            uint qh_base = bb + 16;           // qh starts at offset 16
+
+            // First 32 elements: low nibble + high bit
+            for (uint l = 0; l < 32; l++) {
+                uint ql_byte = read_byte(q5k_weight, qs_base + l);
+                uint qh_byte = read_byte(q5k_weight, qh_base + l);
+                uint q_low = ql_byte & 0xFu;
+                uint q_high = (qh_byte >> (2 * j)) & 1u;
+                float val = d1 * float(q_low + q_high * 16u) - dm1;
+                sum += val * q5k_input[input_base + j * 64 + l];
+            }
+
+            // Next 32 elements: high nibble + high bit
+            for (uint l = 0; l < 32; l++) {
+                uint ql_byte = read_byte(q5k_weight, qs_base + l);
+                uint qh_byte = read_byte(q5k_weight, qh_base + l);
+                uint q_low = (ql_byte >> 4) & 0xFu;
+                uint q_high = (qh_byte >> (2 * j + 1)) & 1u;
+                float val = d2 * float(q_low + q_high * 16u) - dm2;
+                sum += val * q5k_input[input_base + j * 64 + 32 + l];
+            }
+        }
+    }
+
+    q5k_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = num_threads / 2; s > 0; s >>= 1) {
+        if (gi < s) {
+            q5k_shared[gi] += q5k_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        q5k_output[row] = q5k_shared[0];
+    }
+}
+
+// ============================================================
+// Matrix-vector multiply (Q6_K quantized weights)
+// ============================================================
+// Q6_K block: 210 bytes per 256 elements
+// Layout: ql[128] + qh[64] + scales[16] + f16 d(2)
+
+[vk_push_constant] const MatMulParams matmul_q6k_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> q6k_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> q6k_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> q6k_output;
+
+groupshared float q6k_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void matmul_q6k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    uint num_threads = 256;
+
+    if (row >= matmul_q6k_pc.out_dim) return;
+
+    uint blocks_per_row = matmul_q6k_pc.in_dim / 256;
+    uint row_byte_offset = row * blocks_per_row * 210;
+
+    float sum = 0.0;
+
+    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += num_threads) {
+        uint bb = row_byte_offset + block_idx * 210;
+        uint input_base = block_idx * 256;
+
+        // Read d (f16 at offset 208)
+        uint d_byte = bb + 208;
+        uint d_bits = read_byte(q6k_weight, d_byte) | (read_byte(q6k_weight, d_byte + 1) << 8);
+        float d = unpack_f16(d_bits);
+
+        uint ql_base = bb;         // ql[128] at offset 0
+        uint qh_base = bb + 128;   // qh[64] at offset 128
+        uint sc_base = bb + 192;   // scales[16] at offset 192
+
+        // Process 2 halves of 128 elements each
+        // Matches ggml reference: ql advances by 64 per half, qh by 32, scales by 8
+        for (uint half = 0; half < 2; half++) {
+            uint ql_off = ql_base + half * 64;
+            uint qh_off = qh_base + half * 32;
+            uint sc_off = half * 8;
+            uint elem_off = half * 128;
+
+            for (uint l = 0; l < 32; l++) {
+                uint is_idx = l / 16;
+
+                uint ql0 = read_byte(q6k_weight, ql_off + l);
+                uint ql32 = read_byte(q6k_weight, ql_off + 32 + l);
+                uint qh_val = read_byte(q6k_weight, qh_off + l);
+
+                int q1 = int((ql0 & 0xFu) | (((qh_val >> 0) & 3u) << 4)) - 32;
+                int q2 = int((ql32 & 0xFu) | (((qh_val >> 2) & 3u) << 4)) - 32;
+                int q3 = int(((ql0 >> 4) & 0xFu) | (((qh_val >> 4) & 3u) << 4)) - 32;
+                int q4 = int(((ql32 >> 4) & 0xFu) | (((qh_val >> 6) & 3u) << 4)) - 32;
+
+                int sc1 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 0));
+                int sc2 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 2));
+                int sc3 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 4));
+                int sc4 = sign_extend_i8(read_byte(q6k_weight, sc_base + sc_off + is_idx + 6));
+
+                sum += d * float(sc1) * float(q1) * q6k_input[input_base + elem_off + l + 0];
+                sum += d * float(sc2) * float(q2) * q6k_input[input_base + elem_off + l + 32];
+                sum += d * float(sc3) * float(q3) * q6k_input[input_base + elem_off + l + 64];
+                sum += d * float(sc4) * float(q4) * q6k_input[input_base + elem_off + l + 96];
+            }
+        }
+    }
+
+    q6k_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = num_threads / 2; s > 0; s >>= 1) {
+        if (gi < s) {
+            q6k_shared[gi] += q6k_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        q6k_output[row] = q6k_shared[0];
+    }
+}
+
+// ============================================================
 // RoPE (Rotary Position Embeddings)
 // ============================================================
 
@@ -356,6 +568,7 @@ struct AttentionParams {
     uint n_q_heads;
     uint seq_len;
     float scale;
+    uint max_seq_len;
 };
 
 [vk_push_constant] const AttentionParams attn_pc;
@@ -384,7 +597,7 @@ void attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         float dot_val = 0.0;
         for (uint d = 0; d < attn_pc.head_dim; d++) {
             dot_val += attn_q[q_head * attn_pc.head_dim + d] *
-                       attn_k_cache[kv_head * attn_pc.seq_len * attn_pc.head_dim + pos * attn_pc.head_dim + d];
+                       attn_k_cache[kv_head * attn_pc.max_seq_len * attn_pc.head_dim + pos * attn_pc.head_dim + d];
         }
         attn_scores[q_head * attn_pc.seq_len + pos] = dot_val * attn_pc.scale;
     }
@@ -435,7 +648,7 @@ void attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         float acc = 0.0;
         for (uint pos = 0; pos < attn_pc.seq_len; pos++) {
             acc += attn_scores[q_head * attn_pc.seq_len + pos] *
-                   attn_v_cache[kv_head * attn_pc.seq_len * attn_pc.head_dim + pos * attn_pc.head_dim + d];
+                   attn_v_cache[kv_head * attn_pc.max_seq_len * attn_pc.head_dim + pos * attn_pc.head_dim + d];
         }
         attn_output[q_head * attn_pc.head_dim + d] = acc;
     }

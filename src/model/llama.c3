@@ -15,6 +15,8 @@ const char[*] RMSNORM_SPV     = $embed("../../shaders/rmsnorm.spv");
 const char[*] SILU_SPV        = $embed("../../shaders/silu.spv");
 const char[*] MATMUL_SPV      = $embed("../../shaders/matmul.spv");
 const char[*] MATMUL_Q8_SPV   = $embed("../../shaders/matmul_q8.spv");
+const char[*] MATMUL_Q5K_SPV  = $embed("../../shaders/matmul_q5k.spv");
+const char[*] MATMUL_Q6K_SPV  = $embed("../../shaders/matmul_q6k.spv");
 const char[*] ROPE_SPV        = $embed("../../shaders/rope.spv");
 const char[*] SOFTMAX_SPV     = $embed("../../shaders/softmax.spv");
 const char[*] ATTENTION_SPV   = $embed("../../shaders/attention.spv");
@@ -78,6 +80,8 @@ struct LlamaKernels {
     ComputeKernel silu;
     ComputeKernel matmul;
     ComputeKernel matmul_q8;
+    ComputeKernel matmul_q5k;
+    ComputeKernel matmul_q6k;
     ComputeKernel rope;
     ComputeKernel softmax;
     ComputeKernel attention;
@@ -100,7 +104,7 @@ struct SiluPC { uint n; }
 struct MatMulPC { uint out_dim; uint in_dim; }
 struct RoPEPC { uint dim; uint n_heads; uint position; float theta; }
 struct SoftmaxPC { uint n; uint offset; }
-struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_len; float scale; }
+struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_len; float scale; uint max_seq_len; }
 struct ResidualPC { uint n; }
 struct ElemwisePC { uint n; }
 
@@ -152,10 +156,16 @@ fn Tensor load_tensor_by_name(DeviceContext* ctx, GGUFFile* gf, String name) {
     return upload_weight(ctx, info, gf.tensor_data_base)!!;
 }
 
+fn Tensor load_tensor_as_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
+    GGUFTensorInfo* info = gf.find_tensor(name)!!;
+    return upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
+}
+
 fn LlamaWeights? load_weights(DeviceContext* ctx, GGUFFile* gf, LlamaConfig* config) {
     io::printfn("\nLoading weights...");
 
-    Tensor token_embedding = load_tensor_by_name(ctx, gf, "token_embd.weight");
+    // Embedding must be F32 for the embedding lookup shader
+    Tensor token_embedding = load_tensor_as_f32(ctx, gf, "token_embd.weight");
     Tensor output_norm = load_tensor_by_name(ctx, gf, "output_norm.weight");
 
     // Output weight - may be same as embedding (tied weights) or separate
@@ -294,6 +304,8 @@ fn LlamaKernels? create_kernels(DeviceContext* ctx) {
         .silu        = create_kernel(ctx, &SILU_SPV, 1, SiluPC.sizeof)!!,
         .matmul      = create_kernel(ctx, &MATMUL_SPV, 3, MatMulPC.sizeof)!!,
         .matmul_q8   = create_kernel(ctx, &MATMUL_Q8_SPV, 3, MatMulPC.sizeof)!!,
+        .matmul_q5k  = create_kernel(ctx, &MATMUL_Q5K_SPV, 3, MatMulPC.sizeof)!!,
+        .matmul_q6k  = create_kernel(ctx, &MATMUL_Q6K_SPV, 3, MatMulPC.sizeof)!!,
         .rope        = create_kernel(ctx, &ROPE_SPV, 1, RoPEPC.sizeof)!!,
         .softmax     = create_kernel(ctx, &SOFTMAX_SPV, 1, SoftmaxPC.sizeof)!!,
         .attention   = create_kernel(ctx, &ATTENTION_SPV, 5, AttentionPC.sizeof)!!,
@@ -308,27 +320,28 @@ fn uint ceil_div(uint a, uint b) {
 
 fn void dispatch_matmul(
     CommandBuffer cmd,
-    ComputeKernel* matmul_kernel,
-    ComputeKernel* matmul_q8_kernel,
+    LlamaKernels* k,
     Tensor* weight,
     Tensor* input,
     Tensor* output,
     uint out_dim,
     uint in_dim
 ) {
+    MatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim };
+    ComputeKernel* kernel;
     if (weight.dtype == GGML_Q8_0) {
-        MatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim };
-        dispatch_kernel(cmd, matmul_q8_kernel,
-            { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
-            { weight.size_bytes, input.size_bytes, output.size_bytes },
-            &pc, out_dim);
+        kernel = &k.matmul_q8;
+    } else if (weight.dtype == GGML_Q5_K) {
+        kernel = &k.matmul_q5k;
+    } else if (weight.dtype == GGML_Q6_K) {
+        kernel = &k.matmul_q6k;
     } else {
-        MatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim };
-        dispatch_kernel(cmd, matmul_kernel,
-            { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
-            { weight.size_bytes, input.size_bytes, output.size_bytes },
-            &pc, out_dim);
+        kernel = &k.matmul;
     }
+    dispatch_kernel(cmd, kernel,
+        { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
+        { weight.size_bytes, input.size_bytes, output.size_bytes },
+        &pc, out_dim);
 }
 
 fn LlamaModel? load_model(DeviceContext* ctx, String model_path) {
@@ -378,6 +391,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
         { w.token_embedding.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
         { w.token_embedding.size_bytes, a.hidden.size_bytes },
         &emb_pc, ceil_div(c.dim, 256));
+
     compute_barrier(cmd);
 
     // 2. For each transformer layer
@@ -399,9 +413,9 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
 
         // 2c. Q/K/V projections
         uint kv_dim = c.n_kv_heads * c.head_dim;
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.wq, &a.norm_out, &a.q, c.dim, c.dim);
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
+        dispatch_matmul(cmd, k, &lw.wq, &a.norm_out, &a.q, c.dim, c.dim);
+        dispatch_matmul(cmd, k, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
+        dispatch_matmul(cmd, k, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
         compute_barrier(cmd);
 
         // 2d. RoPE on Q and K
@@ -439,6 +453,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
             .n_q_heads = c.n_heads,
             .seq_len = seq_len,
             .scale = 1.0f / std::math::sqrt((float)c.head_dim),
+            .max_seq_len = MAX_SEQ_LEN,
         };
         dispatch_kernel(cmd, &k.attention,
             { a.q.gpu_buffer.buffer, kv.k_cache[l].gpu_buffer.buffer, kv.v_cache[l].gpu_buffer.buffer,
@@ -449,7 +464,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
         compute_barrier(cmd);
 
         // 2g. Output projection
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
+        dispatch_matmul(cmd, k, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
         compute_barrier(cmd);
 
         // 2h. Residual add: hidden = residual + attn_output
@@ -478,8 +493,8 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
         compute_barrier(cmd);
 
         // 2k. FFN: gate and up projections
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
+        dispatch_matmul(cmd, k, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
+        dispatch_matmul(cmd, k, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
         compute_barrier(cmd);
 
         // 2l. SiLU(gate) then gate *= up (SwiGLU)
@@ -498,7 +513,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
         compute_barrier(cmd);
 
         // 2m. Down projection
-        dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+        dispatch_matmul(cmd, k, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
         compute_barrier(cmd);
 
         // 2n. Residual add
@@ -522,7 +537,7 @@ fn void? LlamaModel.forward(&self, uint token, uint position) {
     compute_barrier(cmd);
 
     // 4. Output projection -> logits
-    dispatch_matmul(cmd, &k.matmul, &k.matmul_q8, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
+    dispatch_matmul(cmd, k, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
 
     // 5. Submit and wait
     submit_and_wait(ctx)!!;
@@ -535,6 +550,8 @@ fn void LlamaModel.free(&self) {
     self.kernels.silu.free(self.ctx.device);
     self.kernels.matmul.free(self.ctx.device);
     self.kernels.matmul_q8.free(self.ctx.device);
+    self.kernels.matmul_q5k.free(self.ctx.device);
+    self.kernels.matmul_q6k.free(self.ctx.device);
     self.kernels.rope.free(self.ctx.device);
     self.kernels.softmax.free(self.ctx.device);
     self.kernels.attention.free(self.ctx.device);

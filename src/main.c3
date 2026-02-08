@@ -16,14 +16,15 @@ fn int main(String[] args) {
     LlamaModel model = load_model(&ctx, model_path)!!;
     defer model.free();
 
-    io::printfn("\nGenerating tokens (greedy, 32 tokens from BOS)...\n");
+    io::printfn("\nGenerating tokens (greedy, 64 tokens from BOS)...\n");
 
     uint token = 1;  // BOS token
-    io::printf("Token IDs: ");
-    for (uint pos = 0; pos < 32; pos++) {
+    io::printf("Token IDs:");
+    for (uint pos = 0; pos < 64; pos++) {
         model.forward(token, pos)!!;
         token = argmax_sample(&ctx, &model.acts.logits, model.config.vocab_size)!!;
-        io::printf("%d ", token);
+        io::printf(" %d", token);
+        if (token == 2) break;  // EOS
     }
     io::printfn("");
 
