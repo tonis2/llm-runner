@@ -14,6 +14,7 @@ import vk;
 enum SchedulerType : uint {
     DDIM,
     EULER,
+    FLOW_MATCHING,
 }
 
 struct SchedulerState {
@@ -155,6 +156,52 @@ fn float SchedulerState.get_prev_alpha_cumprod(&self, uint step_idx) {
     uint t_prev = (uint)self.timesteps[step_idx + 1];
     if (t_prev >= self.num_train_timesteps) t_prev = self.num_train_timesteps - 1;
     return self.alphas_cumprod[t_prev];
+}
+
+// --- Flow Matching Euler Scheduler ---
+// For DiT models: linearly space timesteps from 1.0 to ~0.0
+// Euler step: x = x + dt * velocity
+// dt = t_{i+1} - t_i (negative, since going from 1 to 0)
+
+struct FlowMatchingState {
+    uint num_steps;
+    float[] timesteps;    // [num_steps + 1] boundaries
+    float[] sigmas;       // sigma values at each boundary
+}
+
+fn FlowMatchingState init_flow_matching(uint num_steps) {
+    // Linearly space from 1.0 to 0.0
+    float[] timesteps = mem::new_array(float, (usz)num_steps + 1);
+    float[] sigmas = mem::new_array(float, (usz)num_steps + 1);
+
+    for (uint i = 0; i <= num_steps; i++) {
+        float t = 1.0f - (float)i / (float)num_steps;
+        timesteps[i] = t;
+        sigmas[i] = t;  // For flow matching, sigma = t
+    }
+
+    io::printfn("Flow Matching: %d steps", num_steps);
+    io::printfn("  t: %.3f -> %.3f", timesteps[0], timesteps[num_steps]);
+
+    return {
+        .num_steps = num_steps,
+        .timesteps = timesteps,
+        .sigmas = sigmas,
+    };
+}
+
+fn float FlowMatchingState.get_dt(&self, uint step) {
+    // dt = t_{step+1} - t_{step}
+    return self.timesteps[step + 1] - self.timesteps[step];
+}
+
+fn float FlowMatchingState.get_timestep(&self, uint step) {
+    return self.timesteps[step];
+}
+
+fn void FlowMatchingState.free(&self) {
+    mem::free(self.timesteps);
+    mem::free(self.sigmas);
 }
 
 // --- Free ---

@@ -72,6 +72,13 @@ fn Tensor? create_f32_tensor(DeviceContext* ctx, ulong[4] shape, uint n_dims) {
     return create_tensor(ctx, GGML_F32, shape, n_dims);
 }
 
+// CPU-side bf16 to f32 conversion
+fn float cpu_bf16_to_f32(char* ptr) {
+    ushort bits = bitcast(*(char[2]*)ptr, ushort);
+    uint f32_bits = (uint)bits << 16;
+    return bitcast(f32_bits, float);
+}
+
 // CPU-side f16 to f32 conversion
 fn float cpu_f16_to_f32(char* ptr) {
     ushort bits = bitcast(*(char[2]*)ptr, ushort);
@@ -288,6 +295,10 @@ fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* 
     } else if (info.type == GGML_F16) {
         for (usz j = 0; j < n_elements; j++) {
             f32_data[j] = cpu_f16_to_f32(data_ptr + j * 2);
+        }
+    } else if (info.type == GGML_BF16) {
+        for (usz j = 0; j < n_elements; j++) {
+            f32_data[j] = cpu_bf16_to_f32(data_ptr + j * 2);
         }
     } else {
         // Copy raw for F32

@@ -13,6 +13,7 @@ const char[*] LLM_SPV = $embed("../../shaders/llm.spv");
 // Embedded architecture configs
 const char[*] LLAMA_CONFIG_JSON = $embed("../../configs/llama.json");
 const char[*] QWEN2_CONFIG_JSON = $embed("../../configs/qwen2.json");
+const char[*] QWEN3_CONFIG_JSON = $embed("../../configs/qwen3.json");
 const char[*] PHI3_CONFIG_JSON = $embed("../../configs/phi3.json");
 
 struct LayerWeights {
@@ -22,6 +23,8 @@ struct LayerWeights {
     Tensor wk;
     Tensor wv;
     Tensor wo;
+    Tensor wq_norm;
+    Tensor wk_norm;
     Tensor ffn_norm;
     Tensor ffn_norm_bias;
     Tensor ffn_gate;
@@ -134,6 +137,12 @@ fn LlmWeights? load_llm_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* c
         // Load gate weight only for SwiGLU FFN
         if (config.ffn_type == SWIGLU) {
             layers[l].ffn_gate = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_gate);
+        }
+
+        // Load Q/K norm weights if configured
+        if (names.wq_norm.len > 0) {
+            layers[l].wq_norm = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wq_norm);
+            layers[l].wk_norm = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wk_norm);
         }
 
         // Load norm biases for LayerNorm architectures
@@ -343,6 +352,62 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
         dispatch_matmul(cmd, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
         compute_barrier(cmd);
 
+        // 2c2. Q/K norm (per-head RMSNorm, e.g. Qwen3)
+        if (lw.wq_norm.size_bytes > 0) {
+            for (uint h = 0; h < c.n_heads; h++) {
+                RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
+                usz head_offset = (usz)h * c.head_dim * 4;
+                // We dispatch rmsnorm treating the head slice as a separate vector.
+                // rmsnorm reads from buf[0..dim-1], writes to buf[0..dim-1] via weight.
+                // We need to operate in-place on the Q buffer at the head offset.
+                // Use norm_out as temp: copy head slice, rmsnorm, copy back.
+                // Actually, rmsnorm kernel is hardcoded to read buffer from offset 0.
+                // For simplicity, dispatch one rmsnorm per head using buffer offsets via copy.
+                // Simpler approach: we'll add head offset handling later.
+                // For now, apply per-head norm using the norm_out buffer as scratch.
+            }
+            // Apply Q/K norms in a batch by dispatching per head
+            // Since rmsnorm reads from offset 0, we use a workaround:
+            // Process all heads at once treating it as a sequence of head_dim vectors
+            // The rmsnorm shader normalizes the entire input[0..dim-1] - we need per-head.
+            // Use the existing rmsnorm but dispatch once per head with buffer copies.
+            // This is slow but correct. We'll optimize later.
+            for (uint h = 0; h < c.n_heads; h++) {
+                usz h_off = (usz)h * c.head_dim * 4;
+                // Copy Q head to norm_out
+                vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
+                compute_barrier(cmd);
+                // RMSNorm with per-head weight
+                RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
+                // norm weight is [head_dim] repeated for each head - same weight for all heads
+                dispatch_kernel(cmd, &sk.rmsnorm,
+                    { a.norm_out.gpu_buffer.buffer, lw.wq_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
+                    { (usz)c.head_dim * 4, lw.wq_norm.size_bytes, (usz)c.head_dim * 4 },
+                    &qn_pc, 1);
+                compute_barrier(cmd);
+                // Copy back
+                vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
+                compute_barrier(cmd);
+            }
+            for (uint h = 0; h < c.n_kv_heads; h++) {
+                usz h_off = (usz)h * c.head_dim * 4;
+                vk::cmdCopyBuffer(cmd, a.k.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
+                compute_barrier(cmd);
+                RMSNormPC kn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
+                dispatch_kernel(cmd, &sk.rmsnorm,
+                    { a.norm_out.gpu_buffer.buffer, lw.wk_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
+                    { (usz)c.head_dim * 4, lw.wk_norm.size_bytes, (usz)c.head_dim * 4 },
+                    &kn_pc, 1);
+                compute_barrier(cmd);
+                vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
+                compute_barrier(cmd);
+            }
+        }
+
         // 2d. RoPE on Q and K
         RoPEPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .position = position, .theta = c.rope_theta };
         dispatch_kernel(cmd, &k.rope,
@@ -485,6 +550,45 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
     submit_and_wait(ctx)!!;
 }
 
+// Encode text: run forward pass for each token, extract post-final-norm hidden states.
+// Returns a GPU buffer with [seq_len, dim] embeddings.
+// Caller is responsible for freeing the returned tensor.
+fn Tensor? LlmModel.encode_text(&self, uint[] tokens) {
+    ModelConfig* c = &self.config;
+    DeviceContext* ctx = self.ctx;
+
+    // Allocate output buffer: [seq_len, dim]
+    ulong[4] out_shape = { (ulong)tokens.len, (ulong)c.dim, 0, 0 };
+    Tensor text_embeddings = create_f32_tensor(ctx, { (ulong)tokens.len * c.dim, 0, 0, 0 }, 1)!!;
+
+    // Process BOS + each token
+    // BOS at position 0
+    self.forward(tokens[0], 0)!!;
+
+    // After forward, norm_out has the post-final-norm hidden state
+    // Copy norm_out [dim] to text_embeddings at offset 0
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
+        vk::cmdCopyBuffer(cmd, self.acts.norm_out.gpu_buffer.buffer,
+            text_embeddings.gpu_buffer.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)c.dim * 4 }});
+    }!!;
+
+    for (usz i = 1; i < tokens.len; i++) {
+        self.forward(tokens[i], (uint)i)!!;
+        usz dst_offset = i * c.dim * 4;
+        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
+            vk::cmdCopyBuffer(cmd, self.acts.norm_out.gpu_buffer.buffer,
+                text_embeddings.gpu_buffer.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)dst_offset, .size = (ulong)c.dim * 4 }});
+        }!!;
+    }
+
+    text_embeddings.n_dims = 2;
+    text_embeddings.shape = out_shape;
+
+    return text_embeddings;
+}
+
 fn void LlmModel.free(&self) {
     // Free LLM-specific kernels
     self.kernels.embedding.free(self.ctx.device);
@@ -532,6 +636,8 @@ fn void LlmModel.free(&self) {
         lw.wo.free();
         lw.ffn_norm.free();
         if (lw.ffn_norm_bias.size_bytes > 0) lw.ffn_norm_bias.free();
+        if (lw.wq_norm.size_bytes > 0) lw.wq_norm.free();
+        if (lw.wk_norm.size_bytes > 0) lw.wk_norm.free();
         if (lw.ffn_gate.size_bytes > 0) lw.ffn_gate.free();
         lw.ffn_up.free();
         lw.ffn_down.free();

@@ -19,7 +19,8 @@
 			"type": "prepare",
 			"exec": [
 				"slangc ./shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/llm.spv",
-				"slangc ./shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/diffusion.spv"
+				"slangc ./shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/diffusion.spv",
+				"slangc ./shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/zimage.spv"
 			]
 		}
   },

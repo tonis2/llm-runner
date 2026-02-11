@@ -1,0 +1,10 @@
+  {
+    "model": "/home/tonis/Documents/AI/models/z_image_turbo-Q4_K_M.gguf",
+    "prompt": "a photo of a cat",
+    "text_model": "/home/tonis/Documents/AI/models/Qwen3-4B-Instruct-2507-Q4_K_S.gguf",
+    "vae": "/home/tonis/Documents/AI/models/ae.safetensors",
+    "steps": 8,
+    "seed": 42,
+    "size": 512,
+    "output": "output.ppm"
+  }

@@ -6,6 +6,8 @@ import std::io::file::mmap;
 import std::core::mem;
 import std::math::random;
 import std::time::clock;
+import std::encoding::json;
+import std::collections::object;
 
 enum RunMode : char { LLM, TXT2IMG, IMG2IMG }
 
@@ -24,6 +26,10 @@ fn bool is_diffusion_model(GGUFFile* gf) {
 fn int main(String[] args) {
     if (args.len < 2) {
         io::printfn("Usage: llm <model.gguf> [prompt] [options]");
+        io::printfn("       llm --config <config.json> [prompt]");
+        io::printfn("");
+        io::printfn("General options:");
+        io::printfn("  --config   Load settings from JSON config file");
         io::printfn("");
         io::printfn("LLM options:");
         io::printfn("  --temp   Temperature (0 = greedy, default 0.7)");
@@ -38,6 +44,9 @@ fn int main(String[] args) {
         io::printfn("  --seed     Random seed (default 42)");
         io::printfn("  --output   Output image path (default output.ppm)");
         io::printfn("  --input    Input image for img2img mode");
+        io::printfn("  --vae        Path to VAE safetensors (for DiT models)");
+        io::printfn("  --text-model Path to text encoder GGUF (for DiT models)");
+        io::printfn("  --size       Image size (default 512, for DiT models)");
         return 1;
     }
 
@@ -55,7 +64,43 @@ fn int main(String[] args) {
     ulong seed = 42;
     String output_path = "output.ppm";
     String input_path = "";
+    String vae_path = "";
+    String text_model_path = "";
+    uint image_size = 512;
 
+    // Pre-scan for --config and load JSON defaults
+    for (usz ci = 1; ci + 1 < args.len; ci++) {
+        if (args[ci] == "--config") {
+            String config_path = args[ci + 1];
+            char[] config_data = file::load(mem, config_path)!!;
+            Object* cfg = json::parse_string(mem, (String)config_data)!!;
+            // Note: don't free cfg — string values reference its memory
+
+            if (try v = cfg.get_string("model")) model_path = v;
+            if (try v = cfg.get_string("prompt")) prompt = v;
+            if (try v = cfg.get_string("arch")) arch_path = v;
+            if (try v = cfg.get_string("vae")) vae_path = v;
+            if (try v = cfg.get_string("text_model")) text_model_path = v;
+            if (try v = cfg.get_string("output")) output_path = v;
+            if (try v = cfg.get_string("input")) input_path = v;
+            if (try v = cfg.get_float("temp")) sampling.temperature = (float)v;
+            if (try v = cfg.get_uint("top_k")) sampling.top_k = v;
+            if (try v = cfg.get_float("top_p")) sampling.top_p = (float)v;
+            if (try v = cfg.get_uint("steps")) diff_steps = v;
+            if (try v = cfg.get_float("cfg_scale")) cfg_scale = (float)v;
+            if (try v = cfg.get_uint("seed")) seed = (ulong)v;
+            if (try v = cfg.get_uint("size")) image_size = v;
+            if (try v = cfg.get_string("mode")) {
+                if (v == "txt2img") { run_mode = TXT2IMG; mode_forced = true; }
+                else if (v == "img2img") { run_mode = IMG2IMG; mode_forced = true; }
+            }
+
+            io::printfn("Config loaded from: %s", config_path);
+            break;
+        }
+    }
+
+    // CLI args override config values
     usz i = 1;
     while (i < args.len) {
         if (args[i].len > 2 && args[i][0] == '-' && args[i][1] == '-') {
@@ -96,6 +141,17 @@ fn int main(String[] args) {
             } else if (args[i] == "--input") {
                 input_path = args[i + 1];
                 i += 2;
+            } else if (args[i] == "--vae") {
+                vae_path = args[i + 1];
+                i += 2;
+            } else if (args[i] == "--text-model") {
+                text_model_path = args[i + 1];
+                i += 2;
+            } else if (args[i] == "--size") {
+                image_size = args[i + 1].to_uint() ?? 512;
+                i += 2;
+            } else if (args[i] == "--config") {
+                i += 2;  // already handled in pre-scan
             } else {
                 i++;
             }
@@ -126,11 +182,37 @@ fn int main(String[] args) {
     defer gf.free();
     gguf_print_info(&gf);
 
-    // Detect model type: diffusion or LLM
+    // Detect model type: DiT, diffusion, or LLM
+    bool is_dit = is_dit_model(&gf);
     bool is_diffusion = is_diffusion_model(&gf);
 
-    if (is_diffusion && !mode_forced) {
+    if ((is_diffusion || is_dit) && !mode_forced) {
         run_mode = TXT2IMG;
+    }
+
+    // DiT / Z-Image pipeline
+    if (is_dit && (run_mode == TXT2IMG || run_mode == IMG2IMG)) {
+        io::printfn("DiT model detected — Z-Image pipeline");
+        if (prompt.len == 0) {
+            io::printfn("Error: a prompt is required for image generation");
+            return 1;
+        }
+
+        DeviceContext ctx = createContext()!!;
+        ctx.allocator.queue = &ctx.compute_queue;
+        defer ctx.free();
+
+        ZImageParams zparams = {
+            .num_steps = diff_steps > 1 ? diff_steps : 8,
+            .seed = (uint)seed,
+            .output_path = output_path,
+            .vae_path = vae_path,
+            .text_model_path = text_model_path,
+            .image_size = image_size,
+        };
+
+        bool ok = run_zimage_pipeline(&ctx, &gf, prompt, &zparams);
+        return ok ? 0 : 1;
     }
 
     if (run_mode == TXT2IMG || run_mode == IMG2IMG) {
@@ -198,6 +280,8 @@ fn int main(String[] args) {
         config_json = (String)&LLAMA_CONFIG_JSON;
     } else if (arch_name == "qwen2") {
         config_json = (String)&QWEN2_CONFIG_JSON;
+    } else if (arch_name == "qwen3") {
+        config_json = (String)&QWEN3_CONFIG_JSON;
     } else if (arch_name == "phi3") {
         config_json = (String)&PHI3_CONFIG_JSON;
     } else {
