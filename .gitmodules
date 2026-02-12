@@ -1,0 +1,3 @@
+[submodule "dependencies/vulkan.c3l"]
+	path = dependencies/vulkan.c3l
+	url = git@github.com:tonis2/Vulkan.c3.git
