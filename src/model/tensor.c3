@@ -256,6 +256,51 @@ fn void dequant_q8_0_block(char* block, float* output) {
     }
 }
 
+// Dequantize a single row from a quantized embedding table on CPU.
+// The embedding tensor has shape [vocab_size, dim]. For quantized types,
+// each row is dim/block_size blocks of type_size bytes each.
+fn void dequant_embedding_row(char* tensor_data, GGUFTensorInfo* info, uint row, float* output, uint dim) {
+    usz block_size = info.type.block_size();
+    usz type_size = info.type.type_size();
+    usz row_bytes = ((usz)dim / block_size) * type_size;
+    char* row_ptr = tensor_data + (usz)row * row_bytes;
+    usz n_blocks = (usz)dim / block_size;
+
+    switch (info.type) {
+        case GGML_Q4_0:
+            for (usz b = 0; b < n_blocks; b++) {
+                dequant_q4_0_block(row_ptr + b * type_size, output + b * block_size);
+            }
+        case GGML_Q4_K:
+            for (usz b = 0; b < n_blocks; b++) {
+                dequant_q4k_block(row_ptr + b * type_size, output + b * block_size);
+            }
+        case GGML_Q5_K:
+            for (usz b = 0; b < n_blocks; b++) {
+                dequant_q5k_block(row_ptr + b * type_size, output + b * block_size);
+            }
+        case GGML_Q6_K:
+            for (usz b = 0; b < n_blocks; b++) {
+                dequant_q6k_block(row_ptr + b * type_size, output + b * block_size);
+            }
+        case GGML_Q8_0:
+            for (usz b = 0; b < n_blocks; b++) {
+                dequant_q8_0_block(row_ptr + b * type_size, output + b * block_size);
+            }
+        case GGML_F16:
+            for (usz j = 0; j < (usz)dim; j++) {
+                output[j] = cpu_f16_to_f32(row_ptr + j * 2);
+            }
+        case GGML_BF16:
+            for (usz j = 0; j < (usz)dim; j++) {
+                output[j] = cpu_bf16_to_f32(row_ptr + j * 2);
+            }
+        default:
+            // F32: direct copy
+            mem::copy(output, row_ptr, (usz)dim * 4);
+    }
+}
+
 // Upload a quantized tensor as F32 (dequantizes on CPU, uploads F32)
 fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* tensor_data_base) {
     char* data_ptr = tensor_data_base + (usz)info.offset;

@@ -85,10 +85,7 @@ fn bool run_zimage_pipeline(
     ModelConfig text_config = load_arch_config(config_json, &text_gf)!!;
     WeightNames text_names = load_weight_names(config_json)!!;
 
-    // Load LLM model for text encoding
-    LlmModel text_model = load_llm_model(ctx, &text_gf, &text_config, &text_names)!!;
-
-    // Tokenize prompt
+    // Tokenize prompt first to know text_len for KV cache sizing
     Tokenizer tok = load_tokenizer(&text_gf)!!;
     uint[] prompt_tokens = tok.encode(prompt)!!;
     io::printfn("  Prompt: %d tokens", prompt_tokens.len);
@@ -100,6 +97,11 @@ fn bool run_zimage_pipeline(
     for (usz i = 0; i < prompt_tokens.len; i++) {
         full_tokens[i + 1] = prompt_tokens[i];
     }
+
+    // Load LLM model for text encoding (encode_only: skip F32 embedding + output weight, small KV cache)
+    uint enc_max_seq = text_len + 16;
+    LlmModel text_model = load_llm_model(ctx, &text_gf, &text_config, &text_names,
+        encode_only: true, max_seq_len: enc_max_seq)!!;
 
     Clock encode_start = clock::now();
     // Encode text: run LLM forward, get hidden states [text_len, dim]
