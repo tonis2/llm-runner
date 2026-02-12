@@ -16,6 +16,7 @@ struct ZImageParams {
     uint seed;
     String output_path;
     String vae_path;         // Path to Flux VAE safetensors file
+    String taesd_path;       // Path to TAESD safetensors file (alternative to full VAE)
     String text_model_path;  // Path to text encoder GGUF (Qwen3)
     uint image_size;         // 512 default
 }
@@ -127,8 +128,14 @@ fn bool run_zimage_pipeline(
     DiTWeights dit_weights = load_dit_weights(ctx, dit_gf)!!;
     DiTKernels dit_kernels = create_dit_kernels(ctx)!!;
 
-    // Allocate DiT activations
-    uint max_seq = n_patches + text_len + 32;  // some headroom
+    // Compute padded sequence lengths (multiples of 32)
+    uint padded_text = pad_to_multiple(text_len, SEQ_MULTI_OF);
+    uint padded_patches = pad_to_multiple(n_patches, SEQ_MULTI_OF);
+    uint n_text_pad = padded_text - text_len;
+    uint n_img_pad = padded_patches - n_patches;
+
+    // Allocate DiT activations with padded sizes
+    uint max_seq = padded_patches + padded_text;
     DiTActivations dit_acts = allocate_dit_activations(ctx, max_seq)!!;
 
     DiTModel* dit = mem::alloc(DiTModel);
@@ -138,14 +145,27 @@ fn bool run_zimage_pipeline(
     dit.ctx = ctx;
     dit.n_patches = n_patches;
     dit.text_len = text_len;
+    dit.padded_patches = padded_patches;
+    dit.padded_text = padded_text;
     dit.latent_h = lat_h;
     dit.latent_w = lat_w;
 
-    io::printfn("  DiT loaded: %d patches, %d text tokens", n_patches, text_len);
+    // Precompute mRoPE cos/sin tables (with padding positions)
+    uint patches_w = lat_w / DIT_PATCH_SIZE;
+    uint patches_h = lat_h / DIT_PATCH_SIZE;
+    precompute_mrope_tables(ctx, &dit.rope_cos_main, &dit.rope_sin_main,
+        n_patches, patches_w, patches_h, text_len, MROPE_MODE_FULL)!!;
+    precompute_mrope_tables(ctx, &dit.rope_cos_refiner, &dit.rope_sin_refiner,
+        n_patches, patches_w, patches_h, text_len, MROPE_MODE_IMAGE)!!;
+    precompute_mrope_tables(ctx, &dit.rope_cos_context, &dit.rope_sin_context,
+        n_patches, patches_w, patches_h, text_len, MROPE_MODE_TEXT)!!;
+
+    io::printfn("  DiT loaded: %d patches (pad %d), %d text tokens (pad %d)",
+        n_patches, n_img_pad, text_len, n_text_pad);
 
     // Project text embeddings: cap_embedder = Sequential(RMSNorm(text_dim), Linear(text_dim, dim))
-    // text_embeddings is [text_len, text_dim], need [text_len, DIT_DIM]
-    Tensor projected_text = create_f32_tensor(ctx, { (ulong)text_len * DIT_DIM, 0, 0, 0 }, 1)!!;
+    // text_embeddings is [text_len, text_dim], need [padded_text, DIT_DIM] (padded)
+    Tensor projected_text = create_f32_tensor(ctx, { (ulong)padded_text * DIT_DIM, 0, 0, 0 }, 1)!!;
     Tensor norm_scratch = create_f32_tensor(ctx, { (ulong)text_config.dim, 0, 0, 0 }, 1)!!;
 
     CommandBuffer cmd = ctx.command_buffer;
@@ -182,37 +202,61 @@ fn bool run_zimage_pipeline(
           text_embeddings.size_bytes, projected_text.size_bytes },
         &cap_pc, text_len * DIT_DIM);
     compute_barrier(cmd);
+
+    // Pad text with cap_pad_token (append n_text_pad copies after real text)
+    if (n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
+        for (uint p = 0; p < n_text_pad; p++) {
+            vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
+                projected_text.gpu_buffer.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0,
+                    .dstOffset = (ulong)(text_len + p) * DIT_DIM * 4,
+                    .size = (ulong)DIT_DIM * 4 }});
+        }
+        compute_barrier(cmd);
+    }
     submit_and_wait(ctx)!!;
     norm_scratch.free();
 
     // Free original text embeddings
     text_embeddings.free();
 
-    // Run context refiner on projected text (2 layers, no adaLN)
+    // Run context refiner on padded text (2 layers, no adaLN, WITH RoPE)
     begin_compute(cmd)!!;
     for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
         dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-            &projected_text, text_len, 0, false)!!;
+            &projected_text, padded_text, false,
+            &dit.rope_cos_context, &dit.rope_sin_context)!!;
     }
     submit_and_wait(ctx)!!;
 
-    io::printfn("  Context refiner complete.");
+    io::printfn("  Context refiner complete (padded_text=%d).", padded_text);
 
-    // Load VAE
+    // Load VAE (TAESD or full Flux VAE)
     DiffusionKernels diff_kernels = create_diffusion_kernels(ctx)!!;
     FluxVaeDecoder vae_decoder;
     FluxVaeActivations vae_acts;
+    TAESDDecoder taesd_decoder;
+    TAESDActivations taesd_acts;
     bool has_vae = false;
+    bool use_taesd = false;
 
-    if (params.vae_path.len > 0) {
+    if (params.taesd_path.len > 0) {
+        SafetensorsFile sf = safetensors_open(params.taesd_path)!!;
+        taesd_decoder = load_taesd_decoder(ctx, &sf, &diff_kernels)!!;
+        sf.close();
+        taesd_acts = allocate_taesd_activations(ctx, img_size)!!;
+        has_vae = true;
+        use_taesd = true;
+        io::printfn("  TAESD loaded from %s", params.taesd_path);
+    } else if (params.vae_path.len > 0) {
         SafetensorsFile sf = safetensors_open(params.vae_path)!!;
         vae_decoder = load_flux_vae_decoder(ctx, &sf, &diff_kernels)!!;
-        sf.close();  // Release mmap after weights are on GPU
+        sf.close();
         vae_acts = allocate_flux_vae_activations(ctx, img_size)!!;
         has_vae = true;
         io::printfn("  Flux VAE loaded from %s", params.vae_path);
     } else {
-        io::printfn("  Warning: No VAE path specified (--vae). Will output raw latent.");
+        io::printfn("  Warning: No VAE path specified (--vae or --taesd). Will output raw latent.");
     }
 
     io::printfn("  GPU memory: %d MB allocated, %d MB fragmented (reusable)",
@@ -274,9 +318,61 @@ fn bool run_zimage_pipeline(
 
         double step_sec = step_start.to_now().to_sec();
         io::printfn("  Step %d done in %.2fs", step + 1, step_sec);
+
+        // Debug: readback velocity and latent stats per step
+        if (step < 3) {
+            debug_readback_stats(ctx, dit.acts.velocity.gpu_buffer.buffer, latent_elems, "velocity")!!;
+            debug_readback_stats(ctx, dit.acts.latent.gpu_buffer.buffer, latent_elems, "latent")!!;
+        }
     }
     double denoise_sec = denoise_start.to_now().to_sec();
     io::printfn("  Denoising complete in %.2fs", denoise_sec);
+
+    // Debug: readback latent stats after denoising
+    {
+        vk::Memory lat_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)latent_elems * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+            vk::cmdCopyBuffer(dbg_cmd, dit.acts.latent.gpu_buffer.buffer, lat_stg.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+        }!!;
+        float* lat_ptr = (float*)lat_stg.data();
+        float l_min = lat_ptr[0]; float l_max = lat_ptr[0]; float l_sum = 0;
+        for (uint i = 0; i < latent_elems; i++) {
+            float v = lat_ptr[i];
+            if (v < l_min) l_min = v;
+            if (v > l_max) l_max = v;
+            l_sum += v;
+        }
+        io::printfn("  [DEBUG] latent: min=%.6f max=%.6f mean=%.6f", l_min, l_max, l_sum / (float)latent_elems);
+
+        // Also readback velocity
+        vk::Memory vel_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)latent_elems * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd2) {
+            vk::cmdCopyBuffer(dbg_cmd2, dit.acts.velocity.gpu_buffer.buffer, vel_stg.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+        }!!;
+        float* vel_ptr = (float*)vel_stg.data();
+        float v_min = vel_ptr[0]; float v_max = vel_ptr[0]; float v_sum = 0;
+        for (uint i = 0; i < latent_elems; i++) {
+            float v = vel_ptr[i];
+            if (v < v_min) v_min = v;
+            if (v > v_max) v_max = v;
+            v_sum += v;
+        }
+        io::printfn("  [DEBUG] velocity: min=%.6f max=%.6f mean=%.6f", v_min, v_max, v_sum / (float)latent_elems);
+        lat_stg.free();
+        vel_stg.free();
+    }
 
     flow.free();
 
@@ -286,33 +382,66 @@ fn bool run_zimage_pipeline(
     io::printfn("\n[5/5] VAE decoding...");
 
     if (has_vae) {
-        // Scale latent by VAE scaling factor (1/0.3611 for Flux VAE)
-        begin_compute(cmd)!!;
-        ScalePC scale_pc = { .n = latent_elems, .scale = 1.0f / 0.3611f };
-        dispatch_kernel(cmd, &dit.kernels.scale_buffer,
-            { dit.acts.latent.gpu_buffer.buffer },
-            { dit.acts.latent.size_bytes },
-            &scale_pc, ceil_div(latent_elems, 256));
-        submit_and_wait(ctx)!!;
+        Tensor* decode_output;
 
-        // Copy latent to VAE input buffer
-        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer copy_cmd) {
-            vk::cmdCopyBuffer(copy_cmd, dit.acts.latent.gpu_buffer.buffer,
-                vae_acts.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
-        }!!;
+        if (use_taesd) {
+            // TAESD: no latent scaling needed (tanh clamp handles it)
+            // Copy latent to TAESD input buffer
+            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer copy_cmd) {
+                vk::cmdCopyBuffer(copy_cmd, dit.acts.latent.gpu_buffer.buffer,
+                    taesd_acts.buf_a.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            }!!;
 
-        // Run VAE decoder
-        vae_decoder.forward(&vae_acts, lat_h, lat_w)!!;
+            taesd_decoder.forward(&taesd_acts, lat_h, lat_w)!!;
+            decode_output = &taesd_acts.buf_a;
+        } else {
+            // Flux VAE: scale latent by (1/scale_factor) + shift_factor
+            begin_compute(cmd)!!;
+            ScalePC scale_pc = { .n = latent_elems, .scale = 1.0f / 0.3611f };
+            dispatch_kernel(cmd, &dit.kernels.scale_buffer,
+                { dit.acts.latent.gpu_buffer.buffer },
+                { dit.acts.latent.size_bytes },
+                &scale_pc, ceil_div(latent_elems, 256));
+            submit_and_wait(ctx)!!;
+
+            // Copy latent to VAE input buffer
+            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer copy_cmd) {
+                vk::cmdCopyBuffer(copy_cmd, dit.acts.latent.gpu_buffer.buffer,
+                    vae_acts.buf_a.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            }!!;
+
+            vae_decoder.forward(&vae_acts, lat_h, lat_w)!!;
+            decode_output = &vae_acts.buf_a;
+        }
 
         // Download image
-        Image img = download_image_from_gpu(ctx, &vae_acts.buf_a, img_size, img_size, 3)!!;
+        Image img = download_image_from_gpu(ctx, decode_output, img_size, img_size, 3)!!;
+
+        // Debug: check pixel stats
+        {
+            float p_min = img.data[0]; float p_max = img.data[0]; float p_sum = 0;
+            uint p_nan = 0;
+            usz total_px = (usz)img_size * img_size * 3;
+            for (usz i = 0; i < total_px; i++) {
+                float p = img.data[i];
+                if (p != p) { p_nan++; } else { if (p < p_min) p_min = p; if (p > p_max) p_max = p; p_sum += p; }
+            }
+            io::printfn("  [DEBUG] pixels: min=%.4f max=%.4f mean=%.4f nan=%d", p_min, p_max, p_sum / (float)total_px, p_nan);
+        }
+
         bool ok = save_ppm(&img, params.output_path);
         img.free();
 
         // Cleanup
-        vae_decoder.free();
-        vae_acts.free();
+        if (use_taesd) {
+            taesd_decoder.free();
+            taesd_acts.free();
+        } else {
+            vae_decoder.free();
+            vae_acts.free();
+        }
         diff_kernels.free(ctx.device);
         projected_text.free();
         dit.free();

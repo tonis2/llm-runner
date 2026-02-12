@@ -772,6 +772,44 @@ void scale_shift_clamp(uint3 tid: SV_DispatchThreadID) {
 }
 
 // ============================================================
+// ReLU (in-place element-wise)
+// ============================================================
+
+struct ReluParams {
+    uint n;
+};
+
+[vk_push_constant] const ReluParams relu_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> relu_data;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void relu(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= relu_pc.n) return;
+    relu_data[tid.x] = max(relu_data[tid.x], 0.0);
+}
+
+// ============================================================
+// Tanh Clamp (in-place): x = tanh(x / 3.0) * 3.0
+// ============================================================
+
+struct TanhClampParams {
+    uint n;
+};
+
+[vk_push_constant] const TanhClampParams tanh_clamp_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> tanh_clamp_data;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void tanh_clamp(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= tanh_clamp_pc.n) return;
+    tanh_clamp_data[tid.x] = tanh(tanh_clamp_data[tid.x] / 3.0) * 3.0;
+}
+
+// ============================================================
 // F16 to F32 conversion (for loading F16 bias/weights)
 // ============================================================
 

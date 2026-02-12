@@ -154,6 +154,14 @@ struct F16ToF32PC {
     uint n;
 }
 
+struct ReluPC {
+    uint n;
+}
+
+struct TanhClampPC {
+    uint n;
+}
+
 // --- Diffusion Kernels ---
 
 struct DiffusionKernels {
@@ -172,6 +180,8 @@ struct DiffusionKernels {
     ComputeKernel euler_step;
     ComputeKernel scale_shift_clamp;
     ComputeKernel f16_to_f32;
+    ComputeKernel relu;
+    ComputeKernel tanh_clamp;
     // Also need shared kernels (silu, gelu, residual_add, layernorm, etc.)
     SharedKernels shared;
 }
@@ -298,6 +308,8 @@ fn DiffusionKernels? create_diffusion_kernels(DeviceContext* ctx) {
         .euler_step       = create_kernel(ctx, shader, 2, EulerStepPC.sizeof, "euler_step")!!,
         .scale_shift_clamp = create_kernel(ctx, shader, 2, ScaleShiftPC.sizeof, "scale_shift_clamp")!!,
         .f16_to_f32       = create_kernel(ctx, shader, 2, F16ToF32PC.sizeof, "f16_to_f32")!!,
+        .relu             = create_kernel(ctx, shader, 1, ReluPC.sizeof, "relu")!!,
+        .tanh_clamp       = create_kernel(ctx, shader, 1, TanhClampPC.sizeof, "tanh_clamp")!!,
         .shared           = create_shared_kernels(ctx, llm_shader)!!,
     };
 
@@ -322,6 +334,8 @@ fn void DiffusionKernels.free(&self, Device device) {
     self.euler_step.free(device);
     self.scale_shift_clamp.free(device);
     self.f16_to_f32.free(device);
+    self.relu.free(device);
+    self.tanh_clamp.free(device);
     self.shared.free(device);
 }
 

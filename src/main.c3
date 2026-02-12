@@ -45,6 +45,7 @@ fn int main(String[] args) {
         io::printfn("  --output   Output image path (default output.ppm)");
         io::printfn("  --input    Input image for img2img mode");
         io::printfn("  --vae        Path to VAE safetensors (for DiT models)");
+        io::printfn("  --taesd      Path to TAESD safetensors (lightweight VAE alternative)");
         io::printfn("  --text-model Path to text encoder GGUF (for DiT models)");
         io::printfn("  --size       Image size (default 512, for DiT models)");
         return 1;
@@ -65,6 +66,7 @@ fn int main(String[] args) {
     String output_path = "output.ppm";
     String input_path = "";
     String vae_path = "";
+    String taesd_path = "";
     String text_model_path = "";
     uint image_size = 512;
 
@@ -80,6 +82,7 @@ fn int main(String[] args) {
             if (try v = cfg.get_string("prompt")) prompt = v;
             if (try v = cfg.get_string("arch")) arch_path = v;
             if (try v = cfg.get_string("vae")) vae_path = v;
+            if (try v = cfg.get_string("taesd")) taesd_path = v;
             if (try v = cfg.get_string("text_model")) text_model_path = v;
             if (try v = cfg.get_string("output")) output_path = v;
             if (try v = cfg.get_string("input")) input_path = v;
@@ -144,6 +147,9 @@ fn int main(String[] args) {
             } else if (args[i] == "--vae") {
                 vae_path = args[i + 1];
                 i += 2;
+            } else if (args[i] == "--taesd") {
+                taesd_path = args[i + 1];
+                i += 2;
             } else if (args[i] == "--text-model") {
                 text_model_path = args[i + 1];
                 i += 2;
@@ -207,6 +213,7 @@ fn int main(String[] args) {
             .seed = (uint)seed,
             .output_path = output_path,
             .vae_path = vae_path,
+            .taesd_path = taesd_path,
             .text_model_path = text_model_path,
             .image_size = image_size,
         };

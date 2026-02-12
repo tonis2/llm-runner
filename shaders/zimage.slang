@@ -216,11 +216,11 @@ void dit_timestep_embed(uint3 tid: SV_DispatchThreadID) {
 
     if (tid.x < half_dim) {
         float freq = exp(-log(10000.0) * float(tid.x) / float(half_dim));
-        dit_timestep_output[tid.x] = sin(dit_timestep_pc.timestep * freq);
+        dit_timestep_output[tid.x] = cos(dit_timestep_pc.timestep * freq);
     } else {
         uint idx = tid.x - half_dim;
         float freq = exp(-log(10000.0) * float(idx) / float(half_dim));
-        dit_timestep_output[tid.x] = cos(dit_timestep_pc.timestep * freq);
+        dit_timestep_output[tid.x] = sin(dit_timestep_pc.timestep * freq);
     }
 }
 
@@ -264,6 +264,54 @@ struct ScaleParams {
 void scale_buffer(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= scale_pc.n) return;
     scale_data[tid.x] *= scale_pc.scale;
+}
+
+// ============================================================
+// Scale Modulate - output = input * (1 + scale)
+// ============================================================
+// Like adaln_modulate but without shift term
+
+struct ScaleModParams {
+    uint n_elements;
+    uint dim;
+};
+
+[vk_push_constant] const ScaleModParams scale_mod_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> smod_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> smod_scale;   // [dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> smod_output;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void scale_modulate(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= scale_mod_pc.n_elements) return;
+    uint d = tid.x % scale_mod_pc.dim;
+    smod_output[tid.x] = smod_input[tid.x] * (1.0 + smod_scale[d]);
+}
+
+// ============================================================
+// Gated Residual Add - residual += tanh(gate) * input
+// ============================================================
+// gate is [dim], broadcast across sequence positions
+
+struct GatedResidualParams {
+    uint n_elements;
+    uint dim;
+};
+
+[vk_push_constant] const GatedResidualParams gated_res_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> gres_residual;  // [seq_len, dim] modified in-place
+[vk_binding(1, 0)] RWStructuredBuffer<float> gres_gate;      // [dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> gres_input;     // [seq_len, dim]
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void gated_residual(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= gated_res_pc.n_elements) return;
+    uint d = tid.x % gated_res_pc.dim;
+    gres_residual[tid.x] += tanh(gres_gate[d]) * gres_input[tid.x];
 }
 
 // ============================================================
@@ -316,6 +364,67 @@ void batch_rmsnorm(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
     for (uint i = gi; i < batch_rmsnorm_pc.dim; i += 256) {
         brn_output[base + i] = brn_input[base + i] * rms * brn_weight[i];
+    }
+}
+
+// ============================================================
+// Batch LayerNorm (no affine) - normalizes each row to zero mean, unit variance
+// ============================================================
+// Processes [n_rows, dim] in-place: y = (x - mean) / sqrt(var + eps)
+// No learnable weight or bias parameters
+
+struct BatchLayerNormParams {
+    uint dim;
+    float eps;
+    uint n_rows;
+    uint _pad;
+};
+
+[vk_push_constant] const BatchLayerNormParams batch_layernorm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> bln_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bln_output;
+
+groupshared float bln_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_layernorm(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    if (row >= batch_layernorm_pc.n_rows) return;
+
+    uint base = row * batch_layernorm_pc.dim;
+
+    // Pass 1: Compute mean
+    float sum = 0.0;
+    for (uint i = gi; i < batch_layernorm_pc.dim; i += 256) {
+        sum += bln_input[base + i];
+    }
+    bln_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bln_shared[gi] += bln_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float mean = bln_shared[0] / float(batch_layernorm_pc.dim);
+
+    // Pass 2: Compute variance
+    float var_sum = 0.0;
+    for (uint i = gi; i < batch_layernorm_pc.dim; i += 256) {
+        float diff = bln_input[base + i] - mean;
+        var_sum += diff * diff;
+    }
+    bln_shared[gi] = var_sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bln_shared[gi] += bln_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float inv_std = 1.0 / sqrt(bln_shared[0] / float(batch_layernorm_pc.dim) + batch_layernorm_pc.eps);
+
+    // Normalize
+    for (uint i = gi; i < batch_layernorm_pc.dim; i += 256) {
+        bln_output[base + i] = (bln_input[base + i] - mean) * inv_std;
     }
 }
 
@@ -522,3 +631,5 @@ void flash_attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         fa_output[q_pos * dim + head * D + d] = acc;
     }
 }
+
+// mRoPE shader is in separate file (mrope.slang -> mrope.spv)

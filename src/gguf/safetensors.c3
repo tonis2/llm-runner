@@ -251,6 +251,12 @@ fn Tensor? upload_safetensor_f32(DeviceContext* ctx, SafetensorsFile* sf, String
         for (usz j = 0; j < n_elements; j++) {
             f32_data[j] = cpu_bf16_to_f32(data_ptr + j * 2);
         }
+    } else if (info.dtype == "F8_E4M3") {
+        f32_data = (float*)mem::calloc(f32_size);
+        needs_free = true;
+        for (usz j = 0; j < n_elements; j++) {
+            f32_data[j] = cpu_fp8e4m3_to_f32(data_ptr + j);
+        }
     } else {
         io::printfn("Warning: unsupported safetensors dtype '%s' for %s", info.dtype, name);
         return COMPUTE_ERROR~;

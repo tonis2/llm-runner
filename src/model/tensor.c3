@@ -99,6 +99,35 @@ fn float cpu_f16_to_f32(char* ptr) {
     return sign != 0 ? -val : val;
 }
 
+// CPU-side FP8 E4M3 to f32 conversion
+fn float cpu_fp8e4m3_to_f32(char* ptr) {
+    uint bits = (uint)bitcast(*(char[1]*)ptr, char) & 0xFF;
+    uint sign = (bits >> 7) & 1;
+    uint exp_bits = (bits >> 3) & 0xF;
+    uint mant = bits & 0x7;
+
+    if (exp_bits == 0) {
+        if (mant == 0) return sign != 0 ? -0.0f : 0.0f;
+        // Subnormal: value = (-1)^sign * 2^(-6) * (mant/8)
+        float val = (float)mant / 8.0f * (1.0f / 64.0f);
+        return sign != 0 ? -val : val;
+    }
+    if (exp_bits == 15 && mant == 7) {
+        // NaN
+        return 0.0f / 0.0f;
+    }
+    // Normal: value = (-1)^sign * 2^(exp-7) * (1 + mant/8)
+    float mantissa = 1.0f + (float)mant / 8.0f;
+    int exponent = (int)exp_bits - 7;
+    float val;
+    if (exponent >= 0) {
+        val = mantissa * (float)(1 << exponent);
+    } else {
+        val = mantissa / (float)(1 << (-exponent));
+    }
+    return sign != 0 ? -val : val;
+}
+
 // Dequantize Q5_K block (256 elements from 176 bytes) to F32
 fn void dequant_q5k_block(char* block, float* output) {
     float d = cpu_f16_to_f32(block);

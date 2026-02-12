@@ -6,8 +6,9 @@ import std::math;
 import std::core::mem;
 import std::time::clock;
 
-// Embedded Z-Image SPIR-V shader
+// Embedded Z-Image SPIR-V shaders
 const char[*] ZIMAGE_SPV = $embed("../../shaders/zimage.spv");
+const char[*] MROPE_SPV = $embed("../../shaders/mrope.spv");
 
 // DiT (Diffusion Transformer) for Z-Image Turbo / Lumina2 architecture
 // 30-layer transformer with AdaLN modulation, dual RMSNorm, SwiGLU FFN
@@ -23,6 +24,11 @@ const uint DIT_LATENT_CHANNELS = 16;
 const uint DIT_PATCH_DIM = 64;    // 16 * 2 * 2
 const uint DIT_T_EMB_DIM = 256;   // Timestep embedding dimension
 const uint DIT_T_MLP_DIM = 1024;  // t_embedder MLP intermediate dim
+
+// mRoPE config (from Z-Image-Turbo config.json)
+const float DIT_ROPE_THETA = 256.0;
+const uint[3] DIT_ROPE_AXES_DIM = { 32, 48, 48 };  // text, height, width
+const float DIT_T_SCALE = 1000.0;  // Timestep scaling factor
 
 // --- Push constant structs for Z-Image shaders ---
 
@@ -43,6 +49,13 @@ struct UnpatchifyPC {
 struct AdalnModPC {
     uint n_elements;
     uint dim;
+}
+
+struct BatchLayerNormPC {
+    uint dim;
+    float eps;
+    uint n_rows;
+    uint _pad;
 }
 
 struct FlowEulerPC {
@@ -99,6 +112,23 @@ struct FlashAttentionPC {
     float scale;
 }
 
+struct ScaleModPC {
+    uint n_elements;
+    uint dim;
+}
+
+struct GatedResidualPC {
+    uint n_elements;
+    uint dim;
+}
+
+struct MRoPEPC {
+    uint seq_len;
+    uint n_heads;
+    uint _pad0;
+    uint _pad1;
+}
+
 struct BatchMatMulPC {
     uint out_dim;
     uint in_dim;
@@ -123,11 +153,11 @@ struct DiTLayerWeights {
     Tensor ffn_gate;
     Tensor ffn_up;
     Tensor ffn_down;
-    // Dual norms
-    Tensor attn_norm1;   // image tokens
-    Tensor attn_norm2;   // text tokens
-    Tensor ffn_norm1;    // image tokens
-    Tensor ffn_norm2;    // text tokens
+    // Norms (Lumina2: norm1=pre-norm, norm2=post-norm)
+    Tensor attn_norm1;   // pre-attention RMSNorm
+    Tensor attn_norm2;   // post-attention RMSNorm
+    Tensor ffn_norm1;    // pre-FFN RMSNorm
+    Tensor ffn_norm2;    // post-FFN RMSNorm
     // AdaLN: projects t_emb to modulation params [4*dim]
     Tensor adaln_linear;
     Tensor adaln_bias;
@@ -157,6 +187,7 @@ struct DiTWeights {
     Tensor x_emb_bias;
 
     // Final layer
+    Tensor final_norm;          // RMSNorm weight [dim]
     Tensor final_adaln_linear;
     Tensor final_adaln_bias;
     Tensor final_linear;    // [patch_dim, dim]
@@ -206,6 +237,10 @@ struct DiTKernels {
     ComputeKernel batch_rmsnorm;
     ComputeKernel transpose_heads;
     ComputeKernel batch_head_norm;
+    ComputeKernel scale_modulate;
+    ComputeKernel gated_residual;
+    ComputeKernel batch_layernorm;
+    ComputeKernel mrope;
     ComputeKernel batch_matmul;
     ComputeKernel batch_matmul_q8;
     ComputeKernel batch_matmul_q4_0;
@@ -222,10 +257,19 @@ struct DiTModel {
     DiTActivations acts;
     DiTKernels kernels;
     DeviceContext* ctx;
-    uint n_patches;     // Number of image patches
-    uint text_len;      // Text sequence length
+    uint n_patches;     // Number of real image patches
+    uint text_len;      // Real text sequence length
+    uint padded_patches; // n_patches padded to multiple of 32
+    uint padded_text;    // text_len padded to multiple of 32
     uint latent_h;      // Latent height
     uint latent_w;      // Latent width
+    // mRoPE cos/sin tables (precomputed once per config)
+    Tensor rope_cos_main;    // [n_patches + text_len, head_dim/2] for main layers
+    Tensor rope_sin_main;    // [n_patches + text_len, head_dim/2]
+    Tensor rope_cos_refiner; // [n_patches, head_dim/2] for noise refiner
+    Tensor rope_sin_refiner; // [n_patches, head_dim/2]
+    Tensor rope_cos_context; // [text_len, head_dim/2] for context refiner
+    Tensor rope_sin_context; // [text_len, head_dim/2]
 }
 
 // --- Kernel Creation ---
@@ -246,16 +290,41 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
         .setCode((uint*)&llm_spv[0])
         .build(ctx.device)!!;
 
+    io::printfn("  Creating zimage kernels...");
+    ComputeKernel k_patchify = create_kernel(ctx, zi_shader, 2, PatchifyPC.sizeof, "patchify")!!;
+    ComputeKernel k_unpatchify = create_kernel(ctx, zi_shader, 2, UnpatchifyPC.sizeof, "unpatchify")!!;
+    ComputeKernel k_adaln = create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!;
+    ComputeKernel k_euler = create_kernel(ctx, zi_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!;
+    ComputeKernel k_linproj = create_kernel(ctx, zi_shader, 4, LinearProjPC.sizeof, "linear_proj")!!;
+    ComputeKernel k_timestep = create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!;
+    ComputeKernel k_bcastadd = create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!;
+    ComputeKernel k_scalebuf = create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!;
+    ComputeKernel k_flashattn = create_kernel(ctx, zi_shader, 4, FlashAttentionPC.sizeof, "flash_attention")!!;
+    ComputeKernel k_scalemod = create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
+    ComputeKernel k_gatedres = create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
+    io::printfn("  Creating mrope kernel...");
+    char[] mrope_spv = &MROPE_SPV;
+    ShaderModule mrope_shader = vk::shaderModuleCreateInfo()
+        .setCodeSize(mrope_spv.len)
+        .setCode((uint*)&mrope_spv[0])
+        .build(ctx.device)!!;
+    ComputeKernel k_mrope = create_kernel(ctx, mrope_shader, 3, MRoPEPC.sizeof, "mrope")!!;
+    mrope_shader.free(ctx.device);
+    io::printfn("  mrope kernel created.");
     DiTKernels kernels = {
-        .patchify         = create_kernel(ctx, zi_shader, 2, PatchifyPC.sizeof, "patchify")!!,
-        .unpatchify       = create_kernel(ctx, zi_shader, 2, UnpatchifyPC.sizeof, "unpatchify")!!,
-        .adaln_modulate   = create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!,
-        .flow_euler_step  = create_kernel(ctx, zi_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!,
-        .linear_proj      = create_kernel(ctx, zi_shader, 4, LinearProjPC.sizeof, "linear_proj")!!,
-        .dit_timestep_embed = create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!,
-        .broadcast_add_dim = create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!,
-        .scale_buffer     = create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!,
-        .flash_attention   = create_kernel(ctx, zi_shader, 4, FlashAttentionPC.sizeof, "flash_attention")!!,
+        .patchify         = k_patchify,
+        .unpatchify       = k_unpatchify,
+        .adaln_modulate   = k_adaln,
+        .flow_euler_step  = k_euler,
+        .linear_proj      = k_linproj,
+        .dit_timestep_embed = k_timestep,
+        .broadcast_add_dim = k_bcastadd,
+        .scale_buffer     = k_scalebuf,
+        .flash_attention   = k_flashattn,
+        .scale_modulate   = k_scalemod,
+        .gated_residual   = k_gatedres,
+        .batch_layernorm  = create_kernel(ctx, zi_shader, 2, BatchLayerNormPC.sizeof, "batch_layernorm")!!,
+        .mrope            = k_mrope,
         .batch_rmsnorm    = create_kernel(ctx, zi_shader, 3, BatchRMSNormPC.sizeof, "batch_rmsnorm")!!,
         .transpose_heads  = create_kernel(ctx, zi_shader, 2, TransposeHeadsPC.sizeof, "transpose_heads")!!,
         .batch_head_norm  = create_kernel(ctx, zi_shader, 2, BatchHeadNormPC.sizeof, "batch_head_norm")!!,
@@ -303,6 +372,164 @@ fn DiTActivations? allocate_dit_activations(DeviceContext* ctx, uint max_seq_len
         .velocity = create_f32_tensor(ctx, { (ulong)1024 * DIT_PATCH_DIM, 0, 0, 0 }, 1)!!,
         .latent = create_f32_tensor(ctx, { latent_total, 0, 0, 0 }, 1)!!,
     };
+}
+
+// --- mRoPE Precomputation ---
+// Precompute cos/sin tables for multimodal RoPE
+// Our layout: [image_real, image_pad, text_real, text_pad]
+// Reference layout: [text_real, text_pad, image_real, image_pad]
+// Position IDs:
+//   image_real[i]: (padded_text_len + 1, row, col)
+//   image_pad[j]:  (0, 0, 0) — identity rotation
+//   text_real[k]:  (k + 1, 0, 0) — 1-indexed
+//   text_pad[m]:   (text_len + m + 1, 0, 0) — continues text sequence
+
+const uint MROPE_MODE_FULL = 0;     // padded image + padded text (main layers)
+const uint MROPE_MODE_IMAGE = 1;    // padded image only (noise refiner)
+const uint MROPE_MODE_TEXT = 2;     // padded text only (context refiner)
+const uint SEQ_MULTI_OF = 32;      // Pad sequences to multiples of this
+
+fn uint pad_to_multiple(uint n, uint multiple) {
+    return ((n + multiple - 1) / multiple) * multiple;
+}
+
+fn void? precompute_mrope_tables(
+    DeviceContext* ctx,
+    Tensor* cos_out, Tensor* sin_out,
+    uint n_patches, uint patches_w, uint patches_h,
+    uint text_len, uint mode
+) {
+    uint padded_text = pad_to_multiple(text_len, SEQ_MULTI_OF);
+    uint padded_patches = pad_to_multiple(n_patches, SEQ_MULTI_OF);
+    uint n_text_pad = padded_text - text_len;
+    uint n_img_pad = padded_patches - n_patches;
+
+    uint seq_len;
+    switch (mode) {
+        case MROPE_MODE_FULL: seq_len = padded_patches + padded_text;
+        case MROPE_MODE_IMAGE: seq_len = padded_patches;
+        case MROPE_MODE_TEXT: seq_len = padded_text;
+        default: seq_len = padded_patches + padded_text;
+    }
+    uint half_dim = DIT_HEAD_DIM / 2;  // 64
+    usz table_size = (usz)seq_len * half_dim;
+
+    float* cos_data = (float*)mem::calloc(table_size * 4);
+    float* sin_data = (float*)mem::calloc(table_size * 4);
+
+    // Image text-axis position = padded_text_len + 1
+    uint image_index = padded_text + 1;
+
+    // For each token, compute rotation angles for all 3 axes
+    for (uint t = 0; t < seq_len; t++) {
+        uint pos_text;   // axis 0
+        uint pos_row;    // axis 1
+        uint pos_col;    // axis 2
+
+        if (mode == MROPE_MODE_TEXT) {
+            // All tokens are text (real + pad), 1-indexed
+            pos_text = t + 1;
+            pos_row = 0;
+            pos_col = 0;
+        } else if (mode == MROPE_MODE_IMAGE) {
+            if (t < n_patches) {
+                pos_text = image_index;
+                pos_row = t / patches_w;
+                pos_col = t % patches_w;
+            } else {
+                // Image padding: identity rotation (all zeros)
+                pos_text = 0;
+                pos_row = 0;
+                pos_col = 0;
+            }
+        } else {
+            // FULL mode: [image_real, image_pad, text_real, text_pad]
+            if (t < n_patches) {
+                pos_text = image_index;
+                pos_row = t / patches_w;
+                pos_col = t % patches_w;
+            } else if (t < padded_patches) {
+                // Image padding
+                pos_text = 0;
+                pos_row = 0;
+                pos_col = 0;
+            } else {
+                // Text (real + pad), 1-indexed
+                uint text_idx = t - padded_patches;
+                pos_text = text_idx + 1;
+                pos_row = 0;
+                pos_col = 0;
+            }
+        }
+
+        uint pair = 0;
+        // Axis 0: text position (dims 0..15)
+        uint half_ax0 = DIT_ROPE_AXES_DIM[0] / 2;  // 16
+        for (uint k = 0; k < half_ax0; k++) {
+            float freq = 1.0f / math::pow(DIT_ROPE_THETA, (float)(2 * k) / (float)DIT_ROPE_AXES_DIM[0]);
+            float angle = (float)pos_text * freq;
+            cos_data[t * half_dim + pair] = math::cos(angle);
+            sin_data[t * half_dim + pair] = math::sin(angle);
+            pair++;
+        }
+        // Axis 1: row position (dims 16..39)
+        uint half_ax1 = DIT_ROPE_AXES_DIM[1] / 2;  // 24
+        for (uint k = 0; k < half_ax1; k++) {
+            float freq = 1.0f / math::pow(DIT_ROPE_THETA, (float)(2 * k) / (float)DIT_ROPE_AXES_DIM[1]);
+            float angle = (float)pos_row * freq;
+            cos_data[t * half_dim + pair] = math::cos(angle);
+            sin_data[t * half_dim + pair] = math::sin(angle);
+            pair++;
+        }
+        // Axis 2: col position (dims 40..63)
+        uint half_ax2 = DIT_ROPE_AXES_DIM[2] / 2;  // 24
+        for (uint k = 0; k < half_ax2; k++) {
+            float freq = 1.0f / math::pow(DIT_ROPE_THETA, (float)(2 * k) / (float)DIT_ROPE_AXES_DIM[2]);
+            float angle = (float)pos_col * freq;
+            cos_data[t * half_dim + pair] = math::cos(angle);
+            sin_data[t * half_dim + pair] = math::sin(angle);
+            pair++;
+        }
+    }
+
+    // Upload to GPU
+    *cos_out = (Tensor){
+        .gpu_buffer = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            data: cos_data, data_size: table_size * 4,
+        )!!,
+        .size_bytes = table_size * 4,
+        .shape = { seq_len, half_dim, 0, 0 },
+        .n_dims = 2,
+        .dtype = GGML_F32,
+    };
+    *sin_out = (Tensor){
+        .gpu_buffer = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            data: sin_data, data_size: table_size * 4,
+        )!!,
+        .size_bytes = table_size * 4,
+        .shape = { seq_len, half_dim, 0, 0 },
+        .n_dims = 2,
+        .dtype = GGML_F32,
+    };
+
+    mem::free(cos_data);
+    mem::free(sin_data);
+
+    String mode_name;
+    switch (mode) {
+        case MROPE_MODE_FULL: mode_name = "main";
+        case MROPE_MODE_IMAGE: mode_name = "noise_refiner";
+        case MROPE_MODE_TEXT: mode_name = "context_refiner";
+        default: mode_name = "unknown";
+    }
+    io::printfn("  mRoPE tables: seq_len=%d, half_dim=%d, pad=%d (%s)",
+        seq_len, half_dim, seq_len - (mode == MROPE_MODE_TEXT ? text_len : mode == MROPE_MODE_IMAGE ? n_patches : n_patches + text_len), mode_name);
 }
 
 // --- Weight Loading ---
@@ -384,7 +611,8 @@ fn DiTLayerWeights load_dit_layer_weights(DeviceContext* ctx, GGUFFile* gf, Stri
 
     if (has_adaln) {
         io::printfn("    [%s%d] loading adaln...", prefix, layer);
-        lw.adaln_linear = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.weight"));
+        // Must load as F32 since linear_proj shader expects F32 weights
+        lw.adaln_linear = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.weight"));
         lw.adaln_bias = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.bias"));
     }
 
@@ -430,11 +658,36 @@ fn DiTWeights? load_dit_weights(DeviceContext* ctx, GGUFFile* gf) {
     w.t_emb_mlp2_weight = load_dit_tensor_f32(ctx, gf, "t_embedder.mlp.2.weight");
     w.t_emb_mlp2_bias = load_dit_tensor_f32(ctx, gf, "t_embedder.mlp.2.bias");
 
+    // Verify tensor shapes for t_embedder and adaLN
+    if (try info = gf.find_tensor("t_embedder.mlp.0.weight")) {
+        io::printfn("  [shape] t_emb.mlp.0.weight: [%d, %d]", info.shape[0], info.shape[1]);
+    }
+    if (try info = gf.find_tensor("t_embedder.mlp.2.weight")) {
+        io::printfn("  [shape] t_emb.mlp.2.weight: [%d, %d]", info.shape[0], info.shape[1]);
+    }
+    if (try info = gf.find_tensor("layers.0.adaLN_modulation.0.weight")) {
+        io::printfn("  [shape] layers.0.adaLN_modulation.0.weight: [%d, %d]", info.shape[0], info.shape[1]);
+    }
+    if (try info = gf.find_tensor("noise_refiner.0.adaLN_modulation.0.weight")) {
+        io::printfn("  [shape] noise_refiner.0.adaLN_modulation.0.weight: [%d, %d]", info.shape[0], info.shape[1]);
+    }
+    if (try info = gf.find_tensor("layers.0.attention_norm2.weight")) {
+        io::printfn("  [shape] layers.0.attention_norm2.weight: [%d]", info.shape[0]);
+    }
+    if (try info = gf.find_tensor("final_layer.adaLN_modulation.1.weight")) {
+        io::printfn("  [shape] final_layer.adaLN_modulation.1.weight: [%d, %d]", info.shape[0], info.shape[1]);
+    }
+
     w.x_emb_weight = load_dit_tensor_f32(ctx, gf, "x_embedder.weight");
     w.x_emb_bias = load_dit_tensor_f32(ctx, gf, "x_embedder.bias");
 
-    // Final layer: adaln = Sequential(SiLU(), Linear(t_emb_dim, dim)) at index 1
+    // Final layer: norm + adaLN (scale-only) + linear projection
     io::printfn("  Loading final layer...");
+    // Try loading final norm weight (Lumina2: LuminaLayerNormContinuous has RMSNorm)
+    w.final_norm = load_dit_tensor(ctx, gf, "final_layer.norm.weight");
+    if (w.final_norm.size_bytes == 0) {
+        w.final_norm = load_dit_tensor(ctx, gf, "norm_out.norm.weight");
+    }
     w.final_adaln_linear = load_dit_tensor_f32(ctx, gf, "final_layer.adaLN_modulation.1.weight");
     w.final_adaln_bias = load_dit_tensor_f32(ctx, gf, "final_layer.adaLN_modulation.1.bias");
     w.final_linear = load_dit_tensor_f32(ctx, gf, "final_layer.linear.weight");
@@ -523,15 +776,61 @@ fn void dispatch_batch_matmul(
         &pc, groups);
 }
 
-// Run a single DiT transformer layer using batch matmul
+// Check if float bits represent NaN (fast-math safe)
+fn bool is_nan_bits(float v) {
+    uint bits = bitcast(v, uint);
+    return (bits & 0x7FFFFFFF) > 0x7F800000;
+}
+
+// Check if float bits represent Inf (fast-math safe)
+fn bool is_inf_bits(float v) {
+    uint bits = bitcast(v, uint);
+    return (bits & 0x7FFFFFFF) == 0x7F800000;
+}
+
+// Debug: readback a GPU buffer and print stats (min/max/mean/nan count)
+// Must be called OUTSIDE an active command buffer recording (after submit_and_wait)
+fn void? debug_readback_stats(DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String label) {
+    vk::Memory stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: (usz)n_floats * 4,
+    )!!;
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+        vk::cmdCopyBuffer(dbg_cmd, src_buffer, stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_floats * 4 }});
+    }!!;
+    float* ptr = (float*)stg.data();
+    float mn = 1e30; float mx = -1e30; double sm = 0;
+    uint nan_count = 0; uint inf_count = 0;
+    for (uint i = 0; i < n_floats; i++) {
+        float v = ptr[i];
+        if (is_nan_bits(v)) { nan_count++; continue; }
+        if (is_inf_bits(v)) { inf_count++; continue; }
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        sm += v;
+    }
+    uint valid = n_floats - nan_count - inf_count;
+    float mean = valid > 0 ? (float)(sm / (double)valid) : 0;
+    io::printfn("  [DBG] %s: min=%.6f max=%.6f mean=%.6f nan=%d inf=%d (%d elems)",
+        label, mn, mx, mean, nan_count, inf_count, n_floats);
+    stg.free();
+}
+
+// Run a single DiT transformer layer (Lumina2 architecture)
+// Lumina2 adaLN: 4 params = [scale_msa, gate_msa, scale_mlp, gate_mlp]
+// Pre-norm + scale modulation (no shift), post-norm + tanh-gated residual
 fn void? dit_transformer_layer(
     DiTModel* model,
     CommandBuffer cmd,
     DiTLayerWeights* lw,
     Tensor* hidden,        // [seq_len, dim] - modified in place
     uint seq_len,
-    uint img_len,          // number of image tokens (0 if no dual norm)
-    bool has_adaln
+    bool has_adaln,
+    Tensor* rope_cos,      // [seq_len, head_dim/2] precomputed cos table
+    Tensor* rope_sin       // [seq_len, head_dim/2] precomputed sin table
 ) {
     DeviceContext* ctx = model.ctx;
     SharedKernels* sk = &model.kernels.shared;
@@ -542,8 +841,9 @@ fn void? dit_transformer_layer(
     Clock prof_t;
     if (profiling) { prof_t = clock::now(); }
 
-    // === Phase A: AdaLN + Norm ===
+    // === Phase A: AdaLN params + Pre-attention norm + scale ===
     if (has_adaln && lw.adaln_linear.size_bytes > 0) {
+        // Project t_emb -> 4 modulation params: [scale_msa, gate_msa, scale_mlp, gate_mlp]
         LinearProjPC adaln_proj_pc = { .out_dim = 4 * dim, .in_dim = DIT_T_EMB_DIM, .seq_len = 1 };
         dispatch_kernel(cmd, &dk.linear_proj,
             { lw.adaln_linear.gpu_buffer.buffer, lw.adaln_bias.gpu_buffer.buffer,
@@ -553,6 +853,7 @@ fn void? dit_transformer_layer(
             &adaln_proj_pc, 4 * dim);
         compute_barrier(cmd);
 
+        // Extract scale_msa (chunk 0) and gate_msa (chunk 1)
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)dim * 4 }});
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, 1,
@@ -560,44 +861,27 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
-    // Pre-attention RMSNorm (dual: norm1 for image, norm2 for text)
-    if (img_len > 0 && lw.attn_norm2.size_bytes > 0) {
-        BatchRMSNormPC rms_img_pc = { .dim = dim, .eps = 1e-6f, .n_rows = img_len, .row_offset = 0 };
-        dispatch_kernel(cmd, &dk.batch_rmsnorm,
-            { hidden.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { hidden.size_bytes, lw.attn_norm1.size_bytes, a.buf_a.size_bytes },
-            &rms_img_pc, img_len);
-        compute_barrier(cmd);
-        uint text_rows = seq_len - img_len;
-        BatchRMSNormPC rms_txt_pc = { .dim = dim, .eps = 1e-6f, .n_rows = text_rows, .row_offset = img_len };
-        dispatch_kernel(cmd, &dk.batch_rmsnorm,
-            { hidden.gpu_buffer.buffer, lw.attn_norm2.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { hidden.size_bytes, lw.attn_norm2.size_bytes, a.buf_a.size_bytes },
-            &rms_txt_pc, text_rows);
-        compute_barrier(cmd);
-    } else {
-        BatchRMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
-        dispatch_kernel(cmd, &dk.batch_rmsnorm,
-            { hidden.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { hidden.size_bytes, lw.attn_norm1.size_bytes, a.buf_a.size_bytes },
-            &rms_pc, seq_len);
-        compute_barrier(cmd);
-    }
+    // Pre-attention RMSNorm: all tokens get same norm1
+    BatchRMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+    dispatch_kernel(cmd, &dk.batch_rmsnorm,
+        { hidden.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+        { hidden.size_bytes, lw.attn_norm1.size_bytes, a.buf_a.size_bytes },
+        &rms_pc, seq_len);
+    compute_barrier(cmd);
 
-    if (has_adaln && img_len > 0) {
-        AdalnModPC adaln_mod_pc = { .n_elements = img_len * dim, .dim = dim };
-        dispatch_kernel(cmd, &dk.adaln_modulate,
-            { a.buf_a.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer,
-              a.adaln_shift.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { a.buf_a.size_bytes, a.adaln_scale.size_bytes,
-              a.adaln_shift.size_bytes, a.buf_a.size_bytes },
-            &adaln_mod_pc, ceil_div(img_len * dim, 256));
+    // Scale modulation: buf_a = buf_a * (1 + scale_msa) — applied to ALL tokens
+    if (has_adaln) {
+        ScaleModPC smod_pc = { .n_elements = seq_len * dim, .dim = dim };
+        dispatch_kernel(cmd, &dk.scale_modulate,
+            { a.buf_a.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { a.buf_a.size_bytes, a.adaln_scale.size_bytes, a.buf_a.size_bytes },
+            &smod_pc, ceil_div(seq_len * dim, 256));
         compute_barrier(cmd);
     }
 
     if (profiling) { submit_and_wait(ctx)!!; io::printfn("      norm+adaln: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
 
-    // === Phase B: QKV batch matmul (3 dispatches, no per-position loop) ===
+    // === Phase B: QKV batch matmul (3 dispatches) ===
     // wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
@@ -644,6 +928,24 @@ fn void? dit_transformer_layer(
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total_elems * 4 }});
     compute_barrier(cmd);
 
+    // === Apply mRoPE to Q and K (after transpose, before attention) ===
+    if (rope_cos != null && rope_cos.size_bytes > 0) {
+        MRoPEPC mrope_pc = { .seq_len = seq_len, .n_heads = DIT_HEADS };
+        // 2D dispatch: x = pairs (64 threads per workgroup), y = head*seq_len
+        uint groups_y = DIT_HEADS * seq_len;
+
+        dispatch_kernel(cmd, &dk.mrope,
+            { a.q.gpu_buffer.buffer, rope_cos.gpu_buffer.buffer, rope_sin.gpu_buffer.buffer },
+            { a.q.size_bytes, rope_cos.size_bytes, rope_sin.size_bytes },
+            &mrope_pc, 1, groups_y);
+
+        dispatch_kernel(cmd, &dk.mrope,
+            { a.k.gpu_buffer.buffer, rope_cos.gpu_buffer.buffer, rope_sin.gpu_buffer.buffer },
+            { a.k.size_bytes, rope_cos.size_bytes, rope_sin.size_bytes },
+            &mrope_pc, 1, groups_y);
+        compute_barrier(cmd);
+    }
+
     // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
     float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
     FlashAttentionPC fa_pc = {
@@ -662,21 +964,51 @@ fn void? dit_transformer_layer(
 
     if (profiling) { submit_and_wait(ctx)!!; io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
 
-    // === Phase D: Output projection batch matmul + Residual ===
+    // === Phase D: Output projection + Post-attention norm + Gated residual ===
+    // Output projection: buf_b -> buf_a
     dispatch_batch_matmul(cmd, dk, &lw.wo, &a.buf_b, &a.buf_a, dim, dim, seq_len, 0);
     compute_barrier(cmd);
 
-    ResidualPC res_pc = { .n = seq_len * dim };
-    dispatch_kernel(cmd, &sk.residual_add,
-        { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-        { hidden.size_bytes, a.buf_a.size_bytes },
-        &res_pc, ceil_div(seq_len * dim, 256));
-    compute_barrier(cmd);
+    // Post-attention norm: norm2(attn_output)
+    if (lw.attn_norm2.size_bytes > 0) {
+        BatchRMSNormPC post_attn_rms = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { a.buf_a.gpu_buffer.buffer, lw.attn_norm2.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+            { a.buf_a.size_bytes, lw.attn_norm2.size_bytes, a.buf_b.size_bytes },
+            &post_attn_rms, seq_len);
+        compute_barrier(cmd);
+
+        // Gated residual: hidden += tanh(gate_msa) * norm2(attn_output)
+        if (has_adaln) {
+            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim };
+            dispatch_kernel(cmd, &dk.gated_residual,
+                { hidden.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+                { hidden.size_bytes, a.adaln_shift.size_bytes, a.buf_b.size_bytes },
+                &gres_pc, ceil_div(seq_len * dim, 256));
+        } else {
+            // Context refiner: no gate, just residual += post_norm(output)
+            ResidualPC res_pc = { .n = seq_len * dim };
+            dispatch_kernel(cmd, &sk.residual_add,
+                { hidden.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+                { hidden.size_bytes, a.buf_b.size_bytes },
+                &res_pc, ceil_div(seq_len * dim, 256));
+        }
+        compute_barrier(cmd);
+    } else {
+        // No post-norm available: direct residual
+        ResidualPC res_pc = { .n = seq_len * dim };
+        dispatch_kernel(cmd, &sk.residual_add,
+            { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, a.buf_a.size_bytes },
+            &res_pc, ceil_div(seq_len * dim, 256));
+        compute_barrier(cmd);
+    }
 
     if (profiling) { submit_and_wait(ctx)!!; io::printfn("      out_proj:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
 
-    // === Phase E: FFN norm ===
+    // === Phase E: FFN pre-norm + scale ===
     if (has_adaln) {
+        // Extract scale_mlp (chunk 2) and gate_mlp (chunk 3) from adaln_params
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = (ulong)2 * dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 }});
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, 1,
@@ -684,37 +1016,21 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
-    if (img_len > 0 && lw.ffn_norm2.size_bytes > 0) {
-        BatchRMSNormPC ffn_img_pc = { .dim = dim, .eps = 1e-6f, .n_rows = img_len, .row_offset = 0 };
-        dispatch_kernel(cmd, &dk.batch_rmsnorm,
-            { hidden.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { hidden.size_bytes, lw.ffn_norm1.size_bytes, a.buf_a.size_bytes },
-            &ffn_img_pc, img_len);
-        compute_barrier(cmd);
-        uint ffn_text_rows = seq_len - img_len;
-        BatchRMSNormPC ffn_txt_pc = { .dim = dim, .eps = 1e-6f, .n_rows = ffn_text_rows, .row_offset = img_len };
-        dispatch_kernel(cmd, &dk.batch_rmsnorm,
-            { hidden.gpu_buffer.buffer, lw.ffn_norm2.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { hidden.size_bytes, lw.ffn_norm2.size_bytes, a.buf_a.size_bytes },
-            &ffn_txt_pc, ffn_text_rows);
-        compute_barrier(cmd);
-    } else {
-        BatchRMSNormPC ffn_rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
-        dispatch_kernel(cmd, &dk.batch_rmsnorm,
-            { hidden.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { hidden.size_bytes, lw.ffn_norm1.size_bytes, a.buf_a.size_bytes },
-            &ffn_rms_pc, seq_len);
-        compute_barrier(cmd);
-    }
+    // Pre-FFN RMSNorm: all tokens get same ffn_norm1
+    BatchRMSNormPC ffn_rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+    dispatch_kernel(cmd, &dk.batch_rmsnorm,
+        { hidden.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+        { hidden.size_bytes, lw.ffn_norm1.size_bytes, a.buf_a.size_bytes },
+        &ffn_rms_pc, seq_len);
+    compute_barrier(cmd);
 
-    if (has_adaln && img_len > 0) {
-        AdalnModPC adaln_mod_pc = { .n_elements = img_len * dim, .dim = dim };
-        dispatch_kernel(cmd, &dk.adaln_modulate,
-            { a.buf_a.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer,
-              a.adaln_shift.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-            { a.buf_a.size_bytes, a.adaln_scale.size_bytes,
-              a.adaln_shift.size_bytes, a.buf_a.size_bytes },
-            &adaln_mod_pc, ceil_div(img_len * dim, 256));
+    // Scale modulation: buf_a = buf_a * (1 + scale_mlp) — applied to ALL tokens
+    if (has_adaln) {
+        ScaleModPC smod_pc = { .n_elements = seq_len * dim, .dim = dim };
+        dispatch_kernel(cmd, &dk.scale_modulate,
+            { a.buf_a.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { a.buf_a.size_bytes, a.adaln_scale.size_bytes, a.buf_a.size_bytes },
+            &smod_pc, ceil_div(seq_len * dim, 256));
         compute_barrier(cmd);
     }
 
@@ -726,7 +1042,7 @@ fn void? dit_transformer_layer(
     dispatch_batch_matmul(cmd, dk, &lw.ffn_up, &a.buf_a, &a.ffn_up_out, DIT_FFN_DIM, dim, seq_len, 0);
     compute_barrier(cmd);
 
-    // SiLU on gate (operates on full [seq_len * ffn_dim] flat array)
+    // SiLU on gate
     SiluPC silu_pc = { .n = seq_len * DIT_FFN_DIM };
     dispatch_kernel(cmd, &sk.silu,
         { a.ffn_gate_out.gpu_buffer.buffer },
@@ -742,16 +1058,44 @@ fn void? dit_transformer_layer(
         &emul_pc, ceil_div(seq_len * DIT_FFN_DIM, 256));
     compute_barrier(cmd);
 
-    // Down projection
+    // Down projection: [seq_len, ffn_dim] -> [seq_len, dim]
     dispatch_batch_matmul(cmd, dk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM, seq_len, 0);
     compute_barrier(cmd);
 
-    // Residual add: hidden += ffn_output
-    dispatch_kernel(cmd, &sk.residual_add,
-        { hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
-        { hidden.size_bytes, a.ffn_down_out.size_bytes },
-        &res_pc, ceil_div(seq_len * dim, 256));
-    compute_barrier(cmd);
+    // === Phase G: Post-FFN norm + Gated residual ===
+    if (lw.ffn_norm2.size_bytes > 0) {
+        BatchRMSNormPC post_ffn_rms = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { a.ffn_down_out.gpu_buffer.buffer, lw.ffn_norm2.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { a.ffn_down_out.size_bytes, lw.ffn_norm2.size_bytes, a.buf_a.size_bytes },
+            &post_ffn_rms, seq_len);
+        compute_barrier(cmd);
+
+        // Gated residual: hidden += tanh(gate_mlp) * ffn_norm2(ffn_output)
+        if (has_adaln) {
+            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim };
+            dispatch_kernel(cmd, &dk.gated_residual,
+                { hidden.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+                { hidden.size_bytes, a.adaln_shift.size_bytes, a.buf_a.size_bytes },
+                &gres_pc, ceil_div(seq_len * dim, 256));
+        } else {
+            // Context refiner: no gate
+            ResidualPC res_pc = { .n = seq_len * dim };
+            dispatch_kernel(cmd, &sk.residual_add,
+                { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+                { hidden.size_bytes, a.buf_a.size_bytes },
+                &res_pc, ceil_div(seq_len * dim, 256));
+        }
+        compute_barrier(cmd);
+    } else {
+        // No post-norm: direct residual
+        ResidualPC res_pc = { .n = seq_len * dim };
+        dispatch_kernel(cmd, &sk.residual_add,
+            { hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
+            { hidden.size_bytes, a.ffn_down_out.size_bytes },
+            &res_pc, ceil_div(seq_len * dim, 256));
+        compute_barrier(cmd);
+    }
 
     if (profiling) { submit_and_wait(ctx)!!; io::printfn("      ffn:        %.3fs", prof_t.to_now().to_sec()); dit_profile_layer = false; begin_compute(cmd)!!; }
 }
@@ -771,6 +1115,9 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     uint dim = DIT_DIM;
     uint n_patches = self.n_patches;
     uint text_len = self.text_len;
+    uint padded_patches = self.padded_patches;
+    uint padded_text = self.padded_text;
+    uint n_img_pad = padded_patches - n_patches;
 
     Clock step_start = clock::now();
     Clock phase_start = step_start;
@@ -791,7 +1138,6 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     compute_barrier(cmd);
 
     // 2. x_embedder: [n_patches, 64] -> [n_patches, 3840]
-    // Use linear_proj shader
     LinearProjPC x_emb_pc = { .out_dim = dim, .in_dim = DIT_PATCH_DIM, .seq_len = n_patches };
     dispatch_kernel(cmd, &dk.linear_proj,
         { w.x_emb_weight.gpu_buffer.buffer, w.x_emb_bias.gpu_buffer.buffer,
@@ -801,8 +1147,20 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         &x_emb_pc, n_patches * dim);
     compute_barrier(cmd);
 
-    // 3. Timestep embedding
-    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = timestep };
+    // 2b. Pad image tokens with x_pad_token (append n_img_pad copies)
+    if (n_img_pad > 0 && w.x_pad_token.size_bytes > 0) {
+        for (uint p = 0; p < n_img_pad; p++) {
+            vk::cmdCopyBuffer(cmd, w.x_pad_token.gpu_buffer.buffer,
+                a.hidden.gpu_buffer.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0,
+                    .dstOffset = (ulong)(n_patches + p) * dim * 4,
+                    .size = (ulong)dim * 4 }});
+        }
+        compute_barrier(cmd);
+    }
+
+    // 3. Timestep embedding (scaled by t_scale=1000)
+    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = timestep * DIT_T_SCALE };
     dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
         { a.t_emb.size_bytes },
@@ -835,11 +1193,19 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
           a.t_emb_mlp.size_bytes, a.t_emb.size_bytes },
         &t_mlp2_pc, DIT_T_EMB_DIM);
     compute_barrier(cmd);
-    // t_emb now contains the final [256] timestep embedding
 
-    // 4. Noise refiner (2 layers on image tokens, with adaLN from t_emb_mlp)
+    // Pre-apply SiLU to t_emb (all adaLN modulations use Sequential(SiLU(), Linear(...)))
+    SiluPC t_silu_pc = { .n = DIT_T_EMB_DIM };
+    dispatch_kernel(cmd, &sk.silu,
+        { a.t_emb.gpu_buffer.buffer },
+        { a.t_emb.size_bytes },
+        &t_silu_pc, ceil_div(DIT_T_EMB_DIM, 256));
+    compute_barrier(cmd);
+
+    // 4. Noise refiner (2 layers on padded image tokens, with adaLN)
     for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, n_patches, n_patches, true)!!;
+        dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, padded_patches, true,
+            &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
     }
 
     submit_and_wait(ctx)!!;
@@ -847,19 +1213,18 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     phase_start = clock::now();
     begin_compute(cmd)!!;
 
-    // 5. Concat image + text tokens -> [n_patches + text_len, dim]
-    // hidden already has image tokens [n_patches, dim] at offset 0
-    // Copy text embeddings after image tokens
-    // text_embeddings is [text_len, text_dim], need cap_embedder to project to [text_len, dim]
-    // But text is already projected by pipeline before calling forward, so just copy
+    // 5. Concat padded_image + padded_text -> [padded_patches + padded_text, dim]
+    // hidden already has image tokens [padded_patches, dim] at offset 0
+    // Copy padded text embeddings after padded image tokens
+    // text_embeddings is [padded_text, dim] (already padded by pipeline)
     vk::cmdCopyBuffer(cmd, text_embeddings.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)n_patches * dim * 4,
-                         .size = (ulong)text_len * dim * 4 }});
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)padded_patches * dim * 4,
+                         .size = (ulong)padded_text * dim * 4 }});
     compute_barrier(cmd);
 
-    uint total_seq = n_patches + text_len;
+    uint total_seq = padded_patches + padded_text;
 
-    // 6. Main DiT (30 layers with adaLN, dual norm)
+    // 6. Main DiT (30 layers with adaLN, post-norm, tanh gating)
     double[16] batch_times;
     uint batch_idx = 0;
     Clock batch_start = clock::now();
@@ -867,9 +1232,9 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         if (l == 0 && dit_profile_layer) {
             io::printfn("    --- Layer profile (layer 1, seq=%d) ---", total_seq);
         }
-        dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, n_patches, true)!!;
+        dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, true,
+            &self.rope_cos_main, &self.rope_sin_main)!!;
 
-        // Submit every 10 layers to reduce CPU-GPU sync overhead
         if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {
             submit_and_wait(ctx)!!;
             batch_times[batch_idx] = batch_start.to_now().to_sec();
@@ -886,44 +1251,53 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     }
     io::printn("");
 
-    // 7. Final layer: extract image portion, adaLN modulate, linear projection
-    // Final adaLN: SiLU(t_emb) @ weight + bias -> [dim] scale
-    // First apply SiLU to t_emb copy
-    vk::cmdCopyBuffer(cmd, a.t_emb.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
-    compute_barrier(cmd);
-    SiluPC final_silu_pc = { .n = DIT_T_EMB_DIM };
-    dispatch_kernel(cmd, &sk.silu,
-        { a.buf_c.gpu_buffer.buffer },
-        { (usz)DIT_T_EMB_DIM * 4 },
-        &final_silu_pc, ceil_div(DIT_T_EMB_DIM, 256));
-    compute_barrier(cmd);
-
-    // Linear: [256] -> [dim]
+    // 7. Final layer: extract REAL image tokens (first n_patches), skip padding
+    // Final adaLN: t_emb (already SiLU'd) @ weight + bias -> [dim] scale
     LinearProjPC final_adaln_pc = { .out_dim = dim, .in_dim = DIT_T_EMB_DIM, .seq_len = 1 };
     dispatch_kernel(cmd, &dk.linear_proj,
         { w.final_adaln_linear.gpu_buffer.buffer, w.final_adaln_bias.gpu_buffer.buffer,
-          a.buf_c.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer },
+          a.t_emb.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer },
         { w.final_adaln_linear.size_bytes, w.final_adaln_bias.size_bytes,
-          (usz)DIT_T_EMB_DIM * 4, a.adaln_scale.size_bytes },
+          a.t_emb.size_bytes, a.adaln_scale.size_bytes },
         &final_adaln_pc, dim);
     compute_barrier(cmd);
 
-    // Scale image portion: output = hidden * (1 + scale)
-    // Copy image portion to buf_a
+    // Copy only real image portion to buf_a (first n_patches tokens, skip img/text padding)
     vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
     compute_barrier(cmd);
 
-    // Use adaln_modulate with shift=0: output = input * (1 + scale) + 0
-    // Zero the shift buffer
-    AdalnModPC final_mod_pc = { .n_elements = n_patches * dim, .dim = dim };
-    dispatch_kernel(cmd, &dk.adaln_modulate,
-        { a.buf_a.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer,
-          a.adaln_shift.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-        { a.buf_a.size_bytes, a.adaln_scale.size_bytes,
-          a.adaln_shift.size_bytes, a.buf_a.size_bytes },
-        &final_mod_pc, ceil_div(n_patches * dim, 256));
+    // Apply LayerNorm (no affine) to image portion — Lumina2 FinalLayer uses elementwise_affine=False
+    if (w.final_norm.size_bytes > 0) {
+        // Learnable RMSNorm (if weight tensor exists in GGUF)
+        BatchRMSNormPC final_rms = { .dim = dim, .eps = 1e-6f, .n_rows = n_patches, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { a.buf_a.gpu_buffer.buffer, w.final_norm.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+            { a.buf_a.size_bytes, w.final_norm.size_bytes, a.buf_b.size_bytes },
+            &final_rms, n_patches);
+        compute_barrier(cmd);
+        vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
+        compute_barrier(cmd);
+    } else {
+        // No-affine LayerNorm (Lumina2 default: no learnable weight)
+        BatchLayerNormPC final_ln = { .dim = dim, .eps = 1e-6f, .n_rows = n_patches };
+        dispatch_kernel(cmd, &dk.batch_layernorm,
+            { a.buf_a.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+            { a.buf_a.size_bytes, a.buf_b.size_bytes },
+            &final_ln, n_patches);
+        compute_barrier(cmd);
+        vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
+        compute_barrier(cmd);
+    }
+
+    // Scale modulate: buf_a = buf_a * (1 + scale)
+    ScaleModPC final_smod_pc = { .n_elements = n_patches * dim, .dim = dim };
+    dispatch_kernel(cmd, &dk.scale_modulate,
+        { a.buf_a.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+        { a.buf_a.size_bytes, a.adaln_scale.size_bytes, a.buf_a.size_bytes },
+        &final_smod_pc, ceil_div(n_patches * dim, 256));
     compute_barrier(cmd);
 
     // Final linear: batch matmul [n_patches, dim] -> [n_patches, patch_dim] + bias
@@ -1001,12 +1375,21 @@ fn void DiTModel.free(&self) {
     if (self.weights.t_emb_mlp2_bias.size_bytes > 0) self.weights.t_emb_mlp2_bias.free();
     if (self.weights.x_emb_weight.size_bytes > 0) self.weights.x_emb_weight.free();
     if (self.weights.x_emb_bias.size_bytes > 0) self.weights.x_emb_bias.free();
+    if (self.weights.final_norm.size_bytes > 0) self.weights.final_norm.free();
     if (self.weights.final_adaln_linear.size_bytes > 0) self.weights.final_adaln_linear.free();
     if (self.weights.final_adaln_bias.size_bytes > 0) self.weights.final_adaln_bias.free();
     if (self.weights.final_linear.size_bytes > 0) self.weights.final_linear.free();
     if (self.weights.final_bias.size_bytes > 0) self.weights.final_bias.free();
     if (self.weights.x_pad_token.size_bytes > 0) self.weights.x_pad_token.free();
     if (self.weights.cap_pad_token.size_bytes > 0) self.weights.cap_pad_token.free();
+
+    // Free RoPE tables
+    if (self.rope_cos_main.size_bytes > 0) self.rope_cos_main.free();
+    if (self.rope_sin_main.size_bytes > 0) self.rope_sin_main.free();
+    if (self.rope_cos_refiner.size_bytes > 0) self.rope_cos_refiner.free();
+    if (self.rope_sin_refiner.size_bytes > 0) self.rope_sin_refiner.free();
+    if (self.rope_cos_context.size_bytes > 0) self.rope_cos_context.free();
+    if (self.rope_sin_context.size_bytes > 0) self.rope_sin_context.free();
 
     // Free activations
     self.acts.buf_a.free();
@@ -1039,6 +1422,10 @@ fn void DiTModel.free(&self) {
     self.kernels.broadcast_add_dim.free(self.ctx.device);
     self.kernels.scale_buffer.free(self.ctx.device);
     self.kernels.flash_attention.free(self.ctx.device);
+    self.kernels.scale_modulate.free(self.ctx.device);
+    self.kernels.gated_residual.free(self.ctx.device);
+    self.kernels.batch_layernorm.free(self.ctx.device);
+    self.kernels.mrope.free(self.ctx.device);
     self.kernels.batch_rmsnorm.free(self.ctx.device);
     self.kernels.transpose_heads.free(self.ctx.device);
     self.kernels.batch_head_norm.free(self.ctx.device);
