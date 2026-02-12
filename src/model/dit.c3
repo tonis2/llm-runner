@@ -28,7 +28,7 @@ const uint DIT_T_MLP_DIM = 1024;  // t_embedder MLP intermediate dim
 // mRoPE config (from Z-Image-Turbo config.json)
 const float DIT_ROPE_THETA = 256.0;
 const uint[3] DIT_ROPE_AXES_DIM = { 32, 48, 48 };  // text, height, width
-const float DIT_T_SCALE = 1000.0;  // Timestep scaling factor
+const float DIT_T_SCALE = 1.0;  // Raw sigma, no scaling (flow matching uses [0,1])
 
 // --- Push constant structs for Z-Image shaders ---
 
@@ -788,6 +788,60 @@ fn bool is_inf_bits(float v) {
     return (bits & 0x7FFFFFFF) == 0x7F800000;
 }
 
+// Debug: readback hidden states and compare positions to detect spatial uniformity
+// Reads back [n_rows, dim] buffer and computes cross-position variance
+fn void? debug_position_variance(DeviceContext* ctx, vk::Buffer src_buffer, uint n_rows, uint dim, String label) {
+    usz total = (usz)n_rows * dim;
+    vk::Memory stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: total * 4,
+    )!!;
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+        vk::cmdCopyBuffer(dbg_cmd, src_buffer, stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total * 4 }});
+    }!!;
+    float* ptr = (float*)stg.data();
+
+    // Print first 5 elements of 4 sample positions
+    uint[4] sample_pos = { 0, n_rows / 4, n_rows / 2, 3 * n_rows / 4 };
+    io::printfn("  [POS] %s (%d rows x %d dim):", label, n_rows, dim);
+    for (uint si = 0; si < 4; si++) {
+        uint p = sample_pos[si];
+        if (p >= n_rows) continue;
+        float row_sum = 0;
+        for (uint d = 0; d < dim; d++) row_sum += ptr[p * dim + d];
+        float row_mean = row_sum / (float)dim;
+        float row_sq = 0;
+        for (uint d = 0; d < dim; d++) {
+            float diff = ptr[p * dim + d] - row_mean;
+            row_sq += diff * diff;
+        }
+        float row_std = math::sqrt(row_sq / (float)dim);
+        io::printfn("    pos[%d]: mean=%.6f std=%.6f first5=[%.3f %.3f %.3f %.3f %.3f]",
+            p, row_mean, row_std,
+            ptr[p * dim + 0], ptr[p * dim + 1], ptr[p * dim + 2],
+            ptr[p * dim + 3], ptr[p * dim + 4]);
+    }
+
+    // Compute cross-position variance: for each dim, compute variance across all positions
+    double cross_var_sum = 0;
+    for (uint d = 0; d < 10; d++) {  // Sample first 10 dims
+        double col_sum = 0;
+        for (uint r = 0; r < n_rows; r++) col_sum += ptr[r * dim + d];
+        double col_mean = col_sum / (double)n_rows;
+        double col_var = 0;
+        for (uint r = 0; r < n_rows; r++) {
+            double diff = ptr[r * dim + d] - col_mean;
+            col_var += diff * diff;
+        }
+        cross_var_sum += col_var / (double)n_rows;
+    }
+    io::printfn("    cross-pos variance (avg first 10 dims): %.6f", cross_var_sum / 10.0);
+    stg.free();
+}
+
 // Debug: readback a GPU buffer and print stats (min/max/mean/nan count)
 // Must be called OUTSIDE an active command buffer recording (after submit_and_wait)
 fn void? debug_readback_stats(DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String label) {
@@ -947,7 +1001,9 @@ fn void? dit_transformer_layer(
     }
 
     // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
-    float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
+    // Scale = 1/head_dim (not 1/sqrt), matching KoboldCpp z_image.hpp Rope::attention scale=1.f/128.f
+    // With QK-norm (head_norm), Q·K are bounded, so 1/d_k gives proper softmax range
+    float scale = 1.0f / (float)DIT_HEAD_DIM;
     FlashAttentionPC fa_pc = {
         .head_dim = DIT_HEAD_DIM,
         .n_heads = DIT_HEADS,
@@ -1159,6 +1215,11 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         compute_barrier(cmd);
     }
 
+    // Debug: check spatial diversity after x_embedder
+    submit_and_wait(ctx)!!;
+    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after x_embedder")!!;
+    begin_compute(cmd)!!;
+
     // 3. Timestep embedding (scaled by t_scale=1000)
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = timestep * DIT_T_SCALE };
     dispatch_kernel(cmd, &dk.dit_timestep_embed,
@@ -1202,6 +1263,9 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         &t_silu_pc, ceil_div(DIT_T_EMB_DIM, 256));
     compute_barrier(cmd);
 
+    // Save debug flag before noise refiner consumes it
+    bool want_layer_debug = dit_profile_layer;
+
     // 4. Noise refiner (2 layers on padded image tokens, with adaLN)
     for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
         dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, padded_patches, true,
@@ -1209,6 +1273,8 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     }
 
     submit_and_wait(ctx)!!;
+    // Debug: check spatial diversity after noise refiner
+    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after noise_refiner")!!;
     double setup_sec = phase_start.to_now().to_sec();
     phase_start = clock::now();
     begin_compute(cmd)!!;
@@ -1234,6 +1300,26 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         }
         dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, true,
             &self.rope_cos_main, &self.rope_sin_main)!!;
+
+        // Debug: readback after layers 0, 1, 5, 10, 20, 29
+        if (want_layer_debug && (l == 0 || l == 1 || l == 5 || l == 10 || l == 20 || l == 29)) {
+            submit_and_wait(ctx)!!;
+            if (l == 0) {
+                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 0")!!;
+            } else if (l == 1) {
+                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 1")!!;
+            } else if (l == 5) {
+                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 5")!!;
+            } else if (l == 10) {
+                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 10")!!;
+            } else if (l == 20) {
+                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 20")!!;
+            } else if (l == 29) {
+                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 29")!!;
+            }
+            batch_start = clock::now();
+            begin_compute(cmd)!!;
+        }
 
         if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {
             submit_and_wait(ctx)!!;
@@ -1312,6 +1398,15 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         &bias_pc, ceil_div(n_patches * DIT_PATCH_DIM, 256));
     compute_barrier(cmd);
 
+    // Debug: check velocity (patch space) after final layer
+    if (want_layer_debug) {
+        submit_and_wait(ctx)!!;
+        debug_position_variance(ctx, a.velocity.gpu_buffer.buffer, n_patches, DIT_PATCH_DIM, "velocity (patch space)")!!;
+        // Also check hidden state after final layernorm+scale
+        debug_position_variance(ctx, a.buf_a.gpu_buffer.buffer, n_patches, dim, "after final layer (pre-linear)")!!;
+        begin_compute(cmd)!!;
+    }
+
     // 8. Unpatchify velocity -> [16, h, w]
     UnpatchifyPC unpatch_pc = {
         .channels = DIT_LATENT_CHANNELS,
@@ -1329,6 +1424,15 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     // Copy unpatchified velocity back to velocity buffer (for Euler step)
     vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.velocity.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_total * 4 }});
+    compute_barrier(cmd);
+
+    // Negate velocity: model predicts (x_0 - noise), Euler step expects (noise - x_0)
+    // Reference: KoboldCpp z_image.hpp forward() applies ggml_ext_scale(out, -1.f)
+    ScalePC neg_pc = { .n = latent_total, .scale = -1.0f };
+    dispatch_kernel(cmd, &dk.scale_buffer,
+        { a.velocity.gpu_buffer.buffer },
+        { a.velocity.size_bytes },
+        &neg_pc, ceil_div(latent_total, 256));
 
     submit_and_wait(ctx)!!;
     double final_sec = phase_start.to_now().to_sec();

@@ -2,7 +2,10 @@
 // Separate file to avoid AMD driver SPIR-V compilation issues
 // Applies RoPE to Q or K in [n_heads, seq_len, head_dim] layout
 // Uses precomputed cos/sin tables of shape [seq_len, head_dim/2]
-// HALF-SPLIT format: pair j rotates (x[j], x[j + head_dim/2])
+// INTERLEAVED format: pair j rotates (x[2j], x[2j+1])
+// Rotation convention matches KoboldCpp rope.hpp apply_rope(rope_interleaved=true):
+//   out[2j]   =  x[2j]*cos + x[2j+1]*sin
+//   out[2j+1] = -x[2j]*sin + x[2j+1]*cos
 // Dispatched as 2D: gid.x = pair index (0..63), gid.y = head*seq_len + pos
 
 struct MRoPEParams {
@@ -36,11 +39,11 @@ void mrope(uint3 tid: SV_DispatchThreadID) {
     float cv = mrope_cos[cs_idx];
     float sv = mrope_sin[cs_idx];
 
-    // Half-split: pair j uses elements (j) and (j + half_dim)
+    // Interleaved: pair j uses elements (2j) and (2j+1)
     uint base = head * mrope_pc.seq_len * ROPE_HEAD_DIM + pos * ROPE_HEAD_DIM;
-    float x0 = mrope_data[base + pair];
-    float x1 = mrope_data[base + pair + ROPE_HALF_DIM];
+    float x0 = mrope_data[base + 2 * pair];
+    float x1 = mrope_data[base + 2 * pair + 1];
 
-    mrope_data[base + pair]              = x0 * cv - x1 * sv;
-    mrope_data[base + pair + ROPE_HALF_DIM] = x0 * sv + x1 * cv;
+    mrope_data[base + 2 * pair]     =  x0 * cv + x1 * sv;
+    mrope_data[base + 2 * pair + 1] = -x0 * sv + x1 * cv;
 }

@@ -209,7 +209,7 @@ fn int main(String[] args) {
         defer ctx.free();
 
         ZImageParams zparams = {
-            .num_steps = diff_steps > 1 ? diff_steps : 8,
+            .num_steps = diff_steps,
             .seed = (uint)seed,
             .output_path = output_path,
             .vae_path = vae_path,

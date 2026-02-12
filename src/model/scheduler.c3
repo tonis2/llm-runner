@@ -159,48 +159,66 @@ fn float SchedulerState.get_prev_alpha_cumprod(&self, uint step_idx) {
 }
 
 // --- Flow Matching Euler Scheduler ---
-// For DiT models: linearly space timesteps from 1.0 to ~0.0
-// Euler step: x = x + dt * velocity
-// dt = t_{i+1} - t_i (negative, since going from 1 to 0)
+// For DiT models using DiscreteFlowDenoiser with time_snr_shift
+// Reference: KoboldCpp denoiser.hpp DiscreteFlowDenoiser
+// sigma = time_snr_shift(shift, (t+1)/1000) where t is linearly spaced 999->0
+// Euler step: x = x + dt * velocity, dt = sigma_{i+1} - sigma_i (negative)
 
 struct FlowMatchingState {
     uint num_steps;
-    float[] timesteps;    // [num_steps + 1] boundaries
-    float[] sigmas;       // sigma values at each boundary
+    float[] sigmas;       // [num_steps + 1] sigma values (model timestep = sigma * 1000)
+}
+
+fn float time_snr_shift(float alpha, float t) {
+    if (alpha == 1.0f) return t;
+    return alpha * t / (1.0f + (alpha - 1.0f) * t);
 }
 
 fn FlowMatchingState init_flow_matching(uint num_steps) {
-    // Linearly space from 1.0 to 0.0
-    float[] timesteps = mem::new_array(float, (usz)num_steps + 1);
     float[] sigmas = mem::new_array(float, (usz)num_steps + 1);
 
-    for (uint i = 0; i <= num_steps; i++) {
-        float t = 1.0f - (float)i / (float)num_steps;
-        timesteps[i] = t;
-        sigmas[i] = t;  // For flow matching, sigma = t
+    // Match KoboldCpp DiscreteScheduler::get_sigmas with DiscreteFlowDenoiser
+    // t_to_sigma(t) = time_snr_shift(3.0, (t+1)/1000)
+    // Linearly space n timestep indices from t_max=999 to 0, then append sigma=0
+    float shift = 3.0f;
+    float t_max = 999.0f;
+
+    if (num_steps == 1) {
+        sigmas[0] = time_snr_shift(shift, (t_max + 1.0f) / 1000.0f);
+        sigmas[1] = 0.0f;
+    } else {
+        float step = t_max / (float)(num_steps - 1);
+        for (uint i = 0; i < num_steps; i++) {
+            float t = t_max - step * (float)i;
+            sigmas[i] = time_snr_shift(shift, (t + 1.0f) / 1000.0f);
+        }
+        sigmas[num_steps] = 0.0f;
     }
 
-    io::printfn("Flow Matching: %d steps", num_steps);
-    io::printfn("  t: %.3f -> %.3f", timesteps[0], timesteps[num_steps]);
+    io::printfn("Flow Matching: %d steps (shift=%.1f)", num_steps, shift);
+    io::printf("  sigmas:");
+    for (uint i = 0; i <= num_steps; i++) {
+        io::printf(" %.3f", sigmas[i]);
+    }
+    io::printn("");
 
     return {
         .num_steps = num_steps,
-        .timesteps = timesteps,
         .sigmas = sigmas,
     };
 }
 
 fn float FlowMatchingState.get_dt(&self, uint step) {
-    // dt = t_{step+1} - t_{step}
-    return self.timesteps[step + 1] - self.timesteps[step];
+    // dt = sigma_{step+1} - sigma_{step} (negative, since sigma decreases)
+    return self.sigmas[step + 1] - self.sigmas[step];
 }
 
 fn float FlowMatchingState.get_timestep(&self, uint step) {
-    return self.timesteps[step];
+    // Model receives sigma value (scaled by DIT_T_SCALE=1000 in forward pass)
+    return self.sigmas[step];
 }
 
 fn void FlowMatchingState.free(&self) {
-    mem::free(self.timesteps);
     mem::free(self.sigmas);
 }
 

@@ -287,6 +287,92 @@ fn Tensor? upload_safetensor_f32(DeviceContext* ctx, SafetensorsFile* sf, String
     };
 }
 
+// Upload conv2d weight from safetensors, transposing from PyTorch [C_out, C_in, kH, kW]
+// to GGUF [kH, kW, C_in, C_out] layout expected by the conv2d shader
+fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, String name) {
+    SafetensorsTensorInfo* info = sf.find_tensor(name)!!;
+    char* data_ptr = sf.data_base + (usz)info.data_start;
+
+    if (info.n_dims != 4) {
+        io::printfn("Warning: conv weight %s has %d dims (expected 4)", name, info.n_dims);
+        return upload_safetensor_f32(ctx, sf, name);
+    }
+
+    // Safetensors shape: [C_out, C_in, kH, kW]
+    usz c_out = (usz)info.shape[0];
+    usz c_in  = (usz)info.shape[1];
+    usz kh    = (usz)info.shape[2];
+    usz kw    = (usz)info.shape[3];
+    usz n_elements = c_out * c_in * kh * kw;
+    usz f32_size = n_elements * 4;
+
+    // Decode source data to F32
+    float* src_data;
+    bool needs_free_src = false;
+
+    if (info.dtype == "F32") {
+        src_data = (float*)data_ptr;
+    } else if (info.dtype == "F16") {
+        src_data = (float*)mem::calloc(f32_size);
+        needs_free_src = true;
+        for (usz j = 0; j < n_elements; j++) {
+            src_data[j] = cpu_f16_to_f32(data_ptr + j * 2);
+        }
+    } else if (info.dtype == "BF16") {
+        src_data = (float*)mem::calloc(f32_size);
+        needs_free_src = true;
+        for (usz j = 0; j < n_elements; j++) {
+            src_data[j] = cpu_bf16_to_f32(data_ptr + j * 2);
+        }
+    } else if (info.dtype == "F8_E4M3") {
+        src_data = (float*)mem::calloc(f32_size);
+        needs_free_src = true;
+        for (usz j = 0; j < n_elements; j++) {
+            src_data[j] = cpu_fp8e4m3_to_f32(data_ptr + j);
+        }
+    } else {
+        io::printfn("Warning: unsupported dtype '%s' for conv %s", info.dtype, name);
+        return COMPUTE_ERROR~;
+    }
+
+    // Transpose: [C_out, C_in, kH, kW] → [kH, kW, C_in, C_out]
+    float* dst_data = (float*)mem::calloc(f32_size);
+    for (usz oc = 0; oc < c_out; oc++) {
+        for (usz ic = 0; ic < c_in; ic++) {
+            for (usz h = 0; h < kh; h++) {
+                for (usz w = 0; w < kw; w++) {
+                    usz src_idx = oc * (c_in * kh * kw) + ic * (kh * kw) + h * kw + w;
+                    usz dst_idx = h * (kw * c_in * c_out) + w * (c_in * c_out) + ic * c_out + oc;
+                    dst_data[dst_idx] = src_data[src_idx];
+                }
+            }
+        }
+    }
+
+    if (needs_free_src) mem::free(src_data);
+
+    vk::Memory gpu_buffer = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        data: dst_data,
+        data_size: f32_size,
+    )!!;
+
+    mem::free(dst_data);
+
+    // Shape in GGUF convention: [kW, kH, C_in, C_out]
+    ulong[4] shape = { (ulong)kw, (ulong)kh, (ulong)c_in, (ulong)c_out };
+
+    return {
+        .gpu_buffer = gpu_buffer,
+        .dtype = GGML_F32,
+        .n_dims = 4,
+        .shape = shape,
+        .size_bytes = f32_size,
+    };
+}
+
 fn void SafetensorsFile.close(&self) {
     mem::free(self.tensors);
 }

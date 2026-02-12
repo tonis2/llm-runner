@@ -370,6 +370,75 @@ fn bool run_zimage_pipeline(
             v_sum += v;
         }
         io::printfn("  [DEBUG] velocity: min=%.6f max=%.6f mean=%.6f", v_min, v_max, v_sum / (float)latent_elems);
+
+        // Check velocity spatial structure BEFORE unpatchify
+        // Read patch-space velocity [1024, 64]
+        vk::Memory vpatch_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)n_patches * DIT_PATCH_DIM * 4,
+        )!!;
+        // Need to read the velocity BEFORE unpatchify - but we can check the latent's spatial autocorrelation instead
+        // Check adjacent latent pixels (in UNPATCHIFIED latent) for correlation
+        io::printfn("  [SPATIAL] latent autocorrelation (ch0, horiz adjacent pairs):");
+        float corr_sum = 0; uint corr_n = 0;
+        for (uint y = 0; y < lat_h; y++) {
+            for (uint x = 0; x < lat_w - 1; x++) {
+                float a = lat_ptr[0 * lat_h * lat_w +y * lat_w + x];      // ch0 at (y,x)
+                float b = lat_ptr[0 * lat_h * lat_w +y * lat_w + x + 1];  // ch0 at (y,x+1)
+                corr_sum += a * b;
+                corr_n++;
+            }
+        }
+        float auto_corr = corr_sum / (float)corr_n;
+        // Compare with independent noise (which would have ~0 autocorrelation)
+        float var_sum = 0;
+        for (uint i = 0; i < lat_h * lat_w; i++) {
+            float v = lat_ptr[i];
+            var_sum += v * v;
+        }
+        float var_est = var_sum / (float)(lat_h * lat_w);
+        io::printfn("    auto_corr(dx=1)=%.4f  variance=%.4f  ratio=%.4f",
+            auto_corr, var_est, auto_corr / var_est);
+
+        // Print a small row of latent ch0 values to see if there's structure
+        io::printf("  [SPATIAL] latent ch0 row16: ");
+        for (uint x = 0; x < 16; x++) {
+            io::printf("%.2f ", lat_ptr[0 * lat_h * lat_w +16 * lat_w + x]);
+        }
+        io::printn("");
+        io::printf("  [SPATIAL] latent ch0 row17: ");
+        for (uint x = 0; x < 16; x++) {
+            io::printf("%.2f ", lat_ptr[0 * lat_h * lat_w +17 * lat_w + x]);
+        }
+        io::printn("");
+
+        vpatch_stg.free();
+
+        // Check latent spatial structure: for channels 0,1,2,3, check variance across 4 quadrants
+        uint ch_stride = lat_h * lat_w;
+        for (uint ch = 0; ch < 4; ch++) {
+            float[4] q_mean;
+            uint half_h = lat_h / 2;
+            uint half_w = lat_w / 2;
+            for (uint qy = 0; qy < 2; qy++) {
+                for (uint qx = 0; qx < 2; qx++) {
+                    float qsum = 0;
+                    for (uint dy = 0; dy < half_h; dy++) {
+                        for (uint dx = 0; dx < half_w; dx++) {
+                            uint y = qy * half_h + dy;
+                            uint x = qx * half_w + dx;
+                            qsum += lat_ptr[ch * ch_stride + y * lat_w + x];
+                        }
+                    }
+                    q_mean[qy * 2 + qx] = qsum / (float)(half_h * half_w);
+                }
+            }
+            io::printfn("  [SPATIAL] latent ch%d quadrant means: [%.3f, %.3f, %.3f, %.3f]",
+                ch, q_mean[0], q_mean[1], q_mean[2], q_mean[3]);
+        }
+
         lat_stg.free();
         vel_stg.free();
     }

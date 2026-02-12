@@ -60,6 +60,10 @@ fn Tensor load_taesd_tensor(DeviceContext* ctx, SafetensorsFile* sf, String name
     return upload_safetensor_f32(ctx, sf, name)!!;
 }
 
+fn Tensor load_taesd_conv_weight(DeviceContext* ctx, SafetensorsFile* sf, String name) {
+    return upload_safetensor_conv_f32(ctx, sf, name)!!;
+}
+
 fn TAESDConv load_taesd_conv(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint in_c, uint out_c, bool has_bias) {
     char[256] wbuf;
     char[256] bbuf;
@@ -75,7 +79,7 @@ fn TAESDConv load_taesd_conv(DeviceContext* ctx, SafetensorsFile* sf, String pre
     conv.in_c = in_c;
     conv.out_c = out_c;
     conv.has_bias = has_bias;
-    conv.weight = load_taesd_tensor(ctx, sf, (String)wbuf[0..wlen - 1]);
+    conv.weight = load_taesd_conv_weight(ctx, sf, (String)wbuf[0..wlen - 1]);
     if (has_bias) {
         conv.bias = load_taesd_tensor(ctx, sf, (String)bbuf[0..blen - 1]);
     }
