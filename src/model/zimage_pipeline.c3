@@ -257,6 +257,9 @@ fn bool run_zimage_pipeline(
         float dt = flow.get_dt(step);
         io::printfn("  Step %d/%d (t=%.3f, dt=%.3f)", step + 1, params.num_steps, t, dt);
 
+        Clock step_start = clock::now();
+        if (step == 0) { dit_profile_layer = true; }
+
         // DiT forward: predicts velocity
         dit.forward(&projected_text, t)!!;
 
@@ -268,6 +271,9 @@ fn bool run_zimage_pipeline(
             { dit.acts.latent.size_bytes, dit.acts.velocity.size_bytes },
             &euler_pc, ceil_div(latent_elems, 256));
         submit_and_wait(ctx)!!;
+
+        double step_sec = step_start.to_now().to_sec();
+        io::printfn("  Step %d done in %.2fs", step + 1, step_sec);
     }
     double denoise_sec = denoise_start.to_now().to_sec();
     io::printfn("  Denoising complete in %.2fs", denoise_sec);

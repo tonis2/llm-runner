@@ -4,6 +4,7 @@ import vk;
 import std::io;
 import std::math;
 import std::core::mem;
+import std::time::clock;
 
 // Embedded Z-Image SPIR-V shader
 const char[*] ZIMAGE_SPV = $embed("../../shaders/zimage.spv");
@@ -97,6 +98,9 @@ struct BatchMatMulPC {
     uint seq_len;
     uint row_offset;
 }
+
+// Profile flag: when true, the next transformer layer call inserts GPU syncs per phase
+bool dit_profile_layer = false;
 
 // --- DiT Layer Weights ---
 
@@ -498,24 +502,27 @@ fn void dispatch_batch_matmul(
 ) {
     BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
     ComputeKernel* kernel;
-    bool tiled = false;
+    bool tiled_2d = false;
     if (weight.dtype == GGML_Q4_K) {
         kernel = &dk.batch_matmul_q4k;
-        tiled = true;
+        tiled_2d = true;
     } else if (weight.dtype == GGML_Q5_K) {
         kernel = &dk.batch_matmul_q5k;
-        tiled = true;
+        tiled_2d = true;
     } else if (weight.dtype == GGML_Q6_K) {
         kernel = &dk.batch_matmul_q6k;
-        tiled = true;
+        tiled_2d = true;
     } else if (weight.dtype == GGML_Q8_0) {
         kernel = &dk.batch_matmul_q8;
     } else if (weight.dtype == GGML_Q4_0) {
         kernel = &dk.batch_matmul_q4_0;
     } else {
         kernel = &dk.batch_matmul;
+        tiled_2d = true;
     }
-    uint groups = tiled ? ((seq_len + 3) / 4) * out_dim : seq_len * out_dim;
+    // 2D tiled GEMM: ceil(seq_len/64) * ceil(out_dim/64) workgroups
+    // Legacy (Q8_0, Q4_0): seq_len * out_dim workgroups
+    uint groups = tiled_2d ? ((seq_len + 63) / 64) * ((out_dim + 63) / 64) : seq_len * out_dim;
     dispatch_kernel(cmd, kernel,
         { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
         { weight.size_bytes, input.size_bytes, output.size_bytes },
@@ -537,6 +544,9 @@ fn void? dit_transformer_layer(
     DiTKernels* dk = &model.kernels;
     DiTActivations* a = &model.acts;
     uint dim = DIT_DIM;
+    bool profiling = dit_profile_layer;
+    Clock prof_t;
+    if (profiling) { prof_t = clock::now(); }
 
     // === Phase A: AdaLN + Norm ===
     if (has_adaln && lw.adaln_linear.size_bytes > 0) {
@@ -591,12 +601,16 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
+    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      norm+adaln: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
+
     // === Phase B: QKV batch matmul (3 dispatches, no per-position loop) ===
     // wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
     compute_barrier(cmd);
+
+    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
 
     // === Phase C: Head norm + Transpose + Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
@@ -661,6 +675,8 @@ fn void? dit_transformer_layer(
         &th_rev_pc, transpose_groups);
     compute_barrier(cmd);
 
+    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
+
     // === Phase D: Output projection batch matmul + Residual ===
     dispatch_batch_matmul(cmd, dk, &lw.wo, &a.buf_b, &a.buf_a, dim, dim, seq_len, 0);
     compute_barrier(cmd);
@@ -671,6 +687,8 @@ fn void? dit_transformer_layer(
         { hidden.size_bytes, a.buf_a.size_bytes },
         &res_pc, ceil_div(seq_len * dim, 256));
     compute_barrier(cmd);
+
+    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      out_proj:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
 
     // === Phase E: FFN norm ===
     if (has_adaln) {
@@ -715,6 +733,8 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
+    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      ffn_norm:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
+
     // === Phase F: SwiGLU FFN batch matmul ===
     // Gate and Up projections (both read buf_a, write to different outputs)
     dispatch_batch_matmul(cmd, dk, &lw.ffn_gate, &a.buf_a, &a.ffn_gate_out, DIT_FFN_DIM, dim, seq_len, 0);
@@ -747,6 +767,8 @@ fn void? dit_transformer_layer(
         { hidden.size_bytes, a.ffn_down_out.size_bytes },
         &res_pc, ceil_div(seq_len * dim, 256));
     compute_barrier(cmd);
+
+    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      ffn:        %.3fs", prof_t.to_now().to_sec()); dit_profile_layer = false; begin_compute(cmd)!!; }
 }
 
 // --- Main DiT Forward Pass ---
@@ -764,6 +786,9 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     uint dim = DIT_DIM;
     uint n_patches = self.n_patches;
     uint text_len = self.text_len;
+
+    Clock step_start = clock::now();
+    Clock phase_start = step_start;
 
     begin_compute(cmd)!!;
 
@@ -829,11 +854,12 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
 
     // 4. Noise refiner (2 layers on image tokens, with adaLN from t_emb_mlp)
     for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        io::printfn("  Noise refiner layer %d/%d...", l + 1, DIT_NUM_REFINER_LAYERS);
         dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, n_patches, n_patches, true)!!;
     }
 
     submit_and_wait(ctx)!!;
+    double setup_sec = phase_start.to_now().to_sec();
+    phase_start = clock::now();
     begin_compute(cmd)!!;
 
     // 5. Concat image + text tokens -> [n_patches + text_len, dim]
@@ -849,16 +875,31 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     uint total_seq = n_patches + text_len;
 
     // 6. Main DiT (30 layers with adaLN, dual norm)
+    double[16] batch_times;
+    uint batch_idx = 0;
+    Clock batch_start = clock::now();
     for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
-        io::printfn("  DiT layer %d/%d (seq=%d)...", l + 1, DIT_NUM_LAYERS, total_seq);
+        if (l == 0 && dit_profile_layer) {
+            io::printfn("    --- Layer profile (layer 1, seq=%d) ---", total_seq);
+        }
         dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, n_patches, true)!!;
 
-        // Submit every 2 layers to avoid GPU watchdog timeout
-        if ((l + 1) % 2 == 0 || l == DIT_NUM_LAYERS - 1) {
+        // Submit every 10 layers to reduce CPU-GPU sync overhead
+        if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {
             submit_and_wait(ctx)!!;
+            batch_times[batch_idx] = batch_start.to_now().to_sec();
+            batch_idx++;
+            batch_start = clock::now();
             begin_compute(cmd)!!;
         }
     }
+    double dit_sec = phase_start.to_now().to_sec();
+    phase_start = clock::now();
+    io::printf("    layer batches:");
+    for (uint i = 0; i < batch_idx; i++) {
+        io::printf(" %.2f", batch_times[i]);
+    }
+    io::printn("");
 
     // 7. Final layer: extract image portion, adaLN modulate, linear projection
     // Final adaLN: SiLU(t_emb) @ weight + bias -> [dim] scale
@@ -931,6 +972,10 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_total * 4 }});
 
     submit_and_wait(ctx)!!;
+    double final_sec = phase_start.to_now().to_sec();
+    double total_sec = step_start.to_now().to_sec();
+    io::printfn("    setup+refiner: %.2fs | dit_layers: %.2fs | final: %.2fs | total: %.2fs",
+        setup_sec, dit_sec, final_sec, total_sec);
 }
 
 // --- Free ---
