@@ -92,6 +92,13 @@ struct BatchHeadNormPC {
     float eps;
 }
 
+struct FlashAttentionPC {
+    uint head_dim;
+    uint n_heads;
+    uint seq_len;
+    float scale;
+}
+
 struct BatchMatMulPC {
     uint out_dim;
     uint in_dim;
@@ -172,8 +179,6 @@ struct DiTActivations {
     Tensor q;           // [n_heads, seq_len, head_dim]
     Tensor k;           // [n_heads, seq_len, head_dim]
     Tensor v;           // [n_heads, seq_len, head_dim]
-    Tensor attn_scores; // [n_heads, seq_len, seq_len]
-    Tensor attn_out;    // [seq_len, dim]
     Tensor ffn_gate_out; // [seq_len, ffn_dim]
     Tensor ffn_up_out;   // [seq_len, ffn_dim]
     Tensor ffn_down_out; // [seq_len, dim]
@@ -197,7 +202,7 @@ struct DiTKernels {
     ComputeKernel dit_timestep_embed;
     ComputeKernel broadcast_add_dim;
     ComputeKernel scale_buffer;
-    ComputeKernel spatial_attention;
+    ComputeKernel flash_attention;
     ComputeKernel batch_rmsnorm;
     ComputeKernel transpose_heads;
     ComputeKernel batch_head_norm;
@@ -234,13 +239,6 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
         .setCode((uint*)&zi_spv[0])
         .build(ctx.device)!!;
 
-    // Also need diffusion shader for spatial_attention
-    char[] diff_spv = &DIFFUSION_SPV;
-    ShaderModule diff_shader = vk::shaderModuleCreateInfo()
-        .setCodeSize(diff_spv.len)
-        .setCode((uint*)&diff_spv[0])
-        .build(ctx.device)!!;
-
     // Shared kernels from LLM shader (rmsnorm, matmul variants, silu, etc.)
     char[] llm_spv = &LLM_SPV;
     ShaderModule llm_shader = vk::shaderModuleCreateInfo()
@@ -257,7 +255,7 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
         .dit_timestep_embed = create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!,
         .broadcast_add_dim = create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!,
         .scale_buffer     = create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!,
-        .spatial_attention = create_kernel(ctx, diff_shader, 5, SpatialAttentionPC.sizeof, "spatial_attention")!!,
+        .flash_attention   = create_kernel(ctx, zi_shader, 4, FlashAttentionPC.sizeof, "flash_attention")!!,
         .batch_rmsnorm    = create_kernel(ctx, zi_shader, 3, BatchRMSNormPC.sizeof, "batch_rmsnorm")!!,
         .transpose_heads  = create_kernel(ctx, zi_shader, 2, TransposeHeadsPC.sizeof, "transpose_heads")!!,
         .batch_head_norm  = create_kernel(ctx, zi_shader, 2, BatchHeadNormPC.sizeof, "batch_head_norm")!!,
@@ -271,7 +269,6 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
     };
 
     zi_shader.free(ctx.device);
-    diff_shader.free(ctx.device);
     llm_shader.free(ctx.device);
     return kernels;
 }
@@ -283,7 +280,6 @@ fn DiTActivations? allocate_dit_activations(DeviceContext* ctx, uint max_seq_len
 
     ulong max_dim_total = (ulong)max_seq_len * DIT_DIM;
     ulong max_ffn_total = (ulong)max_seq_len * DIT_FFN_DIM;
-    ulong attn_total = (ulong)DIT_HEADS * max_seq_len * max_seq_len;
     ulong latent_total = (ulong)DIT_LATENT_CHANNELS * 64 * 64;  // max 512x512 image
 
     return {
@@ -296,8 +292,6 @@ fn DiTActivations? allocate_dit_activations(DeviceContext* ctx, uint max_seq_len
         .q = create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
         .k = create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
         .v = create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
-        .attn_scores = create_f32_tensor(ctx, { attn_total, 0, 0, 0 }, 1)!!,
-        .attn_out = create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
         .ffn_gate_out = create_f32_tensor(ctx, { max_ffn_total, 0, 0, 0 }, 1)!!,
         .ffn_up_out = create_f32_tensor(ctx, { max_ffn_total, 0, 0, 0 }, 1)!!,
         .ffn_down_out = create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
@@ -612,10 +606,11 @@ fn void? dit_transformer_layer(
 
     if (profiling) { submit_and_wait(ctx)!!; io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
 
-    // === Phase C: Head norm + Transpose + Attention ===
+    // === Phase C: Head norm + Forward Transpose + Flash Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
 
+    // Forward transpose Q/K/V: [seq_len, dim] -> [n_heads, seq_len, head_dim]
     uint total_elems = seq_len * dim;
     uint transpose_groups = ceil_div(total_elems, 256);
     TransposeHeadsPC th_fwd_pc = {
@@ -649,30 +644,20 @@ fn void? dit_transformer_layer(
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total_elems * 4 }});
     compute_barrier(cmd);
 
-    // Spatial attention (non-causal)
+    // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
     float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
-    SpatialAttentionPC sa_pc = {
+    FlashAttentionPC fa_pc = {
         .head_dim = DIT_HEAD_DIM,
         .n_heads = DIT_HEADS,
         .seq_len = seq_len,
         .scale = scale,
     };
-    dispatch_kernel(cmd, &dk.spatial_attention,
+    dispatch_kernel(cmd, &dk.flash_attention,
         { a.q.gpu_buffer.buffer, a.k.gpu_buffer.buffer, a.v.gpu_buffer.buffer,
-          a.attn_scores.gpu_buffer.buffer, a.attn_out.gpu_buffer.buffer },
+          a.buf_b.gpu_buffer.buffer },
         { a.q.size_bytes, a.k.size_bytes, a.v.size_bytes,
-          a.attn_scores.size_bytes, a.attn_out.size_bytes },
-        &sa_pc, DIT_HEADS * seq_len);
-    compute_barrier(cmd);
-
-    // Transpose attention output back: [n_heads, seq_len, head_dim] -> [seq_len, dim]
-    TransposeHeadsPC th_rev_pc = {
-        .seq_len = seq_len, .n_heads = DIT_HEADS, .head_dim = DIT_HEAD_DIM, .direction = 1,
-    };
-    dispatch_kernel(cmd, &dk.transpose_heads,
-        { a.attn_out.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
-        { a.attn_out.size_bytes, a.buf_b.size_bytes },
-        &th_rev_pc, transpose_groups);
+          a.buf_b.size_bytes },
+        &fa_pc, DIT_HEADS * seq_len);
     compute_barrier(cmd);
 
     if (profiling) { submit_and_wait(ctx)!!; io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
@@ -1033,8 +1018,6 @@ fn void DiTModel.free(&self) {
     self.acts.q.free();
     self.acts.k.free();
     self.acts.v.free();
-    self.acts.attn_scores.free();
-    self.acts.attn_out.free();
     self.acts.ffn_gate_out.free();
     self.acts.ffn_up_out.free();
     self.acts.ffn_down_out.free();
@@ -1055,7 +1038,7 @@ fn void DiTModel.free(&self) {
     self.kernels.dit_timestep_embed.free(self.ctx.device);
     self.kernels.broadcast_add_dim.free(self.ctx.device);
     self.kernels.scale_buffer.free(self.ctx.device);
-    self.kernels.spatial_attention.free(self.ctx.device);
+    self.kernels.flash_attention.free(self.ctx.device);
     self.kernels.batch_rmsnorm.free(self.ctx.device);
     self.kernels.transpose_heads.free(self.ctx.device);
     self.kernels.batch_head_norm.free(self.ctx.device);

@@ -422,3 +422,103 @@ void batch_head_norm(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         bhn_data[base + i] = bhn_data[base + i] * rms * bhn_weight[i];
     }
 }
+
+// ============================================================
+// Flash Attention - Shared-memory scores + fused reverse transpose
+// ============================================================
+// Q, K, V in [n_heads, seq_len, head_dim] layout (after forward transpose)
+// Output in [seq_len, dim] layout (reverse transpose fused into write)
+// Scores stay in groupshared memory — eliminates 140MB global buffer
+// One workgroup per (head, query_position) pair
+
+struct FlashAttentionParams {
+    uint head_dim;    // 128
+    uint n_heads;     // 30
+    uint seq_len;     // ~1034
+    float scale;      // 1/sqrt(128)
+};
+
+[vk_push_constant] const FlashAttentionParams flash_attn_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> fa_Q;       // [n_heads, seq_len, head_dim]
+[vk_binding(1, 0)] RWStructuredBuffer<float> fa_K;       // [n_heads, seq_len, head_dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> fa_V;       // [n_heads, seq_len, head_dim]
+[vk_binding(3, 0)] RWStructuredBuffer<float> fa_output;   // [seq_len, n_heads * head_dim]
+
+groupshared float fa_scores[2048];   // max seq_len scores in shared memory
+groupshared float fa_reduce[256];    // for tree reductions
+groupshared float fa_q[128];         // cached Q vector for this query position
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void flash_attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint head = gid.x / flash_attn_pc.seq_len;
+    uint q_pos = gid.x % flash_attn_pc.seq_len;
+    uint D = flash_attn_pc.head_dim;
+    uint S = flash_attn_pc.seq_len;
+
+    if (head >= flash_attn_pc.n_heads) return;
+
+    uint head_offset = head * S * D;
+
+    // Pre-load Q vector into shared memory (128 floats)
+    if (gi < D) {
+        fa_q[gi] = fa_Q[head_offset + q_pos * D + gi];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 1: Q * K^T -> scores in shared memory
+    for (uint kv_pos = gi; kv_pos < S; kv_pos += 256) {
+        float dot_val = 0.0;
+        for (uint d = 0; d < D; d++) {
+            dot_val += fa_q[d] * fa_K[head_offset + kv_pos * D + d];
+        }
+        fa_scores[kv_pos] = dot_val * flash_attn_pc.scale;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 2: Softmax entirely in shared memory
+    float max_val = -1.0e30;
+    for (uint i = gi; i < S; i += 256) {
+        max_val = max(max_val, fa_scores[i]);
+    }
+    fa_reduce[gi] = max_val;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) fa_reduce[gi] = max(fa_reduce[gi], fa_reduce[gi + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float global_max = fa_reduce[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    float sum = 0.0;
+    for (uint i = gi; i < S; i += 256) {
+        float val = exp(fa_scores[i] - global_max);
+        fa_scores[i] = val;
+        sum += val;
+    }
+    fa_reduce[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) fa_reduce[gi] += fa_reduce[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float global_sum = fa_reduce[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint i = gi; i < S; i += 256) {
+        fa_scores[i] /= global_sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 3: Weighted V sum -> output in [seq_len, dim] layout (fused reverse transpose)
+    uint dim = flash_attn_pc.n_heads * D;
+    for (uint d = gi; d < D; d += 256) {
+        float acc = 0.0;
+        for (uint pos = 0; pos < S; pos++) {
+            acc += fa_scores[pos] * fa_V[head_offset + pos * D + d];
+        }
+        // Write directly in [seq_len, dim] layout instead of [n_heads, seq_len, head_dim]
+        fa_output[q_pos * dim + head * D + d] = acc;
+    }
+}
