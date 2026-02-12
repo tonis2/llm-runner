@@ -170,15 +170,26 @@ void linear_proj(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
     if (seq_pos >= linear_proj_pc.seq_len || out_idx >= linear_proj_pc.out_dim) return;
 
-    if (gi == 0) {
-        // Compute dot product
-        float sum = 0.0;
-        for (uint k = 0; k < linear_proj_pc.in_dim; k++) {
-            sum += lp_input[seq_pos * linear_proj_pc.in_dim + k] *
+    // Parallel dot product: each thread handles a stride of elements
+    float partial = 0.0;
+    for (uint k = gi; k < linear_proj_pc.in_dim; k += 256) {
+        partial += lp_input[seq_pos * linear_proj_pc.in_dim + k] *
                    lp_weight[out_idx * linear_proj_pc.in_dim + k];
+    }
+
+    // Tree reduction in shared memory
+    lp_shared[gi] = partial;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            lp_shared[gi] += lp_shared[gi + s];
         }
-        sum += lp_bias[out_idx];
-        lp_output[seq_pos * linear_proj_pc.out_dim + out_idx] = sum;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        lp_output[seq_pos * linear_proj_pc.out_dim + out_idx] = lp_shared[0] + lp_bias[out_idx];
     }
 }
 
@@ -253,4 +264,161 @@ struct ScaleParams {
 void scale_buffer(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= scale_pc.n) return;
     scale_data[tid.x] *= scale_pc.scale;
+}
+
+// ============================================================
+// Batch RMSNorm - One workgroup per row
+// ============================================================
+// Processes [n_rows, dim] with weight [dim], in separate input/output buffers
+// row_offset: offset into input/output for first row (for dual norm second pass)
+
+struct BatchRMSNormParams {
+    uint dim;
+    float eps;
+    uint n_rows;
+    uint row_offset;
+};
+
+[vk_push_constant] const BatchRMSNormParams batch_rmsnorm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> brn_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> brn_weight;
+[vk_binding(2, 0)] RWStructuredBuffer<float> brn_output;
+
+groupshared float brn_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_rmsnorm(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    if (row >= batch_rmsnorm_pc.n_rows) return;
+
+    uint base = (row + batch_rmsnorm_pc.row_offset) * batch_rmsnorm_pc.dim;
+
+    // Compute sum of squares
+    float sum_sq = 0.0;
+    for (uint i = gi; i < batch_rmsnorm_pc.dim; i += 256) {
+        float val = brn_input[base + i];
+        sum_sq += val * val;
+    }
+
+    brn_shared[gi] = sum_sq;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            brn_shared[gi] += brn_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    float rms = 1.0 / sqrt(brn_shared[0] / float(batch_rmsnorm_pc.dim) + batch_rmsnorm_pc.eps);
+
+    for (uint i = gi; i < batch_rmsnorm_pc.dim; i += 256) {
+        brn_output[base + i] = brn_input[base + i] * rms * brn_weight[i];
+    }
+}
+
+// ============================================================
+// Transpose Heads - Remap between [seq, heads, head_dim] <-> [heads, seq, head_dim]
+// ============================================================
+// direction 0: [seq, heads, head_dim] -> [heads, seq, head_dim]
+// direction 1: [heads, seq, head_dim] -> [seq, heads, head_dim]
+
+struct TransposeHeadsParams {
+    uint seq_len;
+    uint n_heads;
+    uint head_dim;
+    uint direction;   // 0 = forward (seq-major -> head-major), 1 = reverse
+};
+
+[vk_push_constant] const TransposeHeadsParams transpose_heads_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> th_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> th_output;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void transpose_heads(uint3 tid: SV_DispatchThreadID) {
+    uint S = transpose_heads_pc.seq_len;
+    uint H = transpose_heads_pc.n_heads;
+    uint D = transpose_heads_pc.head_dim;
+    uint total = S * H * D;
+
+    if (tid.x >= total) return;
+
+    uint d = tid.x % D;
+    uint rem = tid.x / D;
+
+    if (transpose_heads_pc.direction == 0) {
+        // src layout: [seq, heads, head_dim]
+        uint seq = rem / H;
+        uint h = rem % H;
+        // dst layout: [heads, seq, head_dim]
+        th_output[h * S * D + seq * D + d] = th_input[tid.x];
+    } else {
+        // src layout: [heads, seq, head_dim]
+        uint h = rem / S;
+        uint seq = rem % S;
+        // dst layout: [seq, heads, head_dim]
+        th_output[seq * H * D + h * D + d] = th_input[tid.x];
+    }
+}
+
+// ============================================================
+// Batch Head Norm - Per-head RMSNorm on [seq_len, n_heads*head_dim]
+// ============================================================
+// One workgroup per (position, head) pair
+// Each workgroup normalizes head_dim elements in-place
+
+struct BatchHeadNormParams {
+    uint n_heads;
+    uint head_dim;
+    uint seq_len;
+    float eps;
+};
+
+[vk_push_constant] const BatchHeadNormParams batch_head_norm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> bhn_data;    // [seq_len, n_heads * head_dim] in-place
+[vk_binding(1, 0)] RWStructuredBuffer<float> bhn_weight;   // [head_dim]
+
+groupshared float bhn_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_head_norm(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint H = batch_head_norm_pc.n_heads;
+    uint D = batch_head_norm_pc.head_dim;
+
+    uint flat_id = gid.x;  // workgroup index = pos * n_heads + head
+    uint pos = flat_id / H;
+    uint h = flat_id % H;
+
+    if (pos >= batch_head_norm_pc.seq_len) return;
+
+    uint base = (pos * H + h) * D;
+
+    // Compute sum of squares over head_dim elements
+    float sum_sq = 0.0;
+    for (uint i = gi; i < D; i += 256) {
+        float val = bhn_data[base + i];
+        sum_sq += val * val;
+    }
+
+    bhn_shared[gi] = sum_sq;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            bhn_shared[gi] += bhn_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    float rms = 1.0 / sqrt(bhn_shared[0] / float(D) + batch_head_norm_pc.eps);
+
+    for (uint i = gi; i < D; i += 256) {
+        bhn_data[base + i] = bhn_data[base + i] * rms * bhn_weight[i];
+    }
 }

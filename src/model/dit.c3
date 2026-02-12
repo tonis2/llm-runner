@@ -70,6 +70,34 @@ struct ScalePC {
     float scale;
 }
 
+struct BatchRMSNormPC {
+    uint dim;
+    float eps;
+    uint n_rows;
+    uint row_offset;
+}
+
+struct TransposeHeadsPC {
+    uint seq_len;
+    uint n_heads;
+    uint head_dim;
+    uint direction;
+}
+
+struct BatchHeadNormPC {
+    uint n_heads;
+    uint head_dim;
+    uint seq_len;
+    float eps;
+}
+
+struct BatchMatMulPC {
+    uint out_dim;
+    uint in_dim;
+    uint seq_len;
+    uint row_offset;
+}
+
 // --- DiT Layer Weights ---
 
 struct DiTLayerWeights {
@@ -166,6 +194,15 @@ struct DiTKernels {
     ComputeKernel broadcast_add_dim;
     ComputeKernel scale_buffer;
     ComputeKernel spatial_attention;
+    ComputeKernel batch_rmsnorm;
+    ComputeKernel transpose_heads;
+    ComputeKernel batch_head_norm;
+    ComputeKernel batch_matmul;
+    ComputeKernel batch_matmul_q8;
+    ComputeKernel batch_matmul_q4_0;
+    ComputeKernel batch_matmul_q4k;
+    ComputeKernel batch_matmul_q5k;
+    ComputeKernel batch_matmul_q6k;
     SharedKernels shared;
 }
 
@@ -217,6 +254,15 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
         .broadcast_add_dim = create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!,
         .scale_buffer     = create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!,
         .spatial_attention = create_kernel(ctx, diff_shader, 5, SpatialAttentionPC.sizeof, "spatial_attention")!!,
+        .batch_rmsnorm    = create_kernel(ctx, zi_shader, 3, BatchRMSNormPC.sizeof, "batch_rmsnorm")!!,
+        .transpose_heads  = create_kernel(ctx, zi_shader, 2, TransposeHeadsPC.sizeof, "transpose_heads")!!,
+        .batch_head_norm  = create_kernel(ctx, zi_shader, 2, BatchHeadNormPC.sizeof, "batch_head_norm")!!,
+        .batch_matmul     = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul")!!,
+        .batch_matmul_q8  = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q8")!!,
+        .batch_matmul_q4_0 = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4_0")!!,
+        .batch_matmul_q4k = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4k")!!,
+        .batch_matmul_q5k = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q5k")!!,
+        .batch_matmul_q6k = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q6k")!!,
         .shared           = create_shared_kernels(ctx, llm_shader)!!,
     };
 
@@ -410,8 +456,8 @@ fn DiTWeights? load_dit_weights(DeviceContext* ctx, GGUFFile* gf) {
 
 // --- DiT Forward Pass Helpers ---
 
-// Apply per-head RMSNorm to Q or K buffer
-// qk: [seq_len, n_heads * head_dim]  (already projected)
+// Apply per-head RMSNorm to Q or K buffer using batch_head_norm shader
+// qk: [seq_len, n_heads * head_dim]  (in-place)
 // norm_weight: [head_dim]
 fn void? dit_apply_head_norm(
     DiTModel* model,
@@ -422,37 +468,56 @@ fn void? dit_apply_head_norm(
     uint n_heads,
     uint head_dim
 ) {
-    SharedKernels* sk = &model.kernels.shared;
-    DiTActivations* a = &model.acts;
+    DiTKernels* dk = &model.kernels;
 
-    // For each head, extract head slice, normalize, write back
-    for (uint h = 0; h < n_heads; h++) {
-        for (uint pos = 0; pos < seq_len; pos++) {
-            // Offset in the qk buffer: (pos * n_heads + h) * head_dim
-            // Actually, layout is [seq_len, dim] where dim = n_heads * head_dim
-            // head slice at pos: offset = (pos * n_heads * head_dim + h * head_dim) * 4
-            usz src_offset = ((usz)pos * n_heads * head_dim + (usz)h * head_dim) * 4;
-
-            // Copy to norm_out scratch
-            vk::cmdCopyBuffer(cmd, qk.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = 0, .size = (ulong)head_dim * 4 }});
-            compute_barrier(cmd);
-
-            RMSNormPC rms_pc = { .dim = head_dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, norm_weight.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
-                { (usz)head_dim * 4, norm_weight.size_bytes, (usz)head_dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-
-            vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, qk.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = src_offset, .size = (ulong)head_dim * 4 }});
-            compute_barrier(cmd);
-        }
-    }
+    BatchHeadNormPC pc = {
+        .n_heads = n_heads,
+        .head_dim = head_dim,
+        .seq_len = seq_len,
+        .eps = 1e-6f,
+    };
+    dispatch_kernel(cmd, &dk.batch_head_norm,
+        { qk.gpu_buffer.buffer, norm_weight.gpu_buffer.buffer },
+        { qk.size_bytes, norm_weight.size_bytes },
+        &pc, seq_len * n_heads);
+    compute_barrier(cmd);
 }
 
-// Run a single DiT transformer layer
+// Dispatch a batch matmul: weight[out_dim, in_dim] × input[seq_len, in_dim] → output[seq_len, out_dim]
+// row_offset: skip rows in weight (for fused QKV split)
+fn void dispatch_batch_matmul(
+    CommandBuffer cmd,
+    DiTKernels* dk,
+    Tensor* weight,
+    Tensor* input,
+    Tensor* output,
+    uint out_dim,
+    uint in_dim,
+    uint seq_len,
+    uint row_offset
+) {
+    BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
+    ComputeKernel* kernel;
+    if (weight.dtype == GGML_Q4_K) {
+        kernel = &dk.batch_matmul_q4k;
+    } else if (weight.dtype == GGML_Q5_K) {
+        kernel = &dk.batch_matmul_q5k;
+    } else if (weight.dtype == GGML_Q6_K) {
+        kernel = &dk.batch_matmul_q6k;
+    } else if (weight.dtype == GGML_Q8_0) {
+        kernel = &dk.batch_matmul_q8;
+    } else if (weight.dtype == GGML_Q4_0) {
+        kernel = &dk.batch_matmul_q4_0;
+    } else {
+        kernel = &dk.batch_matmul;
+    }
+    dispatch_kernel(cmd, kernel,
+        { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
+        { weight.size_bytes, input.size_bytes, output.size_bytes },
+        &pc, seq_len * out_dim);
+}
+
+// Run a single DiT transformer layer using batch matmul
 fn void? dit_transformer_layer(
     DiTModel* model,
     CommandBuffer cmd,
@@ -462,14 +527,14 @@ fn void? dit_transformer_layer(
     uint img_len,          // number of image tokens (0 if no dual norm)
     bool has_adaln
 ) {
+    DeviceContext* ctx = model.ctx;
     SharedKernels* sk = &model.kernels.shared;
     DiTKernels* dk = &model.kernels;
     DiTActivations* a = &model.acts;
     uint dim = DIT_DIM;
 
-    // 1. AdaLN modulation: project t_emb [256] to scale/shift params [4*dim]
+    // === Phase A: AdaLN + Norm ===
     if (has_adaln && lw.adaln_linear.size_bytes > 0) {
-        // adaln_params = t_emb @ adaln_weight^T + adaln_bias
         LinearProjPC adaln_proj_pc = { .out_dim = 4 * dim, .in_dim = DIT_T_EMB_DIM, .seq_len = 1 };
         dispatch_kernel(cmd, &dk.linear_proj,
             { lw.adaln_linear.gpu_buffer.buffer, lw.adaln_bias.gpu_buffer.buffer,
@@ -479,8 +544,6 @@ fn void? dit_transformer_layer(
             &adaln_proj_pc, 4 * dim);
         compute_barrier(cmd);
 
-        // Split adaln_params [4*dim] into: attn_scale[dim], attn_shift[dim], ffn_scale[dim], ffn_shift[dim]
-        // Copy attn_scale and attn_shift
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)dim * 4 }});
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, 1,
@@ -488,60 +551,30 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
-    // 2. Pre-attention RMSNorm (dual norm: norm1 for image, norm2 for text)
+    // Pre-attention RMSNorm (dual: norm1 for image, norm2 for text)
     if (img_len > 0 && lw.attn_norm2.size_bytes > 0) {
-        // Image portion: positions [0..img_len-1]
-        for (uint pos = 0; pos < img_len; pos++) {
-            usz off = (usz)pos * dim * 4;
-            vk::cmdCopyBuffer(cmd, hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-                { (usz)dim * 4, lw.attn_norm1.size_bytes, (usz)dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = off, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-        }
-        // Text portion: positions [img_len..seq_len-1]
-        for (uint pos = img_len; pos < seq_len; pos++) {
-            usz off = (usz)pos * dim * 4;
-            vk::cmdCopyBuffer(cmd, hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.attn_norm2.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-                { (usz)dim * 4, lw.attn_norm2.size_bytes, (usz)dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = off, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-        }
+        BatchRMSNormPC rms_img_pc = { .dim = dim, .eps = 1e-6f, .n_rows = img_len, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { hidden.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, lw.attn_norm1.size_bytes, a.buf_a.size_bytes },
+            &rms_img_pc, img_len);
+        compute_barrier(cmd);
+        uint text_rows = seq_len - img_len;
+        BatchRMSNormPC rms_txt_pc = { .dim = dim, .eps = 1e-6f, .n_rows = text_rows, .row_offset = img_len };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { hidden.gpu_buffer.buffer, lw.attn_norm2.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, lw.attn_norm2.size_bytes, a.buf_a.size_bytes },
+            &rms_txt_pc, text_rows);
+        compute_barrier(cmd);
     } else {
-        // Single norm
-        for (uint pos = 0; pos < seq_len; pos++) {
-            usz off = (usz)pos * dim * 4;
-            vk::cmdCopyBuffer(cmd, hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-                { (usz)dim * 4, lw.attn_norm1.size_bytes, (usz)dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = off, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-        }
+        BatchRMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { hidden.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, lw.attn_norm1.size_bytes, a.buf_a.size_bytes },
+            &rms_pc, seq_len);
+        compute_barrier(cmd);
     }
 
-    // 2b. Apply AdaLN modulation on image portion only
     if (has_adaln && img_len > 0) {
         AdalnModPC adaln_mod_pc = { .n_elements = img_len * dim, .dim = dim };
         dispatch_kernel(cmd, &dk.adaln_modulate,
@@ -553,101 +586,57 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
-    // 3. QKV projection (loop over positions, using existing matmul for quantized weights)
-    // buf_a contains normed input [seq_len, dim]
-    for (uint pos = 0; pos < seq_len; pos++) {
-        usz in_off = (usz)pos * dim * 4;
-        // Copy position to norm_out for matmul input
-        vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
+    // === Phase B: QKV batch matmul (3 dispatches, no per-position loop) ===
+    // wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
+    dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
+    dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
+    dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
+    compute_barrier(cmd);
 
-        // Matmul: norm_out [dim] @ wqkv [3*dim, dim] -> buf_c [3*dim]
-        // Output Q at buf_b[pos*dim], K at separate offset, V at separate offset
-        MatMulPC mm_pc = { .out_dim = 3 * dim, .in_dim = dim };
-        ComputeKernel* mm_kernel;
-        if (lw.wqkv.dtype == GGML_Q4_K) {
-            mm_kernel = &sk.matmul_q4k;
-        } else if (lw.wqkv.dtype == GGML_Q5_K) {
-            mm_kernel = &sk.matmul_q5k;
-        } else if (lw.wqkv.dtype == GGML_Q6_K) {
-            mm_kernel = &sk.matmul_q6k;
-        } else if (lw.wqkv.dtype == GGML_Q8_0) {
-            mm_kernel = &sk.matmul_q8;
-        } else if (lw.wqkv.dtype == GGML_Q4_0) {
-            mm_kernel = &sk.matmul_q4_0;
-        } else {
-            mm_kernel = &sk.matmul;
-        }
+    submit_and_wait(ctx)!!;
+    begin_compute(cmd)!!;
 
-        dispatch_kernel(cmd, mm_kernel,
-            { lw.wqkv.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-            { lw.wqkv.size_bytes, (usz)dim * 4, (usz)3 * dim * 4 },
-            &mm_pc, 3 * dim);
-        compute_barrier(cmd);
-
-        // Split QKV: Q=[0..dim-1], K=[dim..2*dim-1], V=[2*dim..3*dim-1]
-        usz q_off = (usz)pos * dim * 4;
-        vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = q_off, .size = (ulong)dim * 4 }});
-        vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = (ulong)dim * 4, .dstOffset = q_off, .size = (ulong)dim * 4 }});
-        vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.v.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = (ulong)dim * 2 * 4, .dstOffset = q_off, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
-    }
-
-    // 4. Per-head Q/K norm
+    // === Phase C: Head norm + Transpose + Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
 
-    // 5. Reshape Q,K,V from [seq_len, n_heads * head_dim] to [n_heads, seq_len, head_dim]
-    // The spatial_attention shader expects [n_heads, seq_len, head_dim]
-    // Currently layout is [seq_len, n_heads, head_dim] - need to transpose
-    // Copy to buf_b as transposed
-    for (uint h = 0; h < DIT_HEADS; h++) {
-        for (uint pos = 0; pos < seq_len; pos++) {
-            usz src = ((usz)pos * DIT_HEADS + h) * DIT_HEAD_DIM * 4;
-            usz dst = ((usz)h * seq_len + pos) * DIT_HEAD_DIM * 4;
-            vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = src, .dstOffset = dst, .size = (ulong)DIT_HEAD_DIM * 4 }});
-        }
-    }
+    uint total_elems = seq_len * dim;
+    uint transpose_groups = ceil_div(total_elems, 256);
+    TransposeHeadsPC th_fwd_pc = {
+        .seq_len = seq_len, .n_heads = DIT_HEADS, .head_dim = DIT_HEAD_DIM, .direction = 0,
+    };
+
+    dispatch_kernel(cmd, &dk.transpose_heads,
+        { a.q.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+        { a.q.size_bytes, a.buf_b.size_bytes },
+        &th_fwd_pc, transpose_groups);
     compute_barrier(cmd);
-    // Copy transposed Q back
     vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total_elems * 4 }});
     compute_barrier(cmd);
 
-    // Same for K
-    for (uint h = 0; h < DIT_HEADS; h++) {
-        for (uint pos = 0; pos < seq_len; pos++) {
-            usz src = ((usz)pos * DIT_HEADS + h) * DIT_HEAD_DIM * 4;
-            usz dst = ((usz)h * seq_len + pos) * DIT_HEAD_DIM * 4;
-            vk::cmdCopyBuffer(cmd, a.k.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = src, .dstOffset = dst, .size = (ulong)DIT_HEAD_DIM * 4 }});
-        }
-    }
+    dispatch_kernel(cmd, &dk.transpose_heads,
+        { a.k.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+        { a.k.size_bytes, a.buf_b.size_bytes },
+        &th_fwd_pc, transpose_groups);
     compute_barrier(cmd);
     vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total_elems * 4 }});
     compute_barrier(cmd);
 
-    // Same for V
-    for (uint h = 0; h < DIT_HEADS; h++) {
-        for (uint pos = 0; pos < seq_len; pos++) {
-            usz src = ((usz)pos * DIT_HEADS + h) * DIT_HEAD_DIM * 4;
-            usz dst = ((usz)h * seq_len + pos) * DIT_HEAD_DIM * 4;
-            vk::cmdCopyBuffer(cmd, a.v.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = src, .dstOffset = dst, .size = (ulong)DIT_HEAD_DIM * 4 }});
-        }
-    }
+    dispatch_kernel(cmd, &dk.transpose_heads,
+        { a.v.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+        { a.v.size_bytes, a.buf_b.size_bytes },
+        &th_fwd_pc, transpose_groups);
     compute_barrier(cmd);
     vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, a.v.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total_elems * 4 }});
     compute_barrier(cmd);
 
-    // 6. Spatial attention (non-causal)
+    submit_and_wait(ctx)!!;
+    begin_compute(cmd)!!;
+
+    // Spatial attention (non-causal)
     float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
     SpatialAttentionPC sa_pc = {
         .head_dim = DIT_HEAD_DIM,
@@ -663,33 +652,20 @@ fn void? dit_transformer_layer(
         &sa_pc, DIT_HEADS * seq_len);
     compute_barrier(cmd);
 
-    // 7. Transpose attention output back: [n_heads, seq_len, head_dim] -> [seq_len, dim]
-    for (uint h = 0; h < DIT_HEADS; h++) {
-        for (uint pos = 0; pos < seq_len; pos++) {
-            usz src = ((usz)h * seq_len + pos) * DIT_HEAD_DIM * 4;
-            usz dst = ((usz)pos * DIT_HEADS + h) * DIT_HEAD_DIM * 4;
-            vk::cmdCopyBuffer(cmd, a.attn_out.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = src, .dstOffset = dst, .size = (ulong)DIT_HEAD_DIM * 4 }});
-        }
-    }
+    // Transpose attention output back: [n_heads, seq_len, head_dim] -> [seq_len, dim]
+    TransposeHeadsPC th_rev_pc = {
+        .seq_len = seq_len, .n_heads = DIT_HEADS, .head_dim = DIT_HEAD_DIM, .direction = 1,
+    };
+    dispatch_kernel(cmd, &dk.transpose_heads,
+        { a.attn_out.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
+        { a.attn_out.size_bytes, a.buf_b.size_bytes },
+        &th_rev_pc, transpose_groups);
     compute_barrier(cmd);
 
-    // 8. Output projection (loop over positions)
-    for (uint pos = 0; pos < seq_len; pos++) {
-        usz in_off = (usz)pos * dim * 4;
-        vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
+    // === Phase D: Output projection batch matmul + Residual ===
+    dispatch_batch_matmul(cmd, dk, &lw.wo, &a.buf_b, &a.buf_a, dim, dim, seq_len, 0);
+    compute_barrier(cmd);
 
-        dispatch_matmul(cmd, sk, &lw.wo, &a.norm_out, &a.buf_c, dim, dim);
-        compute_barrier(cmd);
-
-        vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
-    }
-
-    // 9. Residual add: hidden += attn_output
     ResidualPC res_pc = { .n = seq_len * dim };
     dispatch_kernel(cmd, &sk.residual_add,
         { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
@@ -697,9 +673,11 @@ fn void? dit_transformer_layer(
         &res_pc, ceil_div(seq_len * dim, 256));
     compute_barrier(cmd);
 
-    // 10. FFN: Pre-FFN norm (dual or single)
+    submit_and_wait(ctx)!!;
+    begin_compute(cmd)!!;
+
+    // === Phase E: FFN norm ===
     if (has_adaln) {
-        // Get FFN scale/shift from adaln_params [2*dim..3*dim-1] and [3*dim..4*dim-1]
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = (ulong)2 * dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 }});
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, 1,
@@ -708,56 +686,28 @@ fn void? dit_transformer_layer(
     }
 
     if (img_len > 0 && lw.ffn_norm2.size_bytes > 0) {
-        // Dual norm for FFN
-        for (uint pos = 0; pos < img_len; pos++) {
-            usz off = (usz)pos * dim * 4;
-            vk::cmdCopyBuffer(cmd, hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-                { (usz)dim * 4, lw.ffn_norm1.size_bytes, (usz)dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = off, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-        }
-        for (uint pos = img_len; pos < seq_len; pos++) {
-            usz off = (usz)pos * dim * 4;
-            vk::cmdCopyBuffer(cmd, hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.ffn_norm2.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-                { (usz)dim * 4, lw.ffn_norm2.size_bytes, (usz)dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = off, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-        }
+        BatchRMSNormPC ffn_img_pc = { .dim = dim, .eps = 1e-6f, .n_rows = img_len, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { hidden.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, lw.ffn_norm1.size_bytes, a.buf_a.size_bytes },
+            &ffn_img_pc, img_len);
+        compute_barrier(cmd);
+        uint ffn_text_rows = seq_len - img_len;
+        BatchRMSNormPC ffn_txt_pc = { .dim = dim, .eps = 1e-6f, .n_rows = ffn_text_rows, .row_offset = img_len };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { hidden.gpu_buffer.buffer, lw.ffn_norm2.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, lw.ffn_norm2.size_bytes, a.buf_a.size_bytes },
+            &ffn_txt_pc, ffn_text_rows);
+        compute_barrier(cmd);
     } else {
-        for (uint pos = 0; pos < seq_len; pos++) {
-            usz off = (usz)pos * dim * 4;
-            vk::cmdCopyBuffer(cmd, hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f };
-            dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer },
-                { (usz)dim * 4, lw.ffn_norm1.size_bytes, (usz)dim * 4 },
-                &rms_pc, 1);
-            compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = off, .size = (ulong)dim * 4 }});
-            compute_barrier(cmd);
-        }
+        BatchRMSNormPC ffn_rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+        dispatch_kernel(cmd, &dk.batch_rmsnorm,
+            { hidden.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
+            { hidden.size_bytes, lw.ffn_norm1.size_bytes, a.buf_a.size_bytes },
+            &ffn_rms_pc, seq_len);
+        compute_barrier(cmd);
     }
 
-    // Apply AdaLN on image portion for FFN
     if (has_adaln && img_len > 0) {
         AdalnModPC adaln_mod_pc = { .n_elements = img_len * dim, .dim = dim };
         dispatch_kernel(cmd, &dk.adaln_modulate,
@@ -769,48 +719,39 @@ fn void? dit_transformer_layer(
         compute_barrier(cmd);
     }
 
-    // 11. SwiGLU FFN (loop over positions)
-    for (uint pos = 0; pos < seq_len; pos++) {
-        usz in_off = (usz)pos * dim * 4;
-        vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
+    // === Phase F: SwiGLU FFN batch matmul ===
+    // Gate and Up projections (both read buf_a, write to different outputs)
+    dispatch_batch_matmul(cmd, dk, &lw.ffn_gate, &a.buf_a, &a.ffn_gate_out, DIT_FFN_DIM, dim, seq_len, 0);
+    dispatch_batch_matmul(cmd, dk, &lw.ffn_up, &a.buf_a, &a.ffn_up_out, DIT_FFN_DIM, dim, seq_len, 0);
+    compute_barrier(cmd);
 
-        // Gate and Up projections
-        dispatch_matmul(cmd, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, DIT_FFN_DIM, dim);
-        dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, DIT_FFN_DIM, dim);
-        compute_barrier(cmd);
+    // SiLU on gate (operates on full [seq_len * ffn_dim] flat array)
+    SiluPC silu_pc = { .n = seq_len * DIT_FFN_DIM };
+    dispatch_kernel(cmd, &sk.silu,
+        { a.ffn_gate_out.gpu_buffer.buffer },
+        { a.ffn_gate_out.size_bytes },
+        &silu_pc, ceil_div(seq_len * DIT_FFN_DIM, 256));
+    compute_barrier(cmd);
 
-        // SiLU on gate
-        SiluPC silu_pc = { .n = DIT_FFN_DIM };
-        dispatch_kernel(cmd, &sk.silu,
-            { a.ffn_gate_out.gpu_buffer.buffer },
-            { a.ffn_gate_out.size_bytes },
-            &silu_pc, ceil_div(DIT_FFN_DIM, 256));
-        compute_barrier(cmd);
+    // gate * up
+    ElemwisePC emul_pc = { .n = seq_len * DIT_FFN_DIM };
+    dispatch_kernel(cmd, &sk.elemwise_mul,
+        { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
+        { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
+        &emul_pc, ceil_div(seq_len * DIT_FFN_DIM, 256));
+    compute_barrier(cmd);
 
-        // gate * up
-        ElemwisePC emul_pc = { .n = DIT_FFN_DIM };
-        dispatch_kernel(cmd, &sk.elemwise_mul,
-            { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
-            { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
-            &emul_pc, ceil_div(DIT_FFN_DIM, 256));
-        compute_barrier(cmd);
+    submit_and_wait(ctx)!!;
+    begin_compute(cmd)!!;
 
-        // Down projection
-        dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM);
-        compute_barrier(cmd);
+    // Down projection
+    dispatch_batch_matmul(cmd, dk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM, seq_len, 0);
+    compute_barrier(cmd);
 
-        // Write back
-        vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
-    }
-
-    // 12. Residual add: hidden += ffn_output
+    // Residual add: hidden += ffn_output
     dispatch_kernel(cmd, &sk.residual_add,
-        { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
-        { hidden.size_bytes, a.buf_a.size_bytes },
+        { hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
+        { hidden.size_bytes, a.ffn_down_out.size_bytes },
         &res_pc, ceil_div(seq_len * dim, 256));
     compute_barrier(cmd);
 }
@@ -895,10 +836,10 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
 
     // 4. Noise refiner (2 layers on image tokens, with adaLN from t_emb_mlp)
     for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+        io::printfn("  Noise refiner layer %d/%d...", l + 1, DIT_NUM_REFINER_LAYERS);
         dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, n_patches, n_patches, true)!!;
     }
 
-    // Submit and wait between major phases to avoid command buffer overflow
     submit_and_wait(ctx)!!;
     begin_compute(cmd)!!;
 
@@ -916,17 +857,13 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
 
     // 6. Main DiT (30 layers with adaLN, dual norm)
     for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+        io::printfn("  DiT layer %d/%d (seq=%d)...", l + 1, DIT_NUM_LAYERS, total_seq);
         dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, n_patches, true)!!;
 
-        // Submit periodically to prevent command buffer overflow
-        if ((l + 1) % 5 == 0) {
-            submit_and_wait(ctx)!!;
-            begin_compute(cmd)!!;
-        }
+        // Submit after every layer
+        submit_and_wait(ctx)!!;
+        begin_compute(cmd)!!;
     }
-
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
 
     // 7. Final layer: extract image portion, adaLN modulate, linear projection
     // Final adaLN: SiLU(t_emb) @ weight + bias -> [dim] scale
@@ -1092,5 +1029,14 @@ fn void DiTModel.free(&self) {
     self.kernels.broadcast_add_dim.free(self.ctx.device);
     self.kernels.scale_buffer.free(self.ctx.device);
     self.kernels.spatial_attention.free(self.ctx.device);
+    self.kernels.batch_rmsnorm.free(self.ctx.device);
+    self.kernels.transpose_heads.free(self.ctx.device);
+    self.kernels.batch_head_norm.free(self.ctx.device);
+    self.kernels.batch_matmul.free(self.ctx.device);
+    self.kernels.batch_matmul_q8.free(self.ctx.device);
+    self.kernels.batch_matmul_q4_0.free(self.ctx.device);
+    self.kernels.batch_matmul_q4k.free(self.ctx.device);
+    self.kernels.batch_matmul_q5k.free(self.ctx.device);
+    self.kernels.batch_matmul_q6k.free(self.ctx.device);
     self.kernels.shared.free(self.ctx.device);
 }
