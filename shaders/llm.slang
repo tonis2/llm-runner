@@ -1225,61 +1225,83 @@ groupshared float bmq4k_shared[256];
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void batch_matmul_q4k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
-    uint pos = gid.x / bmq4k_pc.out_dim;
+    uint tile_idx = gid.x / bmq4k_pc.out_dim;
     uint row = gid.x % bmq4k_pc.out_dim;
-    if (pos >= bmq4k_pc.seq_len) return;
+    uint pos_base = tile_idx * 4;
+    if (pos_base >= bmq4k_pc.seq_len) return;
     uint actual_row = bmq4k_pc.row_offset + row;
 
     uint blocks_per_row = bmq4k_pc.in_dim / 256;
-    uint row_byte_offset = actual_row * blocks_per_row * 144;
-    uint in_base = pos * bmq4k_pc.in_dim;
-    float sum = 0.0;
+    uint row_bytes = actual_row * blocks_per_row * 144;
 
-    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += 256) {
-        uint bb = row_byte_offset + block_idx * 144;
-        uint input_base = in_base + block_idx * 256;
+    // Thread's element mapping within each 256-element block
+    uint sub = gi / 64;            // sub-block 0-3
+    uint nh = (gi % 64) / 32;     // low nibble (0) or high nibble (1)
+    uint np = gi % 32;            // position within 32-byte chunk
+    uint scale_idx = 2 * sub + nh;
+    uint elem_off = sub * 64 + nh * 32 + np;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint bb = row_bytes + b * 144;
         uint dm_word = bmq4k_weight[bb / 4];
         float d = unpack_f16(dm_word & 0xFFFFu);
         float dmin = unpack_f16((dm_word >> 16) & 0xFFFFu);
-        uint qs_off = bb + 16;
 
-        for (uint j = 0; j < 4; j++) {
-            uint sc1, m1, sc2, m2;
-            get_scale_min_k4(2 * j, bb, bmq4k_weight, sc1, m1);
-            get_scale_min_k4(2 * j + 1, bb, bmq4k_weight, sc2, m2);
-            float d1 = d * float(sc1);
-            float dm1 = dmin * float(m1);
-            float d2 = d * float(sc2);
-            float dm2 = dmin * float(m2);
-            uint qs_base = qs_off + j * 32;
+        uint sc, m;
+        get_scale_min_k4(scale_idx, bb, bmq4k_weight, sc, m);
 
-            for (uint l = 0; l < 32; l += 4) {
-                uint qs_word = bmq4k_weight[(qs_base + l) / 4];
-                uint b0 = qs_word & 0xFFu;
-                uint b1 = (qs_word >> 8) & 0xFFu;
-                uint b2 = (qs_word >> 16) & 0xFFu;
-                uint b3 = (qs_word >> 24) & 0xFFu;
-                sum += (d1 * float(b0 & 0xFu) - dm1) * bmq4k_input[input_base + j * 64 + l];
-                sum += (d1 * float(b1 & 0xFu) - dm1) * bmq4k_input[input_base + j * 64 + l + 1];
-                sum += (d1 * float(b2 & 0xFu) - dm1) * bmq4k_input[input_base + j * 64 + l + 2];
-                sum += (d1 * float(b3 & 0xFu) - dm1) * bmq4k_input[input_base + j * 64 + l + 3];
-                sum += (d2 * float((b0 >> 4) & 0xFu) - dm2) * bmq4k_input[input_base + j * 64 + 32 + l];
-                sum += (d2 * float((b1 >> 4) & 0xFu) - dm2) * bmq4k_input[input_base + j * 64 + 32 + l + 1];
-                sum += (d2 * float((b2 >> 4) & 0xFu) - dm2) * bmq4k_input[input_base + j * 64 + 32 + l + 2];
-                sum += (d2 * float((b3 >> 4) & 0xFu) - dm2) * bmq4k_input[input_base + j * 64 + 32 + l + 3];
-            }
-        }
+        uint qs_byte = read_byte(bmq4k_weight, bb + 16 + sub * 32 + np);
+        uint q = (nh == 0) ? (qs_byte & 0xFu) : ((qs_byte >> 4) & 0xFu);
+        float w = d * float(sc) * float(q) - dmin * float(m);
+
+        uint col = b * 256 + elem_off;
+        sum0 += w * bmq4k_input[pos_base * bmq4k_pc.in_dim + col];
+        if (pos_base + 1 < bmq4k_pc.seq_len)
+            sum1 += w * bmq4k_input[(pos_base + 1) * bmq4k_pc.in_dim + col];
+        if (pos_base + 2 < bmq4k_pc.seq_len)
+            sum2 += w * bmq4k_input[(pos_base + 2) * bmq4k_pc.in_dim + col];
+        if (pos_base + 3 < bmq4k_pc.seq_len)
+            sum3 += w * bmq4k_input[(pos_base + 3) * bmq4k_pc.in_dim + col];
     }
 
-    bmq4k_shared[gi] = sum;
+    // Sequential tree reductions for each tiled position
+    bmq4k_shared[gi] = sum0;
     GroupMemoryBarrierWithGroupSync();
     for (uint s = 128; s > 0; s >>= 1) {
         if (gi < s) bmq4k_shared[gi] += bmq4k_shared[gi + s];
         GroupMemoryBarrierWithGroupSync();
     }
-    if (gi == 0) {
-        bmq4k_output[pos * bmq4k_pc.out_dim + row] = bmq4k_shared[0];
+    if (gi == 0)
+        bmq4k_output[pos_base * bmq4k_pc.out_dim + row] = bmq4k_shared[0];
+
+    bmq4k_shared[gi] = sum1;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq4k_shared[gi] += bmq4k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (gi == 0 && pos_base + 1 < bmq4k_pc.seq_len)
+        bmq4k_output[(pos_base + 1) * bmq4k_pc.out_dim + row] = bmq4k_shared[0];
+
+    bmq4k_shared[gi] = sum2;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq4k_shared[gi] += bmq4k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pos_base + 2 < bmq4k_pc.seq_len)
+        bmq4k_output[(pos_base + 2) * bmq4k_pc.out_dim + row] = bmq4k_shared[0];
+
+    bmq4k_shared[gi] = sum3;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq4k_shared[gi] += bmq4k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pos_base + 3 < bmq4k_pc.seq_len)
+        bmq4k_output[(pos_base + 3) * bmq4k_pc.out_dim + row] = bmq4k_shared[0];
 }
 
 // --- Q5_K batch matmul ---
@@ -1295,68 +1317,88 @@ groupshared float bmq5k_shared[256];
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void batch_matmul_q5k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
-    uint pos = gid.x / bmq5k_pc.out_dim;
+    uint tile_idx = gid.x / bmq5k_pc.out_dim;
     uint row = gid.x % bmq5k_pc.out_dim;
-    if (pos >= bmq5k_pc.seq_len) return;
+    uint pos_base = tile_idx * 4;
+    if (pos_base >= bmq5k_pc.seq_len) return;
     uint actual_row = bmq5k_pc.row_offset + row;
 
     uint blocks_per_row = bmq5k_pc.in_dim / 256;
-    uint row_byte_offset = actual_row * blocks_per_row * 176;
-    uint in_base = pos * bmq5k_pc.in_dim;
-    float sum = 0.0;
+    uint row_bytes = actual_row * blocks_per_row * 176;
 
-    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += 256) {
-        uint bb = row_byte_offset + block_idx * 176;
-        uint input_base = in_base + block_idx * 256;
+    // Thread's element mapping within each 256-element block
+    uint sub = gi / 64;
+    uint nh = (gi % 64) / 32;
+    uint np = gi % 32;
+    uint scale_idx = 2 * sub + nh;
+    uint elem_off = sub * 64 + nh * 32 + np;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint bb = row_bytes + b * 176;
         uint dm_word = bmq5k_weight[bb / 4];
         float d = unpack_f16(dm_word & 0xFFFFu);
         float dmin = unpack_f16((dm_word >> 16) & 0xFFFFu);
 
-        for (uint j = 0; j < 4; j++) {
-            uint sc1, m1, sc2, m2;
-            get_scale_min_k4(2 * j, bb, bmq5k_weight, sc1, m1);
-            get_scale_min_k4(2 * j + 1, bb, bmq5k_weight, sc2, m2);
-            float d1 = d * float(sc1);
-            float dm1 = dmin * float(m1);
-            float d2 = d * float(sc2);
-            float dm2 = dmin * float(m2);
-            uint qs_base = bb + 48 + j * 32;
-            uint qh_base = bb + 16;
-            uint qh_shift_lo = 2 * j;
-            uint qh_shift_hi = 2 * j + 1;
+        uint sc, m;
+        get_scale_min_k4(scale_idx, bb, bmq5k_weight, sc, m);
 
-            for (uint l = 0; l < 32; l += 4) {
-                uint qs_word = bmq5k_weight[(qs_base + l) / 4];
-                uint qh_word = bmq5k_weight[(qh_base + l) / 4];
-                uint ql0 = qs_word & 0xFFu;
-                uint ql1 = (qs_word >> 8) & 0xFFu;
-                uint ql2 = (qs_word >> 16) & 0xFFu;
-                uint ql3 = (qs_word >> 24) & 0xFFu;
-                uint qh0 = qh_word & 0xFFu;
-                uint qh1 = (qh_word >> 8) & 0xFFu;
-                uint qh2 = (qh_word >> 16) & 0xFFu;
-                uint qh3 = (qh_word >> 24) & 0xFFu;
-                sum += (d1 * float((ql0 & 0xFu) + (((qh0 >> qh_shift_lo) & 1u) << 4)) - dm1) * bmq5k_input[input_base + j * 64 + l];
-                sum += (d1 * float((ql1 & 0xFu) + (((qh1 >> qh_shift_lo) & 1u) << 4)) - dm1) * bmq5k_input[input_base + j * 64 + l + 1];
-                sum += (d1 * float((ql2 & 0xFu) + (((qh2 >> qh_shift_lo) & 1u) << 4)) - dm1) * bmq5k_input[input_base + j * 64 + l + 2];
-                sum += (d1 * float((ql3 & 0xFu) + (((qh3 >> qh_shift_lo) & 1u) << 4)) - dm1) * bmq5k_input[input_base + j * 64 + l + 3];
-                sum += (d2 * float(((ql0 >> 4) & 0xFu) + (((qh0 >> qh_shift_hi) & 1u) << 4)) - dm2) * bmq5k_input[input_base + j * 64 + 32 + l];
-                sum += (d2 * float(((ql1 >> 4) & 0xFu) + (((qh1 >> qh_shift_hi) & 1u) << 4)) - dm2) * bmq5k_input[input_base + j * 64 + 32 + l + 1];
-                sum += (d2 * float(((ql2 >> 4) & 0xFu) + (((qh2 >> qh_shift_hi) & 1u) << 4)) - dm2) * bmq5k_input[input_base + j * 64 + 32 + l + 2];
-                sum += (d2 * float(((ql3 >> 4) & 0xFu) + (((qh3 >> qh_shift_hi) & 1u) << 4)) - dm2) * bmq5k_input[input_base + j * 64 + 32 + l + 3];
-            }
-        }
+        uint qs_byte = read_byte(bmq5k_weight, bb + 48 + sub * 32 + np);
+        uint ql = (nh == 0) ? (qs_byte & 0xFu) : ((qs_byte >> 4) & 0xFu);
+
+        uint qh_byte = read_byte(bmq5k_weight, bb + 16 + np);
+        uint qh_bit = (qh_byte >> (2 * sub + nh)) & 1u;
+        uint q = ql + (qh_bit << 4);
+
+        float w = d * float(sc) * float(q) - dmin * float(m);
+
+        uint col = b * 256 + elem_off;
+        sum0 += w * bmq5k_input[pos_base * bmq5k_pc.in_dim + col];
+        if (pos_base + 1 < bmq5k_pc.seq_len)
+            sum1 += w * bmq5k_input[(pos_base + 1) * bmq5k_pc.in_dim + col];
+        if (pos_base + 2 < bmq5k_pc.seq_len)
+            sum2 += w * bmq5k_input[(pos_base + 2) * bmq5k_pc.in_dim + col];
+        if (pos_base + 3 < bmq5k_pc.seq_len)
+            sum3 += w * bmq5k_input[(pos_base + 3) * bmq5k_pc.in_dim + col];
     }
 
-    bmq5k_shared[gi] = sum;
+    // Sequential tree reductions for each tiled position
+    bmq5k_shared[gi] = sum0;
     GroupMemoryBarrierWithGroupSync();
     for (uint s = 128; s > 0; s >>= 1) {
         if (gi < s) bmq5k_shared[gi] += bmq5k_shared[gi + s];
         GroupMemoryBarrierWithGroupSync();
     }
-    if (gi == 0) {
-        bmq5k_output[pos * bmq5k_pc.out_dim + row] = bmq5k_shared[0];
+    if (gi == 0)
+        bmq5k_output[pos_base * bmq5k_pc.out_dim + row] = bmq5k_shared[0];
+
+    bmq5k_shared[gi] = sum1;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq5k_shared[gi] += bmq5k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (gi == 0 && pos_base + 1 < bmq5k_pc.seq_len)
+        bmq5k_output[(pos_base + 1) * bmq5k_pc.out_dim + row] = bmq5k_shared[0];
+
+    bmq5k_shared[gi] = sum2;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq5k_shared[gi] += bmq5k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pos_base + 2 < bmq5k_pc.seq_len)
+        bmq5k_output[(pos_base + 2) * bmq5k_pc.out_dim + row] = bmq5k_shared[0];
+
+    bmq5k_shared[gi] = sum3;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq5k_shared[gi] += bmq5k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pos_base + 3 < bmq5k_pc.seq_len)
+        bmq5k_output[(pos_base + 3) * bmq5k_pc.out_dim + row] = bmq5k_shared[0];
 }
 
 // --- Q6_K batch matmul ---
@@ -1372,20 +1414,28 @@ groupshared float bmq6k_shared[256];
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void batch_matmul_q6k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
-    uint pos = gid.x / bmq6k_pc.out_dim;
+    uint tile_idx = gid.x / bmq6k_pc.out_dim;
     uint row = gid.x % bmq6k_pc.out_dim;
-    if (pos >= bmq6k_pc.seq_len) return;
+    uint pos_base = tile_idx * 4;
+    if (pos_base >= bmq6k_pc.seq_len) return;
     uint actual_row = bmq6k_pc.row_offset + row;
 
     uint blocks_per_row = bmq6k_pc.in_dim / 256;
-    uint row_byte_offset = actual_row * blocks_per_row * 210;
-    uint in_base = pos * bmq6k_pc.in_dim;
-    float sum = 0.0;
+    uint row_bytes = actual_row * blocks_per_row * 210;
 
-    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += 256) {
-        uint bb = row_byte_offset + block_idx * 210;
-        uint input_base = in_base + block_idx * 256;
+    // Thread's element mapping within each 256-element block
+    // Layout: 2 halves of 128 elements, each with 4 quadrants of 32
+    uint half_idx = gi / 128;       // 0-1
+    uint local = gi % 128;          // 0-127
+    uint quadrant = local / 32;     // 0-3
+    uint pos = local % 32;          // 0-31
 
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint b = 0; b < blocks_per_row; b++) {
+        uint bb = row_bytes + b * 210;
+
+        // Read d from bytes 208-209
         uint d_byte = bb + 208;
         uint d_word = bmq6k_weight[d_byte / 4];
         uint d_byte_off = d_byte % 4;
@@ -1394,76 +1444,64 @@ void batch_matmul_q6k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         else { d_bits = (d_word >> 16) & 0xFFFFu; }
         float d = unpack_f16(d_bits);
 
-        uint ql_base = bb;
-        uint qh_base = bb + 128;
-        uint sc_base = bb + 192;
+        // Read ql byte: quadrants 0,2 share bytes 0-31, quadrants 1,3 share bytes 32-63
+        uint ql_byte = read_byte(bmq6k_weight, bb + half_idx * 64 + (quadrant % 2) * 32 + pos);
+        uint ql_nibble = (quadrant < 2) ? (ql_byte & 0xFu) : ((ql_byte >> 4) & 0xFu);
 
-        for (uint half_idx = 0; half_idx < 2; half_idx++) {
-            uint ql_off = ql_base + half_idx * 64;
-            uint qh_off = qh_base + half_idx * 32;
-            uint sc_off = half_idx * 8;
-            uint elem_off = half_idx * 128;
+        // Read qh byte: 2 bits per quadrant
+        uint qh_byte = read_byte(bmq6k_weight, bb + 128 + half_idx * 32 + pos);
+        uint qh_bits = (qh_byte >> (quadrant * 2)) & 3u;
 
-            int sc_0_0 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 0));
-            int sc_0_2 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 2));
-            int sc_0_4 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 4));
-            int sc_0_6 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 6));
-            int sc_1_0 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 1));
-            int sc_1_2 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 3));
-            int sc_1_4 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 5));
-            int sc_1_6 = sign_extend_i8(read_byte(bmq6k_weight, sc_base + sc_off + 7));
+        int q = int(ql_nibble | (qh_bits << 4)) - 32;
 
-            for (uint l = 0; l < 32; l += 4) {
-                int s1, s2, s3, s4;
-                if (l < 16) { s1 = sc_0_0; s2 = sc_0_2; s3 = sc_0_4; s4 = sc_0_6; }
-                else { s1 = sc_1_0; s2 = sc_1_2; s3 = sc_1_4; s4 = sc_1_6; }
-                float ds1 = d * float(s1);
-                float ds2 = d * float(s2);
-                float ds3 = d * float(s3);
-                float ds4 = d * float(s4);
+        // Read scale
+        int sc = sign_extend_i8(read_byte(bmq6k_weight, bb + 192 + half_idx * 8 + quadrant * 2 + (pos >= 16 ? 1u : 0u)));
+        float w = d * float(sc) * float(q);
 
-                uint ql0_pos = ql_off + l;
-                uint ql0_idx = ql0_pos / 4;
-                uint ql0_off = ql0_pos % 4;
-                uint ql0_word = bmq6k_weight[ql0_idx];
-                if (ql0_off != 0) { ql0_word = (ql0_word >> (ql0_off * 8)) | (bmq6k_weight[ql0_idx + 1] << (32 - ql0_off * 8)); }
-
-                uint ql32_pos = ql_off + 32 + l;
-                uint ql32_idx = ql32_pos / 4;
-                uint ql32_off = ql32_pos % 4;
-                uint ql32_word = bmq6k_weight[ql32_idx];
-                if (ql32_off != 0) { ql32_word = (ql32_word >> (ql32_off * 8)) | (bmq6k_weight[ql32_idx + 1] << (32 - ql32_off * 8)); }
-
-                uint qh_pos = qh_off + l;
-                uint qh_idx = qh_pos / 4;
-                uint qh_off2 = qh_pos % 4;
-                uint qh_word = bmq6k_weight[qh_idx];
-                if (qh_off2 != 0) { qh_word = (qh_word >> (qh_off2 * 8)) | (bmq6k_weight[qh_idx + 1] << (32 - qh_off2 * 8)); }
-
-                for (uint k = 0; k < 4; k++) {
-                    uint ql0_b = (ql0_word >> (k * 8)) & 0xFFu;
-                    uint ql32_b = (ql32_word >> (k * 8)) & 0xFFu;
-                    uint qh_b = (qh_word >> (k * 8)) & 0xFFu;
-                    int q1 = int((ql0_b & 0xFu) | (((qh_b >> 0) & 3u) << 4)) - 32;
-                    int q2 = int((ql32_b & 0xFu) | (((qh_b >> 2) & 3u) << 4)) - 32;
-                    int q3 = int(((ql0_b >> 4) & 0xFu) | (((qh_b >> 4) & 3u) << 4)) - 32;
-                    int q4 = int(((ql32_b >> 4) & 0xFu) | (((qh_b >> 6) & 3u) << 4)) - 32;
-                    sum += ds1 * float(q1) * bmq6k_input[input_base + elem_off + l + k];
-                    sum += ds2 * float(q2) * bmq6k_input[input_base + elem_off + l + k + 32];
-                    sum += ds3 * float(q3) * bmq6k_input[input_base + elem_off + l + k + 64];
-                    sum += ds4 * float(q4) * bmq6k_input[input_base + elem_off + l + k + 96];
-                }
-            }
-        }
+        uint col = b * 256 + gi;
+        sum0 += w * bmq6k_input[pos_base * bmq6k_pc.in_dim + col];
+        if (pos_base + 1 < bmq6k_pc.seq_len)
+            sum1 += w * bmq6k_input[(pos_base + 1) * bmq6k_pc.in_dim + col];
+        if (pos_base + 2 < bmq6k_pc.seq_len)
+            sum2 += w * bmq6k_input[(pos_base + 2) * bmq6k_pc.in_dim + col];
+        if (pos_base + 3 < bmq6k_pc.seq_len)
+            sum3 += w * bmq6k_input[(pos_base + 3) * bmq6k_pc.in_dim + col];
     }
 
-    bmq6k_shared[gi] = sum;
+    // Sequential tree reductions for each tiled position
+    bmq6k_shared[gi] = sum0;
     GroupMemoryBarrierWithGroupSync();
     for (uint s = 128; s > 0; s >>= 1) {
         if (gi < s) bmq6k_shared[gi] += bmq6k_shared[gi + s];
         GroupMemoryBarrierWithGroupSync();
     }
-    if (gi == 0) {
-        bmq6k_output[pos * bmq6k_pc.out_dim + row] = bmq6k_shared[0];
+    if (gi == 0)
+        bmq6k_output[pos_base * bmq6k_pc.out_dim + row] = bmq6k_shared[0];
+
+    bmq6k_shared[gi] = sum1;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq6k_shared[gi] += bmq6k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (gi == 0 && pos_base + 1 < bmq6k_pc.seq_len)
+        bmq6k_output[(pos_base + 1) * bmq6k_pc.out_dim + row] = bmq6k_shared[0];
+
+    bmq6k_shared[gi] = sum2;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq6k_shared[gi] += bmq6k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pos_base + 2 < bmq6k_pc.seq_len)
+        bmq6k_output[(pos_base + 2) * bmq6k_pc.out_dim + row] = bmq6k_shared[0];
+
+    bmq6k_shared[gi] = sum3;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq6k_shared[gi] += bmq6k_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0 && pos_base + 3 < bmq6k_pc.seq_len)
+        bmq6k_output[(pos_base + 3) * bmq6k_pc.out_dim + row] = bmq6k_shared[0];
 }

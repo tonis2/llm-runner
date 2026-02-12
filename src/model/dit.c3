@@ -498,12 +498,16 @@ fn void dispatch_batch_matmul(
 ) {
     BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
     ComputeKernel* kernel;
+    bool tiled = false;
     if (weight.dtype == GGML_Q4_K) {
         kernel = &dk.batch_matmul_q4k;
+        tiled = true;
     } else if (weight.dtype == GGML_Q5_K) {
         kernel = &dk.batch_matmul_q5k;
+        tiled = true;
     } else if (weight.dtype == GGML_Q6_K) {
         kernel = &dk.batch_matmul_q6k;
+        tiled = true;
     } else if (weight.dtype == GGML_Q8_0) {
         kernel = &dk.batch_matmul_q8;
     } else if (weight.dtype == GGML_Q4_0) {
@@ -511,10 +515,11 @@ fn void dispatch_batch_matmul(
     } else {
         kernel = &dk.batch_matmul;
     }
+    uint groups = tiled ? ((seq_len + 3) / 4) * out_dim : seq_len * out_dim;
     dispatch_kernel(cmd, kernel,
         { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
         { weight.size_bytes, input.size_bytes, output.size_bytes },
-        &pc, seq_len * out_dim);
+        &pc, groups);
 }
 
 // Run a single DiT transformer layer using batch matmul
