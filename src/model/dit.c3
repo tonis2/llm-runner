@@ -593,9 +593,6 @@ fn void? dit_transformer_layer(
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
     compute_barrier(cmd);
 
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
-
     // === Phase C: Head norm + Transpose + Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
@@ -633,9 +630,6 @@ fn void? dit_transformer_layer(
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total_elems * 4 }});
     compute_barrier(cmd);
 
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
-
     // Spatial attention (non-causal)
     float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
     SpatialAttentionPC sa_pc = {
@@ -672,9 +666,6 @@ fn void? dit_transformer_layer(
         { hidden.size_bytes, a.buf_a.size_bytes },
         &res_pc, ceil_div(seq_len * dim, 256));
     compute_barrier(cmd);
-
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
 
     // === Phase E: FFN norm ===
     if (has_adaln) {
@@ -740,9 +731,6 @@ fn void? dit_transformer_layer(
         { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
         &emul_pc, ceil_div(seq_len * DIT_FFN_DIM, 256));
     compute_barrier(cmd);
-
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
 
     // Down projection
     dispatch_batch_matmul(cmd, dk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM, seq_len, 0);
@@ -860,9 +848,11 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         io::printfn("  DiT layer %d/%d (seq=%d)...", l + 1, DIT_NUM_LAYERS, total_seq);
         dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, n_patches, true)!!;
 
-        // Submit after every layer
-        submit_and_wait(ctx)!!;
-        begin_compute(cmd)!!;
+        // Submit every 2 layers to avoid GPU watchdog timeout
+        if ((l + 1) % 2 == 0 || l == DIT_NUM_LAYERS - 1) {
+            submit_and_wait(ctx)!!;
+            begin_compute(cmd)!!;
+        }
     }
 
     // 7. Final layer: extract image portion, adaLN modulate, linear projection
@@ -905,30 +895,17 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         &final_mod_pc, ceil_div(n_patches * dim, 256));
     compute_barrier(cmd);
 
-    // Final linear: [dim] -> [patch_dim] per position
-    for (uint pos = 0; pos < n_patches; pos++) {
-        usz in_off = (usz)pos * dim * 4;
-        vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)dim * 4 }});
-        compute_barrier(cmd);
+    // Final linear: batch matmul [n_patches, dim] -> [n_patches, patch_dim] + bias
+    dispatch_batch_matmul(cmd, dk, &w.final_linear, &a.buf_a, &a.velocity, DIT_PATCH_DIM, dim, n_patches, 0);
+    compute_barrier(cmd);
 
-        // matmul: [patch_dim, dim] @ norm_out [dim] -> [patch_dim]
-        dispatch_matmul(cmd, sk, &w.final_linear, &a.norm_out, &a.buf_c, DIT_PATCH_DIM, dim);
-        compute_barrier(cmd);
-
-        // Add bias
-        BroadcastAddDimPC bias_pc = { .n_total = DIT_PATCH_DIM, .dim = DIT_PATCH_DIM };
-        dispatch_kernel(cmd, &dk.broadcast_add_dim,
-            { a.buf_c.gpu_buffer.buffer, w.final_bias.gpu_buffer.buffer },
-            { (usz)DIT_PATCH_DIM * 4, w.final_bias.size_bytes },
-            &bias_pc, ceil_div(DIT_PATCH_DIM, 256));
-        compute_barrier(cmd);
-
-        vk::cmdCopyBuffer(cmd, a.buf_c.gpu_buffer.buffer, a.velocity.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (usz)pos * DIT_PATCH_DIM * 4,
-                             .size = (ulong)DIT_PATCH_DIM * 4 }});
-        compute_barrier(cmd);
-    }
+    // Add bias (broadcast [patch_dim] across all patches)
+    BroadcastAddDimPC bias_pc = { .n_total = n_patches * DIT_PATCH_DIM, .dim = DIT_PATCH_DIM };
+    dispatch_kernel(cmd, &dk.broadcast_add_dim,
+        { a.velocity.gpu_buffer.buffer, w.final_bias.gpu_buffer.buffer },
+        { a.velocity.size_bytes, w.final_bias.size_bytes },
+        &bias_pc, ceil_div(n_patches * DIT_PATCH_DIM, 256));
+    compute_barrier(cmd);
 
     // 8. Unpatchify velocity -> [16, h, w]
     UnpatchifyPC unpatch_pc = {
