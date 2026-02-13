@@ -28,7 +28,7 @@ const uint DIT_T_MLP_DIM = 1024;  // t_embedder MLP intermediate dim
 // mRoPE config (from Z-Image-Turbo config.json)
 const float DIT_ROPE_THETA = 256.0;
 const uint[3] DIT_ROPE_AXES_DIM = { 32, 48, 48 };  // text, height, width
-const float DIT_T_SCALE = 1.0;  // Raw sigma, no scaling (flow matching uses [0,1])
+const float DIT_T_PERIOD = 1000.0;  // Maps sigma [0,1] to model timestep [1000,0]
 
 // --- Push constant structs for Z-Image shaders ---
 
@@ -913,6 +913,37 @@ fn void? dit_transformer_layer(
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = (ulong)dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 }});
         compute_barrier(cmd);
+
+        // Debug: dump adaln modulation values for first call
+        if (profiling) {
+            submit_and_wait(ctx)!!;
+            vk::Memory adaln_stg = vk::new_buffer(
+                allocator: &ctx.allocator,
+                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                data: null, data_size: (usz)4 * dim * 4,
+            )!!;
+            begin_compute(cmd)!!;
+            vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, adaln_stg.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)4 * dim * 4 }});
+            submit_and_wait(ctx)!!;
+            float* ap = (float*)adaln_stg.data();
+            String[4] names = { "scale_msa", "gate_msa", "scale_mlp", "gate_mlp" };
+            for (uint c = 0; c < 4; c++) {
+                float cmin = ap[c*dim]; float cmax = cmin; float csum = 0; float csq = 0;
+                for (uint i = 0; i < dim; i++) {
+                    float v = ap[c * dim + i];
+                    if (v < cmin) { cmin = v; }
+                    if (v > cmax) { cmax = v; }
+                    csum += v; csq += v * v;
+                }
+                float cmean = csum / (float)dim;
+                io::printfn("      adaln[%s]: min=%.4f max=%.4f mean=%.4f std=%.4f",
+                    names[c], cmin, cmax, cmean, math::sqrt(csq / (float)dim - cmean * cmean));
+            }
+            adaln_stg.free();
+            begin_compute(cmd)!!;
+        }
     }
 
     // Pre-attention RMSNorm: all tokens get same norm1
@@ -1220,8 +1251,9 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after x_embedder")!!;
     begin_compute(cmd)!!;
 
-    // 3. Timestep embedding (scaled by t_scale=1000)
-    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = timestep * DIT_T_SCALE };
+    // 3. Timestep embedding: convert sigma [0,1] to model timestep [1000,0]
+    // KoboldCpp: timestep = 1000 - sigma_to_t(sigma) = 1000 - sigma*1000 = 1000*(1-sigma)
+    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = DIT_T_PERIOD * (1.0 - timestep) };
     dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
         { a.t_emb.size_bytes },
@@ -1255,13 +1287,37 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
         &t_mlp2_pc, DIT_T_EMB_DIM);
     compute_barrier(cmd);
 
-    // Pre-apply SiLU to t_emb (all adaLN modulations use Sequential(SiLU(), Linear(...)))
-    SiluPC t_silu_pc = { .n = DIT_T_EMB_DIM };
-    dispatch_kernel(cmd, &sk.silu,
-        { a.t_emb.gpu_buffer.buffer },
-        { a.t_emb.size_bytes },
-        &t_silu_pc, ceil_div(DIT_T_EMB_DIM, 256));
-    compute_barrier(cmd);
+    // NOTE: No SiLU here — JointTransformerBlock's adaLN uses t_emb directly (weight at .0)
+    // Only FinalLayer applies SiLU before its adaLN Linear (weight at .1 in Sequential(SiLU, Linear))
+
+    // Debug: readback t_emb after MLP + SiLU
+    if (dit_profile_layer) {
+        submit_and_wait(ctx)!!;
+        vk::Memory t_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)DIT_T_EMB_DIM * 4,
+        )!!;
+        begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.t_emb.gpu_buffer.buffer, t_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
+        submit_and_wait(ctx)!!;
+        float* t_data = (float*)t_stg.data();
+        io::printf("  [DBG] t_emb (after MLP+SiLU, 256d): first10=[");
+        float t_min = t_data[0]; float t_max = t_data[0]; float t_sum = 0; float t_sq = 0;
+        for (uint i = 0; i < DIT_T_EMB_DIM; i++) {
+            if (i < 10) { io::printf("%.4f ", t_data[i]); }
+            if (t_data[i] < t_min) { t_min = t_data[i]; }
+            if (t_data[i] > t_max) { t_max = t_data[i]; }
+            t_sum += t_data[i]; t_sq += t_data[i] * t_data[i];
+        }
+        io::printfn("] min=%.4f max=%.4f mean=%.4f std=%.4f",
+            t_min, t_max, t_sum / DIT_T_EMB_DIM,
+            math::sqrt(t_sq / DIT_T_EMB_DIM - (t_sum / DIT_T_EMB_DIM) * (t_sum / DIT_T_EMB_DIM)));
+        t_stg.free();
+        begin_compute(cmd)!!;
+    }
 
     // Save debug flag before noise refiner consumes it
     bool want_layer_debug = dit_profile_layer;
@@ -1338,13 +1394,25 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     io::printn("");
 
     // 7. Final layer: extract REAL image tokens (first n_patches), skip padding
-    // Final adaLN: t_emb (already SiLU'd) @ weight + bias -> [dim] scale
+    // FinalLayer adaLN: Sequential(SiLU(), Linear) — weight at .1, so apply SiLU to t_emb first
+    // Use t_emb_mlp as temp buffer for SiLU(t_emb) (safe: t_emb_mlp not used after MLP phase)
+    vk::cmdCopyBuffer(cmd, a.t_emb.gpu_buffer.buffer, a.t_emb_mlp.gpu_buffer.buffer, 1,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
+    compute_barrier(cmd);
+    SiluPC final_silu_pc = { .n = DIT_T_EMB_DIM };
+    dispatch_kernel(cmd, &sk.silu,
+        { a.t_emb_mlp.gpu_buffer.buffer },
+        { a.t_emb_mlp.size_bytes },
+        &final_silu_pc, ceil_div(DIT_T_EMB_DIM, 256));
+    compute_barrier(cmd);
+
+    // Final adaLN: SiLU(t_emb) @ weight + bias -> [dim] scale
     LinearProjPC final_adaln_pc = { .out_dim = dim, .in_dim = DIT_T_EMB_DIM, .seq_len = 1 };
     dispatch_kernel(cmd, &dk.linear_proj,
         { w.final_adaln_linear.gpu_buffer.buffer, w.final_adaln_bias.gpu_buffer.buffer,
-          a.t_emb.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer },
+          a.t_emb_mlp.gpu_buffer.buffer, a.adaln_scale.gpu_buffer.buffer },
         { w.final_adaln_linear.size_bytes, w.final_adaln_bias.size_bytes,
-          a.t_emb.size_bytes, a.adaln_scale.size_bytes },
+          a.t_emb_mlp.size_bytes, a.adaln_scale.size_bytes },
         &final_adaln_pc, dim);
     compute_barrier(cmd);
 

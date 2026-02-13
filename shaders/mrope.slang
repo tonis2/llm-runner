@@ -3,9 +3,9 @@
 // Applies RoPE to Q or K in [n_heads, seq_len, head_dim] layout
 // Uses precomputed cos/sin tables of shape [seq_len, head_dim/2]
 // INTERLEAVED format: pair j rotates (x[2j], x[2j+1])
-// Rotation convention matches KoboldCpp rope.hpp apply_rope(rope_interleaved=true):
-//   out[2j]   =  x[2j]*cos + x[2j+1]*sin
-//   out[2j+1] = -x[2j]*sin + x[2j+1]*cos
+// Rotation convention matches KoboldCpp rope.hpp apply_rope (standard RoPE e^{+iθ}):
+//   out[2j]   =  x[2j]*cos - x[2j+1]*sin
+//   out[2j+1] =  x[2j]*sin + x[2j+1]*cos
 // Dispatched as 2D: gid.x = pair index (0..63), gid.y = head*seq_len + pos
 
 struct MRoPEParams {

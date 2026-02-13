@@ -208,6 +208,7 @@ fn int main(String[] args) {
         ctx.allocator.queue = &ctx.compute_queue;
         defer ctx.free();
 
+        float zimage_cfg = cfg_scale == 1.0f ? 7.0f : cfg_scale;  // Default 7.0 for Z-Image
         ZImageParams zparams = {
             .num_steps = diff_steps,
             .seed = (uint)seed,
@@ -216,6 +217,7 @@ fn int main(String[] args) {
             .taesd_path = taesd_path,
             .text_model_path = text_model_path,
             .image_size = image_size,
+            .cfg_scale = zimage_cfg,
         };
 
         bool ok = run_zimage_pipeline(&ctx, &gf, prompt, &zparams);

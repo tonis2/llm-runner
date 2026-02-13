@@ -755,6 +755,89 @@ fn uint[]? Tokenizer.encode_bpe(&self, String text) {
     return result;
 }
 
+// Find a special/control token by its string representation.
+// Scans the full vocabulary (O(n)) — call sparingly, cache results.
+fn uint Tokenizer.find_special_token(&self, String text) {
+    for (usz i = 0; i < self.vocab_size; i++) {
+        if (self.token_types[i] == TOKEN_CONTROL && self.vocab[i] == text) {
+            return (uint)i;
+        }
+    }
+    return 0;
+}
+
+// Encode text containing special token patterns (e.g. <|im_start|>, <|im_end|>).
+// Splits input around special tokens, BPE-encodes regular segments, inserts special token IDs.
+fn uint[]? Tokenizer.encode_with_specials(&self, String text) {
+    if (text.len == 0) return mem::new_array(uint, 0);
+
+    // Find special token IDs (cached per call — fast enough for one-time use)
+    uint im_start_id = self.find_special_token("<|im_start|>");
+    uint im_end_id = self.find_special_token("<|im_end|>");
+
+    // Max possible output tokens
+    uint[] result = mem::new_array(uint, text.len + 32);
+    usz n = 0;
+    usz pos = 0;
+
+    while (pos < text.len) {
+        usz remaining = text.len - pos;
+
+        // Check for <|im_start|> (12 chars)
+        if (remaining >= 12 && im_start_id != 0) {
+            String candidate = (String)text[pos..pos + 11];
+            if (candidate == "<|im_start|>") {
+                result[n] = im_start_id;
+                n++;
+                pos += 12;
+                continue;
+            }
+        }
+
+        // Check for <|im_end|> (10 chars)
+        if (remaining >= 10 && im_end_id != 0) {
+            String candidate = (String)text[pos..pos + 9];
+            if (candidate == "<|im_end|>") {
+                result[n] = im_end_id;
+                n++;
+                pos += 10;
+                continue;
+            }
+        }
+
+        // Find end of regular text segment (next special token or end)
+        usz seg_end = pos + 1;
+        while (seg_end < text.len) {
+            usz rem = text.len - seg_end;
+            if (rem >= 12 && im_start_id != 0) {
+                String c2 = (String)text[seg_end..seg_end + 11];
+                if (c2 == "<|im_start|>") break;
+            }
+            if (rem >= 10 && im_end_id != 0) {
+                String c2 = (String)text[seg_end..seg_end + 9];
+                if (c2 == "<|im_end|>") break;
+            }
+            seg_end++;
+        }
+
+        // Tokenize the regular segment
+        String segment = (String)text[pos..seg_end - 1];
+        uint[] seg_tokens = self.encode(segment)!;
+        for (usz i = 0; i < seg_tokens.len; i++) {
+            result[n] = seg_tokens[i];
+            n++;
+        }
+        mem::free(seg_tokens);
+        pos = seg_end;
+    }
+
+    // Trim to actual size
+    uint[] trimmed = mem::new_array(uint, n);
+    for (usz i = 0; i < n; i++) trimmed[i] = result[i];
+    mem::free(result);
+    return trimmed;
+}
+
 fn void Tokenizer.free(&self) {
     if (self.vocab.len > 0) mem::free(self.vocab);
     if (self.token_types.len > 0) mem::free(self.token_types);
