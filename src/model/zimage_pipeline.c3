@@ -588,7 +588,7 @@ fn bool run_zimage_pipeline(
         io::printfn("  [DBG] raw latent ch0-2: min=%.4f max=%.4f", vmin, vmax);
         float range = vmax - vmin;
         if (range < 1e-6f) range = 1.0f;
-        // Write PPM using same pattern as save_ppm
+        // Write PNG using same pattern as save_png
         Image lat_img = {
             .width = lat_w, .height = lat_h, .channels = 3,
             .data = mem::new_array(float, (usz)3 * spatial),
@@ -600,9 +600,9 @@ fn bool run_zimage_pipeline(
                 lat_img.data[ch * spatial + i] = v;
             }
         }
-        save_ppm(&lat_img, "latent_raw.ppm");
+        save_png(&lat_img, "latent_raw.png");
         mem::free(lat_img.data);
-        io::printfn("  Raw latent saved: latent_raw.ppm (%dx%d)", lat_w, lat_h);
+        io::printfn("  Raw latent saved: latent_raw.png (%dx%d)", lat_w, lat_h);
         lat_dbg.free();
     }
 
@@ -703,7 +703,7 @@ fn bool run_zimage_pipeline(
             io::printfn("  [DEBUG] pixels: min=%.4f max=%.4f mean=%.4f nan=%d", p_min, p_max, p_sum / (float)total_px, p_nan);
         }
 
-        bool ok = save_ppm(&img, params.output_path);
+        bool ok = save_png(&img, params.output_path);
         img.free();
 
         // Cleanup

@@ -201,7 +201,7 @@ fn bool DiffusionPipeline.txt2img(&self, Tokenizer* tokenizer, String prompt, Di
     Image img = download_image_from_gpu(self.ctx, &self.vae_acts.buf_a, 512, 512, 3)!!;
 
     // Save
-    bool ok = save_ppm(&img, params.output_path);
+    bool ok = save_png(&img, params.output_path);
     img.free();
 
     if (ok) {
@@ -219,7 +219,7 @@ fn bool DiffusionPipeline.img2img(&self, Tokenizer* tokenizer, String prompt, St
     io::printfn("  Strength: %.2f, Steps: %d", params.strength, params.num_steps);
 
     // 1. Load input image
-    Image input_img = load_ppm(input_path)!!;
+    Image input_img = load_png(input_path)!!;
     if (input_img.width != 512 || input_img.height != 512) {
         io::printfn("Error: Input image must be 512x512 (got %dx%d)", input_img.width, input_img.height);
         input_img.free();
@@ -326,7 +326,7 @@ fn bool DiffusionPipeline.img2img(&self, Tokenizer* tokenizer, String prompt, St
     self.vae_decoder.forward(&self.vae_acts)!!;
 
     Image img = download_image_from_gpu(self.ctx, &self.vae_acts.buf_a, 512, 512, 3)!!;
-    bool ok = save_ppm(&img, params.output_path);
+    bool ok = save_png(&img, params.output_path);
     img.free();
 
     if (ok) {

@@ -1251,9 +1251,9 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after x_embedder")!!;
     begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: convert sigma [0,1] to model timestep [1000,0]
-    // KoboldCpp: timestep = 1000 - sigma_to_t(sigma) = 1000 - sigma*1000 = 1000*(1-sigma)
-    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = DIT_T_PERIOD * (1.0 - timestep) };
+    // 3. Timestep embedding: sigma is already in [0,1], map to timestep [0,1000]
+    // sigma=1.0 (fully noisy) -> timestep=1000, sigma=0.0 (fully denoised) -> timestep=0
+    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = DIT_T_PERIOD * timestep };
     dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
         { a.t_emb.size_bytes },
@@ -1490,17 +1490,10 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     compute_barrier(cmd);
 
     // Copy unpatchified velocity back to velocity buffer (for Euler step)
+    // Note: No negation needed - flow matching predicts velocity from noise->data,
+    // and Euler step x = x + dt * v with negative dt naturally moves noise->data
     vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.velocity.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_total * 4 }});
-    compute_barrier(cmd);
-
-    // Negate velocity: model predicts (x_0 - noise), Euler step expects (noise - x_0)
-    // Reference: KoboldCpp z_image.hpp forward() applies ggml_ext_scale(out, -1.f)
-    ScalePC neg_pc = { .n = latent_total, .scale = -1.0f };
-    dispatch_kernel(cmd, &dk.scale_buffer,
-        { a.velocity.gpu_buffer.buffer },
-        { a.velocity.size_bytes },
-        &neg_pc, ceil_div(latent_total, 256));
 
     submit_and_wait(ctx)!!;
     double final_sec = phase_start.to_now().to_sec();

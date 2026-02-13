@@ -3,9 +3,11 @@ module llm;
 import std::io;
 import std::io::file;
 import std::core::mem;
+import image;
+import image::png;
 import vk;
 
-// PPM Image I/O (P6 binary format - no external dependencies)
+// Image I/O using image.c3l (PNG format)
 
 struct Image {
     uint width;
@@ -14,44 +16,12 @@ struct Image {
     float[] data;   // [channels, height, width] NCHW layout
 }
 
-// --- Save image to PPM ---
+// --- Save image to PNG ---
 
-fn bool save_ppm(Image* img, String filename) {
-    // Write P6 binary PPM
-    File f = file::open(filename, "wb")!!;
-    defer (void)f.close();
-
-    // PPM header
-    char[64] header_buf;
-    usz hlen = 0;
-    // "P6\n"
-    header_buf[hlen] = 'P'; hlen++;
-    header_buf[hlen] = '6'; hlen++;
-    header_buf[hlen] = '\n'; hlen++;
-
-    // Width
-    uint w = img.width;
-    char[16] num_buf;
-    usz nlen = uint_to_str(w, &num_buf);
-    for (usz i = 0; i < nlen; i++) { header_buf[hlen] = num_buf[i]; hlen++; }
-    header_buf[hlen] = ' '; hlen++;
-
-    // Height
-    nlen = uint_to_str(img.height, &num_buf);
-    for (usz i = 0; i < nlen; i++) { header_buf[hlen] = num_buf[i]; hlen++; }
-    header_buf[hlen] = '\n'; hlen++;
-
-    // Max val
-    header_buf[hlen] = '2'; hlen++;
-    header_buf[hlen] = '5'; hlen++;
-    header_buf[hlen] = '5'; hlen++;
-    header_buf[hlen] = '\n'; hlen++;
-
-    f.write(header_buf[0..hlen - 1])!!;
-
-    // Pixel data: convert NCHW float [0,1] to interleaved RGB bytes
+fn bool save_png(Image* img, String filename) {
+    // Convert NCHW float [0,1] to interleaved RGB bytes for PNG
     uint total_pixels = img.width * img.height;
-    char[] rgb_data = mem::new_array(char, (usz)total_pixels * 3);
+    char[] pixels = mem::new_array(char, (usz)total_pixels * 3);
 
     for (uint y = 0; y < img.height; y++) {
         for (uint x = 0; x < img.width; x++) {
@@ -61,93 +31,61 @@ fn bool save_ppm(Image* img, String filename) {
                 // Clamp to [0, 1]
                 if (val < 0.0f) val = 0.0f;
                 if (val > 1.0f) val = 1.0f;
-                rgb_data[pixel_idx * 3 + c] = (char)(val * 255.0f + 0.5f);
+                pixels[pixel_idx * 3 + c] = (char)(val * 255.0f + 0.5f);
             }
         }
     }
 
-    f.write(rgb_data)!!;
-    mem::free(rgb_data);
+    // Create image struct for image.c3l
+    image::Image png_img = {
+        .width = img.width,
+        .height = img.height,
+        .bit_depth = 8,
+        .format = PixelFormat.RGB,
+        .pixels = pixels,
+    };
+
+    // Save as PNG
+    png::save_file(&png_img, filename)!!;
+    mem::free(pixels);
 
     io::printfn("Image saved: %s (%dx%d)", filename, img.width, img.height);
     return true;
 }
 
-// --- Load image from PPM ---
+// --- Load image from PNG ---
 
-fn Image? load_ppm(String filename) {
-    char[] data = file::load(mem, filename)!!;
+fn Image? load_png(String filename) {
+    image::Image png_img = png::load_file(filename)!!;
+    defer png_img.free();
 
-    // Parse P6 header
-    usz pos = 0;
-
-    // Skip "P6\n" or "P6 "
-    if (data.len < 3 || data[0] != 'P' || data[1] != '6') {
-        io::printfn("Error: Not a P6 PPM file");
-        return COMPUTE_ERROR~;
-    }
-    pos = 2;
-    while (pos < data.len && (data[pos] == '\n' || data[pos] == '\r' || data[pos] == ' ')) pos++;
-
-    // Skip comments
-    while (pos < data.len && data[pos] == '#') {
-        while (pos < data.len && data[pos] != '\n') pos++;
-        pos++;
-    }
-
-    // Read width
-    uint width = 0;
-    while (pos < data.len && data[pos] >= '0' && data[pos] <= '9') {
-        width = width * 10 + (uint)(data[pos] - '0');
-        pos++;
-    }
-    while (pos < data.len && (data[pos] == ' ' || data[pos] == '\n' || data[pos] == '\r')) pos++;
-
-    // Read height
-    uint height = 0;
-    while (pos < data.len && data[pos] >= '0' && data[pos] <= '9') {
-        height = height * 10 + (uint)(data[pos] - '0');
-        pos++;
-    }
-    while (pos < data.len && (data[pos] == ' ' || data[pos] == '\n' || data[pos] == '\r')) pos++;
-
-    // Read maxval
-    uint maxval = 0;
-    while (pos < data.len && data[pos] >= '0' && data[pos] <= '9') {
-        maxval = maxval * 10 + (uint)(data[pos] - '0');
-        pos++;
-    }
-    pos++;  // skip single whitespace after maxval
-
-    if (width == 0 || height == 0 || maxval == 0) {
-        io::printfn("Error: Invalid PPM header");
+    if (png_img.format != PixelFormat.RGB && png_img.format != PixelFormat.RGBA) {
+        io::printfn("Error: Only RGB and RGBA PNG images supported");
         return COMPUTE_ERROR~;
     }
 
-    // Read pixel data
-    uint total_pixels = width * height;
-    float[] img_data = mem::new_array(float, (usz)total_pixels * 3);
+    uint channels = (uint)(png_img.format == PixelFormat.RGBA ? 4 : 3);
+    uint total_pixels = png_img.width * png_img.height;
+    float[] img_data = mem::new_array(float, (usz)total_pixels * channels);
 
-    float scale = 1.0f / (float)maxval;
-    for (uint y = 0; y < height; y++) {
-        for (uint x = 0; x < width; x++) {
-            uint pixel_idx = y * width + x;
-            for (uint c = 0; c < 3; c++) {
-                if (pos < data.len) {
-                    img_data[c * total_pixels + pixel_idx] = (float)(uint)data[pos] * scale;
-                    pos++;
-                }
+    usz bpp = (usz)png_img.bytes_per_pixel();
+    
+    for (uint y = 0; y < png_img.height; y++) {
+        for (uint x = 0; x < png_img.width; x++) {
+            uint pixel_idx = y * png_img.width + x;
+            for (uint c = 0; c < channels; c++) {
+                char val = png_img.pixels[(usz)pixel_idx * bpp + c];
+                img_data[c * total_pixels + pixel_idx] = (float)(uint)val / 255.0f;
             }
         }
     }
 
-    mem::free(data);
-    io::printfn("Image loaded: %s (%dx%d)", filename, width, height);
+    io::printfn("Image loaded: %s (%dx%d)", filename, png_img.width, png_img.height);
 
     return {
-        .width = width,
-        .height = height,
-        .channels = 3,
+        .width = png_img.width,
+        .height = png_img.height,
+        .channels = channels,
         .data = img_data,
     };
 }
@@ -207,28 +145,6 @@ fn Image? download_image_from_gpu(DeviceContext* ctx, Tensor* tensor, uint width
         .channels = channels,
         .data = data,
     };
-}
-
-// --- Helper: uint to string ---
-
-fn usz uint_to_str(uint val, char[16]* buf) {
-    if (val == 0) {
-        (*buf)[0] = '0';
-        return 1;
-    }
-    char[16] tmp;
-    usz len = 0;
-    uint v = val;
-    while (v > 0) {
-        tmp[len] = (char)('0' + v % 10);
-        v /= 10;
-        len++;
-    }
-    // Reverse
-    for (usz i = 0; i < len; i++) {
-        (*buf)[i] = tmp[len - 1 - i];
-    }
-    return len;
 }
 
 // --- Free ---

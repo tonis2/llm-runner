@@ -8,6 +8,7 @@ import std::math::random;
 import std::time::clock;
 import std::encoding::json;
 import std::collections::object;
+import image;
 
 enum RunMode : char { LLM, TXT2IMG, IMG2IMG }
 
@@ -42,7 +43,7 @@ fn int main(String[] args) {
         io::printfn("  --steps    Number of diffusion steps (default 1)");
         io::printfn("  --cfg-scale  Classifier-free guidance scale (default 1.0)");
         io::printfn("  --seed     Random seed (default 42)");
-        io::printfn("  --output   Output image path (default output.ppm)");
+        io::printfn("  --output   Output image path (default output.png)");
         io::printfn("  --input    Input image for img2img mode");
         io::printfn("  --vae        Path to VAE safetensors (for DiT models)");
         io::printfn("  --taesd      Path to TAESD safetensors (lightweight VAE alternative)");
@@ -63,7 +64,7 @@ fn int main(String[] args) {
     uint diff_steps = 1;
     float cfg_scale = 1.0f;
     ulong seed = 42;
-    String output_path = "output.ppm";
+    String output_path = "output.png";
     String input_path = "";
     String vae_path = "";
     String taesd_path = "";
