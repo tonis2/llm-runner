@@ -16,6 +16,72 @@ struct Image {
     float[] data;   // [channels, height, width] NCHW layout
 }
 
+// --- Save image to PPM (fallback format, no compression) ---
+
+// Helper: convert uint to string, returns number of chars written
+fn uint uint_to_str(uint n, char* buf) {
+    if (n == 0) { buf[0] = '0'; return 1; }
+    char[16] temp;
+    uint i = 0;
+    while (n > 0) { temp[i++] = (char)('0' + (n % 10)); n /= 10; }
+    uint j = 0;
+    while (i > 0) { buf[j++] = temp[--i]; }
+    return j;
+}
+
+fn bool save_ppm(Image* img, String filename) {
+    // Convert NCHW float [0,1] to interleaved RGB bytes
+    uint total_pixels = img.width * img.height;
+    char[] pixels = mem::new_array(char, (usz)total_pixels * 3);
+
+    for (uint y = 0; y < img.height; y++) {
+        for (uint x = 0; x < img.width; x++) {
+            uint pixel_idx = y * img.width + x;
+            for (uint c = 0; c < 3; c++) {
+                float val = img.data[c * total_pixels + pixel_idx];
+                // Clamp to [0, 1]
+                if (val < 0.0f) val = 0.0f;
+                if (val > 1.0f) val = 1.0f;
+                pixels[pixel_idx * 3 + c] = (char)(val * 255.0f + 0.5f);
+            }
+        }
+    }
+
+    // Build PPM header: "P6\n[width] [height]\n255\n"
+    char[] header = mem::new_array(char, 256);
+    uint header_len = 0;
+    char* h = header.ptr;
+    
+    // Build header
+    h[header_len++] = 'P';
+    h[header_len++] = '6';
+    h[header_len++] = '\n';
+    header_len += uint_to_str(img.width, &h[header_len]);
+    h[header_len++] = ' ';
+    header_len += uint_to_str(img.height, &h[header_len]);
+    h[header_len++] = '\n';
+    h[header_len++] = '2';
+    h[header_len++] = '5';
+    h[header_len++] = '5';
+    h[header_len++] = '\n';
+
+    // Write file
+    if (try f = io::file::open(filename, "wb")) {
+        f.write(header[:header_len])!!;
+        f.write(pixels)!!;
+        f.close()!!;
+        io::printfn("Image saved: %s (%dx%d) [PPM format]", filename, img.width, img.height);
+        mem::free(pixels);
+        mem::free(header);
+        return true;
+    }
+    
+    io::printfn("Error: failed to open %s for writing", filename);
+    mem::free(pixels);
+    mem::free(header);
+    return false;
+}
+
 // --- Save image to PNG ---
 
 fn bool save_png(Image* img, String filename) {
@@ -45,12 +111,27 @@ fn bool save_png(Image* img, String filename) {
         .pixels = pixels,
     };
 
-    // Save as PNG
-    png::save_file(&png_img, filename)!!;
+    // Save as PNG (with fallback to PPM on failure)
+    bool ok = false;
+    if (catch err = png::save_file(&png_img, filename)) {
+        io::printfn("  Warning: PNG save failed, trying PPM format...");
+        // Create PPM filename by appending .ppm extension
+        char[] ppm_name = mem::new_array(char, filename.len + 5);
+        mem::copy(ppm_name.ptr, filename.ptr, filename.len);
+        ppm_name[filename.len] = '.';
+        ppm_name[filename.len + 1] = 'p';
+        ppm_name[filename.len + 2] = 'p';
+        ppm_name[filename.len + 3] = 'm';
+        ppm_name[filename.len + 4] = '\0';
+        ok = save_ppm(img, (String)ppm_name);
+        mem::free(ppm_name);
+    } else {
+        ok = true;
+        io::printfn("Image saved: %s (%dx%d)", filename, img.width, img.height);
+    }
+    
     mem::free(pixels);
-
-    io::printfn("Image saved: %s (%dx%d)", filename, img.width, img.height);
-    return true;
+    return ok;
 }
 
 // --- Load image from PNG ---

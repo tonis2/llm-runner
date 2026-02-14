@@ -171,10 +171,11 @@ void linear_proj(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     if (seq_pos >= linear_proj_pc.seq_len || out_idx >= linear_proj_pc.out_dim) return;
 
     // Parallel dot product: each thread handles a stride of elements
+    // GGUF stores weights as [in_dim, out_dim], so access as weight[k, out_idx]
     float partial = 0.0;
     for (uint k = gi; k < linear_proj_pc.in_dim; k += 256) {
         partial += lp_input[seq_pos * linear_proj_pc.in_dim + k] *
-                   lp_weight[out_idx * linear_proj_pc.in_dim + k];
+                   lp_weight[k * linear_proj_pc.out_dim + out_idx];
     }
 
     // Tree reduction in shared memory
@@ -190,6 +191,87 @@ void linear_proj(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
     if (gi == 0) {
         lp_output[seq_pos * linear_proj_pc.out_dim + out_idx] = lp_shared[0] + lp_bias[out_idx];
+    }
+}
+
+// ============================================================
+// Linear Projection SIMPLIFIED + DEBUG VERSION
+// ============================================================
+// One workgroup per output row (seq_len workgroups total)
+// Each thread computes a subset of output columns using strided loop
+// Includes debug output buffer for validation
+
+[vk_binding(4, 0)] RWStructuredBuffer<uint> lp_debug;     // Debug buffer [seq_len, out_dim, 6] entries
+[vk_binding(5, 0)] RWStructuredBuffer<uint> lp_debug_count; // Atomic counter for debug entries
+
+struct LinearProjDebugEntry {
+    uint seq_pos;
+    uint out_idx;
+    uint thread_idx;
+    uint workgroup_id;
+    float value;
+    uint flags;
+};
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void linear_proj_debug(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    // gid.x = row index (sequence position)
+    uint seq_pos = gid.x;
+    
+    // Bounds check
+    if (seq_pos >= linear_proj_pc.seq_len) return;
+    
+    // Strided loop: thread gi computes columns gi, gi+256, gi+512, ...
+    for (uint out_idx = gi; out_idx < linear_proj_pc.out_dim; out_idx += 256) {
+        // Compute dot product for this output element
+        float sum = 0.0;
+        for (uint k = 0; k < linear_proj_pc.in_dim; k++) {
+            float input_val = lp_input[seq_pos * linear_proj_pc.in_dim + k];
+            // Weight layout: [in_dim, out_dim] from GGUF
+            float weight_val = lp_weight[k * linear_proj_pc.out_dim + out_idx];
+            sum += input_val * weight_val;
+        }
+        
+        float result = sum + lp_bias[out_idx];
+        uint output_idx = seq_pos * linear_proj_pc.out_dim + out_idx;
+        lp_output[output_idx] = result;
+        
+        // Debug logging for first workgroup and first few outputs
+        if (seq_pos < 2 && out_idx < 10 && gi < 2) {
+            uint debug_idx = 0;
+            if (lp_debug_count[0] < 100) {
+                InterlockedAdd(lp_debug_count[0], 10, debug_idx);
+                if (debug_idx + 9 < 1000) {  // Max 100 entries * 10 uints
+                    lp_debug[debug_idx + 0] = seq_pos;
+                    lp_debug[debug_idx + 1] = out_idx;
+                    lp_debug[debug_idx + 2] = gi;
+                    lp_debug[debug_idx + 3] = gid.x;
+                    // Store float as bits
+                    lp_debug[debug_idx + 4] = asuint(result);
+                    // First weight value accessed (k=0)
+                    float first_weight = lp_weight[0 * linear_proj_pc.out_dim + out_idx];
+                    lp_debug[debug_idx + 5] = asuint(first_weight);
+                    // First input value accessed (k=0)
+                    float first_input = lp_input[seq_pos * linear_proj_pc.in_dim + 0];
+                    lp_debug[debug_idx + 6] = asuint(first_input);
+                    // Input access index for k=0
+                    lp_debug[debug_idx + 7] = seq_pos * linear_proj_pc.in_dim + 0;
+                    // Validation flags
+                    uint flags = 0;
+                    if (seq_pos >= linear_proj_pc.seq_len) flags |= 1;
+                    if (out_idx >= linear_proj_pc.out_dim) flags |= 2;
+                    if (output_idx >= linear_proj_pc.seq_len * linear_proj_pc.out_dim) flags |= 4;
+                    lp_debug[debug_idx + 8] = flags;
+                    // Checksum of first 5 input values
+                    float input_sum = 0.0;
+                    for (uint kk = 0; kk < 5 && kk < linear_proj_pc.in_dim; kk++) {
+                        input_sum += lp_input[seq_pos * linear_proj_pc.in_dim + kk];
+                    }
+                    lp_debug[debug_idx + 9] = asuint(input_sum);
+                }
+            }
+        }
     }
 }
 

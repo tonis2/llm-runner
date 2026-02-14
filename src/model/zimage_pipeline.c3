@@ -9,7 +9,7 @@ import std::math::random;
 import std::time::clock;
 
 // Z-Image Turbo Pipeline
-// Pipeline: tokenize → Qwen3 encode → DiT denoise (×N) → Flux VAE decode → save PPM
+// Pipeline: tokenize → Qwen3 encode → DiT denoise (×N) → Flux VAE decode → save PNG
 
 struct ZImageParams {
     uint num_steps;
@@ -385,13 +385,62 @@ fn bool run_zimage_pipeline(
         ctx.allocator.total_fragmented() / (1024 * 1024));
 
     // ============================================================
-    // Phase 3: Generate random latent
+    // Phase 3: Generate or load random latent
     // ============================================================
-    io::printfn("\n[3/5] Generating random latent...");
-
     uint latent_elems = DIT_LATENT_CHANNELS * lat_h * lat_w;
     float[] latent_data = mem::new_array(float, latent_elems);
-    generate_random_latent(latent_data, params.seed);
+    
+    // Try to load pre-generated latent from file (for debugging/comparison)
+    String latent_file = "debug_output/initial_latent.bin";
+    bool loaded_from_file = false;
+    if (try f = io::file::open(latent_file, "rb")) {
+        // Check file size
+        if (try file_size = f.seek(0, io::Seek.END)) {
+          f.seek(0, io::Seek.SET)!!;
+        
+          // Expected size: header (16 bytes) + 16*64*64*4 = 262160 bytes
+          long expected_size = 16 + (long)latent_elems * 4;
+        
+          if ((long)file_size == expected_size) {
+            io::printfn("\n[3/5] Loading pre-generated latent from %s...", latent_file);
+            // Skip header
+            char[16] header;
+            f.read(header[:16])!!;
+            // Read float data
+            char[] raw_data = mem::new_array(char, (usz)latent_elems * 4);
+            f.read(raw_data)!!;
+            f.close()!!;
+            
+            // Copy to latent_data
+            mem::copy(latent_data.ptr, raw_data.ptr, (usz)latent_elems * 4);
+            mem::free(raw_data);
+            loaded_from_file = true;
+            
+            // Verify stats
+            float dmin = latent_data[0];
+            float dmax = latent_data[0];
+            float dsum = 0;
+            for (uint i = 0; i < latent_elems; i++) {
+                float v = latent_data[i];
+                if (v < dmin) dmin = v;
+                if (v > dmax) dmax = v;
+                dsum += v;
+            }
+            io::printfn("  Loaded latent: min=%.4f max=%.4f mean=%.4f", dmin, dmax, dsum / latent_elems);
+          } else {
+            io::printfn("  Warning: latent file size mismatch (%d vs %d expected), generating fresh latent", file_size, expected_size);
+            f.close()!!;
+          }
+        } else {
+          io::printfn("  Warning: could not determine file size, generating fresh latent");
+          f.close()!!;
+        }
+    }
+    
+    if (!loaded_from_file) {
+        io::printfn("\n[3/5] Generating random latent...");
+        generate_random_latent(latent_data, params.seed);
+    }
 
     // Upload to DiT latent buffer
     vk::Memory staging = vk::new_buffer(
@@ -408,6 +457,9 @@ fn bool run_zimage_pipeline(
     }!!;
     staging.free();
     mem::free(latent_data);
+
+    // Debug: Save initial latent for comparison
+    debug_save_npy(ctx, dit.acts.latent.gpu_buffer.buffer, latent_elems, "debug_output/c3_latent_initial.bin")!!;
 
     // ============================================================
     // Phase 4: Denoising loop (with CFG)
@@ -560,10 +612,10 @@ fn bool run_zimage_pipeline(
     double denoise_sec = denoise_start.to_now().to_sec();
     io::printfn("  Denoising complete in %.2fs", denoise_sec);
 
-    // Debug: readback latent stats + save raw latent as PPM for visualization
+    // Debug: readback latent stats + save raw latent as PNG for visualization
     debug_readback_stats(ctx, dit.acts.latent.gpu_buffer.buffer, latent_elems, "final latent")!!;
     {
-        // Save channels 0,1,2 of denoised latent as RGB PPM (64x64)
+        // Save channels 0,1,2 of denoised latent as RGB PNG (64x64)
         vk::Memory lat_dbg = vk::new_buffer(
             allocator: &ctx.allocator,
             usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,

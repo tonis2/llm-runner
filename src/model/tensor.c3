@@ -99,6 +99,29 @@ fn float cpu_f16_to_f32(char* ptr) {
     return sign != 0 ? -val : val;
 }
 
+// CPU-side f32 to f16 conversion (simplified - rounds to nearest)
+fn void cpu_f32_to_f16(char* ptr, float val) {
+    uint f32_bits = bitcast(val, uint);
+    uint sign = (f32_bits >> 31) & 1;
+    uint exp_bits = ((f32_bits >> 23) & 0xFF) - 127 + 15;  // Convert exponent bias
+    uint mant = (f32_bits >> 13) & 0x3FF;  // Take top 10 bits of mantissa
+    
+    ushort f16_bits;
+    if (exp_bits < 1) {
+        // Underflow to zero
+        f16_bits = (ushort)(sign << 15);
+    } else if (exp_bits >= 31) {
+        // Overflow to infinity
+        f16_bits = (ushort)((sign << 15) | (31 << 10));
+    } else {
+        f16_bits = (ushort)((sign << 15) | (exp_bits << 10) | mant);
+    }
+    
+    char[2] bytes = bitcast(f16_bits, char[2]);
+    ptr[0] = bytes[0];
+    ptr[1] = bytes[1];
+}
+
 // CPU-side FP8 E4M3 to f32 conversion
 fn float cpu_fp8e4m3_to_f32(char* ptr) {
     uint bits = (uint)bitcast(*(char[1]*)ptr, char) & 0xFF;
@@ -285,6 +308,35 @@ fn void dequant_q8_0_block(char* block, float* output) {
     }
 }
 
+// Quantize F32 block (32 elements) to Q8_0 (34 bytes)
+fn void quant_q8_0_block(float* input, char* block) {
+    // Find max absolute value for scale
+    float max_val = 0.0;
+    for (uint i = 0; i < 32; i++) {
+        float val = input[i];
+        if (val < 0) val = -val;
+        if (val > max_val) max_val = val;
+    }
+    
+    // Compute scale (max_val / 127 to use full int8 range)
+    float d = max_val / 127.0;
+    if (d < 1e-8) d = 1e-8;  // Prevent division by zero
+    
+    // Store scale as f16
+    cpu_f32_to_f16(block, d);
+    
+    // Quantize values
+    ichar* qs = (ichar*)(block + 2);
+    for (uint i = 0; i < 32; i++) {
+        float val = input[i];
+        int q = (int)(val / d);
+        // Clamp to int8 range
+        if (q > 127) q = 127;
+        if (q < -127) q = -127;
+        qs[i] = (ichar)q;
+    }
+}
+
 // Dequantize a single row from a quantized embedding table on CPU.
 // The embedding tensor has shape [vocab_size, dim]. For quantized types,
 // each row is dim/block_size blocks of type_size bytes each.
@@ -395,5 +447,52 @@ fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* 
         .n_dims = info.n_dims,
         .shape = info.shape,
         .size_bytes = f32_size,
+    };
+}
+
+// Upload F32 weights as Q8_0 quantized format
+// This is useful for weights that need to use the working Q8 shader path
+fn Tensor? upload_weight_as_q8(DeviceContext* ctx, float* f32_data, uint n_elements, ulong[4] shape, uint n_dims) {
+    // Q8_0: 34 bytes per 32 elements
+    usz n_blocks = n_elements / 32;
+    if (n_elements % 32 != 0) {
+        n_blocks++;  // Handle partial block
+    }
+    usz q8_size = n_blocks * 34;
+    char* q8_data = (char*)mem::calloc(q8_size);
+
+    // Quantize each block
+    for (usz b = 0; b < n_blocks; b++) {
+        usz offset = b * 32;
+        usz remaining = n_elements - offset;
+        if (remaining > 32) remaining = 32;
+        
+        float[32] block_data;
+        for (usz i = 0; i < 32; i++) {
+            if (i < remaining) {
+                block_data[i] = f32_data[offset + i];
+            } else {
+                block_data[i] = 0.0;  // Pad partial block
+            }
+        }
+        quant_q8_0_block(&block_data[0], &q8_data[b * 34]);
+    }
+
+    vk::Memory gpu_buffer = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        data: q8_data,
+        data_size: q8_size,
+    )!!;
+
+    mem::free(q8_data);
+
+    return {
+        .gpu_buffer = gpu_buffer,
+        .dtype = GGML_Q8_0,
+        .n_dims = n_dims,
+        .shape = shape,
+        .size_bytes = q8_size,
     };
 }

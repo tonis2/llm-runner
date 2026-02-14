@@ -139,6 +139,10 @@ struct BatchMatMulPC {
 // Profile flag: when true, the next transformer layer call inserts GPU syncs per phase
 bool dit_profile_layer = false;
 
+// Compile-time flag to enable CPU verification for x_embedder
+// Set to true to enable detailed CPU vs GPU comparison for debugging
+const bool DEBUG_X_EMBEDDER_CPU_VERIFY = false;
+
 // --- DiT Layer Weights ---
 
 struct DiTLayerWeights {
@@ -230,6 +234,7 @@ struct DiTKernels {
     ComputeKernel adaln_modulate;
     ComputeKernel flow_euler_step;
     ComputeKernel linear_proj;
+    ComputeKernel linear_proj_debug;  // Simplified version with debug output
     ComputeKernel dit_timestep_embed;
     ComputeKernel broadcast_add_dim;
     ComputeKernel scale_buffer;
@@ -242,6 +247,7 @@ struct DiTKernels {
     ComputeKernel batch_layernorm;
     ComputeKernel mrope;
     ComputeKernel batch_matmul;
+    ComputeKernel batch_matmul_simple;  // Simple 1D dispatch version (no tiling bugs)
     ComputeKernel batch_matmul_q8;
     ComputeKernel batch_matmul_q4_0;
     ComputeKernel batch_matmul_q4k;
@@ -296,6 +302,7 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
     ComputeKernel k_adaln = create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!;
     ComputeKernel k_euler = create_kernel(ctx, zi_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!;
     ComputeKernel k_linproj = create_kernel(ctx, zi_shader, 4, LinearProjPC.sizeof, "linear_proj")!!;
+    ComputeKernel k_linproj_debug = create_kernel(ctx, zi_shader, 6, LinearProjPC.sizeof, "linear_proj_debug")!!;
     ComputeKernel k_timestep = create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!;
     ComputeKernel k_bcastadd = create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!;
     ComputeKernel k_scalebuf = create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!;
@@ -317,6 +324,7 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
         .adaln_modulate   = k_adaln,
         .flow_euler_step  = k_euler,
         .linear_proj      = k_linproj,
+        .linear_proj_debug = k_linproj_debug,
         .dit_timestep_embed = k_timestep,
         .broadcast_add_dim = k_bcastadd,
         .scale_buffer     = k_scalebuf,
@@ -329,6 +337,7 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
         .transpose_heads  = create_kernel(ctx, zi_shader, 2, TransposeHeadsPC.sizeof, "transpose_heads")!!,
         .batch_head_norm  = create_kernel(ctx, zi_shader, 2, BatchHeadNormPC.sizeof, "batch_head_norm")!!,
         .batch_matmul     = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul")!!,
+        .batch_matmul_simple = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_simple")!!,
         .batch_matmul_q8  = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q8")!!,
         .batch_matmul_q4_0 = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4_0")!!,
         .batch_matmul_q4k = create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4k")!!,
@@ -406,10 +415,10 @@ fn void? precompute_mrope_tables(
 
     uint seq_len;
     switch (mode) {
-        case MROPE_MODE_FULL: seq_len = padded_patches + padded_text;
-        case MROPE_MODE_IMAGE: seq_len = padded_patches;
-        case MROPE_MODE_TEXT: seq_len = padded_text;
-        default: seq_len = padded_patches + padded_text;
+        case MROPE_MODE_FULL: seq_len = padded_patches + padded_text; break;
+        case MROPE_MODE_IMAGE: seq_len = padded_patches; break;
+        case MROPE_MODE_TEXT: seq_len = padded_text; break;
+        default: seq_len = padded_patches + padded_text; break;
     }
     uint half_dim = DIT_HEAD_DIM / 2;  // 64
     usz table_size = (usz)seq_len * half_dim;
@@ -417,8 +426,9 @@ fn void? precompute_mrope_tables(
     float* cos_data = (float*)mem::calloc(table_size * 4);
     float* sin_data = (float*)mem::calloc(table_size * 4);
 
-    // Image text-axis position = padded_text_len + 1
-    uint image_index = padded_text + 1;
+    // Image text-axis position = actual_text_len (not padded)
+    // Python: position_ids[i, cap_seq_len:seq_len, 0] = cap_seq_len
+    uint image_index = text_len;
 
     // For each token, compute rotation angles for all 3 axes
     for (uint t = 0; t < seq_len; t++) {
@@ -678,6 +688,7 @@ fn DiTWeights? load_dit_weights(DeviceContext* ctx, GGUFFile* gf) {
         io::printfn("  [shape] final_layer.adaLN_modulation.1.weight: [%d, %d]", info.shape[0], info.shape[1]);
     }
 
+    // Load x_embedder weights as F32 (using simple shader to avoid tiling bugs)
     w.x_emb_weight = load_dit_tensor_f32(ctx, gf, "x_embedder.weight");
     w.x_emb_bias = load_dit_tensor_f32(ctx, gf, "x_embedder.bias");
 
@@ -764,12 +775,16 @@ fn void dispatch_batch_matmul(
     } else if (weight.dtype == GGML_Q4_0) {
         kernel = &dk.batch_matmul_q4_0;
     } else {
+        // Fallback to tiled version for other types (including F32/F16/BF16)
+        // Note: x_embedder uses Q8 workaround, so F32 weights should be rare
         kernel = &dk.batch_matmul;
         tiled_2d = true;
+        io::printfn("[DEBUG] Using batch_matmul (tiled) for dtype=%d (not Q8)", weight.dtype);
     }
     // 2D tiled GEMM: ceil(seq_len/64) * ceil(out_dim/64) workgroups
     // Legacy (Q8_0, Q4_0): seq_len * out_dim workgroups
     uint groups = tiled_2d ? ((seq_len + 63) / 64) * ((out_dim + 63) / 64) : seq_len * out_dim;
+    io::printfn("[DEBUG] Dispatch: seq_len=%d, out_dim=%d, groups=%d (tiled_2d=%d)", seq_len, out_dim, groups, tiled_2d);
     dispatch_kernel(cmd, kernel,
         { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
         { weight.size_bytes, input.size_bytes, output.size_bytes },
@@ -871,6 +886,156 @@ fn void? debug_readback_stats(DeviceContext* ctx, vk::Buffer src_buffer, uint n_
     io::printfn("  [DBG] %s: min=%.6f max=%.6f mean=%.6f nan=%d inf=%d (%d elems)",
         label, mn, mx, mean, nan_count, inf_count, n_floats);
     stg.free();
+}
+
+// Debug: save a GPU buffer to .npy file for comparison with PyTorch
+// Format: little-endian float32, C-contiguous
+fn void? debug_save_npy(DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String filename) {
+    vk::Memory stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: (usz)n_floats * 4,
+    )!!;
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+        vk::cmdCopyBuffer(dbg_cmd, src_buffer, stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_floats * 4 }});
+    }!!;
+    float* ptr = (float*)stg.data();
+
+    // Write raw binary data (numpy can load this with np.fromfile)
+    if (try f = io::file::open(filename, "wb")) {
+        char[] header = "C3_DEBUG_TENSOR\x00";
+        f.write(header.ptr[:header.len])!;
+        // Cast float pointer to char pointer for binary write
+        char* cptr = (char*)ptr;
+        f.write(cptr[:n_floats * 4])!;
+        f.close()!;
+    } else {
+        io::printfn("Warning: Could not open %s for writing", filename);
+    }
+
+    stg.free();
+}
+
+// CPU-based verification for x_embedder (first row only)
+// Computes expected output on CPU and compares with GPU result
+// This helps identify permutation bugs in GPU shaders
+fn void? verify_x_embedder_cpu(
+    DeviceContext* ctx,
+    Tensor* patches,      // [n_patches, 64] - input
+    Tensor* weight,       // [64, 3840] - weight (GGUF format)
+    Tensor* gpu_output,   // [n_patches, 3840] - GPU result
+    uint n_patches,
+    uint out_dim,
+    uint in_dim
+) {
+    // Read back input patches (first row only)
+    vk::Memory patches_stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: (usz)in_dim * 4,
+    )!!;
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+        vk::cmdCopyBuffer(dbg_cmd, patches.gpu_buffer.buffer, patches_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)in_dim * 4 }});
+    }!!;
+    float* patches_cpu = (float*)patches_stg.data();
+
+    // Read back weights (all rows x cols)
+    vk::Memory weight_stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: weight.size_bytes,
+    )!!;
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+        vk::cmdCopyBuffer(dbg_cmd, weight.gpu_buffer.buffer, weight_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = weight.size_bytes }});
+    }!!;
+
+    // Dequantize weights to F32 if needed
+    float* weight_f32;
+    if (weight.dtype == GGML_Q8_0) {
+        // Q8_0: 34 bytes per 32 elements (2 bytes scale + 32 bytes int8)
+        weight_f32 = (float*)mem::malloc((usz)in_dim * out_dim * 4);
+        char* q8_data = (char*)weight_stg.data();
+        uint n_blocks = (in_dim * out_dim) / 32;
+        for (uint b = 0; b < n_blocks; b++) {
+            dequant_q8_0_block(q8_data + b * 34, weight_f32 + b * 32);
+        }
+    } else {
+        // Already F32
+        weight_f32 = (float*)weight_stg.data();
+    }
+
+    // Read back GPU output (first row only)
+    vk::Memory output_stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: (usz)out_dim * 4,
+    )!!;
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
+        vk::cmdCopyBuffer(dbg_cmd, gpu_output.gpu_buffer.buffer, output_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)out_dim * 4 }});
+    }!!;
+    float* gpu_out_cpu = (float*)output_stg.data();
+
+    // Compute expected output on CPU (first row only)
+    // output[0, out_idx] = sum_k patches[0, k] * weight[k, out_idx]
+    // Weight is stored as [in_dim, out_dim] row-major
+    // Limit to first 100 columns to keep computation reasonable
+    uint check_cols = out_dim < 100 ? out_dim : 100;
+    float* expected = (float*)mem::malloc((usz)check_cols * 4);
+    for (uint out_idx = 0; out_idx < check_cols; out_idx++) {
+        float sum = 0.0;
+        for (uint k = 0; k < in_dim; k++) {
+            // weight[k, out_idx] = weight_f32[k * out_dim + out_idx]
+            sum += patches_cpu[k] * weight_f32[k * out_dim + out_idx];
+        }
+        expected[out_idx] = sum;
+    }
+
+    // Compare and find permutation
+    io::printfn("[CPU VERIFY] x_embedder first row comparison (first %d columns):", check_cols);
+    io::printfn("  Weight dtype: %d (0=F32, 8=Q8_0)", weight.dtype);
+    io::printfn("  Col | GPU Value   | Expected    | Diff       | Matches Col");
+    io::printfn("  ----|-------------|-------------|------------|------------");
+    for (uint out_idx = 0; out_idx < 10 && out_idx < check_cols; out_idx++) {
+        float gpu_val = gpu_out_cpu[out_idx];
+        float exp_val = expected[out_idx];
+        float diff = gpu_val - exp_val;
+        if (diff < 0) diff = -diff;
+        
+        // Find which expected column this GPU value matches
+        uint matched_col = out_dim;  // out_dim means no match
+        float best_diff = 1e30;
+        for (uint search_col = 0; search_col < check_cols; search_col++) {
+            float search_diff = gpu_val - expected[search_col];
+            if (search_diff < 0) search_diff = -search_diff;
+            if (search_diff < best_diff && search_diff < 0.001) {
+                best_diff = search_diff;
+                matched_col = search_col;
+            }
+        }
+        
+        if (matched_col < out_dim) {
+            io::printfn("  %3d | %11.6f | %11.6f | %10.6f | -> [%4d]", out_idx, gpu_val, exp_val, diff, matched_col);
+        } else {
+            io::printfn("  %3d | %11.6f | %11.6f | %10.6f | (no match)", out_idx, gpu_val, exp_val, diff);
+        }
+    }
+    
+    mem::free(expected);
+    if (weight.dtype == GGML_Q8_0) {
+        mem::free(weight_f32);
+    }
+
+    patches_stg.free();
+    weight_stg.free();
+    output_stg.free();
 }
 
 // Run a single DiT transformer layer (Lumina2 architecture)
@@ -1032,9 +1197,9 @@ fn void? dit_transformer_layer(
     }
 
     // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
-    // Scale = 1/head_dim (not 1/sqrt), matching KoboldCpp z_image.hpp Rope::attention scale=1.f/128.f
-    // With QK-norm (head_norm), Q·K are bounded, so 1/d_k gives proper softmax range
-    float scale = 1.0f / (float)DIT_HEAD_DIM;
+    // Standard attention scale: 1/sqrt(head_dim) = 1/sqrt(128)
+    // With QK-norm, Q·K are bounded, but we still use standard scaling
+    float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
     FlashAttentionPC fa_pc = {
         .head_dim = DIT_HEAD_DIM,
         .n_heads = DIT_HEADS,
@@ -1225,13 +1390,31 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     compute_barrier(cmd);
 
     // 2. x_embedder: [n_patches, 64] -> [n_patches, 3840]
-    LinearProjPC x_emb_pc = { .out_dim = dim, .in_dim = DIT_PATCH_DIM, .seq_len = n_patches };
-    dispatch_kernel(cmd, &dk.linear_proj,
-        { w.x_emb_weight.gpu_buffer.buffer, w.x_emb_bias.gpu_buffer.buffer,
-          a.patches.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
-        { w.x_emb_weight.size_bytes, w.x_emb_bias.size_bytes,
-          a.patches.size_bytes, a.hidden.size_bytes },
-        &x_emb_pc, n_patches * dim);
+    // Use batch_matmul_simple (1D dispatch, no tiling bugs) + separate bias add
+    io::printfn("[DEBUG] x_embedder using batch_matmul_simple: seq_len=%d, out_dim=%d, in_dim=%d", n_patches, dim, DIT_PATCH_DIM);
+    
+    // Use batch_matmul_simple for F32 weights (avoids tiled indexing bugs)
+    BatchMatMulPC x_emb_pc = { .out_dim = dim, .in_dim = DIT_PATCH_DIM, .seq_len = n_patches, .row_offset = 0 };
+    // Try 2D dispatch to see if workgroup ordering is more predictable
+    uint groups_x = n_patches;  // 1024
+    uint groups_y = dim;        // 3840
+    io::printfn("[DEBUG] x_embedder dispatch: groups_x=%d, groups_y=%d", groups_x, groups_y);
+    dispatch_kernel(cmd, &dk.batch_matmul_simple,
+        { w.x_emb_weight.gpu_buffer.buffer, a.patches.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
+        { w.x_emb_weight.size_bytes, a.patches.size_bytes, a.hidden.size_bytes },
+        &x_emb_pc, groups_x, groups_y);
+    compute_barrier(cmd);
+    
+    // CPU verification for x_embedder (first row only) - compile-time flag
+    if (DEBUG_X_EMBEDDER_CPU_VERIFY) {
+        verify_x_embedder_cpu(ctx, &a.patches, &w.x_emb_weight, &a.hidden, n_patches, dim, DIT_PATCH_DIM)!!;
+    }
+    
+    // Then add bias using broadcast_add_dim
+    dispatch_kernel(cmd, &dk.broadcast_add_dim,
+        { a.hidden.gpu_buffer.buffer, w.x_emb_bias.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
+        { a.hidden.size_bytes, w.x_emb_bias.size_bytes, a.hidden.size_bytes },
+        null, n_patches * dim);
     compute_barrier(cmd);
 
     // 2b. Pad image tokens with x_pad_token (append n_img_pad copies)
@@ -1249,10 +1432,17 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     // Debug: check spatial diversity after x_embedder
     submit_and_wait(ctx)!!;
     debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after x_embedder")!!;
+
+    // Debug: Save tensors for PyTorch comparison
+    uint latent_elems = DIT_LATENT_CHANNELS * self.latent_h * self.latent_w;
+    debug_save_npy(ctx, a.latent.gpu_buffer.buffer, latent_elems, "debug_output/c3_latent.bin")!!;
+    debug_save_npy(ctx, a.patches.gpu_buffer.buffer, n_patches * DIT_PATCH_DIM, "debug_output/c3_patches.bin")!!;
+    debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, n_patches * dim, "debug_output/c3_hidden.bin")!!;
+
     begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: sigma is already in [0,1], map to timestep [0,1000]
-    // sigma=1.0 (fully noisy) -> timestep=1000, sigma=0.0 (fully denoised) -> timestep=0
+    // 3. Timestep embedding: sigma * 1000 (model expects timestep in [0,1000])
+    // sigma=1.0 -> timestep=1000 (noisy), sigma=0.0 -> timestep=0 (clean)
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = DIT_T_PERIOD * timestep };
     dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
@@ -1490,10 +1680,18 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
     compute_barrier(cmd);
 
     // Copy unpatchified velocity back to velocity buffer (for Euler step)
-    // Note: No negation needed - flow matching predicts velocity from noise->data,
-    // and Euler step x = x + dt * v with negative dt naturally moves noise->data
+    // Python pipeline.py applies: noise_pred = -noise_pred.squeeze(2)
+    // The model predicts velocity from data->noise, but we need noise->data direction
     vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.velocity.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_total * 4 }});
+    compute_barrier(cmd);
+
+    // Negate velocity to get correct direction (noise -> data)
+    ScalePC neg_pc = { .n = latent_total, .scale = -1.0f };
+    dispatch_kernel(cmd, &dk.scale_buffer,
+        { a.velocity.gpu_buffer.buffer },
+        { a.velocity.size_bytes },
+        &neg_pc, ceil_div(latent_total, 256));
 
     submit_and_wait(ctx)!!;
     double final_sec = phase_start.to_now().to_sec();
@@ -1583,6 +1781,7 @@ fn void DiTModel.free(&self) {
     self.kernels.adaln_modulate.free(self.ctx.device);
     self.kernels.flow_euler_step.free(self.ctx.device);
     self.kernels.linear_proj.free(self.ctx.device);
+    self.kernels.linear_proj_debug.free(self.ctx.device);
     self.kernels.dit_timestep_embed.free(self.ctx.device);
     self.kernels.broadcast_add_dim.free(self.ctx.device);
     self.kernels.scale_buffer.free(self.ctx.device);
@@ -1595,6 +1794,7 @@ fn void DiTModel.free(&self) {
     self.kernels.transpose_heads.free(self.ctx.device);
     self.kernels.batch_head_norm.free(self.ctx.device);
     self.kernels.batch_matmul.free(self.ctx.device);
+    self.kernels.batch_matmul_simple.free(self.ctx.device);
     self.kernels.batch_matmul_q8.free(self.ctx.device);
     self.kernels.batch_matmul_q4_0.free(self.ctx.device);
     self.kernels.batch_matmul_q4k.free(self.ctx.device);

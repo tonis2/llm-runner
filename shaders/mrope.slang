@@ -44,6 +44,6 @@ void mrope(uint3 tid: SV_DispatchThreadID) {
     float x0 = mrope_data[base + 2 * pair];
     float x1 = mrope_data[base + 2 * pair + 1];
 
-    mrope_data[base + 2 * pair]     =  x0 * cv + x1 * sv;
-    mrope_data[base + 2 * pair + 1] = -x0 * sv + x1 * cv;
+    mrope_data[base + 2 * pair]     =  x0 * cv - x1 * sv;
+    mrope_data[base + 2 * pair + 1] =  x0 * sv + x1 * cv;
 }

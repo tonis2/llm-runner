@@ -1129,6 +1129,72 @@ void batch_matmul(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// --- Simple F32 batch matmul (1D dispatch, no tiling) ---
+// This is a simplified version that uses 1D dispatch like the Q8 shader
+// to avoid the tile indexing bugs in the tiled version
+// Use this for debugging or when tiled version has permutation issues
+
+[vk_push_constant] const BatchMatMulParams bm_simple_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> bm_simple_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bm_simple_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bm_simple_output;
+
+groupshared float bm_simple_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    // Support both 1D and 2D dispatch
+    // 2D dispatch: gid.x = pos, gid.y = out_idx
+    // 1D dispatch: gid.x = pos * out_dim + out_idx, gid.y = 0
+    uint pos, out_idx;
+    if (gid.y == 0 && gid.x >= bm_simple_pc.seq_len) {
+        // Assume 1D dispatch
+        pos = gid.x / bm_simple_pc.out_dim;
+        out_idx = gid.x % bm_simple_pc.out_dim;
+    } else {
+        // 2D dispatch
+        pos = gid.x;
+        out_idx = gid.y;
+    }
+    
+    if (pos >= bm_simple_pc.seq_len) return;
+    
+    uint actual_out = bm_simple_pc.row_offset + out_idx;
+    uint in_base = pos * bm_simple_pc.in_dim;
+    
+    // Each thread computes a partial sum
+    float partial = 0.0;
+    for (uint k = gi; k < bm_simple_pc.in_dim; k += 256) {
+        // Weight layout: [in_dim, out_dim] - weight[k, actual_out]
+        partial += bm_simple_weight[k * (bm_simple_pc.row_offset + bm_simple_pc.out_dim) + actual_out] 
+                   * bm_simple_input[in_base + k];
+    }
+    
+    bm_simple_shared[gi] = partial;
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Tree reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            bm_simple_shared[gi] += bm_simple_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    // Thread 0 writes final result
+    if (gi == 0) {
+        bm_simple_output[pos * bm_simple_pc.out_dim + out_idx] = bm_simple_shared[0];
+        
+        // Debug: Also store gid.x in a separate location to trace workgroup mapping
+        // Use last row (pos 1023) columns 0-4 to store debug info
+        if (pos == 0 && out_idx < 5 && bm_simple_pc.seq_len > 1023) {
+            bm_simple_output[1023 * bm_simple_pc.out_dim + out_idx] = float(gid.x);
+        }
+    }
+}
+
 // --- Q8_0 batch matmul ---
 
 [vk_push_constant] const BatchMatMulParams bmq8_pc;

@@ -6,5 +6,5 @@
     "steps": 4,
     "seed": 42,
     "size": 512,
-    "output": "output.ppm"
+    "output": "output.png"
   }
