@@ -4,6 +4,8 @@ import std::io;
 import std::io::file;
 import std::io::file::mmap;
 import std::core::mem;
+import std::encoding::json;
+import std::collections::object;
 import vk;
 
 // Safetensors binary format parser
@@ -42,164 +44,63 @@ fn SafetensorsFile? safetensors_open(String path) {
         return FILE_NOT_FOUND~;
     }
 
-    // Parse JSON header manually for tensor info
+    // Parse JSON header using std library parser
     String header_str = (String)data[8 .. 8 + (usz)header_len - 1];
-    SafetensorsTensorInfo[] tensors = mem::new_array(SafetensorsTensorInfo, 256);
-    usz n_tensors = 0;
-    // The safetensors JSON is: {"tensor_name": {"dtype":"F32","shape":[a,b],"data_offsets":[start,end]}, ...}
-    n_tensors = 0;
-    usz pos = 0;
-    while (pos < header_str.len) {
-        // Find next key (quoted string at top level)
-        if (header_str[pos] != '"') { pos++; continue; }
+    Object* root = json::parse_string(mem, header_str)!;
 
-        // Extract key
-        usz key_start = pos + 1;
-        pos++;
-        while (pos < header_str.len && header_str[pos] != '"') pos++;
-        String key = header_str[key_start .. pos - 1];
-        pos++; // skip closing quote
-
-        // Skip "__metadata__" or any non-tensor key
-        if (key == "__metadata__") {
-            // Skip colon, then skip the value object (handle nested braces and quoted strings)
-            while (pos < header_str.len && header_str[pos] != '{') pos++;
-            if (pos < header_str.len) {
-                uint depth = 1; pos++;
-                while (pos < header_str.len && depth > 0) {
-                    if (header_str[pos] == '"') {
-                        pos++;
-                        while (pos < header_str.len && header_str[pos] != '"') {
-                            if (header_str[pos] == '\\') pos++; // skip escaped chars
-                            pos++;
-                        }
-                    } else if (header_str[pos] == '{') {
-                        depth++;
-                    } else if (header_str[pos] == '}') {
-                        depth--;
-                    }
-                    pos++;
-                }
-            }
-            continue;
-        }
-
-        // Find the value object (skip to opening brace)
-        while (pos < header_str.len && header_str[pos] != '{') pos++;
-        if (pos >= header_str.len) break;
-        pos++; // skip '{'
-
-        // Parse dtype, shape, data_offsets from this object
-        String dtype = "";
-        ulong[4] shape = { 0, 0, 0, 0 };
-        uint n_dims = 0;
-        ulong data_start = 0;
-        ulong data_end = 0;
-
-        // Simple state machine parser for the tensor info object
-        uint depth = 1;
-        while (pos < header_str.len && depth > 0) {
-            // Skip whitespace
-            while (pos < header_str.len && (header_str[pos] == ' ' || header_str[pos] == '\n' || header_str[pos] == '\r' || header_str[pos] == '\t' || header_str[pos] == ',')) pos++;
-
-            if (pos >= header_str.len) break;
-            if (header_str[pos] == '}') { depth--; pos++; continue; }
-
-            // Parse key
-            if (header_str[pos] != '"') { pos++; continue; }
-            usz fk_start = pos + 1;
-            pos++;
-            while (pos < header_str.len && header_str[pos] != '"') pos++;
-            String field_key = header_str[fk_start .. pos - 1];
-            pos++; // skip closing quote
-
-            // Skip colon
-            while (pos < header_str.len && header_str[pos] != ':') pos++;
-            pos++;
-            while (pos < header_str.len && header_str[pos] == ' ') pos++;
-
-            if (field_key == "dtype") {
-                // Parse string value
-                if (header_str[pos] == '"') {
-                    usz vs = pos + 1;
-                    pos++;
-                    while (pos < header_str.len && header_str[pos] != '"') pos++;
-                    dtype = header_str[vs .. pos - 1];
-                    pos++;
-                }
-            } else if (field_key == "shape") {
-                // Parse array of ints
-                if (header_str[pos] == '[') {
-                    pos++;
-                    n_dims = 0;
-                    while (pos < header_str.len && header_str[pos] != ']') {
-                        while (pos < header_str.len && (header_str[pos] == ' ' || header_str[pos] == ',')) pos++;
-                        if (header_str[pos] == ']') break;
-                        ulong val = 0;
-                        while (pos < header_str.len && header_str[pos] >= '0' && header_str[pos] <= '9') {
-                            val = val * 10 + (ulong)(header_str[pos] - '0');
-                            pos++;
-                        }
-                        if (n_dims < 4) shape[n_dims] = val;
-                        n_dims++;
-                    }
-                    if (pos < header_str.len) pos++; // skip ']'
-                }
-            } else if (field_key == "data_offsets") {
-                // Parse [start, end]
-                if (header_str[pos] == '[') {
-                    pos++;
-                    while (pos < header_str.len && (header_str[pos] == ' ' || header_str[pos] == ',')) pos++;
-                    // Parse start
-                    while (pos < header_str.len && header_str[pos] >= '0' && header_str[pos] <= '9') {
-                        data_start = data_start * 10 + (ulong)(header_str[pos] - '0');
-                        pos++;
-                    }
-                    while (pos < header_str.len && (header_str[pos] == ' ' || header_str[pos] == ',')) pos++;
-                    // Parse end
-                    while (pos < header_str.len && header_str[pos] >= '0' && header_str[pos] <= '9') {
-                        data_end = data_end * 10 + (ulong)(header_str[pos] - '0');
-                        pos++;
-                    }
-                    while (pos < header_str.len && header_str[pos] != ']') pos++;
-                    if (pos < header_str.len) pos++; // skip ']'
-                }
-            } else {
-                // Skip unknown field value
-                if (header_str[pos] == '"') {
-                    pos++;
-                    while (pos < header_str.len && header_str[pos] != '"') pos++;
-                    pos++;
-                } else if (header_str[pos] == '[') {
-                    uint d = 1; pos++;
-                    while (pos < header_str.len && d > 0) {
-                        if (header_str[pos] == '[') d++;
-                        if (header_str[pos] == ']') d--;
-                        pos++;
-                    }
-                } else if (header_str[pos] == '{') {
-                    uint d = 1; pos++;
-                    while (pos < header_str.len && d > 0) {
-                        if (header_str[pos] == '{') d++;
-                        if (header_str[pos] == '}') d--;
-                        pos++;
-                    }
-                }
-            }
-        }
-
-        if (n_tensors < 256) {
-            tensors[n_tensors] = {
-                .name = key,
-                .dtype = dtype,
-                .shape = shape,
-                .n_dims = n_dims,
-                .data_start = data_start,
-                .data_end = data_end,
-            };
-            n_tensors++;
-        }
+    if (!root.is_map()) {
+        root.free();
+        io::printfn("Error: safetensors header is not a JSON object");
+        return FILE_NOT_FOUND~;
     }
+
+    // Get keys to count tensors and iterate
+    String[] keys = root.map.keys(mem);
+
+    // Count actual tensor entries (skip __metadata__)
+    usz tensor_count = 0;
+    foreach (key : keys) {
+        if (key == "__metadata__") continue;
+        tensor_count++;
+    }
+
+    SafetensorsTensorInfo[] tensors = mem::new_array(SafetensorsTensorInfo, tensor_count);
+    usz n_tensors = 0;
+
+    foreach (key : keys) {
+        if (key == "__metadata__") continue;
+
+        Object* tensor_obj = root.get(key)!;
+
+        String dtype = tensor_obj.get_string("dtype")!;
+
+        // Parse shape array
+        Object* shape_arr = tensor_obj.get("shape")!;
+        uint n_dims = (uint)shape_arr.get_len();
+        ulong[4] shape = { 0, 0, 0, 0 };
+        for (uint i = 0; i < n_dims && i < 4; i++) {
+            shape[i] = shape_arr.get_ulong_at(i)!;
+        }
+
+        // Parse data_offsets [start, end]
+        Object* offsets_arr = tensor_obj.get("data_offsets")!;
+        ulong data_start = offsets_arr.get_ulong_at(0)!;
+        ulong data_end = offsets_arr.get_ulong_at(1)!;
+
+        // Copy strings — JSON Object owns the originals and will be freed below
+        tensors[n_tensors] = {
+            .name = key.copy(mem),
+            .dtype = dtype.copy(mem),
+            .shape = shape,
+            .n_dims = n_dims,
+            .data_start = data_start,
+            .data_end = data_end,
+        };
+        n_tensors++;
+    }
+
+    mem::free(keys);
+    root.free();
 
     char* data_base = &data[8 + (usz)header_len];
 

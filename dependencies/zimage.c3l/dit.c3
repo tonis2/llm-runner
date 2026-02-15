@@ -122,6 +122,13 @@ struct ScaleModPC {
 struct GatedResidualPC {
     uint n_elements;
     uint dim;
+    float scale;
+    float clip_thresh;
+}
+
+struct ClipParams {
+    uint n_elements;
+    float threshold;
 }
 
 struct MRoPEPC {
@@ -246,6 +253,7 @@ struct DiTKernels {
     llm::ComputeKernel batch_head_norm;
     llm::ComputeKernel scale_modulate;
     llm::ComputeKernel gated_residual;
+    llm::ComputeKernel clip_values;
     llm::ComputeKernel batch_layernorm;
     llm::ComputeKernel mrope;
     llm::ComputeKernel batch_matmul;
@@ -311,6 +319,7 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
     llm::ComputeKernel k_flashattn = llm::create_kernel(ctx, zi_shader, 4, FlashAttentionPC.sizeof, "flash_attention")!!;
     llm::ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
     llm::ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
+    llm::ComputeKernel k_clip = llm::create_kernel(ctx, zi_shader, 1, ClipParams.sizeof, "clip_values")!!;
     io::printfn("  Creating mrope kernel...");
     char[] mrope_spv = &MROPE_SPV;
     vk::ShaderModule mrope_shader = vk::shaderModuleCreateInfo()
@@ -333,6 +342,7 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
         .flash_attention   = k_flashattn,
         .scale_modulate   = k_scalemod,
         .gated_residual   = k_gatedres,
+        .clip_values      = k_clip,
         .batch_layernorm  = llm::create_kernel(ctx, zi_shader, 2, BatchLayerNormPC.sizeof, "batch_layernorm")!!,
         .mrope            = k_mrope,
         .batch_rmsnorm    = llm::create_kernel(ctx, zi_shader, 3, BatchRMSNormPC.sizeof, "batch_rmsnorm")!!,
@@ -601,7 +611,12 @@ fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile
     io::printfn("    [%s%d] loading norms + out...", prefix, layer);
     lw.q_norm = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.q_norm.weight"));
     lw.k_norm = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.k_norm.weight"));
-    lw.wo = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight"));
+    String wo_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight");
+    if (try wo_info = gf.find_tensor(wo_name)) {
+        io::printfn("    [DEBUG] Wo GGUF type: %d (%s)", wo_info.type, wo_info.type == llm::GGML_Q5_K ? "Q5_K" : (wo_info.type == llm::GGML_Q4_K ? "Q4_K" : (wo_info.type == llm::GGML_F32 ? "F32" : "other")));
+    }
+    lw.wo = load_dit_tensor(ctx, gf, wo_name);
+    io::printfn("    [DEBUG] Wo loaded dtype: %d", lw.wo.dtype);
 
     io::printfn("    [%s%d] loading ffn...", prefix, layer);
     lw.ffn_gate = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w1.weight"));
@@ -1149,30 +1164,6 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     if (profiling) {
-llm::submit_and_wait(ctx)!!;
-        // Debug: Check Q/K/V stats after matmul
-        vk::Memory q_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)seq_len * dim * 4,
-        )!!;
-llm::begin_compute(cmd)!!;
-        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, q_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
-llm::submit_and_wait(ctx)!!;
-        float* q_ptr = (float*)q_stg.data();
-        float q_min = q_ptr[0];
-        float q_max = q_ptr[0];
-        float q_sum = 0;
-        for (uint i = 0; i < seq_len * dim; i++) {
-            if (q_ptr[i] < q_min) q_min = q_ptr[i];
-            if (q_ptr[i] > q_max) q_max = q_ptr[i];
-            q_sum += q_ptr[i];
-        }
-        io::printfn("      [DEBUG] After QKV matmul - Q: min=%.4f max=%.4f mean=%.4f", q_min, q_max, (float)q_sum / (float)(seq_len * dim));
-        q_stg.free();
-llm::begin_compute(cmd)!!;
         io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
     }
 
@@ -1181,35 +1172,7 @@ llm::begin_compute(cmd)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
 
     if (profiling) {
-llm::submit_and_wait(ctx)!!;
-        // Debug: Check Q after head norm
-        vk::Memory q_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)seq_len * dim * 4,
-        )!!;
-llm::begin_compute(cmd)!!;
-        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, q_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
-llm::submit_and_wait(ctx)!!;
-        float* q_ptr = (float*)q_stg.data();
-        float q_min = q_ptr[0];
-        float q_max = q_ptr[0];
-        float q_sum = 0;
-        float q_sq_sum = 0;
-        for (uint i = 0; i < seq_len * dim; i++) {
-            float v = q_ptr[i];
-            if (v < q_min) { q_min = v; }
-            if (v > q_max) { q_max = v; }
-            q_sum += v;
-            q_sq_sum += v * v;
-        }
-        float q_mean = (float)q_sum / (float)(seq_len * dim);
-        float q_std = math::sqrt(q_sq_sum / (float)(seq_len * dim) - q_mean * q_mean);
-        io::printfn("      [DEBUG] After QK-norm - Q: min=%.4f max=%.4f mean=%.4f std=%.4f", q_min, q_max, q_mean, q_std);
-        q_stg.free();
-llm::begin_compute(cmd)!!;
+        io::printfn("      head_norm: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
     }
 
     // Forward transpose Q/K/V: [seq_len, dim] -> [n_heads, seq_len, head_dim]
@@ -1329,15 +1292,24 @@ llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             &post_attn_rms, seq_len);
 llm::compute_barrier(cmd);
 
+        // GPU-side clipping of extreme values after norm2
+        ClipParams clip_pc = { .n_elements = seq_len * dim, .threshold = 10.0f };
+        llm::dispatch_kernel(cmd, &dk.clip_values,
+            { a.buf_b.gpu_buffer.buffer },
+            { a.buf_b.size_bytes },
+            &clip_pc, llm::ceil_div(seq_len * dim, 256));
+        llm::compute_barrier(cmd);
+
         // Gated residual: hidden += tanh(gate_msa) * norm2(attn_output)
         if (has_adaln) {
-            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim };
+            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim, .scale = 0.5f, .clip_thresh = 10.0f };
 llm::dispatch_kernel(cmd, &dk.gated_residual,
                 { hidden.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
                 { hidden.size_bytes, a.adaln_shift.size_bytes, a.buf_b.size_bytes },
                 &gres_pc, llm::ceil_div(seq_len * dim, 256));
         } else {
             // Context refiner: no gate, just residual += post_norm(output)
+            // buf_b already clipped above
             llm::ResidualPC res_pc = { .n = seq_len * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
                 { hidden.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
@@ -1422,9 +1394,17 @@ llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             &post_ffn_rms, seq_len);
 llm::compute_barrier(cmd);
 
+        // GPU-side clipping of extreme values after ffn_norm2
+        ClipParams ffn_clip_pc = { .n_elements = seq_len * dim, .threshold = 10.0f };
+        llm::dispatch_kernel(cmd, &dk.clip_values,
+            { a.buf_a.gpu_buffer.buffer },
+            { a.buf_a.size_bytes },
+            &ffn_clip_pc, llm::ceil_div(seq_len * dim, 256));
+        llm::compute_barrier(cmd);
+
         // Gated residual: hidden += tanh(gate_mlp) * ffn_norm2(ffn_output)
         if (has_adaln) {
-            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim };
+            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim, .scale = 0.5f, .clip_thresh = 10.0f };
 llm::dispatch_kernel(cmd, &dk.gated_residual,
                 { hidden.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
                 { hidden.size_bytes, a.adaln_shift.size_bytes, a.buf_a.size_bytes },
@@ -1803,6 +1783,35 @@ llm::dispatch_kernel(cmd, &dk.scale_buffer,
         &neg_pc, llm::ceil_div(latent_total, 256));
 
 llm::submit_and_wait(ctx)!!;
+
+    // DEBUG: Check final velocity statistics
+    vk::Memory vel_stg = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null, data_size: (usz)latent_total * 4,
+    )!!;
+    llm::begin_compute(cmd)!!;
+    vk::cmdCopyBuffer(cmd, a.velocity.gpu_buffer.buffer, vel_stg.buffer, 1,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_total * 4 }});
+    llm::submit_and_wait(ctx)!!;
+    float* vel_ptr = (float*)vel_stg.data();
+    float vel_min = vel_ptr[0];
+    float vel_max = vel_ptr[0];
+    float vel_sum = 0;
+    float vel_sq_sum = 0;
+    for (uint i = 0; i < latent_total; i++) {
+        float val = vel_ptr[i];
+        if (val < vel_min) vel_min = val;
+        if (val > vel_max) vel_max = val;
+        vel_sum += val;
+        vel_sq_sum += val * val;
+    }
+    float vel_mean = vel_sum / (float)latent_total;
+    float vel_std = math::sqrt(vel_sq_sum / (float)latent_total - vel_mean * vel_mean);
+    io::printfn("    [DEBUG] Final velocity: min=%.4f max=%.4f mean=%.4f std=%.4f", vel_min, vel_max, vel_mean, vel_std);
+    vel_stg.free();
+
     double final_sec = phase_start.to_now().to_sec();
     double total_sec = step_start.to_now().to_sec();
     io::printfn("    setup+refiner: %.2fs | dit_layers: %.2fs | final: %.2fs | total: %.2fs",
@@ -1897,6 +1906,7 @@ fn void DiTModel.free(&self) {
     self.kernels.flash_attention.free(self.ctx.device);
     self.kernels.scale_modulate.free(self.ctx.device);
     self.kernels.gated_residual.free(self.ctx.device);
+    self.kernels.clip_values.free(self.ctx.device);
     self.kernels.batch_layernorm.free(self.ctx.device);
     self.kernels.mrope.free(self.ctx.device);
     self.kernels.batch_rmsnorm.free(self.ctx.device);

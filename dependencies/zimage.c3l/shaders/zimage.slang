@@ -373,13 +373,17 @@ void scale_modulate(uint3 tid: SV_DispatchThreadID) {
 }
 
 // ============================================================
-// Gated Residual Add - residual += tanh(gate) * input
+// Gated Residual Add - residual += scale * tanh(gate) * clip(input, -clip_thresh, clip_thresh)
 // ============================================================
 // gate is [dim], broadcast across sequence positions
+// scale allows residual scaling (e.g., 0.5 for DeepNet-style stabilization)
+// clip_thresh clamps extreme outlier values to prevent divergence
 
 struct GatedResidualParams {
     uint n_elements;
     uint dim;
+    float scale;        // Residual scale factor (default: 1.0)
+    float clip_thresh;  // Clip threshold (0.0 = no clipping, typical: 10.0)
 };
 
 [vk_push_constant] const GatedResidualParams gated_res_pc;
@@ -393,7 +397,33 @@ struct GatedResidualParams {
 void gated_residual(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= gated_res_pc.n_elements) return;
     uint d = tid.x % gated_res_pc.dim;
-    gres_residual[tid.x] += tanh(gres_gate[d]) * gres_input[tid.x];
+    float residual_scale = (gated_res_pc.scale > 0.0) ? gated_res_pc.scale : 1.0;
+    float clip_thresh = (gated_res_pc.clip_thresh > 0.0) ? gated_res_pc.clip_thresh : 1e10;
+    float gated_val = residual_scale * tanh(gres_gate[d]) * gres_input[tid.x];
+    // Clip to prevent extreme outliers from accumulating
+    gated_val = clamp(gated_val, -clip_thresh, clip_thresh);
+    gres_residual[tid.x] += gated_val;
+}
+
+// ============================================================
+// Value Clipping - Clip extreme outliers in-place
+// ============================================================
+
+struct ClipParams {
+    uint n_elements;
+    float threshold;  // Values outside [-threshold, threshold] are clamped
+};
+
+[vk_push_constant] const ClipParams clip_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> clip_buffer;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void clip_values(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= clip_pc.n_elements) return;
+    float val = clip_buffer[tid.x];
+    clip_buffer[tid.x] = clamp(val, -clip_pc.threshold, clip_pc.threshold);
 }
 
 // ============================================================

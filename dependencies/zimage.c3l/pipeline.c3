@@ -477,6 +477,30 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
                 stg_ptr[i] = cfg_uncond_vel[i] + cfg_scale * (cfg_cond_vel[i] - cfg_uncond_vel[i]);
             }
 
+            // DEBUG: Save velocity to file
+            io::printfn("  [DEBUG] Saving velocity for step %d", step);
+            char[256] filename_vel;
+            usz fn_vel_len = 0;
+            String vel_prefix = "/tmp/zimage_debug/velocity_step_";
+            for (usz i = 0; i < vel_prefix.len; i++) filename_vel[fn_vel_len++] = vel_prefix[i];
+            filename_vel[fn_vel_len++] = (char)('0' + (step + 1) / 10);
+            filename_vel[fn_vel_len++] = (char)('0' + (step + 1) % 10);
+            String vel_suffix = "_c3.bin";
+            for (usz i = 0; i < vel_suffix.len; i++) filename_vel[fn_vel_len++] = vel_suffix[i];
+            filename_vel[fn_vel_len] = 0;
+            
+            File f_vel = file::open((String)filename_vel[0..fn_vel_len-1], "wb")!!;
+            uint n_vel = (uint)latent_elems;
+            char[4] vel_header = {
+                (char)(n_vel & 0xFF), 
+                (char)((n_vel >> 8) & 0xFF),
+                (char)((n_vel >> 16) & 0xFF), 
+                (char)((n_vel >> 24) & 0xFF)
+            };
+            f_vel.write(&vel_header)!;
+            f_vel.write(((char*)stg_ptr)[0..latent_elems*4-1])!;
+            f_vel.close()!;
+
             // Upload combined velocity
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer write_cmd) {
                 vk::cmdCopyBuffer(write_cmd, cfg_staging.buffer, dit.acts.velocity.gpu_buffer.buffer, 1,
@@ -501,6 +525,45 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
             { dit.acts.latent.size_bytes, dit.acts.velocity.size_bytes },
             &euler_pc, llm::ceil_div(latent_elems, 256));
         llm::submit_and_wait(ctx)!!;
+
+        // DEBUG: Save latent after Euler step
+        io::printfn("  [DEBUG] Saving latent for step %d", step);
+        char[256] filename_lat;
+        usz fn_lat_len = 0;
+        String lat_prefix = "/tmp/zimage_debug/latent_step_";
+        for (usz i = 0; i < lat_prefix.len; i++) filename_lat[fn_lat_len++] = lat_prefix[i];
+        filename_lat[fn_lat_len++] = (char)('0' + (step + 1) / 10);
+        filename_lat[fn_lat_len++] = (char)('0' + (step + 1) % 10);
+        String lat_suffix = "_c3.bin";
+        for (usz i = 0; i < lat_suffix.len; i++) filename_lat[fn_lat_len++] = lat_suffix[i];
+        filename_lat[fn_lat_len] = 0;
+        
+        // Read latent from GPU
+        vk::Memory lat_staging = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null,
+            data_size: (usz)latent_elems * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer lat_cmd) {
+            vk::cmdCopyBuffer(lat_cmd, dit.acts.latent.gpu_buffer.buffer, lat_staging.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+        }!!;
+        float* lat_ptr = (float*)lat_staging.data();
+        
+        File f_lat = file::open((String)filename_lat[0..fn_lat_len-1], "wb")!!;
+        uint n_lat = (uint)latent_elems;
+        char[4] lat_header = {
+            (char)(n_lat & 0xFF), 
+            (char)((n_lat >> 8) & 0xFF),
+            (char)((n_lat >> 16) & 0xFF), 
+            (char)((n_lat >> 24) & 0xFF)
+        };
+        f_lat.write(&lat_header)!;
+        f_lat.write(((char*)lat_ptr)[0..latent_elems*4-1])!;
+        f_lat.close()!;
+        lat_staging.free();
     }
 
     io::printfn("  Denoising complete");
@@ -672,7 +735,7 @@ fn void zimage_free(void* data) {
 }
 
 fn llm::pipelines::PipelineImpl create_pipeline() {
-    ZImageState* state = mem::alloc(ZImageState);
+    ZImageState* state = mem::new(ZImageState);
     *state = {};
     return {
         .data = state,
