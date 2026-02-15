@@ -2,19 +2,16 @@
   "langrev": "1",
   "warnings": [ "no-unused" ],
   "dependency-search-paths": [ "dependencies" ],
-  "dependencies": ["vk", "image"],
+  "dependencies": ["vk", "image", "llm_text", "zimage", "sdxs"],
   "linked-libraries": ["vulkan"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
-  "sources": [ "src/**"],
+  "sources": [ "lib/**"],
   "test-sources": [ "test/**" ],
   "build-dir": "build",
   "script-dir": "./",
   "output": "build",
   "targets": {
-    "llm": {
-      "type": "executable",
-    },
     "shaders": {
 			"type": "prepare",
 			"exec": [
@@ -22,6 +19,10 @@
 				"slangc ./shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/diffusion.spv",
 				"slangc ./shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/zimage.spv"
 			]
+		},
+    "zimage": {
+			"type": "executable",
+      "sources": ["examples/z-image/**"]
 		}
   },
   "cpu": "generic",

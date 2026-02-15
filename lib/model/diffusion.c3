@@ -285,13 +285,8 @@ fn DiffusionKernels? create_diffusion_kernels(DeviceContext* ctx) {
         .setCode((uint*)&spv[0])
         .build(ctx.device)!!;
 
-    // Also create shared kernels from the LLM shader (for silu, gelu, layernorm, etc.)
-    char[] llm_spv = &llm::diffusers::LLM_SPV;
-    ShaderModule llm_shader = vk::shaderModuleCreateInfo()
-        .setCodeSize(llm_spv.len)
-        .setCode((uint*)&llm_spv[0])
-        .build(ctx.device)!!;
-
+    // Shared kernels (rmsnorm, layernorm, silu, gelu, matmul, etc.) are now
+    // embedded in diffusion.spv — no need to import from llm::diffusers::LLM_SPV
     DiffusionKernels kernels = {
         .conv2d           = create_kernel(ctx, shader, 4, Conv2dPC.sizeof, "conv2d")!!,
         .conv2d_q8        = create_kernel(ctx, shader, 4, Conv2dPC.sizeof, "conv2d_q8")!!,
@@ -310,11 +305,10 @@ fn DiffusionKernels? create_diffusion_kernels(DeviceContext* ctx) {
         .f16_to_f32       = create_kernel(ctx, shader, 2, F16ToF32PC.sizeof, "f16_to_f32")!!,
         .relu             = create_kernel(ctx, shader, 1, ReluPC.sizeof, "relu")!!,
         .tanh_clamp       = create_kernel(ctx, shader, 1, TanhClampPC.sizeof, "tanh_clamp")!!,
-        .shared           = create_shared_kernels(ctx, llm_shader)!!,
+        .shared           = create_shared_kernels(ctx, shader)!!,
     };
 
     shader.free(ctx.device);
-    llm_shader.free(ctx.device);
     return kernels;
 }
 

@@ -1,4 +1,4 @@
-module llm::diffusers;
+module sdxs;
 
 import vk;
 import llm;
@@ -13,8 +13,8 @@ import std::core::mem;
 
 // A single Conv2d layer: weight + optional bias
 struct VaeConvLayer {
-    Tensor weight;
-    Tensor bias;
+    llm::Tensor weight;
+    llm::Tensor bias;
     uint in_c;
     uint out_c;
     uint kH;
@@ -27,19 +27,19 @@ struct VaeConvLayer {
 // conv.2: GroupNorm + Conv3x3
 // conv.4: Skip connection conv (1x1 or identity)
 struct VaeResBlock {
-    Tensor conv0_weight;
-    Tensor conv0_bias;
-    Tensor conv2_weight;
-    Tensor conv2_bias;
-    Tensor conv4_weight;
-    Tensor conv4_bias;
+    llm::Tensor conv0_weight;
+    llm::Tensor conv0_bias;
+    llm::Tensor conv2_weight;
+    llm::Tensor conv2_bias;
+    llm::Tensor conv4_weight;
+    llm::Tensor conv4_bias;
     uint channels;
 }
 
 // --- VAE Decoder ---
 
 struct VaeDecoder {
-    VaeConfig config;
+    llm::VaeConfig config;
 
     // conv_in: 4 -> 64 channels
     VaeConvLayer conv_in;
@@ -59,14 +59,14 @@ struct VaeDecoder {
     VaeConvLayer[3] upsample_convs;  // 3 upsample layers
     VaeConvLayer conv_out;
 
-    DiffusionKernels* kernels;
-    DeviceContext* ctx;
+    llm::DiffusionKernels* kernels;
+    llm::DeviceContext* ctx;
 }
 
 // --- VAE Encoder ---
 
 struct VaeEncoder {
-    VaeConfig config;
+    llm::VaeConfig config;
 
     // conv_in: 3 -> 64 channels
     VaeConvLayer conv_in;
@@ -84,16 +84,16 @@ struct VaeEncoder {
     VaeConvLayer[3] downsample_convs;
     VaeConvLayer conv_out;
 
-    DiffusionKernels* kernels;
-    DeviceContext* ctx;
+    llm::DiffusionKernels* kernels;
+    llm::DeviceContext* ctx;
 }
 
 // --- VAE Activations (shared between encoder and decoder) ---
 
 struct VaeActivations {
-    Tensor buf_a;  // Primary spatial buffer
-    Tensor buf_b;  // Secondary spatial buffer (ping-pong)
-    Tensor buf_c;  // Temporary for residual
+    llm::Tensor buf_a;  // Primary spatial buffer
+    llm::Tensor buf_b;  // Secondary spatial buffer (ping-pong)
+    llm::Tensor buf_c;  // Temporary for residual
 }
 
 // --- Tensor name helpers ---
@@ -114,12 +114,12 @@ fn String vae_tensor_name(char[128]* buf, String prefix, uint layer, String suff
     return (String)(*buf)[0..pos - 1];
 }
 
-fn VaeConvLayer load_vae_conv(DeviceContext* ctx, GGUFFile* gf, String prefix, uint layer, uint in_c, uint out_c, bool has_bias = true) {
+fn VaeConvLayer? load_vae_conv(llm::DeviceContext* ctx, llm::GGUFFile* gf, String prefix, uint layer, uint in_c, uint out_c, bool has_bias = true) {
     char[128] buf;
-    Tensor w = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "weight"));
-    Tensor b;
+    llm::Tensor w = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "weight"))!!;
+    llm::Tensor b;
     if (has_bias) {
-        b = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "bias"));
+        b = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "bias"))!!;
     }
     return {
         .weight = w,
@@ -132,42 +132,42 @@ fn VaeConvLayer load_vae_conv(DeviceContext* ctx, GGUFFile* gf, String prefix, u
     };
 }
 
-fn VaeResBlock load_vae_resblock(DeviceContext* ctx, GGUFFile* gf, String prefix, uint layer, uint channels) {
+fn VaeResBlock? load_vae_resblock(llm::DeviceContext* ctx, llm::GGUFFile* gf, String prefix, uint layer, uint channels) {
     char[128] buf;
     return {
-        .conv0_weight = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.0.weight")),
-        .conv0_bias = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.0.bias")),
-        .conv2_weight = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.2.weight")),
-        .conv2_bias = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.2.bias")),
-        .conv4_weight = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.4.weight")),
-        .conv4_bias = load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.4.bias")),
+        .conv0_weight = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.0.weight"))!!,
+        .conv0_bias = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.0.bias"))!!,
+        .conv2_weight = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.2.weight"))!!,
+        .conv2_bias = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.2.bias"))!!,
+        .conv4_weight = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.4.weight"))!!,
+        .conv4_bias = llm::load_tensor_by_name(ctx, gf, vae_tensor_name(&buf, prefix, layer, "conv.4.bias"))!!,
         .channels = channels,
     };
 }
 
 // --- Load VAE Decoder ---
 
-fn VaeDecoder? load_vae_decoder(DeviceContext* ctx, GGUFFile* gf, VaeConfig* config, DiffusionKernels* kernels) {
+fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::VaeConfig* config, llm::DiffusionKernels* kernels) {
     io::printfn("\nLoading VAE decoder weights...");
     String pfx = config.prefix_decoder;
 
-    VaeConvLayer conv_in = load_vae_conv(ctx, gf, pfx, 0, 4, 64);
+    VaeConvLayer conv_in = load_vae_conv(ctx, gf, pfx, 0, 4, 64)!!;
 
     // ResBlocks: layers 2,3,4, 7,8,9, 12,13,14, 17
     VaeResBlock[10] res_blocks;
     uint[10] rb_layers = { 2, 3, 4, 7, 8, 9, 12, 13, 14, 17 };
     for (uint i = 0; i < 10; i++) {
-        res_blocks[i] = load_vae_resblock(ctx, gf, pfx, rb_layers[i], 64);
+        res_blocks[i] = load_vae_resblock(ctx, gf, pfx, rb_layers[i], 64)!!;
     }
 
     // Upsample convs: layers 6, 11, 16 (weight-only, no bias)
     VaeConvLayer[3] upsample_convs;
     uint[3] up_layers = { 6, 11, 16 };
     for (uint i = 0; i < 3; i++) {
-        upsample_convs[i] = load_vae_conv(ctx, gf, pfx, up_layers[i], 64, 64, has_bias: false);
+        upsample_convs[i] = load_vae_conv(ctx, gf, pfx, up_layers[i], 64, 64, has_bias: false)!!;
     }
 
-    VaeConvLayer conv_out = load_vae_conv(ctx, gf, pfx, 18, 64, 3);
+    VaeConvLayer conv_out = load_vae_conv(ctx, gf, pfx, 18, 64, 3)!!;
 
     io::printfn("  VAE decoder loaded: %d res blocks, %d upsample layers",
         (uint)10, (uint)3);
@@ -185,27 +185,27 @@ fn VaeDecoder? load_vae_decoder(DeviceContext* ctx, GGUFFile* gf, VaeConfig* con
 
 // --- Load VAE Encoder ---
 
-fn VaeEncoder? load_vae_encoder(DeviceContext* ctx, GGUFFile* gf, VaeConfig* config, DiffusionKernels* kernels) {
+fn VaeEncoder? load_vae_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::VaeConfig* config, llm::DiffusionKernels* kernels) {
     io::printfn("\nLoading VAE encoder weights...");
     String pfx = config.prefix_encoder;
 
-    VaeConvLayer conv_in = load_vae_conv(ctx, gf, pfx, 0, 3, 64);
+    VaeConvLayer conv_in = load_vae_conv(ctx, gf, pfx, 0, 3, 64)!!;
 
     // ResBlocks: layers 1,3,4,5, 7,8,9, 11,12,13
     VaeResBlock[10] res_blocks;
     uint[10] rb_layers = { 1, 3, 4, 5, 7, 8, 9, 11, 12, 13 };
     for (uint i = 0; i < 10; i++) {
-        res_blocks[i] = load_vae_resblock(ctx, gf, pfx, rb_layers[i], 64);
+        res_blocks[i] = load_vae_resblock(ctx, gf, pfx, rb_layers[i], 64)!!;
     }
 
     // Downsample convs: layers 2, 6, 10 (weight-only, no bias)
     VaeConvLayer[3] downsample_convs;
     uint[3] dn_layers = { 2, 6, 10 };
     for (uint i = 0; i < 3; i++) {
-        downsample_convs[i] = load_vae_conv(ctx, gf, pfx, dn_layers[i], 64, 64, has_bias: false);
+        downsample_convs[i] = load_vae_conv(ctx, gf, pfx, dn_layers[i], 64, 64, has_bias: false)!!;
     }
 
-    VaeConvLayer conv_out = load_vae_conv(ctx, gf, pfx, 14, 64, 4);
+    VaeConvLayer conv_out = load_vae_conv(ctx, gf, pfx, 14, 64, 4)!!;
 
     io::printfn("  VAE encoder loaded: %d res blocks, %d downsample layers",
         (uint)10, (uint)3);
@@ -223,7 +223,7 @@ fn VaeEncoder? load_vae_encoder(DeviceContext* ctx, GGUFFile* gf, VaeConfig* con
 
 // --- Allocate VAE activation buffers ---
 
-fn VaeActivations? allocate_vae_activations(DeviceContext* ctx, uint max_spatial_size, uint max_channels) {
+fn VaeActivations? allocate_vae_activations(llm::DeviceContext* ctx, uint max_spatial_size, uint max_channels) {
     // Largest buffer: max_channels * max_spatial_size^2 floats
     // For decoder: 64 * 512 * 512 = 16M floats = 64MB
     ulong max_elems = (ulong)max_channels * max_spatial_size * max_spatial_size;
@@ -240,16 +240,16 @@ fn VaeActivations? allocate_vae_activations(DeviceContext* ctx, uint max_spatial
 
 fn void dispatch_vae_conv(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     VaeConvLayer* layer,
-    Tensor* input,
-    Tensor* output,
+    llm::Tensor* input,
+    llm::Tensor* output,
     uint in_h, uint in_w,
     uint stride, uint pad
 ) {
     uint out_h = (in_h + 2 * pad - layer.kH) / stride + 1;
     uint out_w = (in_w + 2 * pad - layer.kW) / stride + 1;
-    Conv2dPC pc = {
+    llm::Conv2dPC pc = {
         .in_c = layer.in_c,
         .out_c = layer.out_c,
         .in_h = in_h,
@@ -264,7 +264,7 @@ fn void dispatch_vae_conv(
         .has_bias = layer.has_bias ? 1 : 0,
     };
     // When no bias, pass weight buffer as dummy (shader won't read it with has_bias=0)
-    Tensor* bias_tensor = layer.has_bias ? &layer.bias : &layer.weight;
+    llm::Tensor* bias_tensor = layer.has_bias ? &layer.bias : &layer.weight;
 	llm::dispatch_conv2d(cmd, k, &layer.weight, bias_tensor, input, output, &pc);
 }
 
@@ -274,18 +274,18 @@ fn void dispatch_vae_conv(
 
 fn void dispatch_vae_resblock(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     VaeResBlock* rb,
-    Tensor* input,     // buf_a
-    Tensor* temp,      // buf_b (temporary)
-    Tensor* skip_temp, // buf_c (for skip connection)
+    llm::Tensor* input,     // buf_a
+    llm::Tensor* temp,      // buf_b (temporary)
+    llm::Tensor* skip_temp, // buf_c (for skip connection)
     uint h, uint w
 ) {
     uint ch = rb.channels;
     uint spatial = h * w;
 
     // SiLU on input -> temp (in-place would need copy, so we use temp)
-    SiluPC silu_pc = { .n = ch * spatial };
+    llm::SiluPC silu_pc = { .n = ch * spatial };
     // Copy input to temp first, then apply SiLU in-place on temp
     vk::cmdCopyBuffer(cmd, input.gpu_buffer.buffer, temp.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)ch * spatial * 4 }});
@@ -298,7 +298,7 @@ llm::dispatch_kernel(cmd, &k.shared.silu,
 llm::compute_barrier(cmd);
 
     // Conv3x3 (conv.0): temp -> skip_temp
-    Conv2dPC pc0 = {
+    llm::Conv2dPC pc0 = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -319,7 +319,7 @@ llm::compute_barrier(cmd);
 
     // Skip connection conv (conv.4): input -> skip_temp
     // This is typically a 3x3 conv that acts as identity or channel projection
-    Conv2dPC pc_skip = {
+    llm::Conv2dPC pc_skip = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -328,7 +328,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Residual add: skip_temp += temp, result in skip_temp
-    ResidualPC res_pc = { .n = ch * spatial };
+    llm::ResidualPC res_pc = { .n = ch * spatial };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { skip_temp.gpu_buffer.buffer, temp.gpu_buffer.buffer },
         { skip_temp.size_bytes, temp.size_bytes },
@@ -346,9 +346,9 @@ llm::compute_barrier(cmd);
 // Output: image [3, 512, 512] in buf_a
 
 fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
-    DeviceContext* ctx = self.ctx;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    DiffusionKernels* k = self.kernels;
+    llm::DiffusionKernels* k = self.kernels;
 
     uint h = 64;  // latent height
     uint w = 64;  // latent width
@@ -369,7 +369,7 @@ llm::compute_barrier(cmd);
     }
 
     // Upsample 0 (layer 6): 64x64 -> 128x128
-    UpsamplePC up_pc = { .channels = 64, .in_h = h, .in_w = w };
+    llm::UpsamplePC up_pc = { .channels = 64, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
@@ -423,7 +423,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Scale + shift to [0,1] range: output = output * 0.5 + 0.5
-    ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
+    llm::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer },
         { acts.buf_b.size_bytes, acts.buf_a.size_bytes },
@@ -438,9 +438,9 @@ llm::submit_and_wait(ctx)!!;
 // Output: latent [4, H/8, W/8] in buf_a
 
 fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w) {
-    DeviceContext* ctx = self.ctx;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    DiffusionKernels* k = self.kernels;
+    llm::DiffusionKernels* k = self.kernels;
 
     uint h = img_h;
     uint w = img_w;

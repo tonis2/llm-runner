@@ -1,4 +1,4 @@
-module llm::diffusers;
+module sdxs;
 
 import vk;
 import llm;
@@ -6,55 +6,57 @@ import std::io;
 import std::math;
 import std::core::mem;
 
+struct EmbeddingPC { uint token_id; uint dim; }
+
 // CLIP Text Encoder for Stable Diffusion
 // 12-layer transformer with non-causal self-attention
 // Processes all 77 token positions at once using batched matmul
 
 struct ClipLayerWeights {
-    Tensor ln1_weight;
-    Tensor ln1_bias;
-    Tensor q_proj;
-    Tensor q_proj_bias;
-    Tensor k_proj;
-    Tensor k_proj_bias;
-    Tensor v_proj;
-    Tensor v_proj_bias;
-    Tensor out_proj;
-    Tensor out_proj_bias;
-    Tensor ln2_weight;
-    Tensor ln2_bias;
-    Tensor fc1;
-    Tensor fc1_bias;
-    Tensor fc2;
-    Tensor fc2_bias;
+    llm::Tensor ln1_weight;
+    llm::Tensor ln1_bias;
+    llm::Tensor q_proj;
+    llm::Tensor q_proj_bias;
+    llm::Tensor k_proj;
+    llm::Tensor k_proj_bias;
+    llm::Tensor v_proj;
+    llm::Tensor v_proj_bias;
+    llm::Tensor out_proj;
+    llm::Tensor out_proj_bias;
+    llm::Tensor ln2_weight;
+    llm::Tensor ln2_bias;
+    llm::Tensor fc1;
+    llm::Tensor fc1_bias;
+    llm::Tensor fc2;
+    llm::Tensor fc2_bias;
 }
 
 struct ClipWeights {
-    Tensor token_embedding;     // [vocab_size, dim]
-    Tensor position_embedding;  // [max_tokens, dim]
-    Tensor final_ln_weight;
-    Tensor final_ln_bias;
+    llm::Tensor token_embedding;     // [vocab_size, dim]
+    llm::Tensor position_embedding;  // [max_tokens, dim]
+    llm::Tensor final_ln_weight;
+    llm::Tensor final_ln_bias;
     ClipLayerWeights[] layers;
 }
 
 struct ClipActivations {
-    Tensor hidden;      // [max_tokens, dim] = [77, 768]
-    Tensor norm_out;    // [max_tokens, dim]
-    Tensor q;           // [max_tokens, dim]
-    Tensor k;           // [max_tokens, dim]
-    Tensor v;           // [max_tokens, dim]
-    Tensor attn_out;    // [max_tokens, dim]
-    Tensor ffn_out;     // [max_tokens, ffn_dim] (ffn_dim = 4 * dim = 3072)
-    Tensor ffn_down_out; // [max_tokens, dim]
-    Tensor scores;      // [n_heads, max_tokens, max_tokens]
+    llm::Tensor hidden;      // [max_tokens, dim] = [77, 768]
+    llm::Tensor norm_out;    // [max_tokens, dim]
+    llm::Tensor q;           // [max_tokens, dim]
+    llm::Tensor k;           // [max_tokens, dim]
+    llm::Tensor v;           // [max_tokens, dim]
+    llm::Tensor attn_out;    // [max_tokens, dim]
+    llm::Tensor ffn_out;     // [max_tokens, ffn_dim] (ffn_dim = 4 * dim = 3072)
+    llm::Tensor ffn_down_out; // [max_tokens, dim]
+    llm::Tensor scores;      // [n_heads, max_tokens, max_tokens]
 }
 
 struct ClipEncoder {
-    ClipConfig config;
+    llm::ClipConfig config;
     ClipWeights weights;
     ClipActivations acts;
-    DiffusionKernels* kernels;
-    DeviceContext* ctx;
+    llm::DiffusionKernels* kernels;
+    llm::DeviceContext* ctx;
 }
 
 fn String clip_tensor_name(char[128]* buf, String prefix, String suffix) {
@@ -92,56 +94,56 @@ fn String clip_layer_tensor_name(char[128]* buf, String prefix, uint layer, Stri
     return (String)(*buf)[0..pos - 1];
 }
 
-fn ClipWeights? load_clip_weights(DeviceContext* ctx, GGUFFile* gf, ClipConfig* config) {
+fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ClipConfig* config) {
     io::printfn("\nLoading CLIP weights...");
     String pfx = config.prefix;
     char[128] buf;
 
-    Tensor token_emb = load_tensor_as_f32(ctx, gf,
-        clip_tensor_name(&buf, pfx, "embeddings.token_embedding.weight"));
-    Tensor pos_emb = load_tensor_as_f32(ctx, gf,
-        clip_tensor_name(&buf, pfx, "embeddings.position_embedding.weight"));
-    Tensor final_ln_w = load_tensor_by_name(ctx, gf,
-        clip_tensor_name(&buf, pfx, "final_layer_norm.weight"));
-    Tensor final_ln_b = load_tensor_by_name(ctx, gf,
-        clip_tensor_name(&buf, pfx, "final_layer_norm.bias"));
+    llm::Tensor token_emb = llm::load_tensor_as_f32(ctx, gf,
+        clip_tensor_name(&buf, pfx, "embeddings.token_embedding.weight"))!!;
+    llm::Tensor pos_emb = llm::load_tensor_as_f32(ctx, gf,
+        clip_tensor_name(&buf, pfx, "embeddings.position_embedding.weight"))!!;
+    llm::Tensor final_ln_w = llm::load_tensor_by_name(ctx, gf,
+        clip_tensor_name(&buf, pfx, "final_layer_norm.weight"))!!;
+    llm::Tensor final_ln_b = llm::load_tensor_by_name(ctx, gf,
+        clip_tensor_name(&buf, pfx, "final_layer_norm.bias"))!!;
 
     ClipLayerWeights[] layers = mem::new_array(ClipLayerWeights, config.n_layers);
 
     for (uint l = 0; l < config.n_layers; l++) {
         layers[l] = {
-            .ln1_weight = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "layer_norm1.weight")),
-            .ln1_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "layer_norm1.bias")),
-            .q_proj = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.q_proj.weight")),
-            .q_proj_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.q_proj.bias")),
-            .k_proj = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.k_proj.weight")),
-            .k_proj_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.k_proj.bias")),
-            .v_proj = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.v_proj.weight")),
-            .v_proj_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.v_proj.bias")),
-            .out_proj = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.out_proj.weight")),
-            .out_proj_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "self_attn.out_proj.bias")),
-            .ln2_weight = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "layer_norm2.weight")),
-            .ln2_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "layer_norm2.bias")),
-            .fc1 = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc1.weight")),
-            .fc1_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc1.bias")),
-            .fc2 = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc2.weight")),
-            .fc2_bias = load_tensor_by_name(ctx, gf,
-                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc2.bias")),
+            .ln1_weight = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "layer_norm1.weight"))!!,
+            .ln1_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "layer_norm1.bias"))!!,
+            .q_proj = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.q_proj.weight"))!!,
+            .q_proj_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.q_proj.bias"))!!,
+            .k_proj = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.k_proj.weight"))!!,
+            .k_proj_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.k_proj.bias"))!!,
+            .v_proj = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.v_proj.weight"))!!,
+            .v_proj_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.v_proj.bias"))!!,
+            .out_proj = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.out_proj.weight"))!!,
+            .out_proj_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "self_attn.out_proj.bias"))!!,
+            .ln2_weight = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "layer_norm2.weight"))!!,
+            .ln2_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "layer_norm2.bias"))!!,
+            .fc1 = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc1.weight"))!!,
+            .fc1_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc1.bias"))!!,
+            .fc2 = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc2.weight"))!!,
+            .fc2_bias = llm::load_tensor_by_name(ctx, gf,
+                clip_layer_tensor_name(&buf, pfx, l, "mlp.fc2.bias"))!!,
         };
 
         if ((l + 1) % 4 == 0 || l == config.n_layers - 1) {
@@ -158,7 +160,7 @@ fn ClipWeights? load_clip_weights(DeviceContext* ctx, GGUFFile* gf, ClipConfig* 
     };
 }
 
-fn ClipActivations? allocate_clip_activations(DeviceContext* ctx, ClipConfig* config) {
+fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, llm::ClipConfig* config) {
     io::printfn("Allocating CLIP activation buffers...");
 
     ulong seq = config.max_tokens;  // 77
@@ -183,7 +185,7 @@ fn ClipActivations? allocate_clip_activations(DeviceContext* ctx, ClipConfig* co
     };
 }
 
-fn ClipEncoder? load_clip_encoder(DeviceContext* ctx, GGUFFile* gf, ClipConfig* config, DiffusionKernels* kernels) {
+fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ClipConfig* config, llm::DiffusionKernels* kernels) {
     ClipWeights weights = load_clip_weights(ctx, gf, config)!!;
     ClipActivations acts = allocate_clip_activations(ctx, config)!!;
 
@@ -199,13 +201,13 @@ fn ClipEncoder? load_clip_encoder(DeviceContext* ctx, GGUFFile* gf, ClipConfig* 
 // CLIP forward pass: tokens[max_tokens] -> hidden[max_tokens, dim]
 // Result is in self.acts.hidden after this call
 fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
-    DeviceContext* ctx = self.ctx;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    ClipConfig* c = &self.config;
+    llm::ClipConfig* c = &self.config;
     ClipWeights* w = &self.weights;
     ClipActivations* a = &self.acts;
-    DiffusionKernels* k = self.kernels;
-    SharedKernels* sk = &k.shared;
+    llm::DiffusionKernels* k = self.kernels;
+    llm::SharedKernels* sk = &k.shared;
 
     uint seq = c.max_tokens;  // 77
     uint dim = c.dim;         // 768
@@ -245,7 +247,7 @@ llm::begin_compute(cmd)!!;
 llm::compute_barrier(cmd);
 
     // Add position embedding: hidden += position_embedding (element-wise, full seq*dim)
-    ResidualPC res_pc = { .n = seq * dim };
+    llm::ResidualPC res_pc = { .n = seq * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
         { a.hidden.gpu_buffer.buffer, w.position_embedding.gpu_buffer.buffer },
         { a.hidden.size_bytes, w.position_embedding.size_bytes },
@@ -259,7 +261,7 @@ llm::compute_barrier(cmd);
         // 2a. LayerNorm1(hidden) -> norm_out
         // Apply layernorm per-position (77 times, each of dim=768)
         for (uint pos = 0; pos < seq; pos++) {
-            LayerNormPC ln_pc = { .dim = dim, .eps = c.eps };
+            llm::LayerNormPC ln_pc = { .dim = dim, .eps = c.eps };
             usz offset = (usz)pos * dim * 4;
             // We need per-position layernorm. Use the existing layernorm shader
             // but with an offset. Since our layernorm operates on binding 0 from start,
@@ -277,17 +279,17 @@ llm::compute_barrier(cmd);
         // 2b. Q/K/V projections: batched matmul [77, 768] x [768, 768]^T -> [77, 768]
         // Weight is stored as [out_dim, in_dim], matmul is input * weight^T
         // output[seq, dim] = norm_out[seq, dim] x weight^T[dim, dim]
-        BatchedMatMulPC qkv_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
+        llm::BatchedMatMulPC qkv_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
         llm::dispatch_batched_matmul_auto(cmd, k, &lw.q_proj, &a.norm_out, &a.q, &qkv_pc);
         llm::dispatch_batched_matmul_auto(cmd, k, &lw.k_proj, &a.norm_out, &a.k, &qkv_pc);
         llm::dispatch_batched_matmul_auto(cmd, k, &lw.v_proj, &a.norm_out, &a.v, &qkv_pc);
 llm::compute_barrier(cmd);
 
         // Add biases to Q, K, V
-        ResidualPC bias_pc = { .n = seq * dim };
+        llm::ResidualPC bias_pc = { .n = seq * dim };
         // TODO: broadcast add bias[dim] across seq positions
         // For now we need a broadcast add for [seq, dim] += [dim]
-        BroadcastAddPC ba_pc = { .channels = dim, .spatial = seq };
+        llm::BroadcastAddPC ba_pc = { .channels = dim, .spatial = seq };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.q.gpu_buffer.buffer, lw.q_proj_bias.gpu_buffer.buffer },
             { a.q.size_bytes, lw.q_proj_bias.size_bytes },
@@ -306,7 +308,7 @@ llm::compute_barrier(cmd);
         // Reshape Q/K/V from [seq, dim] to [n_heads, seq, head_dim]
         // The spatial_attention shader expects [n_heads, seq, head_dim] layout
         float scale = 1.0f / math::sqrt((float)c.head_dim);
-        SpatialAttentionPC sa_pc = {
+        llm::SpatialAttentionPC sa_pc = {
             .head_dim = c.head_dim,
             .n_heads = c.n_heads,
             .seq_len = seq,
@@ -321,7 +323,7 @@ llm::dispatch_kernel(cmd, &k.spatial_attention,
 llm::compute_barrier(cmd);
 
         // 2d. Output projection
-        BatchedMatMulPC out_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
+        llm::BatchedMatMulPC out_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
         llm::dispatch_batched_matmul_auto(cmd, k, &lw.out_proj, &a.attn_out, &a.norm_out, &out_pc);
 llm::compute_barrier(cmd);
 
@@ -341,7 +343,7 @@ llm::compute_barrier(cmd);
 
         // 2f. LayerNorm2(hidden) -> norm_out
         for (uint pos = 0; pos < seq; pos++) {
-            LayerNormPC ln_pc2 = { .dim = dim, .eps = c.eps };
+            llm::LayerNormPC ln_pc2 = { .dim = dim, .eps = c.eps };
 llm::dispatch_kernel(cmd, &sk.layernorm,
                 { a.hidden.gpu_buffer.buffer, lw.ln2_weight.gpu_buffer.buffer,
                   lw.ln2_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
@@ -352,12 +354,12 @@ llm::dispatch_kernel(cmd, &sk.layernorm,
 llm::compute_barrier(cmd);
 
         // 2g. FFN: fc1 -> GELU -> fc2
-        BatchedMatMulPC fc1_pc = { .m_dim = seq, .n_dim = ffn_dim, .k_dim = dim };
+        llm::BatchedMatMulPC fc1_pc = { .m_dim = seq, .n_dim = ffn_dim, .k_dim = dim };
         llm::dispatch_batched_matmul_auto(cmd, k, &lw.fc1, &a.norm_out, &a.ffn_out, &fc1_pc);
 llm::compute_barrier(cmd);
 
         // Add fc1 bias
-        BroadcastAddPC fc1_ba = { .channels = ffn_dim, .spatial = seq };
+        llm::BroadcastAddPC fc1_ba = { .channels = ffn_dim, .spatial = seq };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.ffn_out.gpu_buffer.buffer, lw.fc1_bias.gpu_buffer.buffer },
             { a.ffn_out.size_bytes, lw.fc1_bias.size_bytes },
@@ -365,7 +367,7 @@ llm::dispatch_kernel(cmd, &k.broadcast_add,
 llm::compute_barrier(cmd);
 
         // GELU activation
-        GeluPC gelu_pc = { .n = seq * ffn_dim };
+        llm::GeluPC gelu_pc = { .n = seq * ffn_dim };
 llm::dispatch_kernel(cmd, &sk.gelu,
             { a.ffn_out.gpu_buffer.buffer },
             { a.ffn_out.size_bytes },
@@ -373,7 +375,7 @@ llm::dispatch_kernel(cmd, &sk.gelu,
 llm::compute_barrier(cmd);
 
         // fc2
-        BatchedMatMulPC fc2_pc = { .m_dim = seq, .n_dim = dim, .k_dim = ffn_dim };
+        llm::BatchedMatMulPC fc2_pc = { .m_dim = seq, .n_dim = dim, .k_dim = ffn_dim };
         llm::dispatch_batched_matmul_auto(cmd, k, &lw.fc2, &a.ffn_out, &a.ffn_down_out, &fc2_pc);
 llm::compute_barrier(cmd);
 
@@ -394,7 +396,7 @@ llm::compute_barrier(cmd);
 
     // 3. Final LayerNorm
     for (uint pos = 0; pos < seq; pos++) {
-        LayerNormPC final_ln = { .dim = dim, .eps = c.eps };
+        llm::LayerNormPC final_ln = { .dim = dim, .eps = c.eps };
 llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, w.final_ln_weight.gpu_buffer.buffer,
               w.final_ln_bias.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },

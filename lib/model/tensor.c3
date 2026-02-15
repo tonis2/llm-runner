@@ -516,3 +516,15 @@ fn Tensor? upload_weight_as_q8(DeviceContext* ctx, float* f32_data, uint n_eleme
         .size_bytes = q8_size,
     };
 }
+
+// Convenience: load a tensor by name from a GGUF file
+fn Tensor? load_tensor_by_name(DeviceContext* ctx, GGUFFile* gf, String name) {
+    GGUFTensorInfo* info = gf.find_tensor(name)!!;
+    return upload_weight(ctx, info, gf.tensor_data_base);
+}
+
+// Convenience: load a tensor by name, dequantizing to F32
+fn Tensor? load_tensor_as_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
+    GGUFTensorInfo* info = gf.find_tensor(name)!!;
+    return upload_weight_as_f32(ctx, info, gf.tensor_data_base);
+}

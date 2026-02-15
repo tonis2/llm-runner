@@ -1,38 +1,39 @@
-module llm;
+module example;
 
 import std::io;
 import vk;
 import image;
 import image::png;
-import llm::args;
+import llm;
 import llm::pipelines;
-import llm::diffusers;
+import zimage;
+import sdxs;
 
 fn int main(String[] args) {
     // Parse arguments
-    AppConfig config = args::parse_args(args)!!;
+    AppConfig config = parse_args(args)!!;
 
     io::printfn("Loading model from: %s", config.model_path);
     io::printfn("Prompt: %s", config.prompt);
 
+    // Register available diffusers
+    llm::pipelines::register_pipeline(zimage::create_pipeline());
+    llm::pipelines::register_pipeline(sdxs::create_pipeline());
+
     // Setup Vulkan context
-    DeviceContext ctx = createContext()!!;
+    llm::DeviceContext ctx = llm::createContext()!!;
     defer ctx.free();
 
-    // Load pipeline (auto-detects model type from GGUF)
-    llm::pipelines::ImagePipeline pipeline = llm::pipelines::pipeline_from_gguf(&ctx, config.model_path)!!;
-    defer pipeline.free();
+    // Configure pipeline options
+    llm::pipelines::PipelineOptions opts = {
+        .text_model_path = config.text_model_path,
+        .vae_path = config.vae_path,
+        .taesd_path = config.taesd_path,
+    };
 
-    // Configure pipeline
-    if (config.text_model_path.len > 0) {
-        pipeline.set_text_encoder(config.text_model_path);
-    }
-    if (config.vae_path.len > 0) {
-        pipeline.set_vae(config.vae_path);
-    }
-    if (config.taesd_path.len > 0) {
-        pipeline.set_taesd(config.taesd_path);
-    }
+    // Create pipeline (auto-detects model type from GGUF)
+    llm::pipelines::ImagePipeline pipeline = llm::pipelines::create_image_pipeline(&ctx, config.model_path, &opts)!!;
+    defer pipeline.free();
 
     // Prepare inputs
     llm::pipelines::GenerationInputs inputs = llm::pipelines::generation_inputs_defaults();
@@ -45,7 +46,7 @@ fn int main(String[] args) {
     // Optional: img2img mode
     image::Image input_img;
     if (config.input_path.len > 0) {
-        input_img = load_png(config.input_path)!!;
+        input_img = llm::load_png(config.input_path)!!;
         inputs.input_image = &input_img;
         inputs.strength = 0.75;
     }

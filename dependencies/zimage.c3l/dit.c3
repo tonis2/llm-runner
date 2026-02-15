@@ -1,7 +1,8 @@
-module llm::diffusers;
+module zimage;
 
 import vk;
 import llm;
+import llm_text;
 import std::io;
 import std::math;
 import std::core::mem;
@@ -148,24 +149,24 @@ const bool DEBUG_X_EMBEDDER_CPU_VERIFY = false;
 
 struct DiTLayerWeights {
     // Fused QKV: [3*dim, dim]
-    Tensor wqkv;
+    llm::Tensor wqkv;
     // Q/K norms: [head_dim]
-    Tensor q_norm;
-    Tensor k_norm;
+    llm::Tensor q_norm;
+    llm::Tensor k_norm;
     // Output projection: [dim, dim]
-    Tensor wo;
+    llm::Tensor wo;
     // FFN SwiGLU: gate [ffn_dim, dim], up [ffn_dim, dim], down [dim, ffn_dim]
-    Tensor ffn_gate;
-    Tensor ffn_up;
-    Tensor ffn_down;
+    llm::Tensor ffn_gate;
+    llm::Tensor ffn_up;
+    llm::Tensor ffn_down;
     // Norms (Lumina2: norm1=pre-norm, norm2=post-norm)
-    Tensor attn_norm1;   // pre-attention RMSNorm
-    Tensor attn_norm2;   // post-attention RMSNorm
-    Tensor ffn_norm1;    // pre-FFN RMSNorm
-    Tensor ffn_norm2;    // post-FFN RMSNorm
+    llm::Tensor attn_norm1;   // pre-attention RMSNorm
+    llm::Tensor attn_norm2;   // post-attention RMSNorm
+    llm::Tensor ffn_norm1;    // pre-FFN RMSNorm
+    llm::Tensor ffn_norm2;    // post-FFN RMSNorm
     // AdaLN: projects t_emb to modulation params [4*dim]
-    Tensor adaln_linear;
-    Tensor adaln_bias;
+    llm::Tensor adaln_linear;
+    llm::Tensor adaln_bias;
 }
 
 struct DiTWeights {
@@ -177,84 +178,84 @@ struct DiTWeights {
     DiTLayerWeights[DIT_NUM_REFINER_LAYERS] context_refiner;
 
     // cap_embedder: Sequential(RMSNorm(text_dim), Linear(text_dim, dim))
-    Tensor cap_emb_norm;    // RMSNorm weight [text_dim]
-    Tensor cap_emb_weight;  // Linear weight [text_dim, dim]
-    Tensor cap_emb_bias;    // Linear bias [dim]
+    llm::Tensor cap_emb_norm;    // RMSNorm weight [text_dim]
+    llm::Tensor cap_emb_weight;  // Linear weight [text_dim, dim]
+    llm::Tensor cap_emb_bias;    // Linear bias [dim]
 
     // t_embedder MLP: sinusoidal [256] -> Linear(256,1024) -> SiLU -> Linear(1024,256) -> [256]
-    Tensor t_emb_mlp0_weight;
-    Tensor t_emb_mlp0_bias;
-    Tensor t_emb_mlp2_weight;
-    Tensor t_emb_mlp2_bias;
+    llm::Tensor t_emb_mlp0_weight;
+    llm::Tensor t_emb_mlp0_bias;
+    llm::Tensor t_emb_mlp2_weight;
+    llm::Tensor t_emb_mlp2_bias;
 
     // x_embedder: [dim, patch_dim] + bias
-    Tensor x_emb_weight;
-    Tensor x_emb_bias;
+    llm::Tensor x_emb_weight;
+    llm::Tensor x_emb_bias;
 
     // Final layer
-    Tensor final_norm;          // RMSNorm weight [dim]
-    Tensor final_adaln_linear;
-    Tensor final_adaln_bias;
-    Tensor final_linear;    // [patch_dim, dim]
-    Tensor final_bias;
+    llm::Tensor final_norm;          // RMSNorm weight [dim]
+    llm::Tensor final_adaln_linear;
+    llm::Tensor final_adaln_bias;
+    llm::Tensor final_linear;    // [patch_dim, dim]
+    llm::Tensor final_bias;
 
     // Pad tokens: [dim] (learnable padding for text)
-    Tensor x_pad_token;
-    Tensor cap_pad_token;
+    llm::Tensor x_pad_token;
+    llm::Tensor cap_pad_token;
 }
 
 // --- DiT Activations ---
 
 struct DiTActivations {
-    Tensor buf_a;       // General purpose [max_seq * dim]
-    Tensor buf_b;       // General purpose [max_seq * dim]
-    Tensor buf_c;       // General purpose [max_seq * dim]
-    Tensor patches;     // [n_patches, patch_dim]
-    Tensor hidden;      // [n_patches + text_len, dim]
-    Tensor norm_out;    // [dim] per-position scratch
-    Tensor q;           // [n_heads, seq_len, head_dim]
-    Tensor k;           // [n_heads, seq_len, head_dim]
-    Tensor v;           // [n_heads, seq_len, head_dim]
-    Tensor ffn_gate_out; // [seq_len, ffn_dim]
-    Tensor ffn_up_out;   // [seq_len, ffn_dim]
-    Tensor ffn_down_out; // [seq_len, dim]
-    Tensor t_emb;       // [t_emb_dim]
-    Tensor t_emb_mlp;   // [DIT_T_MLP_DIM] intermediate / [DIT_T_EMB_DIM] final
-    Tensor adaln_params; // [4 * dim]
-    Tensor adaln_scale;  // [dim] (split from adaln_params)
-    Tensor adaln_shift;  // [dim]
-    Tensor velocity;     // [n_patches, patch_dim]
-    Tensor latent;       // [channels, h, w]
+    llm::Tensor buf_a;       // General purpose [max_seq * dim]
+    llm::Tensor buf_b;       // General purpose [max_seq * dim]
+    llm::Tensor buf_c;       // General purpose [max_seq * dim]
+    llm::Tensor patches;     // [n_patches, patch_dim]
+    llm::Tensor hidden;      // [n_patches + text_len, dim]
+    llm::Tensor norm_out;    // [dim] per-position scratch
+    llm::Tensor q;           // [n_heads, seq_len, head_dim]
+    llm::Tensor k;           // [n_heads, seq_len, head_dim]
+    llm::Tensor v;           // [n_heads, seq_len, head_dim]
+    llm::Tensor ffn_gate_out; // [seq_len, ffn_dim]
+    llm::Tensor ffn_up_out;   // [seq_len, ffn_dim]
+    llm::Tensor ffn_down_out; // [seq_len, dim]
+    llm::Tensor t_emb;       // [t_emb_dim]
+    llm::Tensor t_emb_mlp;   // [DIT_T_MLP_DIM] intermediate / [DIT_T_EMB_DIM] final
+    llm::Tensor adaln_params; // [4 * dim]
+    llm::Tensor adaln_scale;  // [dim] (split from adaln_params)
+    llm::Tensor adaln_shift;  // [dim]
+    llm::Tensor velocity;     // [n_patches, patch_dim]
+    llm::Tensor latent;       // [channels, h, w]
 }
 
 // --- DiT Kernels ---
 
 struct DiTKernels {
-    ComputeKernel patchify;
-    ComputeKernel unpatchify;
-    ComputeKernel adaln_modulate;
-    ComputeKernel flow_euler_step;
-    ComputeKernel linear_proj;
-    ComputeKernel linear_proj_debug;  // Simplified version with debug output
-    ComputeKernel dit_timestep_embed;
-    ComputeKernel broadcast_add_dim;
-    ComputeKernel scale_buffer;
-    ComputeKernel flash_attention;
-    ComputeKernel batch_rmsnorm;
-    ComputeKernel transpose_heads;
-    ComputeKernel batch_head_norm;
-    ComputeKernel scale_modulate;
-    ComputeKernel gated_residual;
-    ComputeKernel batch_layernorm;
-    ComputeKernel mrope;
-    ComputeKernel batch_matmul;
-    ComputeKernel batch_matmul_simple;  // Simple 1D dispatch version (no tiling bugs)
-    ComputeKernel batch_matmul_q8;
-    ComputeKernel batch_matmul_q4_0;
-    ComputeKernel batch_matmul_q4k;
-    ComputeKernel batch_matmul_q5k;
-    ComputeKernel batch_matmul_q6k;
-    SharedKernels shared;
+    llm::ComputeKernel patchify;
+    llm::ComputeKernel unpatchify;
+    llm::ComputeKernel adaln_modulate;
+    llm::ComputeKernel flow_euler_step;
+    llm::ComputeKernel linear_proj;
+    llm::ComputeKernel linear_proj_debug;  // Simplified version with debug output
+    llm::ComputeKernel dit_timestep_embed;
+    llm::ComputeKernel broadcast_add_dim;
+    llm::ComputeKernel scale_buffer;
+    llm::ComputeKernel flash_attention;
+    llm::ComputeKernel batch_rmsnorm;
+    llm::ComputeKernel transpose_heads;
+    llm::ComputeKernel batch_head_norm;
+    llm::ComputeKernel scale_modulate;
+    llm::ComputeKernel gated_residual;
+    llm::ComputeKernel batch_layernorm;
+    llm::ComputeKernel mrope;
+    llm::ComputeKernel batch_matmul;
+    llm::ComputeKernel batch_matmul_simple;  // Simple 1D dispatch version (no tiling bugs)
+    llm::ComputeKernel batch_matmul_q8;
+    llm::ComputeKernel batch_matmul_q4_0;
+    llm::ComputeKernel batch_matmul_q4k;
+    llm::ComputeKernel batch_matmul_q5k;
+    llm::ComputeKernel batch_matmul_q6k;
+    llm::SharedKernels shared;
 }
 
 // --- DiT Model ---
@@ -263,7 +264,7 @@ struct DiTModel {
     DiTWeights weights;
     DiTActivations acts;
     DiTKernels kernels;
-    DeviceContext* ctx;
+    llm::DeviceContext* ctx;
     uint n_patches;     // Number of real image patches
     uint text_len;      // Real text sequence length
     uint padded_patches; // n_patches padded to multiple of 32
@@ -271,52 +272,52 @@ struct DiTModel {
     uint latent_h;      // Latent height
     uint latent_w;      // Latent width
     // mRoPE cos/sin tables (precomputed once per config)
-    Tensor rope_cos_main;    // [n_patches + text_len, head_dim/2] for main layers
-    Tensor rope_sin_main;    // [n_patches + text_len, head_dim/2]
-    Tensor rope_cos_refiner; // [n_patches, head_dim/2] for noise refiner
-    Tensor rope_sin_refiner; // [n_patches, head_dim/2]
-    Tensor rope_cos_context; // [text_len, head_dim/2] for context refiner
-    Tensor rope_sin_context; // [text_len, head_dim/2]
+    llm::Tensor rope_cos_main;    // [n_patches + text_len, head_dim/2] for main layers
+    llm::Tensor rope_sin_main;    // [n_patches + text_len, head_dim/2]
+    llm::Tensor rope_cos_refiner; // [n_patches, head_dim/2] for noise refiner
+    llm::Tensor rope_sin_refiner; // [n_patches, head_dim/2]
+    llm::Tensor rope_cos_context; // [text_len, head_dim/2] for context refiner
+    llm::Tensor rope_sin_context; // [text_len, head_dim/2]
 }
 
 // --- Kernel Creation ---
 
-fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
+fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
     io::printfn("Creating DiT compute kernels...");
 
     char[] zi_spv = &ZIMAGE_SPV;
-    ShaderModule zi_shader = vk::shaderModuleCreateInfo()
+    vk::ShaderModule zi_shader = vk::shaderModuleCreateInfo()
         .setCodeSize(zi_spv.len)
         .setCode((uint*)&zi_spv[0])
         .build(ctx.device)!!;
 
     // Shared kernels from LLM shader (rmsnorm, matmul variants, silu, etc.)
-    char[] llm_spv = &LLM_SPV;
-    ShaderModule llm_shader = vk::shaderModuleCreateInfo()
+    char[] llm_spv = &llm_text::LLM_SPV;
+    vk::ShaderModule llm_shader = vk::shaderModuleCreateInfo()
         .setCodeSize(llm_spv.len)
         .setCode((uint*)&llm_spv[0])
         .build(ctx.device)!!;
 
     io::printfn("  Creating zimage kernels...");
-    ComputeKernel k_patchify = llm::create_kernel(ctx, zi_shader, 2, PatchifyPC.sizeof, "patchify")!!;
-    ComputeKernel k_unpatchify = llm::create_kernel(ctx, zi_shader, 2, UnpatchifyPC.sizeof, "unpatchify")!!;
-    ComputeKernel k_adaln = llm::create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!;
-    ComputeKernel k_euler = llm::create_kernel(ctx, zi_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!;
-    ComputeKernel k_linproj = llm::create_kernel(ctx, zi_shader, 4, LinearProjPC.sizeof, "linear_proj")!!;
-    ComputeKernel k_linproj_debug = llm::create_kernel(ctx, zi_shader, 6, LinearProjPC.sizeof, "linear_proj_debug")!!;
-    ComputeKernel k_timestep = llm::create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!;
-    ComputeKernel k_bcastadd = llm::create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!;
-    ComputeKernel k_scalebuf = llm::create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!;
-    ComputeKernel k_flashattn = llm::create_kernel(ctx, zi_shader, 4, FlashAttentionPC.sizeof, "flash_attention")!!;
-    ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
-    ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
+    llm::ComputeKernel k_patchify = llm::create_kernel(ctx, zi_shader, 2, PatchifyPC.sizeof, "patchify")!!;
+    llm::ComputeKernel k_unpatchify = llm::create_kernel(ctx, zi_shader, 2, UnpatchifyPC.sizeof, "unpatchify")!!;
+    llm::ComputeKernel k_adaln = llm::create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!;
+    llm::ComputeKernel k_euler = llm::create_kernel(ctx, zi_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!;
+    llm::ComputeKernel k_linproj = llm::create_kernel(ctx, zi_shader, 4, LinearProjPC.sizeof, "linear_proj")!!;
+    llm::ComputeKernel k_linproj_debug = llm::create_kernel(ctx, zi_shader, 6, LinearProjPC.sizeof, "linear_proj_debug")!!;
+    llm::ComputeKernel k_timestep = llm::create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!;
+    llm::ComputeKernel k_bcastadd = llm::create_kernel(ctx, zi_shader, 2, BroadcastAddDimPC.sizeof, "broadcast_add_dim")!!;
+    llm::ComputeKernel k_scalebuf = llm::create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!;
+    llm::ComputeKernel k_flashattn = llm::create_kernel(ctx, zi_shader, 4, FlashAttentionPC.sizeof, "flash_attention")!!;
+    llm::ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
+    llm::ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
     io::printfn("  Creating mrope kernel...");
     char[] mrope_spv = &MROPE_SPV;
-    ShaderModule mrope_shader = vk::shaderModuleCreateInfo()
+    vk::ShaderModule mrope_shader = vk::shaderModuleCreateInfo()
         .setCodeSize(mrope_spv.len)
         .setCode((uint*)&mrope_spv[0])
         .build(ctx.device)!!;
-    ComputeKernel k_mrope = llm::create_kernel(ctx, mrope_shader, 3, MRoPEPC.sizeof, "mrope")!!;
+    llm::ComputeKernel k_mrope = llm::create_kernel(ctx, mrope_shader, 3, MRoPEPC.sizeof, "mrope")!!;
     mrope_shader.free(ctx.device);
     io::printfn("  mrope kernel created.");
     DiTKernels kernels = {
@@ -354,7 +355,7 @@ fn DiTKernels? create_dit_kernels(DeviceContext* ctx) {
 
 // --- Activation Allocation ---
 
-fn DiTActivations? allocate_dit_activations(DeviceContext* ctx, uint max_seq_len) {
+fn DiTActivations? allocate_dit_activations(llm::DeviceContext* ctx, uint max_seq_len) {
     io::printfn("Allocating DiT activation buffers (max_seq=%d)...", max_seq_len);
 
     ulong max_dim_total = (ulong)max_seq_len * DIT_DIM;
@@ -404,8 +405,8 @@ fn uint pad_to_multiple(uint n, uint multiple) {
 }
 
 fn void? precompute_mrope_tables(
-    DeviceContext* ctx,
-    Tensor* cos_out, Tensor* sin_out,
+    llm::DeviceContext* ctx,
+    llm::Tensor* cos_out, llm::Tensor* sin_out,
     uint n_patches, uint patches_w, uint patches_h,
     uint text_len, uint mode
 ) {
@@ -504,7 +505,7 @@ fn void? precompute_mrope_tables(
     }
 
     // Upload to GPU
-    *cos_out = (Tensor){
+    *cos_out = (llm::Tensor){
         .gpu_buffer = vk::new_buffer(
             allocator: &ctx.allocator,
             usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -516,7 +517,7 @@ fn void? precompute_mrope_tables(
         .n_dims = 2,
         .dtype = llm::GGML_F32,
     };
-    *sin_out = (Tensor){
+    *sin_out = (llm::Tensor){
         .gpu_buffer = vk::new_buffer(
             allocator: &ctx.allocator,
             usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -559,7 +560,7 @@ fn String dit_layer_tensor_name(char[128]* buf, String prefix, uint layer, Strin
     return (String)(*buf)[0..pos - 1];
 }
 
-fn Tensor load_dit_tensor(DeviceContext* ctx, GGUFFile* gf, String name) {
+fn llm::Tensor load_dit_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) {
     if (try info = gf.find_tensor(name)) {
         // F16/BF16 weights get dequantized to F32
         if (info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32) {
@@ -569,15 +570,15 @@ fn Tensor load_dit_tensor(DeviceContext* ctx, GGUFFile* gf, String name) {
         return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
     }
     io::printfn("Warning: DiT tensor not found: %s", name);
-    return (Tensor){};
+    return (llm::Tensor){};
 }
 
-fn Tensor load_dit_tensor_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
-    GGUFTensorInfo* info = gf.find_tensor(name)!!;
+fn llm::Tensor load_dit_tensor_f32(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) {
+    llm::GGUFTensorInfo* info = gf.find_tensor(name)!!;
     return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
 }
 
-fn DiTLayerWeights load_dit_layer_weights(DeviceContext* ctx, GGUFFile* gf, String prefix, uint layer, bool has_adaln) {
+fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, String prefix, uint layer, bool has_adaln) {
     char[128] buf;
 
     DiTLayerWeights lw;
@@ -632,7 +633,7 @@ fn DiTLayerWeights load_dit_layer_weights(DeviceContext* ctx, GGUFFile* gf, Stri
     return lw;
 }
 
-fn DiTWeights? load_dit_weights(DeviceContext* ctx, GGUFFile* gf) {
+fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf) {
     io::printfn("\nLoading DiT weights...");
 
     DiTWeights w;
@@ -727,8 +728,8 @@ fn DiTWeights? load_dit_weights(DeviceContext* ctx, GGUFFile* gf) {
 fn void? dit_apply_head_norm(
     DiTModel* model,
     CommandBuffer cmd,
-    Tensor* qk,
-    Tensor* norm_weight,
+    llm::Tensor* qk,
+    llm::Tensor* norm_weight,
     uint seq_len,
     uint n_heads,
     uint head_dim
@@ -753,16 +754,16 @@ llm::compute_barrier(cmd);
 fn void dispatch_batch_matmul(
     CommandBuffer cmd,
     DiTKernels* dk,
-    Tensor* weight,
-    Tensor* input,
-    Tensor* output,
+    llm::Tensor* weight,
+    llm::Tensor* input,
+    llm::Tensor* output,
     uint out_dim,
     uint in_dim,
     uint seq_len,
     uint row_offset
 ) {
     BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
-    ComputeKernel* kernel;
+    llm::ComputeKernel* kernel;
     bool tiled_2d = false;
     if (weight.dtype == llm::GGML_Q4_K) {
         kernel = &dk.batch_matmul_q4k;
@@ -808,7 +809,7 @@ fn bool is_inf_bits(float v) {
 
 // Debug: readback hidden states and compare positions to detect spatial uniformity
 // Reads back [n_rows, dim] buffer and computes cross-position variance
-fn void? debug_position_variance(DeviceContext* ctx, vk::Buffer src_buffer, uint n_rows, uint dim, String label) {
+fn void? debug_position_variance(llm::DeviceContext* ctx, vk::Buffer src_buffer, uint n_rows, uint dim, String label) {
     usz total = (usz)n_rows * dim;
     vk::Memory stg = vk::new_buffer(
         allocator: &ctx.allocator,
@@ -862,7 +863,7 @@ fn void? debug_position_variance(DeviceContext* ctx, vk::Buffer src_buffer, uint
 
 // Debug: readback a GPU buffer and print stats (min/max/mean/nan count)
 // Must be called OUTSIDE an active command buffer recording (after submit_and_wait)
-fn void? debug_readback_stats(DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String label) {
+fn void? debug_readback_stats(llm::DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String label) {
     vk::Memory stg = vk::new_buffer(
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -893,7 +894,7 @@ fn void? debug_readback_stats(DeviceContext* ctx, vk::Buffer src_buffer, uint n_
 
 // Debug: save a GPU buffer to .npy file for comparison with PyTorch
 // Format: little-endian float32, C-contiguous
-fn void? debug_save_npy(DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String filename) {
+fn void? debug_save_npy(llm::DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String filename) {
     vk::Memory stg = vk::new_buffer(
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -925,10 +926,10 @@ fn void? debug_save_npy(DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats
 // Computes expected output on CPU and compares with GPU result
 // This helps identify permutation bugs in GPU shaders
 fn void? verify_x_embedder_cpu(
-    DeviceContext* ctx,
-    Tensor* patches,      // [n_patches, 64] - input
-    Tensor* weight,       // [64, 3840] - weight (GGUF format)
-    Tensor* gpu_output,   // [n_patches, 3840] - GPU result
+    llm::DeviceContext* ctx,
+    llm::Tensor* patches,      // [n_patches, 64] - input
+    llm::Tensor* weight,       // [64, 3840] - weight (GGUF format)
+    llm::Tensor* gpu_output,   // [n_patches, 3840] - GPU result
     uint n_patches,
     uint out_dim,
     uint in_dim
@@ -1048,14 +1049,14 @@ fn void? dit_transformer_layer(
     DiTModel* model,
     CommandBuffer cmd,
     DiTLayerWeights* lw,
-    Tensor* hidden,        // [seq_len, dim] - modified in place
+    llm::Tensor* hidden,        // [seq_len, dim] - modified in place
     uint seq_len,
     bool has_adaln,
-    Tensor* rope_cos,      // [seq_len, head_dim/2] precomputed cos table
-    Tensor* rope_sin       // [seq_len, head_dim/2] precomputed sin table
+    llm::Tensor* rope_cos,      // [seq_len, head_dim/2] precomputed cos table
+    llm::Tensor* rope_sin       // [seq_len, head_dim/2] precomputed sin table
 ) {
-    DeviceContext* ctx = model.ctx;
-    SharedKernels* sk = &model.kernels.shared;
+    llm::DeviceContext* ctx = model.ctx;
+    llm::SharedKernels* sk = &model.kernels.shared;
     DiTKernels* dk = &model.kernels;
     DiTActivations* a = &model.acts;
     uint dim = DIT_DIM;
@@ -1337,7 +1338,7 @@ llm::dispatch_kernel(cmd, &dk.gated_residual,
                 &gres_pc, llm::ceil_div(seq_len * dim, 256));
         } else {
             // Context refiner: no gate, just residual += post_norm(output)
-            ResidualPC res_pc = { .n = seq_len * dim };
+            llm::ResidualPC res_pc = { .n = seq_len * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
                 { hidden.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
                 { hidden.size_bytes, a.buf_b.size_bytes },
@@ -1346,7 +1347,7 @@ llm::dispatch_kernel(cmd, &sk.residual_add,
 llm::compute_barrier(cmd);
     } else {
         // No post-norm available: direct residual
-        ResidualPC res_pc = { .n = seq_len * dim };
+        llm::ResidualPC res_pc = { .n = seq_len * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
             { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
             { hidden.size_bytes, a.buf_a.size_bytes },
@@ -1393,7 +1394,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // SiLU on gate
-    SiluPC silu_pc = { .n = seq_len * DIT_FFN_DIM };
+    llm::SiluPC silu_pc = { .n = seq_len * DIT_FFN_DIM };
 llm::dispatch_kernel(cmd, &sk.silu,
         { a.ffn_gate_out.gpu_buffer.buffer },
         { a.ffn_gate_out.size_bytes },
@@ -1401,7 +1402,7 @@ llm::dispatch_kernel(cmd, &sk.silu,
 llm::compute_barrier(cmd);
 
     // gate * up
-    ElemwisePC emul_pc = { .n = seq_len * DIT_FFN_DIM };
+    llm::ElemwisePC emul_pc = { .n = seq_len * DIT_FFN_DIM };
 llm::dispatch_kernel(cmd, &sk.elemwise_mul,
         { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
         { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
@@ -1430,7 +1431,7 @@ llm::dispatch_kernel(cmd, &dk.gated_residual,
                 &gres_pc, llm::ceil_div(seq_len * dim, 256));
         } else {
             // Context refiner: no gate
-            ResidualPC res_pc = { .n = seq_len * dim };
+            llm::ResidualPC res_pc = { .n = seq_len * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
                 { hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
                 { hidden.size_bytes, a.buf_a.size_bytes },
@@ -1439,7 +1440,7 @@ llm::dispatch_kernel(cmd, &sk.residual_add,
 llm::compute_barrier(cmd);
     } else {
         // No post-norm: direct residual
-        ResidualPC res_pc = { .n = seq_len * dim };
+        llm::ResidualPC res_pc = { .n = seq_len * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
             { hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
             { hidden.size_bytes, a.ffn_down_out.size_bytes },
@@ -1454,13 +1455,13 @@ llm::compute_barrier(cmd);
 // Takes: latent [16, h, w], text_embeddings [text_len, 3840], timestep scalar
 // Returns: velocity [16, h, w] in acts.latent
 
-fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
-    DeviceContext* ctx = self.ctx;
+fn void? DiTModel.forward(&self, llm::Tensor* text_embeddings, float timestep) {
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
     DiTWeights* w = &self.weights;
     DiTActivations* a = &self.acts;
     DiTKernels* dk = &self.kernels;
-    SharedKernels* sk = &dk.shared;
+    llm::SharedKernels* sk = &dk.shared;
 
     uint dim = DIT_DIM;
     uint n_patches = self.n_patches;
@@ -1558,7 +1559,7 @@ llm::dispatch_kernel(cmd, &dk.linear_proj,
         &t_mlp0_pc, DIT_T_MLP_DIM);
 llm::compute_barrier(cmd);
 
-    SiluPC silu_pc = { .n = DIT_T_MLP_DIM };
+    llm::SiluPC silu_pc = { .n = DIT_T_MLP_DIM };
 llm::dispatch_kernel(cmd, &sk.silu,
         { a.t_emb_mlp.gpu_buffer.buffer },
         { a.t_emb_mlp.size_bytes },
@@ -1697,7 +1698,7 @@ llm::begin_compute(cmd)!!;
     vk::cmdCopyBuffer(cmd, a.t_emb.gpu_buffer.buffer, a.t_emb_mlp.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
 llm::compute_barrier(cmd);
-    SiluPC final_silu_pc = { .n = DIT_T_EMB_DIM };
+    llm::SiluPC final_silu_pc = { .n = DIT_T_EMB_DIM };
 llm::dispatch_kernel(cmd, &sk.silu,
         { a.t_emb_mlp.gpu_buffer.buffer },
         { a.t_emb_mlp.size_bytes },

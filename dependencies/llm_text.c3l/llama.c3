@@ -1,4 +1,4 @@
-module llm::diffusers;
+module llm_text;
 
 import vk;
 import llm;
@@ -18,124 +18,107 @@ const char[*] QWEN3_CONFIG_JSON = $embed("../../configs/qwen3.json");
 const char[*] PHI3_CONFIG_JSON = $embed("../../configs/phi3.json");
 
 struct LayerWeights {
-    Tensor attn_norm;
-    Tensor attn_norm_bias;
-    Tensor wq;
-    Tensor wk;
-    Tensor wv;
-    Tensor wo;
-    Tensor wq_norm;
-    Tensor wk_norm;
-    Tensor ffn_norm;
-    Tensor ffn_norm_bias;
-    Tensor ffn_gate;
-    Tensor ffn_up;
-    Tensor ffn_down;
+    llm::Tensor attn_norm;
+    llm::Tensor attn_norm_bias;
+    llm::Tensor wq;
+    llm::Tensor wk;
+    llm::Tensor wv;
+    llm::Tensor wo;
+    llm::Tensor wq_norm;
+    llm::Tensor wk_norm;
+    llm::Tensor ffn_norm;
+    llm::Tensor ffn_norm_bias;
+    llm::Tensor ffn_gate;
+    llm::Tensor ffn_up;
+    llm::Tensor ffn_down;
 }
 
 struct LlmWeights {
-    Tensor token_embedding;
-    Tensor output_norm;
-    Tensor output_norm_bias;
-    Tensor output;
+    llm::Tensor token_embedding;
+    llm::Tensor output_norm;
+    llm::Tensor output_norm_bias;
+    llm::Tensor output;
     LayerWeights[] layers;
     // CPU-side embedding for encode_only mode (avoids F32 expansion on GPU)
     char* embedding_data;
-    GGUFTensorInfo embedding_info;
+    llm::GGUFTensorInfo embedding_info;
 }
 
 struct LlmActivations {
-    Tensor hidden;
-    Tensor norm_out;
-    Tensor q;
-    Tensor k;
-    Tensor v;
-    Tensor attn_out;
-    Tensor ffn_gate_out;
-    Tensor ffn_up_out;
-    Tensor ffn_down_out;
-    Tensor logits;
-    Tensor attn_scores;
+    llm::Tensor hidden;
+    llm::Tensor norm_out;
+    llm::Tensor q;
+    llm::Tensor k;
+    llm::Tensor v;
+    llm::Tensor attn_out;
+    llm::Tensor ffn_gate_out;
+    llm::Tensor ffn_up_out;
+    llm::Tensor ffn_down_out;
+    llm::Tensor logits;
+    llm::Tensor attn_scores;
 }
 
 struct KVCache {
-    Tensor[] k_cache;
-    Tensor[] v_cache;
+    llm::Tensor[] k_cache;
+    llm::Tensor[] v_cache;
 }
 
 // LLM-specific kernels (rope, embedding, causal attention)
 struct LlmKernels {
-    ComputeKernel embedding;
-    ComputeKernel rope;
-    ComputeKernel attention;
-    SharedKernels shared;
+    llm::ComputeKernel embedding;
+    llm::ComputeKernel rope;
+    llm::ComputeKernel attention;
+    llm::SharedKernels shared;
 }
 
 struct LlmModel {
-    ModelConfig config;
+    llm::ModelConfig config;
     LlmWeights weights;
     LlmActivations acts;
     KVCache kv;
     LlmKernels kernels;
-    DeviceContext* ctx;
+    llm::DeviceContext* ctx;
     bool encode_only;
     uint max_seq_len;
     vk::Memory embedding_staging;  // HOST_VISIBLE staging for CPU embedding upload
     // References for streaming layer loading (encode_only mode)
-    GGUFFile* gf;
-    WeightNames* names;
+    llm::GGUFFile* gf;
+    llm::WeightNames* names;
 }
 
+// LLM-specific push constant structs (shared PC structs are in llm::kernels.c3)
 struct EmbeddingPC { uint token_id; uint dim; }
-struct RMSNormPC { uint dim; float eps; }
-struct LayerNormPC { uint dim; float eps; }
-struct SiluPC { uint n; }
-struct GeluPC { uint n; }
-struct MatMulPC { uint out_dim; uint in_dim; }
 struct RoPEPC { uint dim; uint n_heads; uint position; float theta; }
-struct SoftmaxPC { uint n; uint offset; }
 struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_len; float scale; uint max_seq_len; }
-struct ResidualPC { uint n; }
-struct ElemwisePC { uint n; }
 
-fn Tensor load_tensor_by_name(DeviceContext* ctx, GGUFFile* gf, String name) {
-    GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
-}
-
-fn Tensor load_tensor_as_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
-    GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
-}
-
-fn LlmWeights? load_llm_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* config, WeightNames* names, bool encode_only = false) {
+fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ModelConfig* config, llm::WeightNames* names, bool encode_only = false) {
     io::printfn("\nLoading weights...");
 
-    Tensor token_embedding;
+    llm::Tensor token_embedding;
     char* embedding_data = null;
-    GGUFTensorInfo embedding_info;
+    llm::GGUFTensorInfo embedding_info;
 
     if (encode_only) {
         // Store CPU-side reference for per-token dequant (saves ~1.5GB for large vocabs)
-        GGUFTensorInfo* info = gf.find_tensor(names.embedding)!!;
+        llm::GGUFTensorInfo* info = gf.find_tensor(names.embedding)!!;
         embedding_info = *info;
         embedding_data = gf.tensor_data_base + (usz)info.offset;
         io::printfn("  Embedding: CPU-side dequant (encode_only), type=%d", info.type);
     } else {
         // Embedding must be F32 for the embedding lookup shader
-        token_embedding = load_tensor_as_f32(ctx, gf, names.embedding);
+        token_embedding = llm::load_tensor_as_f32(ctx, gf, names.embedding)!!;
     }
 
-    Tensor output_norm = load_tensor_by_name(ctx, gf, names.output_norm);
+    llm::Tensor output_norm = llm::load_tensor_by_name(ctx, gf, names.output_norm)!!;
 
     // Load output norm bias for LayerNorm architectures
-    Tensor output_norm_bias;
+    llm::Tensor output_norm_bias;
     if (config.norm_type == LAYERNORM && names.output_norm_bias.len > 0) {
-        output_norm_bias = load_tensor_by_name(ctx, gf, names.output_norm_bias);
+        output_norm_bias = llm::load_tensor_by_name(ctx, gf, names.output_norm_bias)!!;
     }
 
     // Output weight - skip entirely in encode_only mode (saves ~200-700MB)
-    Tensor output_weight;
+    llm::Tensor output_weight;
     if (encode_only) {
         io::printfn("  Skipping output weight (encode_only)");
     } else if (try output_info = gf.find_tensor(names.output)) {
@@ -203,12 +186,12 @@ fn LlmWeights? load_llm_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* c
     };
 }
 
-fn Tensor load_layer_tensor(DeviceContext* ctx, GGUFFile* gf, String prefix, uint layer, String suffix) {
+fn llm::Tensor load_layer_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, String prefix, uint layer, String suffix) {
     char[64] buf;
     usz len = format_layer_name(&buf, prefix, layer, suffix);
     String name = (String)buf[0..len - 1];
 
-    GGUFTensorInfo* info = gf.find_tensor(name)!!;
+    llm::GGUFTensorInfo* info = gf.find_tensor(name)!!;
     return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
 }
 
@@ -252,7 +235,7 @@ fn usz format_layer_name(char[64]* buf, String prefix, uint layer, String suffix
 }
 
 // Upload one layer's weights to GPU (for streaming mode)
-fn LayerWeights? load_single_layer(DeviceContext* ctx, GGUFFile* gf, WeightNames* names, ModelConfig* config, uint layer) {
+fn LayerWeights? load_single_layer(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::WeightNames* names, llm::ModelConfig* config, uint layer) {
     LayerWeights lw = {
         .attn_norm = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.attn_norm),
         .wq = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.wq),
@@ -282,7 +265,7 @@ fn LayerWeights? load_single_layer(DeviceContext* ctx, GGUFFile* gf, WeightNames
 }
 
 // Free one layer's GPU weights
-fn void free_layer_weights(LayerWeights* lw, ModelConfig* config) {
+fn void free_layer_weights(LayerWeights* lw, llm::ModelConfig* config) {
     lw.attn_norm.free();
     if (lw.attn_norm_bias.size_bytes > 0) lw.attn_norm_bias.free();
     lw.wq.free();
@@ -298,7 +281,7 @@ fn void free_layer_weights(LayerWeights* lw, ModelConfig* config) {
     lw.ffn_down.free();
 }
 
-fn LlmActivations? allocate_llm_activations(DeviceContext* ctx, ModelConfig* config, uint max_seq_len = MAX_SEQ_LEN, bool encode_only = false) {
+fn LlmActivations? allocate_llm_activations(llm::DeviceContext* ctx, llm::ModelConfig* config, uint max_seq_len = MAX_SEQ_LEN, bool encode_only = false) {
     io::printfn("Allocating activation buffers (max_seq=%d)...", max_seq_len);
 
     ulong dim = config.dim;
@@ -310,7 +293,7 @@ fn LlmActivations? allocate_llm_activations(DeviceContext* ctx, ModelConfig* con
     ulong[4] qkv_shape = { dim, 0, 0, 0 };  // n_heads * head_dim = dim
     ulong[4] scores_shape = { n_heads * max_seq_len, 0, 0, 0 };
 
-    Tensor logits;
+    llm::Tensor logits;
     if (!encode_only) {
         ulong[4] vocab_shape = { (ulong)config.vocab_size, 0, 0, 0 };
         logits = llm::create_f32_tensor(ctx, vocab_shape, 1)!!;
@@ -331,11 +314,11 @@ fn LlmActivations? allocate_llm_activations(DeviceContext* ctx, ModelConfig* con
     };
 }
 
-fn KVCache? allocate_kv_cache(DeviceContext* ctx, ModelConfig* config, uint max_seq_len = MAX_SEQ_LEN) {
+fn KVCache? allocate_kv_cache(llm::DeviceContext* ctx, llm::ModelConfig* config, uint max_seq_len = MAX_SEQ_LEN) {
     io::printfn("Allocating KV cache (max_seq=%d, %d layers)...", max_seq_len, config.n_layers);
 
-    Tensor[] k_cache = mem::new_array(Tensor, config.n_layers);
-    Tensor[] v_cache = mem::new_array(Tensor, config.n_layers);
+    llm::Tensor[] k_cache = mem::new_array(llm::Tensor, config.n_layers);
+    llm::Tensor[] v_cache = mem::new_array(llm::Tensor, config.n_layers);
 
     ulong cache_size = (ulong)config.n_kv_heads * max_seq_len * config.head_dim;
     ulong[4] cache_shape = { cache_size, 0, 0, 0 };
@@ -351,7 +334,7 @@ fn KVCache? allocate_kv_cache(DeviceContext* ctx, ModelConfig* config, uint max_
     };
 }
 
-fn LlmKernels? create_llm_kernels(DeviceContext* ctx) {
+fn LlmKernels? create_llm_kernels(llm::DeviceContext* ctx) {
     io::printfn("Creating compute kernels...");
     char[] spv = &LLM_SPV;
     ShaderModule shader = vk::shaderModuleCreateInfo()
@@ -370,7 +353,7 @@ fn LlmKernels? create_llm_kernels(DeviceContext* ctx) {
     return kernels;
 }
 
-fn LlmModel? load_llm_model(DeviceContext* ctx, GGUFFile* gf, ModelConfig* config, WeightNames* names, bool encode_only = false, uint max_seq_len = MAX_SEQ_LEN) {
+fn LlmModel? load_llm_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ModelConfig* config, llm::WeightNames* names, bool encode_only = false, uint max_seq_len = MAX_SEQ_LEN) {
     LlmWeights weights = load_llm_weights(ctx, gf, config, names, encode_only)!!;
     LlmActivations acts = allocate_llm_activations(ctx, config, max_seq_len, encode_only)!!;
     KVCache kv = allocate_kv_cache(ctx, config, max_seq_len)!!;
@@ -409,21 +392,21 @@ fn LlmModel? load_llm_model(DeviceContext* ctx, GGUFFile* gf, ModelConfig* confi
 // Process a single transformer layer. Reads/writes acts.hidden.
 // Must be called within a begin_compute/submit_and_wait block.
 fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint layer, uint position) {
-    ModelConfig* c = &self.config;
+    llm::ModelConfig* c = &self.config;
     LlmActivations* a = &self.acts;
     KVCache* kv = &self.kv;
     LlmKernels* k = &self.kernels;
-    SharedKernels* sk = &k.shared;
+    llm::SharedKernels* sk = &k.shared;
 
     // Norm(hidden, attn_norm) -> norm_out
     if (c.norm_type == RMSNORM) {
-        RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
+        llm::RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.rmsnorm,
             { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.attn_norm.size_bytes, a.norm_out.size_bytes },
             &rms_pc, 1);
     } else {
-        LayerNormPC ln_pc = { .dim = c.dim, .eps = c.rms_eps };
+        llm::LayerNormPC ln_pc = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, lw.attn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.attn_norm.size_bytes, lw.attn_norm_bias.size_bytes, a.norm_out.size_bytes },
@@ -445,7 +428,7 @@ llm::compute_barrier(cmd);
             vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
 llm::compute_barrier(cmd);
-            RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
+            llm::RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.rmsnorm,
                 { a.norm_out.gpu_buffer.buffer, lw.wq_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
                 { (usz)c.head_dim * 4, lw.wq_norm.size_bytes, (usz)c.head_dim * 4 },
@@ -460,7 +443,7 @@ llm::compute_barrier(cmd);
             vk::cmdCopyBuffer(cmd, a.k.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
 llm::compute_barrier(cmd);
-            RMSNormPC kn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
+            llm::RMSNormPC kn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.rmsnorm,
                 { a.norm_out.gpu_buffer.buffer, lw.wk_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
                 { (usz)c.head_dim * 4, lw.wk_norm.size_bytes, (usz)c.head_dim * 4 },
@@ -522,7 +505,7 @@ llm::dispatch_matmul(cmd, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
 llm::compute_barrier(cmd);
 
     // Residual add: hidden += attn_output
-    ResidualPC res_pc = { .n = c.dim };
+    llm::ResidualPC res_pc = { .n = c.dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
         { a.hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
         { a.hidden.size_bytes, a.norm_out.size_bytes },
@@ -531,13 +514,13 @@ llm::compute_barrier(cmd);
 
     // Norm for FFN
     if (c.norm_type == RMSNORM) {
-        RMSNormPC rms_pc2 = { .dim = c.dim, .eps = c.rms_eps };
+        llm::RMSNormPC rms_pc2 = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.rmsnorm,
             { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.ffn_norm.size_bytes, a.norm_out.size_bytes },
             &rms_pc2, 1);
     } else {
-        LayerNormPC ln_pc2 = { .dim = c.dim, .eps = c.rms_eps };
+        llm::LayerNormPC ln_pc2 = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, lw.ffn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.ffn_norm.size_bytes, lw.ffn_norm_bias.size_bytes, a.norm_out.size_bytes },
@@ -551,14 +534,14 @@ llm::dispatch_matmul(cmd, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_
 llm::dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
 llm::compute_barrier(cmd);
 
-        SiluPC silu_pc = { .n = c.ffn_dim };
+        llm::SiluPC silu_pc = { .n = c.ffn_dim };
 llm::dispatch_kernel(cmd, &sk.silu,
             { a.ffn_gate_out.gpu_buffer.buffer },
             { a.ffn_gate_out.size_bytes },
             &silu_pc, llm::ceil_div(c.ffn_dim, 256));
 llm::compute_barrier(cmd);
 
-        ElemwisePC emul_pc = { .n = c.ffn_dim };
+        llm::ElemwisePC emul_pc = { .n = c.ffn_dim };
 llm::dispatch_kernel(cmd, &sk.elemwise_mul,
             { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
             { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
@@ -570,7 +553,7 @@ llm::dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.
 llm::dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
 llm::compute_barrier(cmd);
 
-        GeluPC gelu_pc = { .n = c.ffn_dim };
+        llm::GeluPC gelu_pc = { .n = c.ffn_dim };
 llm::dispatch_kernel(cmd, &sk.gelu,
             { a.ffn_up_out.gpu_buffer.buffer },
             { a.ffn_up_out.size_bytes },
@@ -590,14 +573,14 @@ llm::compute_barrier(cmd);
 }
 
 fn void? LlmModel.forward(&self, uint token, uint position) {
-    DeviceContext* ctx = self.ctx;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    ModelConfig* c = &self.config;
+    llm::ModelConfig* c = &self.config;
     LlmWeights* w = &self.weights;
     LlmActivations* a = &self.acts;
     KVCache* kv = &self.kv;
     LlmKernels* k = &self.kernels;
-    SharedKernels* sk = &k.shared;
+    llm::SharedKernels* sk = &k.shared;
 
     // 1. Embedding lookup -> hidden
     if (self.encode_only) {
@@ -630,13 +613,13 @@ llm::compute_barrier(cmd);
 
     // 3. Final norm
     if (c.norm_type == RMSNORM) {
-        RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
+        llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.rmsnorm,
             { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, w.output_norm.size_bytes, a.norm_out.size_bytes },
             &final_rms, 1);
     } else {
-        LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
+        llm::LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, w.output_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, w.output_norm.size_bytes, w.output_norm_bias.size_bytes, a.norm_out.size_bytes },
@@ -656,17 +639,17 @@ llm::submit_and_wait(ctx)!!;
 // Encode text: run forward pass for each token, extract post-final-norm hidden states.
 // Returns a GPU buffer with [seq_len, dim] embeddings.
 // Caller is responsible for freeing the returned tensor.
-fn Tensor? LlmModel.encode_text(&self, uint[] tokens) {
+fn llm::Tensor? LlmModel.encode_text(&self, uint[] tokens) {
     if (self.encode_only) {
         return self.encode_text_streaming(tokens);
     }
 
-    ModelConfig* c = &self.config;
-    DeviceContext* ctx = self.ctx;
+    llm::ModelConfig* c = &self.config;
+    llm::DeviceContext* ctx = self.ctx;
 
     // Allocate output buffer: [seq_len, dim]
     ulong[4] out_shape = { (ulong)tokens.len, (ulong)c.dim, 0, 0 };
-    Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)tokens.len * c.dim, 0, 0, 0 }, 1)!!;
+    llm::Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)tokens.len * c.dim, 0, 0, 0 }, 1)!!;
 
     // Process BOS + each token
     self.forward(tokens[0], 0)!!;
@@ -695,14 +678,14 @@ fn Tensor? LlmModel.encode_text(&self, uint[] tokens) {
 
 // Streaming encode: load one layer's weights at a time, process all positions, free weights.
 // GPU memory = 1 layer of weights + KV cache + activations (instead of all 36 layers).
-fn Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
-    ModelConfig* c = &self.config;
-    DeviceContext* ctx = self.ctx;
+fn llm::Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
+    llm::ModelConfig* c = &self.config;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
     uint seq_len = (uint)tokens.len;
 
     // Allocate intermediate hidden states: [seq_len, dim]
-    Tensor hidden_states = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+    llm::Tensor hidden_states = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
 
     // 1. Embed all tokens into hidden_states via CPU dequant
     for (uint pos = 0; pos < seq_len; pos++) {
@@ -748,7 +731,7 @@ llm::submit_and_wait(ctx)!!;
     }
 
     // 3. Apply final norm to each position, build output
-    Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+    llm::Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
 
 llm::begin_compute(cmd)!!;
     for (uint pos = 0; pos < seq_len; pos++) {
@@ -759,13 +742,13 @@ llm::compute_barrier(cmd);
 
         // Final norm
         if (c.norm_type == RMSNORM) {
-            RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
+            llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &self.kernels.shared.rmsnorm,
                 { self.acts.hidden.gpu_buffer.buffer, self.weights.output_norm.gpu_buffer.buffer, self.acts.norm_out.gpu_buffer.buffer },
                 { self.acts.hidden.size_bytes, self.weights.output_norm.size_bytes, self.acts.norm_out.size_bytes },
                 &final_rms, 1);
         } else {
-            LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
+            llm::LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
 llm::dispatch_kernel(cmd, &self.kernels.shared.layernorm,
                 { self.acts.hidden.gpu_buffer.buffer, self.weights.output_norm.gpu_buffer.buffer, self.weights.output_norm_bias.gpu_buffer.buffer, self.acts.norm_out.gpu_buffer.buffer },
                 { self.acts.hidden.size_bytes, self.weights.output_norm.size_bytes, self.weights.output_norm_bias.size_bytes, self.acts.norm_out.size_bytes },

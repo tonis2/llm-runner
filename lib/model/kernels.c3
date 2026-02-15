@@ -3,6 +3,16 @@ module llm;
 import vk;
 import std::io;
 
+// Push constant structs matching shared shader entry points
+struct RMSNormPC { uint dim; float eps; }
+struct LayerNormPC { uint dim; float eps; }
+struct SiluPC { uint n; }
+struct GeluPC { uint n; }
+struct MatMulPC { uint out_dim; uint in_dim; }
+struct SoftmaxPC { uint n; uint offset; }
+struct ResidualPC { uint n; }
+struct ElemwisePC { uint n; }
+
 // Shared compute kernels usable by both LLM and Diffusion models
 struct SharedKernels {
     ComputeKernel rmsnorm;

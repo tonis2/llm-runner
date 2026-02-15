@@ -1,4 +1,4 @@
-module llm::diffusers;
+module zimage;
 
 import vk;
 import llm;
@@ -21,8 +21,8 @@ const uint TAESD_OUT_CHANNELS = 3;
 const uint TAESD_NUM_BLOCKS = 3;  // blocks per stage
 
 struct TAESDConv {
-    Tensor weight;
-    Tensor bias;
+    llm::Tensor weight;
+    llm::Tensor bias;
     uint in_c;
     uint out_c;
     bool has_bias;
@@ -45,27 +45,27 @@ struct TAESDDecoder {
     TAESDBlock final_block;                    // index 17
     TAESDConv conv_out;                        // index 18: Conv(64→3, bias)
 
-    DiffusionKernels* kernels;
-    DeviceContext* ctx;
+    llm::DiffusionKernels* kernels;
+    llm::DeviceContext* ctx;
 }
 
 struct TAESDActivations {
-    Tensor buf_a;
-    Tensor buf_b;
-    Tensor buf_c;
+    llm::Tensor buf_a;
+    llm::Tensor buf_b;
+    llm::Tensor buf_c;
 }
 
 // --- Loading ---
 
-fn Tensor load_taesd_tensor(DeviceContext* ctx, SafetensorsFile* sf, String name) {
+fn llm::Tensor load_taesd_tensor(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String name) {
     return llm::upload_safetensor_f32(ctx, sf, name)!!;
 }
 
-fn Tensor load_taesd_conv_weight(DeviceContext* ctx, SafetensorsFile* sf, String name) {
+fn llm::Tensor load_taesd_conv_weight(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String name) {
     return llm::upload_safetensor_conv_f32(ctx, sf, name)!!;
 }
 
-fn TAESDConv load_taesd_conv(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint in_c, uint out_c, bool has_bias) {
+fn TAESDConv load_taesd_conv(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint in_c, uint out_c, bool has_bias) {
     char[256] wbuf;
     char[256] bbuf;
     usz wlen = 0;
@@ -87,7 +87,7 @@ fn TAESDConv load_taesd_conv(DeviceContext* ctx, SafetensorsFile* sf, String pre
     return conv;
 }
 
-fn TAESDBlock load_taesd_block(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint in_c, uint out_c) {
+fn TAESDBlock load_taesd_block(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint in_c, uint out_c) {
     char[256] p0; char[256] p2; char[256] p4;
     usz l0 = 0; usz l2 = 0; usz l4 = 0;
     for (usz i = 0; i < prefix.len; i++) {
@@ -107,7 +107,7 @@ fn TAESDBlock load_taesd_block(DeviceContext* ctx, SafetensorsFile* sf, String p
     };
 }
 
-fn TAESDDecoder? load_taesd_decoder(DeviceContext* ctx, SafetensorsFile* sf, DiffusionKernels* kernels) {
+fn TAESDDecoder? load_taesd_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, llm::DiffusionKernels* kernels) {
     io::printfn("\nLoading TAESD decoder...");
 
     TAESDDecoder dec;
@@ -177,7 +177,7 @@ fn usz fmt_taesd_prefix(char[64]* buf, uint index) {
 
 // --- Activation Allocation ---
 
-fn TAESDActivations? allocate_taesd_activations(DeviceContext* ctx, uint max_img_size) {
+fn TAESDActivations? allocate_taesd_activations(llm::DeviceContext* ctx, uint max_img_size) {
     // Max buffer: 64ch at full output resolution (after all upsamples)
     ulong max_elems = (ulong)TAESD_CHANNELS * max_img_size * max_img_size;
     ulong[4] shape = { max_elems, 0, 0, 0 };
@@ -192,13 +192,13 @@ fn TAESDActivations? allocate_taesd_activations(DeviceContext* ctx, uint max_img
 
 fn void dispatch_taesd_conv(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     TAESDConv* conv,
-    Tensor* input,
-    Tensor* output,
+    llm::Tensor* input,
+    llm::Tensor* output,
     uint h, uint w
 ) {
-    Conv2dPC pc = {
+    llm::Conv2dPC pc = {
         .in_c = conv.in_c,
         .out_c = conv.out_c,
         .in_h = h,
@@ -215,8 +215,8 @@ fn void dispatch_taesd_conv(
 	llm::dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
 }
 
-fn void dispatch_taesd_relu(CommandBuffer cmd, DiffusionKernels* k, Tensor* buf, uint n) {
-    ReluPC pc = { .n = n };
+fn void dispatch_taesd_relu(CommandBuffer cmd, llm::DiffusionKernels* k, llm::Tensor* buf, uint n) {
+    llm::ReluPC pc = { .n = n };
 llm::dispatch_kernel(cmd, &k.relu,
         { buf.gpu_buffer.buffer },
         { buf.size_bytes },
@@ -228,11 +228,11 @@ llm::dispatch_kernel(cmd, &k.relu,
 // Output written to `temp1`
 fn void dispatch_taesd_block(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     TAESDBlock* block,
-    Tensor* input,   // e.g. buf_a
-    Tensor* temp1,   // e.g. buf_b — will contain output
-    Tensor* temp2,   // e.g. buf_c — scratch
+    llm::Tensor* input,   // e.g. buf_a
+    llm::Tensor* temp1,   // e.g. buf_b — will contain output
+    llm::Tensor* temp2,   // e.g. buf_c — scratch
     uint h, uint w
 ) {
     uint ch = block.conv0.out_c;
@@ -260,7 +260,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // residual: temp1 += input
-    ResidualPC res_pc = { .n = n };
+    llm::ResidualPC res_pc = { .n = n };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { temp1.gpu_buffer.buffer, input.gpu_buffer.buffer },
         { temp1.size_bytes, input.size_bytes },
@@ -277,9 +277,9 @@ llm::compute_barrier(cmd);
 // Output: image [3, 8*lat_h, 8*lat_w] in acts.buf_a
 
 fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint lat_w) {
-    DeviceContext* ctx = self.ctx;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    DiffusionKernels* k = self.kernels;
+    llm::DiffusionKernels* k = self.kernels;
 
     uint h = lat_h;
     uint w = lat_w;
@@ -288,7 +288,7 @@ llm::begin_compute(cmd)!!;
 
     // tanh_clamp: z = tanh(z/3) * 3  (in-place on buf_a)
     uint latent_n = TAESD_Z_CHANNELS * h * w;
-    TanhClampPC tc_pc = { .n = latent_n };
+    llm::TanhClampPC tc_pc = { .n = latent_n };
 llm::dispatch_kernel(cmd, &k.tanh_clamp,
         { acts.buf_a.gpu_buffer.buffer },
         { acts.buf_a.size_bytes },
@@ -313,7 +313,7 @@ llm::compute_barrier(cmd);
     // Result in buf_a
 
     // Upsample 2x: buf_a → buf_b
-    UpsamplePC up_pc = { .channels = TAESD_CHANNELS, .in_h = h, .in_w = w };
+    llm::UpsamplePC up_pc = { .channels = TAESD_CHANNELS, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
@@ -382,7 +382,7 @@ llm::compute_barrier(cmd);
 
     // Clamp to [0, 1]: buf_a → buf_b → copy back to buf_a
     uint out_n = TAESD_OUT_CHANNELS * h * w;
-    ScaleShiftPC ss_pc = { .n = out_n, .scale = 1.0f, .shift = 0.0f };
+    llm::ScaleShiftPC ss_pc = { .n = out_n, .scale = 1.0f, .shift = 0.0f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },

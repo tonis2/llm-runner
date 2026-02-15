@@ -1,4 +1,4 @@
-module llm::diffusers;
+module zimage;
 
 import vk;
 import llm;
@@ -15,8 +15,8 @@ import std::core::mem;
 // --- Flux VAE Structures ---
 
 struct FluxVaeConv {
-    Tensor weight;
-    Tensor bias;
+    llm::Tensor weight;
+    llm::Tensor bias;
     uint in_c;
     uint out_c;
     uint kH;
@@ -25,32 +25,32 @@ struct FluxVaeConv {
 
 struct FluxVaeResBlock {
     // norm1 + conv1 + norm2 + conv2 + optional nin_shortcut
-    Tensor norm1_weight;
-    Tensor norm1_bias;
-    Tensor conv1_weight;
-    Tensor conv1_bias;
-    Tensor norm2_weight;
-    Tensor norm2_bias;
-    Tensor conv2_weight;
-    Tensor conv2_bias;
-    Tensor nin_shortcut_weight;
-    Tensor nin_shortcut_bias;
+    llm::Tensor norm1_weight;
+    llm::Tensor norm1_bias;
+    llm::Tensor conv1_weight;
+    llm::Tensor conv1_bias;
+    llm::Tensor norm2_weight;
+    llm::Tensor norm2_bias;
+    llm::Tensor conv2_weight;
+    llm::Tensor conv2_bias;
+    llm::Tensor nin_shortcut_weight;
+    llm::Tensor nin_shortcut_bias;
     uint in_c;
     uint out_c;
     bool has_nin_shortcut;
 }
 
 struct FluxVaeAttn {
-    Tensor norm_weight;
-    Tensor norm_bias;
-    Tensor q_weight;
-    Tensor q_bias;
-    Tensor k_weight;
-    Tensor k_bias;
-    Tensor v_weight;
-    Tensor v_bias;
-    Tensor proj_out_weight;
-    Tensor proj_out_bias;
+    llm::Tensor norm_weight;
+    llm::Tensor norm_bias;
+    llm::Tensor q_weight;
+    llm::Tensor q_bias;
+    llm::Tensor k_weight;
+    llm::Tensor k_bias;
+    llm::Tensor v_weight;
+    llm::Tensor v_bias;
+    llm::Tensor proj_out_weight;
+    llm::Tensor proj_out_bias;
     uint channels;
 }
 
@@ -75,23 +75,23 @@ struct FluxVaeDecoder {
     FluxVaeResBlock[3] up0_blocks;  // 3 resblocks 256->128
 
     // Output
-    Tensor norm_out_weight;
-    Tensor norm_out_bias;
+    llm::Tensor norm_out_weight;
+    llm::Tensor norm_out_bias;
     FluxVaeConv conv_out;          // [3, 128, 3, 3]
 
-    DiffusionKernels* kernels;
-    DeviceContext* ctx;
+    llm::DiffusionKernels* kernels;
+    llm::DeviceContext* ctx;
 }
 
 struct FluxVaeActivations {
-    Tensor buf_a;  // Primary buffer
-    Tensor buf_b;  // Secondary buffer
-    Tensor buf_c;  // Temp for residual
+    llm::Tensor buf_a;  // Primary buffer
+    llm::Tensor buf_b;  // Secondary buffer
+    llm::Tensor buf_c;  // Temp for residual
 }
 
 // --- Loading Helpers ---
 
-fn FluxVaeConv load_flux_conv(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint in_c, uint out_c) {
+fn FluxVaeConv load_flux_conv(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint in_c, uint out_c) {
     char[256] buf;
     usz pos = 0;
     for (usz i = 0; i < prefix.len; i++) { buf[pos] = prefix[i]; pos++; }
@@ -107,8 +107,8 @@ fn FluxVaeConv load_flux_conv(DeviceContext* ctx, SafetensorsFile* sf, String pr
     String w_name = (String)wname[0..pos + w_suffix.len - 1];
     String b_name = (String)bname[0..pos + b_suffix.len - 1];
 
-    Tensor w = llm::upload_safetensor_f32(ctx, sf, w_name)!!;
-    Tensor b = llm::upload_safetensor_f32(ctx, sf, b_name)!!;
+    llm::Tensor w = llm::upload_safetensor_f32(ctx, sf, w_name)!!;
+    llm::Tensor b = llm::upload_safetensor_f32(ctx, sf, b_name)!!;
 
     return {
         .weight = w,
@@ -120,7 +120,7 @@ fn FluxVaeConv load_flux_conv(DeviceContext* ctx, SafetensorsFile* sf, String pr
     };
 }
 
-fn FluxVaeResBlock load_flux_resblock(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint in_c, uint out_c) {
+fn FluxVaeResBlock load_flux_resblock(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint in_c, uint out_c) {
     char[256] buf;
 
     FluxVaeResBlock rb;
@@ -158,13 +158,13 @@ fn String flux_vae_name(char[256]* buf, String prefix, String suffix) {
     return (String)(*buf)[0..pos - 1];
 }
 
-fn Tensor load_flux_vae_tensor(DeviceContext* ctx, SafetensorsFile* sf, String prefix, String suffix) {
+fn llm::Tensor load_flux_vae_tensor(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, String suffix) {
     char[256] buf;
     String name = flux_vae_name(&buf, prefix, suffix);
     return llm::upload_safetensor_f32(ctx, sf, name)!!;
 }
 
-fn FluxVaeAttn load_flux_attn(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint channels) {
+fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint channels) {
     return {
         .norm_weight = load_flux_vae_tensor(ctx, sf, prefix, "norm.weight"),
         .norm_bias = load_flux_vae_tensor(ctx, sf, prefix, "norm.bias"),
@@ -182,7 +182,7 @@ fn FluxVaeAttn load_flux_attn(DeviceContext* ctx, SafetensorsFile* sf, String pr
 
 // --- Load Flux VAE Decoder ---
 
-fn FluxVaeDecoder? load_flux_vae_decoder(DeviceContext* ctx, SafetensorsFile* sf, DiffusionKernels* kernels) {
+fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, llm::DiffusionKernels* kernels) {
     io::printfn("\nLoading Flux VAE decoder...");
     String pfx = "decoder.";
 
@@ -265,7 +265,7 @@ fn FluxVaeDecoder? load_flux_vae_decoder(DeviceContext* ctx, SafetensorsFile* sf
 
 // --- Allocate Flux VAE Activations ---
 
-fn FluxVaeActivations? allocate_flux_vae_activations(DeviceContext* ctx, uint max_size) {
+fn FluxVaeActivations? allocate_flux_vae_activations(llm::DeviceContext* ctx, uint max_size) {
     // Max buffer size is determined by the largest channels*H*W across all stages:
     //   512ch at 1/4 res: 512*(max_size/4)^2   (up.2)
     //   256ch at full res: 256*max_size^2        (after up.1 upsample)
@@ -285,16 +285,16 @@ fn FluxVaeActivations? allocate_flux_vae_activations(DeviceContext* ctx, uint ma
 
 fn void dispatch_flux_conv(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     FluxVaeConv* conv,
-    Tensor* input,
-    Tensor* output,
+    llm::Tensor* input,
+    llm::Tensor* output,
     uint in_h, uint in_w,
     uint stride, uint pad
 ) {
     uint out_h = (in_h + 2 * pad - conv.kH) / stride + 1;
     uint out_w = (in_w + 2 * pad - conv.kW) / stride + 1;
-    Conv2dPC pc = {
+    llm::Conv2dPC pc = {
         .in_c = conv.in_c,
         .out_c = conv.out_c,
         .in_h = in_h,
@@ -313,15 +313,15 @@ fn void dispatch_flux_conv(
 
 fn void dispatch_flux_groupnorm(
     CommandBuffer cmd,
-    DiffusionKernels* k,
-    Tensor* weight,
-    Tensor* bias,
-    Tensor* input,
-    Tensor* output,
+    llm::DiffusionKernels* k,
+    llm::Tensor* weight,
+    llm::Tensor* bias,
+    llm::Tensor* input,
+    llm::Tensor* output,
     uint channels,
     uint spatial
 ) {
-    GroupNormPC pc = {
+    llm::GroupNormPC pc = {
         .channels = channels,
         .spatial = spatial,
         .num_groups = 32,
@@ -335,11 +335,11 @@ llm::dispatch_kernel(cmd, &k.group_norm,
 
 fn void dispatch_flux_resblock(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     FluxVaeResBlock* rb,
-    Tensor* input,     // buf_a - also receives output
-    Tensor* temp,      // buf_b
-    Tensor* skip_temp, // buf_c
+    llm::Tensor* input,     // buf_a - also receives output
+    llm::Tensor* temp,      // buf_b
+    llm::Tensor* skip_temp, // buf_c
     uint h, uint w
 ) {
     uint in_c = rb.in_c;
@@ -350,14 +350,14 @@ fn void dispatch_flux_resblock(
     dispatch_flux_groupnorm(cmd, k, &rb.norm1_weight, &rb.norm1_bias, input, temp, in_c, spatial);
 llm::compute_barrier(cmd);
 
-    SiluPC silu_pc = { .n = in_c * spatial };
+    llm::SiluPC silu_pc = { .n = in_c * spatial };
 llm::dispatch_kernel(cmd, &k.shared.silu,
         { temp.gpu_buffer.buffer },
         { temp.size_bytes },
         &silu_pc, llm::ceil_div(in_c * spatial, 256));
 llm::compute_barrier(cmd);
 
-    Conv2dPC pc1 = {
+    llm::Conv2dPC pc1 = {
         .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -369,14 +369,14 @@ llm::compute_barrier(cmd);
     dispatch_flux_groupnorm(cmd, k, &rb.norm2_weight, &rb.norm2_bias, skip_temp, temp, out_c, spatial);
 llm::compute_barrier(cmd);
 
-    SiluPC silu_pc2 = { .n = out_c * spatial };
+    llm::SiluPC silu_pc2 = { .n = out_c * spatial };
 llm::dispatch_kernel(cmd, &k.shared.silu,
         { temp.gpu_buffer.buffer },
         { temp.size_bytes },
         &silu_pc2, llm::ceil_div(out_c * spatial, 256));
 llm::compute_barrier(cmd);
 
-    Conv2dPC pc2 = {
+    llm::Conv2dPC pc2 = {
         .in_c = out_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -387,7 +387,7 @@ llm::compute_barrier(cmd);
     // Skip connection
     if (rb.has_nin_shortcut && rb.nin_shortcut_weight.size_bytes > 0) {
         // 1x1 conv for channel change
-        Conv2dPC pc_nin = {
+        llm::Conv2dPC pc_nin = {
             .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
             .kH = 1, .kW = 1, .stride = 1, .pad = 0,
             .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -395,14 +395,14 @@ llm::compute_barrier(cmd);
 	llm::dispatch_conv2d(cmd, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
 llm::compute_barrier(cmd);
         // Residual: skip_temp += temp
-        ResidualPC res_pc = { .n = out_c * spatial };
+        llm::ResidualPC res_pc = { .n = out_c * spatial };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
             { skip_temp.gpu_buffer.buffer, temp.gpu_buffer.buffer },
             { skip_temp.size_bytes, temp.size_bytes },
             &res_pc, llm::ceil_div(out_c * spatial, 256));
     } else {
         // Identity skip: skip_temp += input
-        ResidualPC res_pc = { .n = out_c * spatial };
+        llm::ResidualPC res_pc = { .n = out_c * spatial };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
             { skip_temp.gpu_buffer.buffer, input.gpu_buffer.buffer },
             { skip_temp.size_bytes, input.size_bytes },
@@ -418,11 +418,11 @@ llm::compute_barrier(cmd);
 
 fn void dispatch_flux_mid_attn(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     FluxVaeAttn* attn,
-    Tensor* input,   // [C, H, W]
-    Tensor* temp_a,  // scratch
-    Tensor* temp_b,  // scratch
+    llm::Tensor* input,   // [C, H, W]
+    llm::Tensor* temp_a,  // scratch
+    llm::Tensor* temp_b,  // scratch
     uint h, uint w
 ) {
     uint ch = attn.channels;
@@ -438,7 +438,7 @@ llm::compute_barrier(cmd);
     // These are 1x1 convolutions, but stored as linear weights [ch, ch]
     // Apply as batched matmul: for each spatial position, matmul
     // Actually conv2d with 1x1 kernel works
-    Conv2dPC pc_qkv = {
+    llm::Conv2dPC pc_qkv = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 1, .kW = 1, .stride = 1, .pad = 0,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -472,9 +472,9 @@ llm::compute_barrier(cmd);
 // Output: image [3, 8h, 8w] in acts.buf_a
 
 fn void? FluxVaeDecoder.forward(&self, FluxVaeActivations* acts, uint lat_h, uint lat_w) {
-    DeviceContext* ctx = self.ctx;
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    DiffusionKernels* k = self.kernels;
+    llm::DiffusionKernels* k = self.kernels;
 
     uint h = lat_h;
     uint w = lat_w;
@@ -501,7 +501,7 @@ llm::begin_compute(cmd)!!;
         dispatch_flux_resblock(cmd, k, &self.up3_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
     }
     // Upsample 2x
-    UpsamplePC up_pc = { .channels = 512, .in_h = h, .in_w = w };
+    llm::UpsamplePC up_pc = { .channels = 512, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
@@ -558,7 +558,7 @@ llm::begin_compute(cmd)!!;
         &acts.buf_a, &acts.buf_b, 128, h * w);
 llm::compute_barrier(cmd);
 
-    SiluPC silu_pc = { .n = 128 * h * w };
+    llm::SiluPC silu_pc = { .n = 128 * h * w };
 llm::dispatch_kernel(cmd, &k.shared.silu,
         { acts.buf_b.gpu_buffer.buffer },
         { acts.buf_b.size_bytes },
@@ -569,7 +569,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Scale+shift to [0,1]: output = output * 0.5 + 0.5
-    ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
+    llm::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },

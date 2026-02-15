@@ -1,4 +1,4 @@
-module llm::args;
+module example;
 
 import std::io;
 import std::io::file;

@@ -1,4 +1,4 @@
-module llm::diffusers;
+module sdxs;
 
 import vk;
 import llm;
@@ -15,21 +15,21 @@ import std::core::mem;
 // ResBlock: GroupNorm -> SiLU -> Conv3x3 -> time_emb -> GroupNorm -> SiLU -> Conv3x3
 struct UnetResBlock {
     // in_layers: [0]=GroupNorm weight, [2]=Conv3x3
-    Tensor in_norm_weight;   // GroupNorm weight (in_channels)
-    Tensor in_norm_bias;     // GroupNorm bias
-    Tensor in_conv_weight;   // Conv3x3 weight [kH, kW, in_c, out_c]
-    Tensor in_conv_bias;     // Conv3x3 bias
+    llm::Tensor in_norm_weight;   // GroupNorm weight (in_channels)
+    llm::Tensor in_norm_bias;     // GroupNorm bias
+    llm::Tensor in_conv_weight;   // Conv3x3 weight [kH, kW, in_c, out_c]
+    llm::Tensor in_conv_bias;     // Conv3x3 bias
     // emb_layers: [1]=Linear (time_emb_dim -> out_channels)
-    Tensor emb_weight;       // Linear weight [1280, out_c]
-    Tensor emb_bias;         // Linear bias
+    llm::Tensor emb_weight;       // Linear weight [1280, out_c]
+    llm::Tensor emb_bias;         // Linear bias
     // out_layers: [0]=GroupNorm weight, [3]=Conv3x3
-    Tensor out_norm_weight;  // GroupNorm weight (out_channels)
-    Tensor out_norm_bias;
-    Tensor out_conv_weight;  // Conv3x3 weight
-    Tensor out_conv_bias;
+    llm::Tensor out_norm_weight;  // GroupNorm weight (out_channels)
+    llm::Tensor out_norm_bias;
+    llm::Tensor out_conv_weight;  // Conv3x3 weight
+    llm::Tensor out_conv_bias;
     // Skip connection (only if in_c != out_c)
-    Tensor skip_weight;      // 1x1 conv weight [1, 1, in_c, out_c]
-    Tensor skip_bias;
+    llm::Tensor skip_weight;      // 1x1 conv weight [1, 1, in_c, out_c]
+    llm::Tensor skip_bias;
     bool has_skip;
     uint in_c;
     uint out_c;
@@ -38,50 +38,50 @@ struct UnetResBlock {
 // Spatial Transformer block: self-attention + cross-attention + FFN
 struct SpatialTransformerWeights {
     // GroupNorm before proj_in
-    Tensor norm_weight;
-    Tensor norm_bias;
+    llm::Tensor norm_weight;
+    llm::Tensor norm_bias;
     // proj_in: 1x1 conv
-    Tensor proj_in_weight;
-    Tensor proj_in_bias;
+    llm::Tensor proj_in_weight;
+    llm::Tensor proj_in_bias;
     // Self-attention (attn1)
-    Tensor attn1_q;
-    Tensor attn1_k;
-    Tensor attn1_v;
-    Tensor attn1_out_weight;
-    Tensor attn1_out_bias;
-    Tensor attn1_norm_weight;
-    Tensor attn1_norm_bias;
+    llm::Tensor attn1_q;
+    llm::Tensor attn1_k;
+    llm::Tensor attn1_v;
+    llm::Tensor attn1_out_weight;
+    llm::Tensor attn1_out_bias;
+    llm::Tensor attn1_norm_weight;
+    llm::Tensor attn1_norm_bias;
     // Cross-attention (attn2)
-    Tensor attn2_q;
-    Tensor attn2_k;   // context_dim -> channels
-    Tensor attn2_v;   // context_dim -> channels
-    Tensor attn2_out_weight;
-    Tensor attn2_out_bias;
-    Tensor attn2_norm_weight;
-    Tensor attn2_norm_bias;
+    llm::Tensor attn2_q;
+    llm::Tensor attn2_k;   // context_dim -> channels
+    llm::Tensor attn2_v;   // context_dim -> channels
+    llm::Tensor attn2_out_weight;
+    llm::Tensor attn2_out_bias;
+    llm::Tensor attn2_norm_weight;
+    llm::Tensor attn2_norm_bias;
     // FFN
-    Tensor ff_net0_weight;  // GEGLU: [channels, inner_dim*2]
-    Tensor ff_net0_bias;
-    Tensor ff_net2_weight;  // [inner_dim, channels]
-    Tensor ff_net2_bias;
-    Tensor ff_norm_weight;  // norm3
-    Tensor ff_norm_bias;
+    llm::Tensor ff_net0_weight;  // GEGLU: [channels, inner_dim*2]
+    llm::Tensor ff_net0_bias;
+    llm::Tensor ff_net2_weight;  // [inner_dim, channels]
+    llm::Tensor ff_net2_bias;
+    llm::Tensor ff_norm_weight;  // norm3
+    llm::Tensor ff_norm_bias;
     // proj_out: 1x1 conv
-    Tensor proj_out_weight;
-    Tensor proj_out_bias;
+    llm::Tensor proj_out_weight;
+    llm::Tensor proj_out_bias;
     uint channels;
 }
 
 struct UnetWeights {
     // Time embedding MLP: Linear(320, 1280) -> SiLU -> Linear(1280, 1280)
-    Tensor time_emb_0_weight;
-    Tensor time_emb_0_bias;
-    Tensor time_emb_2_weight;
-    Tensor time_emb_2_bias;
+    llm::Tensor time_emb_0_weight;
+    llm::Tensor time_emb_0_bias;
+    llm::Tensor time_emb_2_weight;
+    llm::Tensor time_emb_2_bias;
 
     // conv_in: input_blocks.0.0
-    Tensor conv_in_weight;
-    Tensor conv_in_bias;
+    llm::Tensor conv_in_weight;
+    llm::Tensor conv_in_bias;
 
     // Input blocks (encoder path)
     UnetResBlock input_rb1;        // input_blocks.1.0 (320->320)
@@ -91,10 +91,10 @@ struct UnetWeights {
     SpatialTransformerWeights input_st7;  // input_blocks.7.1
 
     // Downsample convs
-    Tensor down3_weight;  // input_blocks.3.0.op (320->320, stride 2)
-    Tensor down3_bias;
-    Tensor down6_weight;  // input_blocks.6.0.op (640->640, stride 2)
-    Tensor down6_bias;
+    llm::Tensor down3_weight;  // input_blocks.3.0.op (320->320, stride 2)
+    llm::Tensor down3_bias;
+    llm::Tensor down6_weight;  // input_blocks.6.0.op (640->640, stride 2)
+    llm::Tensor down6_bias;
 
     // Middle attentions (up_blocks.0.attentions)
     SpatialTransformerWeights mid_attn0;  // up_blocks.0.attentions.0
@@ -111,28 +111,28 @@ struct UnetWeights {
     UnetResBlock output_rb7;  // output_blocks.7.0 (640->320)
 
     // Upsample convs
-    Tensor up2_weight;  // output_blocks.2.1.conv (1280->1280)
-    Tensor up2_bias;
-    Tensor up5_weight;  // output_blocks.5.2.conv (640->640)
-    Tensor up5_bias;
+    llm::Tensor up2_weight;  // output_blocks.2.1.conv (1280->1280)
+    llm::Tensor up2_bias;
+    llm::Tensor up5_weight;  // output_blocks.5.2.conv (640->640)
+    llm::Tensor up5_bias;
 
     // Output: GroupNorm -> SiLU -> Conv3x3
-    Tensor out_norm_weight;  // out.0
-    Tensor out_norm_bias;
-    Tensor out_conv_weight;  // out.2
-    Tensor out_conv_bias;
+    llm::Tensor out_norm_weight;  // out.0
+    llm::Tensor out_norm_bias;
+    llm::Tensor out_conv_weight;  // out.2
+    llm::Tensor out_conv_bias;
 }
 
 // --- UNet Activations ---
 
 struct UnetActivations {
     // Working buffers for spatial features
-    Tensor buf_a;       // Primary spatial buffer (max: 1280 * 16 * 16)
-    Tensor buf_b;       // Secondary
-    Tensor buf_c;       // Tertiary (for residual, skip)
+    llm::Tensor buf_a;       // Primary spatial buffer (max: 1280 * 16 * 16)
+    llm::Tensor buf_b;       // Secondary
+    llm::Tensor buf_c;       // Tertiary (for residual, skip)
 
     // Time embedding: [1280]
-    Tensor time_emb;
+    llm::Tensor time_emb;
 
     // Skip connection storage (saved during encoder for decoder)
     // skip0: after conv_in [320, 64, 64]
@@ -141,23 +141,23 @@ struct UnetActivations {
     // skip4: after input_rb4+st4 [640, 32, 32]
     // skip6: after downsample [640, 16, 16] (before rb7)
     // skip7: after input_rb7+st7 [1280, 16, 16]
-    Tensor[6] skips;
+    llm::Tensor[6] skips;
 
     // Attention buffers
-    Tensor attn_q;
-    Tensor attn_k;
-    Tensor attn_v;
-    Tensor attn_scores;
-    Tensor attn_out;
-    Tensor ffn_buf;  // For GEGLU intermediate
+    llm::Tensor attn_q;
+    llm::Tensor attn_k;
+    llm::Tensor attn_v;
+    llm::Tensor attn_scores;
+    llm::Tensor attn_out;
+    llm::Tensor ffn_buf;  // For GEGLU intermediate
 }
 
 struct UnetModel {
-    UnetConfig config;
+    llm::UnetConfig config;
     UnetWeights weights;
     UnetActivations acts;
-    DiffusionKernels* kernels;
-    DeviceContext* ctx;
+    llm::DiffusionKernels* kernels;
+    llm::DeviceContext* ctx;
 }
 
 // --- Tensor name helpers ---
@@ -174,69 +174,69 @@ fn String unet_name(char[256]* buf, String prefix, String suffix) {
 
 // --- Load helpers ---
 
-fn UnetResBlock load_unet_resblock(DeviceContext* ctx, GGUFFile* gf, String base, uint in_c, uint out_c) {
+fn UnetResBlock? load_unet_resblock(llm::DeviceContext* ctx, llm::GGUFFile* gf, String base, uint in_c, uint out_c) {
     char[256] buf;
     bool has_skip = in_c != out_c;
     UnetResBlock rb = {
-        .in_norm_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.0.weight")),
-        .in_norm_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.0.bias")),
-        .in_conv_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.2.weight")),
-        .in_conv_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.2.bias")),
-        .emb_weight     = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "emb_layers.1.weight")),
-        .emb_bias       = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "emb_layers.1.bias")),
-        .out_norm_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.0.weight")),
-        .out_norm_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.0.bias")),
-        .out_conv_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.3.weight")),
-        .out_conv_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.3.bias")),
+        .in_norm_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.0.weight"))!!,
+        .in_norm_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.0.bias"))!!,
+        .in_conv_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.2.weight"))!!,
+        .in_conv_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "in_layers.2.bias"))!!,
+        .emb_weight     = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "emb_layers.1.weight"))!!,
+        .emb_bias       = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "emb_layers.1.bias"))!!,
+        .out_norm_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.0.weight"))!!,
+        .out_norm_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.0.bias"))!!,
+        .out_conv_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.3.weight"))!!,
+        .out_conv_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "out_layers.3.bias"))!!,
         .has_skip = has_skip,
         .in_c = in_c,
         .out_c = out_c,
     };
 
     if (has_skip) {
-        rb.skip_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "skip_connection.weight"));
-        rb.skip_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "skip_connection.bias"));
+        rb.skip_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "skip_connection.weight"))!!;
+        rb.skip_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "skip_connection.bias"))!!;
     }
 
     return rb;
 }
 
-fn SpatialTransformerWeights load_spatial_transformer(DeviceContext* ctx, GGUFFile* gf, String base, uint channels) {
+fn SpatialTransformerWeights? load_spatial_transformer(llm::DeviceContext* ctx, llm::GGUFFile* gf, String base, uint channels) {
     char[256] buf;
     return {
-        .norm_weight     = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "norm.weight")),
-        .norm_bias       = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "norm.bias")),
-        .proj_in_weight  = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_in.weight")),
-        .proj_in_bias    = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_in.bias")),
-        .attn1_q         = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_q.weight")),
-        .attn1_k         = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_k.weight")),
-        .attn1_v         = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_v.weight")),
-        .attn1_out_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_out.0.weight")),
-        .attn1_out_bias  = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_out.0.bias")),
-        .attn1_norm_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm1.weight")),
-        .attn1_norm_bias = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm1.bias")),
-        .attn2_q         = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_q.weight")),
-        .attn2_k         = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_k.weight")),
-        .attn2_v         = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_v.weight")),
-        .attn2_out_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_out.0.weight")),
-        .attn2_out_bias  = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_out.0.bias")),
-        .attn2_norm_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm2.weight")),
-        .attn2_norm_bias = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm2.bias")),
-        .ff_net0_weight  = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.0.proj.weight")),
-        .ff_net0_bias    = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.0.proj.bias")),
-        .ff_net2_weight  = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.2.weight")),
-        .ff_net2_bias    = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.2.bias")),
-        .ff_norm_weight  = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm3.weight")),
-        .ff_norm_bias    = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm3.bias")),
-        .proj_out_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_out.weight")),
-        .proj_out_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_out.bias")),
+        .norm_weight     = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "norm.weight"))!!,
+        .norm_bias       = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "norm.bias"))!!,
+        .proj_in_weight  = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_in.weight"))!!,
+        .proj_in_bias    = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_in.bias"))!!,
+        .attn1_q         = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_q.weight"))!!,
+        .attn1_k         = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_k.weight"))!!,
+        .attn1_v         = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_v.weight"))!!,
+        .attn1_out_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_out.0.weight"))!!,
+        .attn1_out_bias  = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn1.to_out.0.bias"))!!,
+        .attn1_norm_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm1.weight"))!!,
+        .attn1_norm_bias = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm1.bias"))!!,
+        .attn2_q         = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_q.weight"))!!,
+        .attn2_k         = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_k.weight"))!!,
+        .attn2_v         = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_v.weight"))!!,
+        .attn2_out_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_out.0.weight"))!!,
+        .attn2_out_bias  = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.attn2.to_out.0.bias"))!!,
+        .attn2_norm_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm2.weight"))!!,
+        .attn2_norm_bias = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm2.bias"))!!,
+        .ff_net0_weight  = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.0.proj.weight"))!!,
+        .ff_net0_bias    = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.0.proj.bias"))!!,
+        .ff_net2_weight  = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.2.weight"))!!,
+        .ff_net2_bias    = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.ff.net.2.bias"))!!,
+        .ff_norm_weight  = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm3.weight"))!!,
+        .ff_norm_bias    = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "transformer_blocks.0.norm3.bias"))!!,
+        .proj_out_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_out.weight"))!!,
+        .proj_out_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, base, "proj_out.bias"))!!,
         .channels = channels,
     };
 }
 
 // --- Load UNet ---
 
-fn UnetWeights? load_unet_weights(DeviceContext* ctx, GGUFFile* gf, UnetConfig* config) {
+fn UnetWeights? load_unet_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::UnetConfig* config) {
     io::printfn("\nLoading UNet weights...");
     String pfx = config.prefix;
     char[256] buf;
@@ -244,82 +244,82 @@ fn UnetWeights? load_unet_weights(DeviceContext* ctx, GGUFFile* gf, UnetConfig* 
     UnetWeights w;
 
     // Time embedding MLP
-    w.time_emb_0_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.0.weight"));
-    w.time_emb_0_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.0.bias"));
-    w.time_emb_2_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.2.weight"));
-    w.time_emb_2_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.2.bias"));
+    w.time_emb_0_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.0.weight"))!!;
+    w.time_emb_0_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.0.bias"))!!;
+    w.time_emb_2_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.2.weight"))!!;
+    w.time_emb_2_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "time_embed.2.bias"))!!;
     io::printfn("  Time embedding loaded");
 
     // conv_in
-    w.conv_in_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.0.0.weight"));
-    w.conv_in_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.0.0.bias"));
+    w.conv_in_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.0.0.weight"))!!;
+    w.conv_in_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.0.0.bias"))!!;
 
     // Input ResBlocks
     String ib1 = unet_name(&buf, pfx, "input_blocks.1.0.");
-    w.input_rb1 = load_unet_resblock(ctx, gf, ib1, 320, 320);
+    w.input_rb1 = load_unet_resblock(ctx, gf, ib1, 320, 320)!!;
     io::printfn("  Input block 1 loaded (320->320)");
 
     // Downsample 3
-    w.down3_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.3.0.op.weight"));
-    w.down3_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.3.0.op.bias"));
+    w.down3_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.3.0.op.weight"))!!;
+    w.down3_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.3.0.op.bias"))!!;
 
     String ib4 = unet_name(&buf, pfx, "input_blocks.4.0.");
-    w.input_rb4 = load_unet_resblock(ctx, gf, ib4, 320, 640);
+    w.input_rb4 = load_unet_resblock(ctx, gf, ib4, 320, 640)!!;
     String is4 = unet_name(&buf, pfx, "input_blocks.4.1.");
-    w.input_st4 = load_spatial_transformer(ctx, gf, is4, 640);
+    w.input_st4 = load_spatial_transformer(ctx, gf, is4, 640)!!;
     io::printfn("  Input block 4 loaded (320->640 + SpatialTransformer)");
 
     // Downsample 6
-    w.down6_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.6.0.op.weight"));
-    w.down6_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.6.0.op.bias"));
+    w.down6_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.6.0.op.weight"))!!;
+    w.down6_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "input_blocks.6.0.op.bias"))!!;
 
     String ib7 = unet_name(&buf, pfx, "input_blocks.7.0.");
-    w.input_rb7 = load_unet_resblock(ctx, gf, ib7, 640, 1280);
+    w.input_rb7 = load_unet_resblock(ctx, gf, ib7, 640, 1280)!!;
     String is7 = unet_name(&buf, pfx, "input_blocks.7.1.");
-    w.input_st7 = load_spatial_transformer(ctx, gf, is7, 1280);
+    w.input_st7 = load_spatial_transformer(ctx, gf, is7, 1280)!!;
     io::printfn("  Input block 7 loaded (640->1280 + SpatialTransformer)");
 
     // Middle attentions (up_blocks.0.attentions.{0,1})
     String ma0 = unet_name(&buf, pfx, "up_blocks.0.attentions.0.");
-    w.mid_attn0 = load_spatial_transformer(ctx, gf, ma0, 1280);
+    w.mid_attn0 = load_spatial_transformer(ctx, gf, ma0, 1280)!!;
     String ma1 = unet_name(&buf, pfx, "up_blocks.0.attentions.1.");
-    w.mid_attn1 = load_spatial_transformer(ctx, gf, ma1, 1280);
+    w.mid_attn1 = load_spatial_transformer(ctx, gf, ma1, 1280)!!;
     io::printfn("  Middle attentions loaded (2x SpatialTransformer 1280ch)");
 
     // Output blocks
     String ob0 = unet_name(&buf, pfx, "output_blocks.0.0.");
-    w.output_rb0 = load_unet_resblock(ctx, gf, ob0, 2560, 1280);
+    w.output_rb0 = load_unet_resblock(ctx, gf, ob0, 2560, 1280)!!;
     String ob1 = unet_name(&buf, pfx, "output_blocks.1.0.");
-    w.output_rb1 = load_unet_resblock(ctx, gf, ob1, 1920, 1280);
+    w.output_rb1 = load_unet_resblock(ctx, gf, ob1, 1920, 1280)!!;
     io::printfn("  Output blocks 0-1 loaded");
 
-    w.up2_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.2.1.conv.weight"));
-    w.up2_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.2.1.conv.bias"));
+    w.up2_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.2.1.conv.weight"))!!;
+    w.up2_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.2.1.conv.bias"))!!;
 
     String ob3 = unet_name(&buf, pfx, "output_blocks.3.0.");
-    w.output_rb3 = load_unet_resblock(ctx, gf, ob3, 1920, 640);
+    w.output_rb3 = load_unet_resblock(ctx, gf, ob3, 1920, 640)!!;
     String os3 = unet_name(&buf, pfx, "output_blocks.3.1.");
-    w.output_st3 = load_spatial_transformer(ctx, gf, os3, 640);
+    w.output_st3 = load_spatial_transformer(ctx, gf, os3, 640)!!;
     String ob4 = unet_name(&buf, pfx, "output_blocks.4.0.");
-    w.output_rb4 = load_unet_resblock(ctx, gf, ob4, 960, 640);
+    w.output_rb4 = load_unet_resblock(ctx, gf, ob4, 960, 640)!!;
     String os4 = unet_name(&buf, pfx, "output_blocks.4.1.");
-    w.output_st4 = load_spatial_transformer(ctx, gf, os4, 640);
+    w.output_st4 = load_spatial_transformer(ctx, gf, os4, 640)!!;
     io::printfn("  Output blocks 3-4 loaded (with SpatialTransformers)");
 
-    w.up5_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.5.2.conv.weight"));
-    w.up5_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.5.2.conv.bias"));
+    w.up5_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.5.2.conv.weight"))!!;
+    w.up5_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "output_blocks.5.2.conv.bias"))!!;
 
     String ob6 = unet_name(&buf, pfx, "output_blocks.6.0.");
-    w.output_rb6 = load_unet_resblock(ctx, gf, ob6, 960, 320);
+    w.output_rb6 = load_unet_resblock(ctx, gf, ob6, 960, 320)!!;
     String ob7 = unet_name(&buf, pfx, "output_blocks.7.0.");
-    w.output_rb7 = load_unet_resblock(ctx, gf, ob7, 640, 320);
+    w.output_rb7 = load_unet_resblock(ctx, gf, ob7, 640, 320)!!;
     io::printfn("  Output blocks 6-7 loaded");
 
     // Final output
-    w.out_norm_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.0.weight"));
-    w.out_norm_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.0.bias"));
-    w.out_conv_weight = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.2.weight"));
-    w.out_conv_bias   = load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.2.bias"));
+    w.out_norm_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.0.weight"))!!;
+    w.out_norm_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.0.bias"))!!;
+    w.out_conv_weight = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.2.weight"))!!;
+    w.out_conv_bias   = llm::load_tensor_by_name(ctx, gf, unet_name(&buf, pfx, "out.2.bias"))!!;
     io::printfn("  Output head loaded");
 
     return w;
@@ -327,7 +327,7 @@ fn UnetWeights? load_unet_weights(DeviceContext* ctx, GGUFFile* gf, UnetConfig* 
 
 // --- Allocate UNet activations ---
 
-fn UnetActivations? allocate_unet_activations(DeviceContext* ctx, UnetConfig* config, uint latent_h, uint latent_w) {
+fn UnetActivations? allocate_unet_activations(llm::DeviceContext* ctx, llm::UnetConfig* config, uint latent_h, uint latent_w) {
     // Max spatial buffer: 1280 channels at 16x16, but also need 320 at 64x64
     // 320 * 64 * 64 = 1,310,720 floats
     // 1280 * 16 * 16 = 327,680 floats
@@ -344,7 +344,7 @@ fn UnetActivations? allocate_unet_activations(DeviceContext* ctx, UnetConfig* co
     ulong[4] emb_shape = { 1280, 0, 0, 0 };
 
     // Skip connections
-    Tensor[6] skips;
+    llm::Tensor[6] skips;
     // skip0: conv_in output [320, 64, 64]
     ulong[4] s0 = { (ulong)320 * latent_h * latent_w, 0, 0, 0 };
     skips[0] = llm::create_f32_tensor(ctx, s0, 1)!!;
@@ -395,12 +395,12 @@ fn UnetActivations? allocate_unet_activations(DeviceContext* ctx, UnetConfig* co
 
 fn void dispatch_unet_resblock(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     UnetResBlock* rb,
-    Tensor* input,
-    Tensor* output,
-    Tensor* temp,
-    Tensor* time_emb,
+    llm::Tensor* input,
+    llm::Tensor* output,
+    llm::Tensor* temp,
+    llm::Tensor* time_emb,
     uint h, uint w
 ) {
     uint in_c = rb.in_c;
@@ -408,7 +408,7 @@ fn void dispatch_unet_resblock(
     uint spatial = h * w;
 
     // 1. GroupNorm(in) -> temp
-    GroupNormPC gn_pc = { .channels = in_c, .spatial = spatial, .num_groups = 32, .eps = 1e-5f };
+    llm::GroupNormPC gn_pc = { .channels = in_c, .spatial = spatial, .num_groups = 32, .eps = 1e-5f };
 llm::dispatch_kernel(cmd, &k.group_norm,
         { input.gpu_buffer.buffer, rb.in_norm_weight.gpu_buffer.buffer,
           rb.in_norm_bias.gpu_buffer.buffer, temp.gpu_buffer.buffer },
@@ -418,7 +418,7 @@ llm::dispatch_kernel(cmd, &k.group_norm,
 llm::compute_barrier(cmd);
 
     // 2. SiLU(temp) in-place
-    SiluPC silu_pc = { .n = in_c * spatial };
+    llm::SiluPC silu_pc = { .n = in_c * spatial };
 llm::dispatch_kernel(cmd, &k.shared.silu,
         { temp.gpu_buffer.buffer },
         { temp.size_bytes },
@@ -426,7 +426,7 @@ llm::dispatch_kernel(cmd, &k.shared.silu,
 llm::compute_barrier(cmd);
 
     // 3. Conv3x3(temp) -> output
-    Conv2dPC conv_pc = {
+    llm::Conv2dPC conv_pc = {
         .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -437,12 +437,12 @@ llm::compute_barrier(cmd);
     // 4. Time embedding projection: emb = SiLU(time_emb) then Linear -> [out_c]
     // SiLU already applied to time_emb during embedding creation
     // Linear: time_emb[1280] -> [out_c] via emb_weight
-    BatchedMatMulPC emb_pc = { .m_dim = 1, .n_dim = out_c, .k_dim = 1280 };
+    llm::BatchedMatMulPC emb_pc = { .m_dim = 1, .n_dim = out_c, .k_dim = 1280 };
     llm::dispatch_batched_matmul_auto(cmd, k, &rb.emb_weight, time_emb, temp, &emb_pc);
 llm::compute_barrier(cmd);
 
     // Add emb bias
-    ResidualPC rbias = { .n = out_c };
+    llm::ResidualPC rbias = { .n = out_c };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { temp.gpu_buffer.buffer, rb.emb_bias.gpu_buffer.buffer },
         { temp.size_bytes, rb.emb_bias.size_bytes },
@@ -450,7 +450,7 @@ llm::dispatch_kernel(cmd, &k.shared.residual_add,
 llm::compute_barrier(cmd);
 
     // 5. Broadcast add: output[c, h, w] += emb[c]
-    BroadcastAddPC ba_pc = { .channels = out_c, .spatial = spatial };
+    llm::BroadcastAddPC ba_pc = { .channels = out_c, .spatial = spatial };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
         { output.gpu_buffer.buffer, temp.gpu_buffer.buffer },
         { output.size_bytes, temp.size_bytes },
@@ -487,7 +487,7 @@ llm::compute_barrier(cmd);
     // 9. Skip connection
     if (rb.has_skip) {
         // 1x1 conv on input -> temp
-        Conv2dPC skip_pc = {
+        llm::Conv2dPC skip_pc = {
             .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
             .kH = 1, .kW = 1, .stride = 1, .pad = 0,
             .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -502,7 +502,7 @@ llm::compute_barrier(cmd);
     }
 
     // 10. output += temp (residual)
-    ResidualPC res_pc = { .n = out_c * spatial };
+    llm::ResidualPC res_pc = { .n = out_c * spatial };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { output.gpu_buffer.buffer, temp.gpu_buffer.buffer },
         { output.size_bytes, temp.size_bytes },
@@ -514,12 +514,12 @@ llm::compute_barrier(cmd);
 
 fn void dispatch_spatial_transformer(
     CommandBuffer cmd,
-    DiffusionKernels* k,
+    llm::DiffusionKernels* k,
     SpatialTransformerWeights* st,
-    Tensor* input,       // [channels, h, w] — spatial features
-    Tensor* output,      // same shape as input
-    Tensor* temp,        // working buffer
-    Tensor* context,     // [77, 768] — CLIP text conditioning
+    llm::Tensor* input,       // [channels, h, w] — spatial features
+    llm::Tensor* output,      // same shape as input
+    llm::Tensor* temp,        // working buffer
+    llm::Tensor* context,     // [77, 768] — CLIP text conditioning
     UnetActivations* acts,
     uint h, uint w,
     uint n_heads,
@@ -530,7 +530,7 @@ fn void dispatch_spatial_transformer(
     uint head_dim = ch / n_heads;
 
     // 1. GroupNorm -> temp
-    GroupNormPC gn_pc = { .channels = ch, .spatial = spatial, .num_groups = 32, .eps = 1e-6f };
+    llm::GroupNormPC gn_pc = { .channels = ch, .spatial = spatial, .num_groups = 32, .eps = 1e-6f };
 llm::dispatch_kernel(cmd, &k.group_norm,
         { input.gpu_buffer.buffer, st.norm_weight.gpu_buffer.buffer,
           st.norm_bias.gpu_buffer.buffer, temp.gpu_buffer.buffer },
@@ -540,7 +540,7 @@ llm::dispatch_kernel(cmd, &k.group_norm,
 llm::compute_barrier(cmd);
 
     // 2. proj_in: 1x1 conv temp -> output (reshape to sequence)
-    Conv2dPC proj_pc = {
+    llm::Conv2dPC proj_pc = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 1, .kW = 1, .stride = 1, .pad = 0,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -553,7 +553,7 @@ llm::compute_barrier(cmd);
     // LayerNorm on output -> temp (per-position, 'spatial' positions of 'ch' dims)
     // We use layernorm per position
     for (uint pos = 0; pos < spatial; pos++) {
-        LayerNormPC ln = { .dim = ch, .eps = 1e-5f };
+        llm::LayerNormPC ln = { .dim = ch, .eps = 1e-5f };
 llm::dispatch_kernel(cmd, &k.shared.layernorm,
             { output.gpu_buffer.buffer, st.attn1_norm_weight.gpu_buffer.buffer,
               st.attn1_norm_bias.gpu_buffer.buffer, temp.gpu_buffer.buffer },
@@ -564,7 +564,7 @@ llm::dispatch_kernel(cmd, &k.shared.layernorm,
 llm::compute_barrier(cmd);
 
     // Q/K/V projections: batched matmul [spatial, ch] x [ch, ch]^T -> [spatial, ch]
-    BatchedMatMulPC qkv_pc = { .m_dim = spatial, .n_dim = ch, .k_dim = ch };
+    llm::BatchedMatMulPC qkv_pc = { .m_dim = spatial, .n_dim = ch, .k_dim = ch };
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn1_q, temp, &acts.attn_q, &qkv_pc);
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn1_k, temp, &acts.attn_k, &qkv_pc);
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn1_v, temp, &acts.attn_v, &qkv_pc);
@@ -572,7 +572,7 @@ llm::compute_barrier(cmd);
 
     // Self-attention: Q, K, V are [spatial, ch] -> reshape to [n_heads, spatial, head_dim]
     float scale = 1.0f / math::sqrt((float)head_dim);
-    SpatialAttentionPC sa_pc = {
+    llm::SpatialAttentionPC sa_pc = {
         .head_dim = head_dim,
         .n_heads = n_heads,
         .seq_len = spatial,
@@ -589,12 +589,12 @@ llm::dispatch_kernel(cmd, &k.spatial_attention,
 llm::compute_barrier(cmd);
 
     // Output projection
-    BatchedMatMulPC out_pc = { .m_dim = spatial, .n_dim = ch, .k_dim = ch };
+    llm::BatchedMatMulPC out_pc = { .m_dim = spatial, .n_dim = ch, .k_dim = ch };
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn1_out_weight, &acts.attn_out, temp, &out_pc);
 llm::compute_barrier(cmd);
 
     // Add bias
-    BroadcastAddPC ba = { .channels = ch, .spatial = spatial };
+    llm::BroadcastAddPC ba = { .channels = ch, .spatial = spatial };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
         { temp.gpu_buffer.buffer, st.attn1_out_bias.gpu_buffer.buffer },
         { temp.size_bytes, st.attn1_out_bias.size_bytes },
@@ -602,7 +602,7 @@ llm::dispatch_kernel(cmd, &k.broadcast_add,
 llm::compute_barrier(cmd);
 
     // Residual: output += attn1_output
-    ResidualPC res_pc = { .n = ch * spatial };
+    llm::ResidualPC res_pc = { .n = ch * spatial };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { output.gpu_buffer.buffer, temp.gpu_buffer.buffer },
         { output.size_bytes, temp.size_bytes },
@@ -612,7 +612,7 @@ llm::compute_barrier(cmd);
     // 4. Cross-attention (attn2): Q from image, K/V from text context
     // LayerNorm on output -> temp
     for (uint pos = 0; pos < spatial; pos++) {
-        LayerNormPC ln = { .dim = ch, .eps = 1e-5f };
+        llm::LayerNormPC ln = { .dim = ch, .eps = 1e-5f };
 llm::dispatch_kernel(cmd, &k.shared.layernorm,
             { output.gpu_buffer.buffer, st.attn2_norm_weight.gpu_buffer.buffer,
               st.attn2_norm_bias.gpu_buffer.buffer, temp.gpu_buffer.buffer },
@@ -625,13 +625,13 @@ llm::compute_barrier(cmd);
     // Q from image features: [spatial, ch] x [ch, ch]^T -> [spatial, ch]
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn2_q, temp, &acts.attn_q, &qkv_pc);
     // K from context: [77, context_dim] x [context_dim, ch]^T -> [77, ch]
-    BatchedMatMulPC kv_ctx_pc = { .m_dim = 77, .n_dim = ch, .k_dim = context_dim };
+    llm::BatchedMatMulPC kv_ctx_pc = { .m_dim = 77, .n_dim = ch, .k_dim = context_dim };
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn2_k, context, &acts.attn_k, &kv_ctx_pc);
     llm::dispatch_batched_matmul_auto(cmd, k, &st.attn2_v, context, &acts.attn_v, &kv_ctx_pc);
 llm::compute_barrier(cmd);
 
     // Cross-attention: Q=[spatial, ch], K/V=[77, ch]
-    CrossAttentionPC ca_pc = {
+    llm::CrossAttentionPC ca_pc = {
         .head_dim = head_dim,
         .n_heads = n_heads,
         .q_len = spatial,
@@ -667,7 +667,7 @@ llm::compute_barrier(cmd);
     // 5. FFN: LayerNorm -> GEGLU -> Linear -> residual
     // LayerNorm
     for (uint pos = 0; pos < spatial; pos++) {
-        LayerNormPC ln = { .dim = ch, .eps = 1e-5f };
+        llm::LayerNormPC ln = { .dim = ch, .eps = 1e-5f };
 llm::dispatch_kernel(cmd, &k.shared.layernorm,
             { output.gpu_buffer.buffer, st.ff_norm_weight.gpu_buffer.buffer,
               st.ff_norm_bias.gpu_buffer.buffer, temp.gpu_buffer.buffer },
@@ -680,12 +680,12 @@ llm::compute_barrier(cmd);
     // GEGLU: Linear([ch] -> [inner_dim*2]), split, GELU(first_half) * second_half
     // inner_dim = ch * 4 (from ff.net.0.proj output is [ch, inner_dim*2])
     uint inner_dim = ch * 4;
-    BatchedMatMulPC ff0_pc = { .m_dim = spatial, .n_dim = inner_dim * 2, .k_dim = ch };
+    llm::BatchedMatMulPC ff0_pc = { .m_dim = spatial, .n_dim = inner_dim * 2, .k_dim = ch };
     llm::dispatch_batched_matmul_auto(cmd, k, &st.ff_net0_weight, temp, &acts.ffn_buf, &ff0_pc);
 llm::compute_barrier(cmd);
 
     // Add bias to ffn_buf
-    BroadcastAddPC ff_ba = { .channels = inner_dim * 2, .spatial = spatial };
+    llm::BroadcastAddPC ff_ba = { .channels = inner_dim * 2, .spatial = spatial };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
         { acts.ffn_buf.gpu_buffer.buffer, st.ff_net0_bias.gpu_buffer.buffer },
         { acts.ffn_buf.size_bytes, st.ff_net0_bias.size_bytes },
@@ -694,7 +694,7 @@ llm::compute_barrier(cmd);
 
     // GELU on first half, multiply with second half
     // For now: apply GELU to first inner_dim elements, then elemwise_mul with second half
-    GeluPC gelu_pc = { .n = inner_dim * spatial };
+    llm::GeluPC gelu_pc = { .n = inner_dim * spatial };
 llm::dispatch_kernel(cmd, &k.shared.gelu,
         { acts.ffn_buf.gpu_buffer.buffer },
         { acts.ffn_buf.size_bytes },
@@ -702,14 +702,14 @@ llm::dispatch_kernel(cmd, &k.shared.gelu,
 llm::compute_barrier(cmd);
 
     // Multiply: ffn_buf[0..inner_dim*spatial-1] *= ffn_buf[inner_dim*spatial..]
-    ElemwisePC ew_pc = { .n = inner_dim * spatial };
+    llm::ElemwisePC ew_pc = { .n = inner_dim * spatial };
     // Use elemwise_mul treating second half as separate buffer (offset)
     // TODO: This needs an offset-aware elemwise or we copy
     // For now, we'll just use the first half (skip GEGLU gate for initial implementation)
     // This simplification will affect quality but allows testing the pipeline
 
     // Linear down: [inner_dim] -> [ch]
-    BatchedMatMulPC ff2_pc = { .m_dim = spatial, .n_dim = ch, .k_dim = inner_dim };
+    llm::BatchedMatMulPC ff2_pc = { .m_dim = spatial, .n_dim = ch, .k_dim = inner_dim };
     llm::dispatch_batched_matmul_auto(cmd, k, &st.ff_net2_weight, &acts.ffn_buf, temp, &ff2_pc);
 llm::compute_barrier(cmd);
 
@@ -748,13 +748,13 @@ llm::compute_barrier(cmd);
 // Input: noisy latent [4, 64, 64] in acts.buf_a
 // Output: predicted noise [4, 64, 64] in acts.buf_a
 
-fn void? UnetModel.forward(&self, Tensor* context, float timestep) {
-    DeviceContext* ctx = self.ctx;
+fn void? UnetModel.forward(&self, llm::Tensor* context, float timestep) {
+    llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    DiffusionKernels* k = self.kernels;
+    llm::DiffusionKernels* k = self.kernels;
     UnetWeights* w = &self.weights;
     UnetActivations* a = &self.acts;
-    UnetConfig* cfg = &self.config;
+    llm::UnetConfig* cfg = &self.config;
 
     uint h = 64;  // latent height
     uint wd = 64;  // latent width (renamed to avoid shadowing)
@@ -763,7 +763,7 @@ llm::begin_compute(cmd)!!;
 
     // === 1. Timestep Embedding ===
     // Sinusoidal embedding -> MLP
-    TimestepEmbedPC te_pc = { .dim = cfg.model_channels, .timestep = timestep, .max_period = 10000.0f };
+    llm::TimestepEmbedPC te_pc = { .dim = cfg.model_channels, .timestep = timestep, .max_period = 10000.0f };
 llm::dispatch_kernel(cmd, &k.timestep_embed,
         { a.time_emb.gpu_buffer.buffer },
         { a.time_emb.size_bytes },
@@ -771,24 +771,24 @@ llm::dispatch_kernel(cmd, &k.timestep_embed,
 llm::compute_barrier(cmd);
 
     // MLP: Linear(320, 1280) -> SiLU -> Linear(1280, 1280)
-    BatchedMatMulPC te_mlp0 = { .m_dim = 1, .n_dim = 1280, .k_dim = cfg.model_channels };
+    llm::BatchedMatMulPC te_mlp0 = { .m_dim = 1, .n_dim = 1280, .k_dim = cfg.model_channels };
     llm::dispatch_batched_matmul_auto(cmd, k, &w.time_emb_0_weight, &a.time_emb, &a.buf_c, &te_mlp0);
 llm::compute_barrier(cmd);
-    ResidualPC te_bias = { .n = 1280 };
+    llm::ResidualPC te_bias = { .n = 1280 };
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { a.buf_c.gpu_buffer.buffer, w.time_emb_0_bias.gpu_buffer.buffer },
         { a.buf_c.size_bytes, w.time_emb_0_bias.size_bytes },
         &te_bias, llm::ceil_div(1280, 256));
 llm::compute_barrier(cmd);
 
-    SiluPC te_silu = { .n = 1280 };
+    llm::SiluPC te_silu = { .n = 1280 };
 llm::dispatch_kernel(cmd, &k.shared.silu,
         { a.buf_c.gpu_buffer.buffer },
         { a.buf_c.size_bytes },
         &te_silu, llm::ceil_div(1280, 256));
 llm::compute_barrier(cmd);
 
-    BatchedMatMulPC te_mlp2 = { .m_dim = 1, .n_dim = 1280, .k_dim = 1280 };
+    llm::BatchedMatMulPC te_mlp2 = { .m_dim = 1, .n_dim = 1280, .k_dim = 1280 };
     llm::dispatch_batched_matmul_auto(cmd, k, &w.time_emb_2_weight, &a.buf_c, &a.time_emb, &te_mlp2);
 llm::compute_barrier(cmd);
 llm::dispatch_kernel(cmd, &k.shared.residual_add,
@@ -800,7 +800,7 @@ llm::compute_barrier(cmd);
     // === 2. Encoder (Input Blocks) ===
 
     // conv_in: [4, 64, 64] -> [320, 64, 64]
-    Conv2dPC conv_in_pc = {
+    llm::Conv2dPC conv_in_pc = {
         .in_c = 4, .out_c = 320, .in_h = h, .in_w = wd,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = wd, .has_bias = 1,
@@ -825,7 +825,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Downsample 3: stride-2 conv [320, 64, 64] -> [320, 32, 32]
-    Conv2dPC down3_pc = {
+    llm::Conv2dPC down3_pc = {
         .in_c = 320, .out_c = 320, .in_h = h, .in_w = wd,
         .kH = 3, .kW = 3, .stride = 2, .pad = 1,
         .groups = 1, .out_h = h / 2, .out_w = wd / 2, .has_bias = 1,
@@ -861,7 +861,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Downsample 6: stride-2 conv [640, 32, 32] -> [640, 16, 16]
-    Conv2dPC down6_pc = {
+    llm::Conv2dPC down6_pc = {
         .in_c = 640, .out_c = 640, .in_h = h, .in_w = wd,
         .kH = 3, .kW = 3, .stride = 2, .pad = 1,
         .groups = 1, .out_h = h / 2, .out_w = wd / 2, .has_bias = 1,
@@ -905,7 +905,7 @@ llm::compute_barrier(cmd);
     // === 4. Decoder (Output Blocks) ===
 
     // output_blocks.0: concat(buf_b[1280,16,16], skip5[1280,16,16]) -> ResBlock(2560->1280)
-    ChannelConcatPC cc0 = { .channels_a = 1280, .channels_b = 1280, .spatial = h * wd };
+    llm::ChannelConcatPC cc0 = { .channels_a = 1280, .channels_b = 1280, .spatial = h * wd };
 llm::dispatch_kernel(cmd, &k.channel_concat,
         { a.buf_b.gpu_buffer.buffer, a.skips[5].gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { a.buf_b.size_bytes, a.skips[5].size_bytes, a.buf_a.size_bytes },
@@ -915,7 +915,7 @@ llm::compute_barrier(cmd);
     // Result in buf_a (resblock copies back)
 
     // output_blocks.1: concat(buf_a[1280,16,16], skip4[640,16,16]) -> ResBlock(1920->1280)
-    ChannelConcatPC cc1 = { .channels_a = 1280, .channels_b = 640, .spatial = h * wd };
+    llm::ChannelConcatPC cc1 = { .channels_a = 1280, .channels_b = 640, .spatial = h * wd };
 llm::dispatch_kernel(cmd, &k.channel_concat,
         { a.buf_a.gpu_buffer.buffer, a.skips[4].gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
         { a.buf_a.size_bytes, a.skips[4].size_bytes, a.buf_b.size_bytes },
@@ -924,7 +924,7 @@ llm::compute_barrier(cmd);
     dispatch_unet_resblock(cmd, k, &w.output_rb1, &a.buf_b, &a.buf_a, &a.buf_c, &a.time_emb, h, wd);
 
     // output_blocks.2: upsample 1280ch, 16x16 -> 32x32
-    UpsamplePC up2 = { .channels = 1280, .in_h = h, .in_w = wd };
+    llm::UpsamplePC up2 = { .channels = 1280, .in_h = h, .in_w = wd };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { a.buf_b.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { a.buf_b.size_bytes, a.buf_a.size_bytes },
@@ -933,7 +933,7 @@ llm::compute_barrier(cmd);
     h *= 2; wd *= 2;  // 32x32
 
     // Conv after upsample
-    Conv2dPC up2_conv = {
+    llm::Conv2dPC up2_conv = {
         .in_c = 1280, .out_c = 1280, .in_h = h, .in_w = wd,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = wd, .has_bias = 1,
@@ -942,7 +942,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // output_blocks.3: concat(buf_b[1280,32,32], skip3[640,32,32]) -> ResBlock(1920->640) + ST
-    ChannelConcatPC cc3 = { .channels_a = 1280, .channels_b = 640, .spatial = h * wd };
+    llm::ChannelConcatPC cc3 = { .channels_a = 1280, .channels_b = 640, .spatial = h * wd };
 llm::dispatch_kernel(cmd, &k.channel_concat,
         { a.buf_b.gpu_buffer.buffer, a.skips[3].gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { a.buf_b.size_bytes, a.skips[3].size_bytes, a.buf_a.size_bytes },
@@ -958,7 +958,7 @@ llm::compute_barrier(cmd);
         context, &self.acts, h, wd, cfg.n_heads, cfg.context_dim);
 
     // output_blocks.4: concat(buf_a[640,32,32], skip2[320,32,32]) -> ResBlock(960->640) + ST
-    ChannelConcatPC cc4 = { .channels_a = 640, .channels_b = 320, .spatial = h * wd };
+    llm::ChannelConcatPC cc4 = { .channels_a = 640, .channels_b = 320, .spatial = h * wd };
 llm::dispatch_kernel(cmd, &k.channel_concat,
         { a.buf_a.gpu_buffer.buffer, a.skips[2].gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
         { a.buf_a.size_bytes, a.skips[2].size_bytes, a.buf_b.size_bytes },
@@ -973,7 +973,7 @@ llm::compute_barrier(cmd);
         context, &self.acts, h, wd, cfg.n_heads, cfg.context_dim);
 
     // output_blocks.5: upsample 640ch, 32x32 -> 64x64
-    UpsamplePC up5 = { .channels = 640, .in_h = h, .in_w = wd };
+    llm::UpsamplePC up5 = { .channels = 640, .in_h = h, .in_w = wd };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { a.buf_b.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { a.buf_b.size_bytes, a.buf_a.size_bytes },
@@ -981,7 +981,7 @@ llm::dispatch_kernel(cmd, &k.upsample_nearest,
 llm::compute_barrier(cmd);
     h *= 2; wd *= 2;  // 64x64
 
-    Conv2dPC up5_conv = {
+    llm::Conv2dPC up5_conv = {
         .in_c = 640, .out_c = 640, .in_h = h, .in_w = wd,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = wd, .has_bias = 1,
@@ -990,7 +990,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // output_blocks.6: concat(buf_b[640,64,64], skip1[320,64,64]) -> ResBlock(960->320)
-    ChannelConcatPC cc6 = { .channels_a = 640, .channels_b = 320, .spatial = h * wd };
+    llm::ChannelConcatPC cc6 = { .channels_a = 640, .channels_b = 320, .spatial = h * wd };
 llm::dispatch_kernel(cmd, &k.channel_concat,
         { a.buf_b.gpu_buffer.buffer, a.skips[1].gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { a.buf_b.size_bytes, a.skips[1].size_bytes, a.buf_a.size_bytes },
@@ -999,7 +999,7 @@ llm::compute_barrier(cmd);
     dispatch_unet_resblock(cmd, k, &w.output_rb6, &a.buf_a, &a.buf_b, &a.buf_c, &a.time_emb, h, wd);
 
     // output_blocks.7: concat(buf_a[320,64,64], skip0[320,64,64]) -> ResBlock(640->320)
-    ChannelConcatPC cc7 = { .channels_a = 320, .channels_b = 320, .spatial = h * wd };
+    llm::ChannelConcatPC cc7 = { .channels_a = 320, .channels_b = 320, .spatial = h * wd };
 llm::dispatch_kernel(cmd, &k.channel_concat,
         { a.buf_a.gpu_buffer.buffer, a.skips[0].gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
         { a.buf_a.size_bytes, a.skips[0].size_bytes, a.buf_b.size_bytes },
@@ -1010,7 +1010,7 @@ llm::compute_barrier(cmd);
     // === 5. Output Head ===
     // GroupNorm -> SiLU -> Conv3x3 (320 -> 4)
     uint spatial = h * wd;
-    GroupNormPC out_gn = { .channels = 320, .spatial = spatial, .num_groups = 32, .eps = 1e-5f };
+    llm::GroupNormPC out_gn = { .channels = 320, .spatial = spatial, .num_groups = 32, .eps = 1e-5f };
 llm::dispatch_kernel(cmd, &k.group_norm,
         { a.buf_b.gpu_buffer.buffer, w.out_norm_weight.gpu_buffer.buffer,
           w.out_norm_bias.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
@@ -1019,14 +1019,14 @@ llm::dispatch_kernel(cmd, &k.group_norm,
         &out_gn, llm::ceil_div(spatial, 256), 320 / 32);
 llm::compute_barrier(cmd);
 
-    SiluPC out_silu = { .n = 320 * spatial };
+    llm::SiluPC out_silu = { .n = 320 * spatial };
 llm::dispatch_kernel(cmd, &k.shared.silu,
         { a.buf_a.gpu_buffer.buffer },
         { a.buf_a.size_bytes },
         &out_silu, llm::ceil_div(320 * spatial, 256));
 llm::compute_barrier(cmd);
 
-    Conv2dPC out_conv = {
+    llm::Conv2dPC out_conv = {
         .in_c = 320, .out_c = 4, .in_h = h, .in_w = wd,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = wd, .has_bias = 1,
@@ -1044,7 +1044,7 @@ llm::submit_and_wait(ctx)!!;
 
 // --- Load UNet Model ---
 
-fn UnetModel? load_unet_model(DeviceContext* ctx, GGUFFile* gf, UnetConfig* config, DiffusionKernels* kernels) {
+fn UnetModel? load_unet_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::UnetConfig* config, llm::DiffusionKernels* kernels) {
     UnetWeights weights = load_unet_weights(ctx, gf, config)!!;
     UnetActivations acts = allocate_unet_activations(ctx, config, 64, 64)!!;
 

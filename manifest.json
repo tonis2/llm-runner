@@ -1,0 +1,13 @@
+{
+  "provides": "llm_engine",
+  "dependencies": ["vk", "image"],
+  "sources": ["lib/**"],
+  "targets": {
+    "linux-x64": {
+      "linked-libraries": ["vulkan"]
+    },
+    "windows-x64": {
+      "linked-libraries": ["vulkan-1"]
+    }
+  }
+}
