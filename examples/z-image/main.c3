@@ -17,8 +17,8 @@ fn int main(String[] args) {
     io::printfn("Prompt: %s", config.prompt);
 
     // Register available diffusers
-    llm::pipelines::register_pipeline(zimage::create_pipeline());
-    llm::pipelines::register_pipeline(sdxs::create_pipeline());
+    pipelines::register_pipeline(zimage::create_pipeline());
+    pipelines::register_pipeline(sdxs::create_pipeline());
 
     // Setup Vulkan context
     llm::DeviceContext ctx = llm::createContext()!!;
@@ -32,11 +32,11 @@ fn int main(String[] args) {
     };
 
     // Create pipeline (auto-detects model type from GGUF)
-    llm::pipelines::ImagePipeline pipeline = llm::pipelines::create_image_pipeline(&ctx, config.model_path, &opts)!!;
+    ImagePipeline pipeline = pipelines::create_image_pipeline(&ctx, config.model_path, &opts)!!;
     defer pipeline.free();
 
     // Prepare inputs
-    llm::pipelines::GenerationInputs inputs = llm::pipelines::generation_inputs_defaults();
+    GenerationInputs inputs = pipelines::generation_inputs_defaults();
     inputs.prompt = config.prompt;
     inputs.image_size = config.image_size;
     inputs.num_steps = config.num_steps;
