@@ -39,7 +39,7 @@ struct VaeResBlock {
 // --- VAE Decoder ---
 
 struct VaeDecoder {
-    llm::VaeConfig config;
+    pipelines::VaeConfig config;
 
     // conv_in: 4 -> 64 channels
     VaeConvLayer conv_in;
@@ -59,14 +59,14 @@ struct VaeDecoder {
     VaeConvLayer[3] upsample_convs;  // 3 upsample layers
     VaeConvLayer conv_out;
 
-    llm::DiffusionKernels* kernels;
+    pipelines::DiffusionKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
 // --- VAE Encoder ---
 
 struct VaeEncoder {
-    llm::VaeConfig config;
+    pipelines::VaeConfig config;
 
     // conv_in: 3 -> 64 channels
     VaeConvLayer conv_in;
@@ -84,7 +84,7 @@ struct VaeEncoder {
     VaeConvLayer[3] downsample_convs;
     VaeConvLayer conv_out;
 
-    llm::DiffusionKernels* kernels;
+    pipelines::DiffusionKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -147,7 +147,7 @@ fn VaeResBlock? load_vae_resblock(llm::DeviceContext* ctx, llm::GGUFFile* gf, St
 
 // --- Load VAE Decoder ---
 
-fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::VaeConfig* config, llm::DiffusionKernels* kernels) {
+fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::VaeConfig* config, pipelines::DiffusionKernels* kernels) {
     io::printfn("\nLoading VAE decoder weights...");
     String pfx = config.prefix_decoder;
 
@@ -185,7 +185,7 @@ fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm:
 
 // --- Load VAE Encoder ---
 
-fn VaeEncoder? load_vae_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::VaeConfig* config, llm::DiffusionKernels* kernels) {
+fn VaeEncoder? load_vae_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::VaeConfig* config, pipelines::DiffusionKernels* kernels) {
     io::printfn("\nLoading VAE encoder weights...");
     String pfx = config.prefix_encoder;
 
@@ -240,7 +240,7 @@ fn VaeActivations? allocate_vae_activations(llm::DeviceContext* ctx, uint max_sp
 
 fn void dispatch_vae_conv(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     VaeConvLayer* layer,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -274,7 +274,7 @@ fn void dispatch_vae_conv(
 
 fn void dispatch_vae_resblock(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     VaeResBlock* rb,
     llm::Tensor* input,     // buf_a
     llm::Tensor* temp,      // buf_b (temporary)
@@ -348,7 +348,7 @@ llm::compute_barrier(cmd);
 fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    llm::DiffusionKernels* k = self.kernels;
+    pipelines::DiffusionKernels* k = self.kernels;
 
     uint h = 64;  // latent height
     uint w = 64;  // latent width
@@ -440,7 +440,7 @@ llm::submit_and_wait(ctx)!!;
 fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    llm::DiffusionKernels* k = self.kernels;
+    pipelines::DiffusionKernels* k = self.kernels;
 
     uint h = img_h;
     uint w = img_w;

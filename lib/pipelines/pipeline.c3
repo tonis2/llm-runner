@@ -11,25 +11,25 @@ import image;
 import image::png;
 import llm;
 
-// ImagePipeline: Thin wrapper around PipelineImpl
+// ImagePipeline: Thin wrapper around Pipeline interface
 // Usage:
-//   PipelineImpl impl = zimage::create_pipeline();
-//   ImagePipeline pipeline = create_image_pipeline(&ctx, impl, "model.gguf", &opts)!!;
-//   image::Image output = pipeline.generate(&inputs)!!;
-//   pipeline.free();
+//   Pipeline pipeline = zimage::create_pipeline();
+//   ImagePipeline image_pipeline = create_image_pipeline(&ctx, pipeline, "model.gguf", &opts)!!;
+//   image::Image output = image_pipeline.generate(&inputs)!!;
+//   image_pipeline.free();
 
 struct ImagePipeline {
     llm::DeviceContext* ctx;
-    PipelineImpl impl;
+    Pipeline pipeline;
     bool loaded;
 }
 
-fn ImagePipeline? create_image_pipeline(llm::DeviceContext* ctx, PipelineImpl impl, String model_path, PipelineOptions* opts) {
-    impl.load(impl.data, ctx, model_path, opts)!!;
+fn ImagePipeline? create_image_pipeline(llm::DeviceContext* ctx, Pipeline pipeline, String model_path, PipelineOptions* opts) {
+    pipeline.load(ctx, model_path, opts)!!;
 
     return {
         .ctx = ctx,
-        .impl = impl,
+        .pipeline = pipeline,
         .loaded = true,
     };
 }
@@ -42,12 +42,12 @@ fn image::Image? ImagePipeline.generate(ImagePipeline* self, GenerationInputs* i
     if (!inputs.validate()) {
         return PIPELINE_INVALID_INPUT~;
     }
-    return self.impl.generate(self.impl.data, self.ctx, inputs);
+    return self.pipeline.generate(self.ctx, inputs);
 }
 
 fn void ImagePipeline.free(ImagePipeline* self) {
     if (self.loaded) {
-        self.impl.free_fn(self.impl.data);
+        self.pipeline.free();
         self.loaded = false;
     }
 }

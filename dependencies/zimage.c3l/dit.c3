@@ -1292,24 +1292,15 @@ llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             &post_attn_rms, seq_len);
 llm::compute_barrier(cmd);
 
-        // GPU-side clipping of extreme values after norm2
-        ClipParams clip_pc = { .n_elements = seq_len * dim, .threshold = 10.0f };
-        llm::dispatch_kernel(cmd, &dk.clip_values,
-            { a.buf_b.gpu_buffer.buffer },
-            { a.buf_b.size_bytes },
-            &clip_pc, llm::ceil_div(seq_len * dim, 256));
-        llm::compute_barrier(cmd);
-
         // Gated residual: hidden += tanh(gate_msa) * norm2(attn_output)
         if (has_adaln) {
-            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim, .scale = 0.5f, .clip_thresh = 10.0f };
+            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim, .scale = 1.0f, .clip_thresh = 0.0f };
 llm::dispatch_kernel(cmd, &dk.gated_residual,
                 { hidden.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
                 { hidden.size_bytes, a.adaln_shift.size_bytes, a.buf_b.size_bytes },
                 &gres_pc, llm::ceil_div(seq_len * dim, 256));
         } else {
             // Context refiner: no gate, just residual += post_norm(output)
-            // buf_b already clipped above
             llm::ResidualPC res_pc = { .n = seq_len * dim };
 llm::dispatch_kernel(cmd, &sk.residual_add,
                 { hidden.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
@@ -1394,17 +1385,9 @@ llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             &post_ffn_rms, seq_len);
 llm::compute_barrier(cmd);
 
-        // GPU-side clipping of extreme values after ffn_norm2
-        ClipParams ffn_clip_pc = { .n_elements = seq_len * dim, .threshold = 10.0f };
-        llm::dispatch_kernel(cmd, &dk.clip_values,
-            { a.buf_a.gpu_buffer.buffer },
-            { a.buf_a.size_bytes },
-            &ffn_clip_pc, llm::ceil_div(seq_len * dim, 256));
-        llm::compute_barrier(cmd);
-
         // Gated residual: hidden += tanh(gate_mlp) * ffn_norm2(ffn_output)
         if (has_adaln) {
-            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim, .scale = 0.5f, .clip_thresh = 10.0f };
+            GatedResidualPC gres_pc = { .n_elements = seq_len * dim, .dim = dim, .scale = 1.0f, .clip_thresh = 0.0f };
 llm::dispatch_kernel(cmd, &dk.gated_residual,
                 { hidden.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
                 { hidden.size_bytes, a.adaln_shift.size_bytes, a.buf_a.size_bytes },

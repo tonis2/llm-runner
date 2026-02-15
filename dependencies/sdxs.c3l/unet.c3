@@ -153,10 +153,10 @@ struct UnetActivations {
 }
 
 struct UnetModel {
-    llm::UnetConfig config;
+    pipelines::UnetConfig config;
     UnetWeights weights;
     UnetActivations acts;
-    llm::DiffusionKernels* kernels;
+    pipelines::DiffusionKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -236,7 +236,7 @@ fn SpatialTransformerWeights? load_spatial_transformer(llm::DeviceContext* ctx, 
 
 // --- Load UNet ---
 
-fn UnetWeights? load_unet_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::UnetConfig* config) {
+fn UnetWeights? load_unet_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::UnetConfig* config) {
     io::printfn("\nLoading UNet weights...");
     String pfx = config.prefix;
     char[256] buf;
@@ -327,7 +327,7 @@ fn UnetWeights? load_unet_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, ll
 
 // --- Allocate UNet activations ---
 
-fn UnetActivations? allocate_unet_activations(llm::DeviceContext* ctx, llm::UnetConfig* config, uint latent_h, uint latent_w) {
+fn UnetActivations? allocate_unet_activations(llm::DeviceContext* ctx, pipelines::UnetConfig* config, uint latent_h, uint latent_w) {
     // Max spatial buffer: 1280 channels at 16x16, but also need 320 at 64x64
     // 320 * 64 * 64 = 1,310,720 floats
     // 1280 * 16 * 16 = 327,680 floats
@@ -395,7 +395,7 @@ fn UnetActivations? allocate_unet_activations(llm::DeviceContext* ctx, llm::Unet
 
 fn void dispatch_unet_resblock(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     UnetResBlock* rb,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -514,7 +514,7 @@ llm::compute_barrier(cmd);
 
 fn void dispatch_spatial_transformer(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     SpatialTransformerWeights* st,
     llm::Tensor* input,       // [channels, h, w] — spatial features
     llm::Tensor* output,      // same shape as input
@@ -751,10 +751,10 @@ llm::compute_barrier(cmd);
 fn void? UnetModel.forward(&self, llm::Tensor* context, float timestep) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    llm::DiffusionKernels* k = self.kernels;
+    pipelines::DiffusionKernels* k = self.kernels;
     UnetWeights* w = &self.weights;
     UnetActivations* a = &self.acts;
-    llm::UnetConfig* cfg = &self.config;
+    pipelines::UnetConfig* cfg = &self.config;
 
     uint h = 64;  // latent height
     uint wd = 64;  // latent width (renamed to avoid shadowing)
@@ -1044,7 +1044,7 @@ llm::submit_and_wait(ctx)!!;
 
 // --- Load UNet Model ---
 
-fn UnetModel? load_unet_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::UnetConfig* config, llm::DiffusionKernels* kernels) {
+fn UnetModel? load_unet_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::UnetConfig* config, pipelines::DiffusionKernels* kernels) {
     UnetWeights weights = load_unet_weights(ctx, gf, config)!!;
     UnetActivations acts = allocate_unet_activations(ctx, config, 64, 64)!!;
 

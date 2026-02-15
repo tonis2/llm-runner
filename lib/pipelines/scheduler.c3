@@ -102,7 +102,7 @@ fn void generate_random_latent(float[] latent, uint seed) {
 
 fn void dispatch_ddim_step(
     vk::CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     Tensor* noisy,           // current noisy latent (read/write)
     Tensor* predicted_noise, // model output
     uint n_elements,
@@ -126,7 +126,7 @@ fn void dispatch_ddim_step(
 
 fn void dispatch_euler_step(
     vk::CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     Tensor* noisy,
     Tensor* predicted_noise,
     uint n_elements,

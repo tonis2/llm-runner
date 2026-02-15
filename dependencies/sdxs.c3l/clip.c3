@@ -52,10 +52,10 @@ struct ClipActivations {
 }
 
 struct ClipEncoder {
-    llm::ClipConfig config;
+    pipelines::ClipConfig config;
     ClipWeights weights;
     ClipActivations acts;
-    llm::DiffusionKernels* kernels;
+    pipelines::DiffusionKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -94,7 +94,7 @@ fn String clip_layer_tensor_name(char[128]* buf, String prefix, uint layer, Stri
     return (String)(*buf)[0..pos - 1];
 }
 
-fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ClipConfig* config) {
+fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::ClipConfig* config) {
     io::printfn("\nLoading CLIP weights...");
     String pfx = config.prefix;
     char[128] buf;
@@ -160,7 +160,7 @@ fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, ll
     };
 }
 
-fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, llm::ClipConfig* config) {
+fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, pipelines::ClipConfig* config) {
     io::printfn("Allocating CLIP activation buffers...");
 
     ulong seq = config.max_tokens;  // 77
@@ -185,7 +185,7 @@ fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, llm::Clip
     };
 }
 
-fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ClipConfig* config, llm::DiffusionKernels* kernels) {
+fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::ClipConfig* config, pipelines::DiffusionKernels* kernels) {
     ClipWeights weights = load_clip_weights(ctx, gf, config)!!;
     ClipActivations acts = allocate_clip_activations(ctx, config)!!;
 
@@ -203,10 +203,10 @@ fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, ll
 fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    llm::ClipConfig* c = &self.config;
+    pipelines::ClipConfig* c = &self.config;
     ClipWeights* w = &self.weights;
     ClipActivations* a = &self.acts;
-    llm::DiffusionKernels* k = self.kernels;
+    pipelines::DiffusionKernels* k = self.kernels;
     llm::SharedKernels* sk = &k.shared;
 
     uint seq = c.max_tokens;  // 77

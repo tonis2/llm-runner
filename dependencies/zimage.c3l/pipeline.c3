@@ -13,7 +13,7 @@ import std::time::clock;
 import image;
 import image::png;
 
-struct ZImageState {
+struct ZImageState (llm::pipelines::Pipeline) {
     bool loaded;
     String model_path;
     String text_model_path;
@@ -21,17 +21,15 @@ struct ZImageState {
     String taesd_path;
 }
 
-fn void? zimage_load(void* data, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) {
-    ZImageState* state = (ZImageState*)data;
-    state.loaded = true;
-    state.model_path = model_path;
-    state.text_model_path = opts.text_model_path;
-    state.vae_path = opts.vae_path;
-    state.taesd_path = opts.taesd_path;
+fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) @dynamic {
+    self.loaded = true;
+    self.model_path = model_path;
+    self.text_model_path = opts.text_model_path;
+    self.vae_path = opts.vae_path;
+    self.taesd_path = opts.taesd_path;
 }
 
-fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) {
-    ZImageState* state = (ZImageState*)data;
+fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) @dynamic {
     float cfg_scale = inputs.cfg_scale;
     bool use_cfg = cfg_scale > 1.0f;
     bool is_img2img = inputs.input_image != null;
@@ -56,14 +54,14 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
     // ---- Phase 1: Text Encoding via LLM ----
     io::printfn("\n[1/5] Text encoding (LLM)...");
 
-    if (state.text_model_path.len == 0) {
+    if (self.text_model_path.len == 0) {
         io::printfn("Error: text_model_path required for DiT pipeline");
         return llm::pipelines::PIPELINE_INVALID_INPUT~;
     }
 
-    mmap::FileMmap text_mm = file::mmap_open(state.text_model_path, "rb")!!;
+    mmap::FileMmap text_mm = file::mmap_open(self.text_model_path, "rb")!!;
     char[] text_data = text_mm.bytes();
-    io::printfn("  Text model: %s (%d bytes)", state.text_model_path, text_data.len);
+    io::printfn("  Text model: %s (%d bytes)", self.text_model_path, text_data.len);
 
     llm::GGUFFile text_gf = llm::gguf_parse(text_data)!!;
 
@@ -153,7 +151,7 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
     // ---- Phase 2: Load DiT + VAE ----
     io::printfn("\n[2/5] Loading DiT + VAE...");
 
-    mmap::FileMmap dit_mm = file::mmap_open(state.model_path, "rb")!!;
+    mmap::FileMmap dit_mm = file::mmap_open(self.model_path, "rb")!!;
     char[] dit_data = dit_mm.bytes();
     llm::GGUFFile dit_gf = llm::gguf_parse(dit_data)!!;
 
@@ -334,7 +332,7 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
     norm_scratch.free();
 
     // Load VAE/TAESD
-    llm::DiffusionKernels diff_kernels = llm::create_diffusion_kernels(ctx)!!;
+    pipelines::DiffusionKernels diff_kernels = pipelines::create_diffusion_kernels(ctx)!!;
     FluxVaeDecoder vae_decoder;
     FluxVaeActivations vae_acts;
     TAESDDecoder taesd_decoder;
@@ -342,21 +340,21 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
     bool has_vae = false;
     bool use_taesd = false;
 
-    if (state.taesd_path.len > 0) {
-        llm::SafetensorsFile sf = llm::safetensors_open(state.taesd_path)!!;
+    if (self.taesd_path.len > 0) {
+        llm::SafetensorsFile sf = llm::safetensors_open(self.taesd_path)!!;
         taesd_decoder = load_taesd_decoder(ctx, &sf, &diff_kernels)!!;
         sf.close();
         taesd_acts = allocate_taesd_activations(ctx, img_size)!!;
         has_vae = true;
         use_taesd = true;
-        io::printfn("  TAESD loaded from %s", state.taesd_path);
-    } else if (state.vae_path.len > 0) {
-        llm::SafetensorsFile sf = llm::safetensors_open(state.vae_path)!!;
+        io::printfn("  TAESD loaded from %s", self.taesd_path);
+    } else if (self.vae_path.len > 0) {
+        llm::SafetensorsFile sf = llm::safetensors_open(self.vae_path)!!;
         vae_decoder = load_flux_vae_decoder(ctx, &sf, &diff_kernels)!!;
         sf.close();
         vae_acts = allocate_flux_vae_activations(ctx, img_size)!!;
         has_vae = true;
-        io::printfn("  Flux VAE loaded from %s", state.vae_path);
+        io::printfn("  Flux VAE loaded from %s", self.vae_path);
     } else {
         io::printfn("  Warning: No VAE path specified. Will output raw latent.");
     }
@@ -729,18 +727,12 @@ fn image::Image? zimage_generate(void* data, llm::DeviceContext* ctx, llm::pipel
     return result;
 }
 
-fn void zimage_free(void* data) {
-    ZImageState* state = (ZImageState*)data;
-    state.loaded = false;
+fn void ZImageState.free(ZImageState* self) @dynamic {
+    self.loaded = false;
 }
 
-fn llm::pipelines::PipelineImpl create_pipeline() {
+fn llm::pipelines::Pipeline create_pipeline() {
     ZImageState* state = mem::new(ZImageState);
     *state = {};
-    return {
-        .data = state,
-        .load = &zimage_load,
-        .generate = &zimage_generate,
-        .free_fn = &zimage_free,
-    };
+    return (llm::pipelines::Pipeline)state;
 }

@@ -7,7 +7,7 @@ import std::core::mem;
 const MAX_BINDINGS = 8;
 
 struct ComputeKernel {
-    Pipeline pipeline;
+    vk::Pipeline pipeline;
     PipelineLayout pipeline_layout;
     DescriptorSetLayout desc_layout;
     uint num_buffers;
@@ -63,7 +63,7 @@ fn ComputeKernel? create_kernel(
         .setMod(shader_module)
         .setName(entry_point);
 
-    Pipeline pipeline = vk::computePipelineCreateInfo()
+    vk::Pipeline pipeline = vk::computePipelineCreateInfo()
         .setStage(stage)
         .setLayout(pipeline_layout)
         .build(device)!!;

@@ -79,7 +79,7 @@ struct FluxVaeDecoder {
     llm::Tensor norm_out_bias;
     FluxVaeConv conv_out;          // [3, 128, 3, 3]
 
-    llm::DiffusionKernels* kernels;
+    pipelines::DiffusionKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -182,7 +182,7 @@ fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf,
 
 // --- Load Flux VAE Decoder ---
 
-fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, llm::DiffusionKernels* kernels) {
+fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, pipelines::DiffusionKernels* kernels) {
     io::printfn("\nLoading Flux VAE decoder...");
     String pfx = "decoder.";
 
@@ -285,7 +285,7 @@ fn FluxVaeActivations? allocate_flux_vae_activations(llm::DeviceContext* ctx, ui
 
 fn void dispatch_flux_conv(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     FluxVaeConv* conv,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -294,7 +294,7 @@ fn void dispatch_flux_conv(
 ) {
     uint out_h = (in_h + 2 * pad - conv.kH) / stride + 1;
     uint out_w = (in_w + 2 * pad - conv.kW) / stride + 1;
-    llm::Conv2dPC pc = {
+    pipelines::Conv2dPC pc = {
         .in_c = conv.in_c,
         .out_c = conv.out_c,
         .in_h = in_h,
@@ -308,12 +308,12 @@ fn void dispatch_flux_conv(
         .out_w = out_w,
         .has_bias = 1,
     };
-	llm::dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
+	pipelines::dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
 }
 
 fn void dispatch_flux_groupnorm(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     llm::Tensor* weight,
     llm::Tensor* bias,
     llm::Tensor* input,
@@ -321,7 +321,7 @@ fn void dispatch_flux_groupnorm(
     uint channels,
     uint spatial
 ) {
-    llm::GroupNormPC pc = {
+    pipelines::GroupNormPC pc = {
         .channels = channels,
         .spatial = spatial,
         .num_groups = 32,
@@ -335,7 +335,7 @@ llm::dispatch_kernel(cmd, &k.group_norm,
 
 fn void dispatch_flux_resblock(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     FluxVaeResBlock* rb,
     llm::Tensor* input,     // buf_a - also receives output
     llm::Tensor* temp,      // buf_b
@@ -357,12 +357,12 @@ llm::dispatch_kernel(cmd, &k.shared.silu,
         &silu_pc, llm::ceil_div(in_c * spatial, 256));
 llm::compute_barrier(cmd);
 
-    llm::Conv2dPC pc1 = {
+    pipelines::Conv2dPC pc1 = {
         .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	llm::dispatch_conv2d(cmd, k, &rb.conv1_weight, &rb.conv1_bias, temp, skip_temp, &pc1);
+	pipelines::dispatch_conv2d(cmd, k, &rb.conv1_weight, &rb.conv1_bias, temp, skip_temp, &pc1);
 llm::compute_barrier(cmd);
 
     // GroupNorm2 -> SiLU -> Conv2
@@ -376,23 +376,23 @@ llm::dispatch_kernel(cmd, &k.shared.silu,
         &silu_pc2, llm::ceil_div(out_c * spatial, 256));
 llm::compute_barrier(cmd);
 
-    llm::Conv2dPC pc2 = {
+    pipelines::Conv2dPC pc2 = {
         .in_c = out_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	llm::dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, temp, skip_temp, &pc2);
+	pipelines::dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, temp, skip_temp, &pc2);
 llm::compute_barrier(cmd);
 
     // Skip connection
     if (rb.has_nin_shortcut && rb.nin_shortcut_weight.size_bytes > 0) {
         // 1x1 conv for channel change
-        llm::Conv2dPC pc_nin = {
+        pipelines::Conv2dPC pc_nin = {
             .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
             .kH = 1, .kW = 1, .stride = 1, .pad = 0,
             .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
         };
-	llm::dispatch_conv2d(cmd, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
+	pipelines::dispatch_conv2d(cmd, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
 llm::compute_barrier(cmd);
         // Residual: skip_temp += temp
         llm::ResidualPC res_pc = { .n = out_c * spatial };
@@ -418,7 +418,7 @@ llm::compute_barrier(cmd);
 
 fn void dispatch_flux_mid_attn(
     CommandBuffer cmd,
-    llm::DiffusionKernels* k,
+    pipelines::DiffusionKernels* k,
     FluxVaeAttn* attn,
     llm::Tensor* input,   // [C, H, W]
     llm::Tensor* temp_a,  // scratch
@@ -438,7 +438,7 @@ llm::compute_barrier(cmd);
     // These are 1x1 convolutions, but stored as linear weights [ch, ch]
     // Apply as batched matmul: for each spatial position, matmul
     // Actually conv2d with 1x1 kernel works
-    llm::Conv2dPC pc_qkv = {
+    pipelines::Conv2dPC pc_qkv = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 1, .kW = 1, .stride = 1, .pad = 0,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
@@ -449,7 +449,7 @@ llm::compute_barrier(cmd);
     // We need 3 * ch * spatial storage. Use temp_b for Q, temp_a offset for K, V.
 
     // Q: temp_a (normed input) -> temp_b
-	llm::dispatch_conv2d(cmd, k, &attn.q_weight, &attn.q_bias, temp_a, temp_b, &pc_qkv);
+	pipelines::dispatch_conv2d(cmd, k, &attn.q_weight, &attn.q_bias, temp_a, temp_b, &pc_qkv);
 llm::compute_barrier(cmd);
 
     // Save Q, compute K into same temp_a region (we can reuse after)
@@ -474,7 +474,7 @@ llm::compute_barrier(cmd);
 fn void? FluxVaeDecoder.forward(&self, FluxVaeActivations* acts, uint lat_h, uint lat_w) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    llm::DiffusionKernels* k = self.kernels;
+    pipelines::DiffusionKernels* k = self.kernels;
 
     uint h = lat_h;
     uint w = lat_w;
@@ -501,7 +501,7 @@ llm::begin_compute(cmd)!!;
         dispatch_flux_resblock(cmd, k, &self.up3_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
     }
     // Upsample 2x
-    llm::UpsamplePC up_pc = { .channels = 512, .in_h = h, .in_w = w };
+    pipelines::UpsamplePC up_pc = { .channels = 512, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
@@ -569,7 +569,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Scale+shift to [0,1]: output = output * 0.5 + 0.5
-    llm::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
+    pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },

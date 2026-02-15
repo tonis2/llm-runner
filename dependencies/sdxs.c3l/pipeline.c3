@@ -11,10 +11,10 @@ import std::time::clock;
 import image;
 import image::png;
 
-struct SDXSState {
+struct SDXSState (llm::pipelines::Pipeline) {
     bool loaded;
-    llm::DiffusionConfig config;
-    llm::DiffusionKernels kernels;
+    pipelines::DiffusionConfig config;
+    pipelines::DiffusionKernels kernels;
     ClipEncoder clip;
     UnetModel unet;
     VaeDecoder vae_decoder;
@@ -24,9 +24,8 @@ struct SDXSState {
     llm::DeviceContext* ctx;
 }
 
-fn void? sdxs_load(void* data, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) {
-    SDXSState* state = (SDXSState*)data;
-    state.ctx = ctx;
+fn void? SDXSState.load(SDXSState* self, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) @dynamic {
+    self.ctx = ctx;
 
     io::printfn("\n=== Loading SDXS Pipeline ===");
 
@@ -34,38 +33,37 @@ fn void? sdxs_load(void* data, llm::DeviceContext* ctx, String model_path, llm::
     char[] file_data = mm.bytes();
     llm::GGUFFile gf = llm::gguf_parse(file_data)!!;
 
-    state.config = llm::load_diffusion_config((String)&llm::SD_CONFIG_JSON)!!;
-    state.kernels = llm::create_diffusion_kernels(ctx)!!;
+    self.config = pipelines::load_diffusion_config((String)&pipelines::SD_CONFIG_JSON)!!;
+    self.kernels = pipelines::create_diffusion_kernels(ctx)!!;
 
-    state.clip = load_clip_encoder(ctx, &gf, &state.config.clip, &state.kernels)!!;
-    state.unet = load_unet_model(ctx, &gf, &state.config.unet, &state.kernels)!!;
-    state.vae_decoder = load_vae_decoder(ctx, &gf, &state.config.vae, &state.kernels)!!;
-    state.vae_encoder = load_vae_encoder(ctx, &gf, &state.config.vae, &state.kernels)!!;
+    self.clip = load_clip_encoder(ctx, &gf, &self.config.clip, &self.kernels)!!;
+    self.unet = load_unet_model(ctx, &gf, &self.config.unet, &self.kernels)!!;
+    self.vae_decoder = load_vae_decoder(ctx, &gf, &self.config.vae, &self.kernels)!!;
+    self.vae_encoder = load_vae_encoder(ctx, &gf, &self.config.vae, &self.kernels)!!;
 
-    state.vae_acts = allocate_vae_activations(ctx, state.config.image.size, 64)!!;
+    self.vae_acts = allocate_vae_activations(ctx, self.config.image.size, 64)!!;
 
-    state.scheduler = llm::pipelines::init_scheduler(
-        &state.config.scheduler,
+    self.scheduler = llm::pipelines::init_scheduler(
+        &self.config.scheduler,
         llm::pipelines::SchedulerType.DDIM,
         1,
         1.0f
     )!!;
 
     // Fix up internal pointers
-    state.clip.kernels = &state.kernels;
-    state.unet.kernels = &state.kernels;
-    state.vae_decoder.kernels = &state.kernels;
-    state.vae_encoder.kernels = &state.kernels;
+    self.clip.kernels = &self.kernels;
+    self.unet.kernels = &self.kernels;
+    self.vae_decoder.kernels = &self.kernels;
+    self.vae_encoder.kernels = &self.kernels;
 
     gf.free();
     mm.destroy();
 
-    state.loaded = true;
+    self.loaded = true;
     io::printfn("\n=== SDXS Pipeline Ready ===\n");
 }
 
-fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) {
-    SDXSState* state = (SDXSState*)data;
+fn image::Image? SDXSState.generate(SDXSState* self, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) @dynamic {
 
     bool is_img2img = inputs.input_image != null;
 
@@ -97,7 +95,7 @@ fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelin
         )!!;
 
         ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
-            vk::cmdCopyBuffer(cmd, img_staging.buffer, state.vae_acts.buf_a.gpu_buffer.buffer, 1,
+            vk::cmdCopyBuffer(cmd, img_staging.buffer, self.vae_acts.buf_a.gpu_buffer.buffer, 1,
                 (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = img_bytes }});
         }!!;
         img_staging.free();
@@ -105,24 +103,24 @@ fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelin
 
         // VAE encode
         io::printfn("[1/4] VAE encoding...");
-        state.vae_encoder.forward(&state.vae_acts, 512, 512)!!;
+        self.vae_encoder.forward(&self.vae_acts, 512, 512)!!;
 
         // Copy encoded latent to UNet buf_a
         uint latent_elems = 4 * 64 * 64;
         ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
-            vk::cmdCopyBuffer(cmd, state.vae_acts.buf_a.gpu_buffer.buffer,
-                state.unet.acts.buf_a.gpu_buffer.buffer, 1,
+            vk::cmdCopyBuffer(cmd, self.vae_acts.buf_a.gpu_buffer.buffer,
+                self.unet.acts.buf_a.gpu_buffer.buffer, 1,
                 (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
         }!!;
 
         // Tokenize + CLIP
         io::printfn("[2/4] Tokenizing + CLIP encoding...");
-        encode_prompt(state, inputs.prompt);
+        encode_prompt(self, inputs.prompt);
 
         // Denoise
         io::printfn("[3/4] Denoising...");
         uint start_step = (uint)((1.0f - inputs.strength) * (float)inputs.num_steps);
-        denoise(state, inputs, start_step);
+        denoise(self, inputs, start_step);
 
     } else {
         io::printfn("=== Text-to-Image Generation ===");
@@ -131,11 +129,11 @@ fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelin
 
         // Tokenize
         io::printfn("\n[1/3] Tokenizing + CLIP encoding...");
-        encode_prompt(state, inputs.prompt);
+        encode_prompt(self, inputs.prompt);
 
         // Generate latent and denoise
         io::printfn("[2/3] UNet denoising (%d steps)...", inputs.num_steps);
-        generate_and_denoise(state, inputs);
+        generate_and_denoise(self, inputs);
     }
 
     // VAE decode
@@ -143,12 +141,12 @@ fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelin
 
     uint latent_elems = 4 * 64 * 64;
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
-        vk::cmdCopyBuffer(cmd, state.unet.acts.buf_a.gpu_buffer.buffer,
-            state.vae_acts.buf_a.gpu_buffer.buffer, 1,
+        vk::cmdCopyBuffer(cmd, self.unet.acts.buf_a.gpu_buffer.buffer,
+            self.vae_acts.buf_a.gpu_buffer.buffer, 1,
             (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
     }!!;
 
-    state.vae_decoder.forward(&state.vae_acts)!!;
+    self.vae_decoder.forward(&self.vae_acts)!!;
 
     // Download and convert to image
     usz total_px = (usz)3 * 512 * 512;
@@ -163,7 +161,7 @@ fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelin
     )!!;
 
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
-        vk::cmdCopyBuffer(cmd, state.vae_acts.buf_a.gpu_buffer.buffer, download_staging.buffer, 1,
+        vk::cmdCopyBuffer(cmd, self.vae_acts.buf_a.gpu_buffer.buffer, download_staging.buffer, 1,
             (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = total_px * 4 }});
     }!!;
 
@@ -179,7 +177,7 @@ fn image::Image? sdxs_generate(void* data, llm::DeviceContext* ctx, llm::pipelin
 }
 
 // Helper: encode prompt with CLIP
-fn void encode_prompt(SDXSState* state, String prompt) {
+fn void encode_prompt(SDXSState* self, String prompt) {
     uint[77] tokens;
     uint n_tokens = 0;
 
@@ -195,32 +193,32 @@ fn void encode_prompt(SDXSState* state, String prompt) {
     io::printfn("  Tokens: %d", n_tokens);
 
     uint[] token_slice = tokens[0..76];
-    state.clip.forward(token_slice, n_tokens)!!;
+    self.clip.forward(token_slice, n_tokens)!!;
 }
 
 // Helper: generate random latent and denoise
-fn void generate_and_denoise(SDXSState* state, llm::pipelines::GenerationInputs* inputs) {
+fn void generate_and_denoise(SDXSState* self, llm::pipelines::GenerationInputs* inputs) {
     uint latent_elems = 4 * 64 * 64;
     float[] latent_data = mem::new_array(float, latent_elems);
     llm::pipelines::generate_random_latent(latent_data, inputs.seed);
 
     vk::Memory staging = vk::new_buffer(
-        allocator: &state.ctx.allocator,
+        allocator: &self.ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: latent_data.ptr,
         data_size: (usz)latent_elems * 4,
     )!!;
 
-    state.ctx.device.@single_time_command(state.ctx.compute_queue; vk::CommandBuffer cmd) {
-        vk::cmdCopyBuffer(cmd, staging.buffer, state.unet.acts.buf_a.gpu_buffer.buffer, 1,
+    self.ctx.device.@single_time_command(self.ctx.compute_queue; vk::CommandBuffer cmd) {
+        vk::cmdCopyBuffer(cmd, staging.buffer, self.unet.acts.buf_a.gpu_buffer.buffer, 1,
             (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
     }!!;
     staging.free();
     mem::free(latent_data);
 
     // Setup scheduler
-    llm::pipelines::SchedulerState* sched = &state.scheduler;
+    llm::pipelines::SchedulerState* sched = &self.scheduler;
     sched.num_inference_steps = inputs.num_steps;
     sched.cfg_scale = inputs.cfg_scale;
 
@@ -237,75 +235,69 @@ fn void generate_and_denoise(SDXSState* state, llm::pipelines::GenerationInputs*
         float t = sched.timesteps[step];
         io::printfn("  Step %d/%d (t=%.1f)", step + 1, inputs.num_steps, t);
 
-        state.unet.forward(&state.clip.acts.hidden, t)!!;
+        self.unet.forward(&self.clip.acts.hidden, t)!!;
 
         float alpha_t = sched.get_alpha_cumprod(t);
         float alpha_prev = sched.get_prev_alpha_cumprod(step);
 
-        vk::CommandBuffer cmd = state.ctx.command_buffer;
+        vk::CommandBuffer cmd = self.ctx.command_buffer;
         llm::begin_compute(cmd)!!;
         if (sched.stype == llm::pipelines::SchedulerType.DDIM) {
-            llm::pipelines::dispatch_ddim_step(cmd, &state.kernels,
-                &state.unet.acts.buf_a,
-                &state.unet.acts.buf_b,
+            llm::pipelines::dispatch_ddim_step(cmd, &self.kernels,
+                &self.unet.acts.buf_a,
+                &self.unet.acts.buf_b,
                 latent_elems, alpha_t, alpha_prev);
         } else {
             float sigma_t = 1.0f - alpha_t;
             float sigma_prev = 1.0f - alpha_prev;
             float dt = sigma_prev - sigma_t;
-            llm::pipelines::dispatch_euler_step(cmd, &state.kernels,
-                &state.unet.acts.buf_a,
-                &state.unet.acts.buf_b,
+            llm::pipelines::dispatch_euler_step(cmd, &self.kernels,
+                &self.unet.acts.buf_a,
+                &self.unet.acts.buf_b,
                 latent_elems, dt);
         }
-        llm::submit_and_wait(state.ctx)!!;
+        llm::submit_and_wait(self.ctx)!!;
     }
 }
 
 // Helper: denoise from a specific step (for img2img)
-fn void denoise(SDXSState* state, llm::pipelines::GenerationInputs* inputs, uint start_step) {
+fn void denoise(SDXSState* self, llm::pipelines::GenerationInputs* inputs, uint start_step) {
     uint latent_elems = 4 * 64 * 64;
-    llm::pipelines::SchedulerState* sched = &state.scheduler;
+    llm::pipelines::SchedulerState* sched = &self.scheduler;
 
     for (uint step = start_step; step < inputs.num_steps; step++) {
         float t = sched.timesteps[step];
         io::printfn("  Step %d/%d (t=%.1f)", step + 1, inputs.num_steps, t);
 
-        state.unet.forward(&state.clip.acts.hidden, t)!!;
+        self.unet.forward(&self.clip.acts.hidden, t)!!;
 
         float alpha_t = sched.get_alpha_cumprod(t);
         float alpha_prev = sched.get_prev_alpha_cumprod(step);
 
-        vk::CommandBuffer cmd = state.ctx.command_buffer;
+        vk::CommandBuffer cmd = self.ctx.command_buffer;
         llm::begin_compute(cmd)!!;
-        llm::pipelines::dispatch_ddim_step(cmd, &state.kernels,
-            &state.unet.acts.buf_a, &state.unet.acts.buf_b,
+        llm::pipelines::dispatch_ddim_step(cmd, &self.kernels,
+            &self.unet.acts.buf_a, &self.unet.acts.buf_b,
             latent_elems, alpha_t, alpha_prev);
-        llm::submit_and_wait(state.ctx)!!;
+        llm::submit_and_wait(self.ctx)!!;
     }
 }
 
-fn void sdxs_free(void* data) {
-    SDXSState* state = (SDXSState*)data;
-    if (state.loaded) {
-        state.clip.free();
-        state.unet.free();
-        state.vae_decoder.free();
-        state.vae_encoder.free();
-        state.vae_acts.free();
-        state.scheduler.free();
-        state.kernels.free(state.ctx.device);
-        state.loaded = false;
+fn void SDXSState.free(SDXSState* self) @dynamic {
+    if (self.loaded) {
+        self.clip.free();
+        self.unet.free();
+        self.vae_decoder.free();
+        self.vae_encoder.free();
+        self.vae_acts.free();
+        self.scheduler.free();
+        self.kernels.free(self.ctx.device);
+        self.loaded = false;
     }
 }
 
-fn llm::pipelines::PipelineImpl create_pipeline() {
-    SDXSState* state = mem::alloc(SDXSState);
-    *state = {};
-    return {
-        .data = state,
-        .load = &sdxs_load,
-        .generate = &sdxs_generate,
-        .free_fn = &sdxs_free,
-    };
+fn llm::pipelines::Pipeline create_pipeline() {
+    SDXSState* self = mem::alloc(SDXSState);
+    *self = {};
+    return (llm::pipelines::Pipeline)self;
 }
