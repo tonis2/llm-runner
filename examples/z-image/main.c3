@@ -26,8 +26,9 @@ fn int main(String[] args) {
         .taesd_path = config.taesd_path,
     };
 
-    // Create pipeline
-    ImagePipeline pipeline = pipelines::create_image_pipeline(&ctx, zimage::create_pipeline(), config.model_path, &opts)!!;
+    // Create and load pipeline
+    llm::pipelines::Pipeline pipeline = zimage::create_pipeline();
+    pipeline.load(&ctx, config.model_path, &opts)!!;
     defer pipeline.free();
 
     // Prepare inputs
@@ -48,7 +49,7 @@ fn int main(String[] args) {
 
     // Generate image
     io::printfn("\nGenerating image...");
-    image::Image output = pipeline.generate(&inputs)!!;
+    image::Image output = pipeline.generate(&ctx, &inputs)!!;
 
     // Cleanup input if loaded
     if (config.input_path.len > 0) {

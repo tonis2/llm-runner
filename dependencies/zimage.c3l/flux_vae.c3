@@ -79,7 +79,7 @@ struct FluxVaeDecoder {
     llm::Tensor norm_out_bias;
     FluxVaeConv conv_out;          // [3, 128, 3, 3]
 
-    pipelines::DiffusionKernels* kernels;
+    VaeKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -182,7 +182,7 @@ fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf,
 
 // --- Load Flux VAE Decoder ---
 
-fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, pipelines::DiffusionKernels* kernels) {
+fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, VaeKernels* kernels) {
     io::printfn("\nLoading Flux VAE decoder...");
     String pfx = "decoder.";
 
@@ -285,7 +285,7 @@ fn FluxVaeActivations? allocate_flux_vae_activations(llm::DeviceContext* ctx, ui
 
 fn void dispatch_flux_conv(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    VaeKernels* k,
     FluxVaeConv* conv,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -308,12 +308,12 @@ fn void dispatch_flux_conv(
         .out_w = out_w,
         .has_bias = 1,
     };
-	pipelines::dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
+	dispatch_vae_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
 }
 
 fn void dispatch_flux_groupnorm(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    VaeKernels* k,
     llm::Tensor* weight,
     llm::Tensor* bias,
     llm::Tensor* input,
@@ -335,7 +335,7 @@ llm::dispatch_kernel(cmd, &k.group_norm,
 
 fn void dispatch_flux_resblock(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    VaeKernels* k,
     FluxVaeResBlock* rb,
     llm::Tensor* input,     // buf_a - also receives output
     llm::Tensor* temp,      // buf_b
@@ -362,7 +362,7 @@ llm::compute_barrier(cmd);
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	pipelines::dispatch_conv2d(cmd, k, &rb.conv1_weight, &rb.conv1_bias, temp, skip_temp, &pc1);
+	dispatch_vae_conv2d(cmd, k, &rb.conv1_weight, &rb.conv1_bias, temp, skip_temp, &pc1);
 llm::compute_barrier(cmd);
 
     // GroupNorm2 -> SiLU -> Conv2
@@ -381,7 +381,7 @@ llm::compute_barrier(cmd);
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	pipelines::dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, temp, skip_temp, &pc2);
+	dispatch_vae_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, temp, skip_temp, &pc2);
 llm::compute_barrier(cmd);
 
     // Skip connection
@@ -392,7 +392,7 @@ llm::compute_barrier(cmd);
             .kH = 1, .kW = 1, .stride = 1, .pad = 0,
             .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
         };
-	pipelines::dispatch_conv2d(cmd, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
+	dispatch_vae_conv2d(cmd, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
 llm::compute_barrier(cmd);
         // Residual: skip_temp += temp
         llm::ResidualPC res_pc = { .n = out_c * spatial };
@@ -418,7 +418,7 @@ llm::compute_barrier(cmd);
 
 fn void dispatch_flux_mid_attn(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    VaeKernels* k,
     FluxVaeAttn* attn,
     llm::Tensor* input,   // [C, H, W]
     llm::Tensor* temp_a,  // scratch
@@ -449,7 +449,7 @@ llm::compute_barrier(cmd);
     // We need 3 * ch * spatial storage. Use temp_b for Q, temp_a offset for K, V.
 
     // Q: temp_a (normed input) -> temp_b
-	pipelines::dispatch_conv2d(cmd, k, &attn.q_weight, &attn.q_bias, temp_a, temp_b, &pc_qkv);
+	dispatch_vae_conv2d(cmd, k, &attn.q_weight, &attn.q_bias, temp_a, temp_b, &pc_qkv);
 llm::compute_barrier(cmd);
 
     // Save Q, compute K into same temp_a region (we can reuse after)
@@ -474,7 +474,7 @@ llm::compute_barrier(cmd);
 fn void? FluxVaeDecoder.forward(&self, FluxVaeActivations* acts, uint lat_h, uint lat_w) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    pipelines::DiffusionKernels* k = self.kernels;
+    VaeKernels* k = self.kernels;
 
     uint h = lat_h;
     uint w = lat_w;

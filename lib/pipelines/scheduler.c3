@@ -98,50 +98,6 @@ fn void generate_random_latent(float[] latent, uint seed) {
     }
 }
 
-// --- DDIM Step on GPU ---
-
-fn void dispatch_ddim_step(
-    vk::CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
-    Tensor* noisy,           // current noisy latent (read/write)
-    Tensor* predicted_noise, // model output
-    uint n_elements,
-    float alpha_t,
-    float alpha_prev
-) {
-    DdimStepPC pc = {
-        .n = n_elements,
-        .sqrt_alpha_t = math::sqrt(alpha_t),
-        .sqrt_one_minus_alpha_t = math::sqrt(1.0f - alpha_t),
-        .sqrt_alpha_prev = math::sqrt(alpha_prev),
-        .sqrt_one_minus_alpha_prev = math::sqrt(1.0f - alpha_prev),
-    };
-    llm::dispatch_kernel(cmd, &k.ddim_step,
-        { noisy.gpu_buffer.buffer, predicted_noise.gpu_buffer.buffer },
-        { noisy.size_bytes, predicted_noise.size_bytes },
-        &pc, llm::ceil_div(n_elements, 256));
-}
-
-// --- Euler Step on GPU ---
-
-fn void dispatch_euler_step(
-    vk::CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
-    Tensor* noisy,
-    Tensor* predicted_noise,
-    uint n_elements,
-    float dt
-) {
-    EulerStepPC pc = {
-        .n = n_elements,
-        .dt = dt,
-    };
-    llm::dispatch_kernel(cmd, &k.euler_step,
-        { noisy.gpu_buffer.buffer, predicted_noise.gpu_buffer.buffer },
-        { noisy.size_bytes, predicted_noise.size_bytes },
-        &pc, llm::ceil_div(n_elements, 256));
-}
-
 // --- Get alpha values for a timestep ---
 
 fn float SchedulerState.get_alpha_cumprod(&self, float timestep) {

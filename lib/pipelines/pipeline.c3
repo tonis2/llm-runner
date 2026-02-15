@@ -2,55 +2,149 @@ module llm::pipelines;
 
 import vk;
 import std::io;
-import std::io::file;
-import std::io::file::mmap;
 import std::core::mem;
-import std::math::random;
-import std::time::clock;
-import image;
-import image::png;
 import llm;
+import image;
 
-// ImagePipeline: Thin wrapper around Pipeline interface
-// Usage:
-//   Pipeline pipeline = zimage::create_pipeline();
-//   ImagePipeline image_pipeline = create_image_pipeline(&ctx, pipeline, "model.gguf", &opts)!!;
-//   image::Image output = image_pipeline.generate(&inputs)!!;
-//   image_pipeline.free();
+// --- Embedded Shaders ---
 
-struct ImagePipeline {
-    llm::DeviceContext* ctx;
-    Pipeline pipeline;
-    bool loaded;
+const char[*] DIFFUSION_SPV = $embed("../shaders/diffusion.spv");
+
+// --- Fault Definitions ---
+
+faultdef PIPELINE_DEVICE_ERROR,
+         PIPELINE_GENERATION_FAILED,
+         PIPELINE_INVALID_INPUT;
+
+// --- Pluggable Pipeline Interface ---
+// Diffusers implement this interface. The engine delegates to the active impl.
+// Types implementing this interface: ZImageState, SDXSState
+interface Pipeline {
+    fn void? load(llm::DeviceContext* ctx, String model_path, PipelineOptions* opts);
+    fn image::Image? generate(llm::DeviceContext* ctx, GenerationInputs* inputs);
+    fn void free();
 }
 
-fn ImagePipeline? create_image_pipeline(llm::DeviceContext* ctx, Pipeline pipeline, String model_path, PipelineOptions* opts) {
-    pipeline.load(ctx, model_path, opts)!!;
+struct PipelineOptions {
+    String text_model_path;
+    String vae_path;
+    String taesd_path;
+}
 
+// --- Unified Generation Inputs ---
+
+struct GenerationInputs {
+    String prompt;
+    uint image_size;
+    uint num_steps;
+    float cfg_scale;
+    uint seed;
+
+    // Optional: for img2img mode (if null, does txt2img)
+    image::Image* input_image;
+    float strength;          // 0.0-1.0, only used with input_image
+}
+
+fn GenerationInputs generation_inputs_defaults() {
     return {
-        .ctx = ctx,
-        .pipeline = pipeline,
-        .loaded = true,
+        .prompt = "",
+        .image_size = 512,
+        .num_steps = 4,
+        .cfg_scale = 7.0,
+        .seed = 42,
+        .input_image = null,
+        .strength = 0.75,
     };
 }
 
-fn image::Image? ImagePipeline.generate(ImagePipeline* self, GenerationInputs* inputs) {
-    if (!self.loaded) {
-        io::printfn("Error: Pipeline not loaded");
-        return PIPELINE_NOT_INITIALIZED~;
+fn bool GenerationInputs.validate(GenerationInputs* self) {
+    if (self.prompt.len == 0) {
+        io::printfn("Error: prompt is required");
+        return false;
     }
-    if (!inputs.validate()) {
-        return PIPELINE_INVALID_INPUT~;
+    if (self.num_steps == 0) {
+        io::printfn("Error: num_steps must be > 0");
+        return false;
     }
-    return self.pipeline.generate(self.ctx, inputs);
+    if (self.cfg_scale < 1.0) {
+        io::printfn("Error: cfg_scale must be >= 1.0");
+        return false;
+    }
+    if (self.input_image != null && (self.strength < 0.0 || self.strength > 1.0)) {
+        io::printfn("Error: strength must be in [0.0, 1.0]");
+        return false;
+    }
+    return true;
 }
 
-fn void ImagePipeline.free(ImagePipeline* self) {
-    if (self.loaded) {
-        self.pipeline.free();
-        self.loaded = false;
-    }
+// --- Shared Push Constant Structs ---
+// Used by multiple pipeline implementations (SDXS, ZImage VAE)
+
+struct Conv2dPC {
+    uint in_c;
+    uint out_c;
+    uint in_h;
+    uint in_w;
+    uint kH;
+    uint kW;
+    uint stride;
+    uint pad;
+    uint groups;
+    uint out_h;
+    uint out_w;
+    uint has_bias;
 }
+
+struct GroupNormPC {
+    uint channels;
+    uint spatial;
+    uint num_groups;
+    float eps;
+}
+
+struct UpsamplePC {
+    uint channels;
+    uint in_h;
+    uint in_w;
+}
+
+struct DdimStepPC {
+    uint n;
+    float sqrt_alpha_t;
+    float sqrt_one_minus_alpha_t;
+    float sqrt_alpha_prev;
+    float sqrt_one_minus_alpha_prev;
+}
+
+struct EulerStepPC {
+    uint n;
+    float dt;
+}
+
+struct ScaleShiftPC {
+    uint n;
+    float scale;
+    float shift;
+}
+
+struct ReluPC {
+    uint n;
+}
+
+struct TanhClampPC {
+    uint n;
+}
+
+// --- Scheduler Config ---
+// Kept in engine because init_scheduler() references it.
+
+struct SchedulerConfig {
+    uint num_train_timesteps;
+    float beta_start;
+    float beta_end;
+}
+
+
 
 // ============================================================
 // Shared Helpers (used by diffuser implementations)

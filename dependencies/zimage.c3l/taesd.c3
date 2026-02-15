@@ -45,7 +45,7 @@ struct TAESDDecoder {
     TAESDBlock final_block;                    // index 17
     TAESDConv conv_out;                        // index 18: Conv(64→3, bias)
 
-    pipelines::DiffusionKernels* kernels;
+    VaeKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -107,7 +107,7 @@ fn TAESDBlock load_taesd_block(llm::DeviceContext* ctx, llm::SafetensorsFile* sf
     };
 }
 
-fn TAESDDecoder? load_taesd_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, pipelines::DiffusionKernels* kernels) {
+fn TAESDDecoder? load_taesd_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, VaeKernels* kernels) {
     io::printfn("\nLoading TAESD decoder...");
 
     TAESDDecoder dec;
@@ -192,7 +192,7 @@ fn TAESDActivations? allocate_taesd_activations(llm::DeviceContext* ctx, uint ma
 
 fn void dispatch_taesd_conv(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    VaeKernels* k,
     TAESDConv* conv,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -212,10 +212,10 @@ fn void dispatch_taesd_conv(
         .out_w = w,
         .has_bias = conv.has_bias ? 1 : 0,
     };
-	pipelines::dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
+	dispatch_vae_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
 }
 
-fn void dispatch_taesd_relu(CommandBuffer cmd, pipelines::DiffusionKernels* k, llm::Tensor* buf, uint n) {
+fn void dispatch_taesd_relu(CommandBuffer cmd, VaeKernels* k, llm::Tensor* buf, uint n) {
     pipelines::ReluPC pc = { .n = n };
 llm::dispatch_kernel(cmd, &k.relu,
         { buf.gpu_buffer.buffer },
@@ -228,7 +228,7 @@ llm::dispatch_kernel(cmd, &k.relu,
 // Output written to `temp1`
 fn void dispatch_taesd_block(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    VaeKernels* k,
     TAESDBlock* block,
     llm::Tensor* input,   // e.g. buf_a
     llm::Tensor* temp1,   // e.g. buf_b — will contain output
@@ -279,7 +279,7 @@ llm::compute_barrier(cmd);
 fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint lat_w) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    pipelines::DiffusionKernels* k = self.kernels;
+    VaeKernels* k = self.kernels;
 
     uint h = lat_h;
     uint w = lat_w;

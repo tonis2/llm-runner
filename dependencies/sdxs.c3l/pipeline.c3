@@ -13,8 +13,8 @@ import image::png;
 
 struct SDXSState (llm::pipelines::Pipeline) {
     bool loaded;
-    pipelines::DiffusionConfig config;
-    pipelines::DiffusionKernels kernels;
+    DiffusionConfig config;
+    SDXSKernels kernels;
     ClipEncoder clip;
     UnetModel unet;
     VaeDecoder vae_decoder;
@@ -33,8 +33,8 @@ fn void? SDXSState.load(SDXSState* self, llm::DeviceContext* ctx, String model_p
     char[] file_data = mm.bytes();
     llm::GGUFFile gf = llm::gguf_parse(file_data)!!;
 
-    self.config = pipelines::load_diffusion_config((String)&pipelines::SD_CONFIG_JSON)!!;
-    self.kernels = pipelines::create_diffusion_kernels(ctx)!!;
+    self.config = load_diffusion_config((String)&SD_CONFIG_JSON)!!;
+    self.kernels = create_sdxs_kernels(ctx)!!;
 
     self.clip = load_clip_encoder(ctx, &gf, &self.config.clip, &self.kernels)!!;
     self.unet = load_unet_model(ctx, &gf, &self.config.unet, &self.kernels)!!;
@@ -243,7 +243,7 @@ fn void generate_and_denoise(SDXSState* self, llm::pipelines::GenerationInputs* 
         vk::CommandBuffer cmd = self.ctx.command_buffer;
         llm::begin_compute(cmd)!!;
         if (sched.stype == llm::pipelines::SchedulerType.DDIM) {
-            llm::pipelines::dispatch_ddim_step(cmd, &self.kernels,
+            dispatch_ddim_step(cmd, &self.kernels,
                 &self.unet.acts.buf_a,
                 &self.unet.acts.buf_b,
                 latent_elems, alpha_t, alpha_prev);
@@ -251,7 +251,7 @@ fn void generate_and_denoise(SDXSState* self, llm::pipelines::GenerationInputs* 
             float sigma_t = 1.0f - alpha_t;
             float sigma_prev = 1.0f - alpha_prev;
             float dt = sigma_prev - sigma_t;
-            llm::pipelines::dispatch_euler_step(cmd, &self.kernels,
+            dispatch_euler_step(cmd, &self.kernels,
                 &self.unet.acts.buf_a,
                 &self.unet.acts.buf_b,
                 latent_elems, dt);
@@ -276,7 +276,7 @@ fn void denoise(SDXSState* self, llm::pipelines::GenerationInputs* inputs, uint 
 
         vk::CommandBuffer cmd = self.ctx.command_buffer;
         llm::begin_compute(cmd)!!;
-        llm::pipelines::dispatch_ddim_step(cmd, &self.kernels,
+        dispatch_ddim_step(cmd, &self.kernels,
             &self.unet.acts.buf_a, &self.unet.acts.buf_b,
             latent_elems, alpha_t, alpha_prev);
         llm::submit_and_wait(self.ctx)!!;

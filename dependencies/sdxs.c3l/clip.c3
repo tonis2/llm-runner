@@ -52,10 +52,10 @@ struct ClipActivations {
 }
 
 struct ClipEncoder {
-    pipelines::ClipConfig config;
+    ClipConfig config;
     ClipWeights weights;
     ClipActivations acts;
-    pipelines::DiffusionKernels* kernels;
+    SDXSKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -94,7 +94,7 @@ fn String clip_layer_tensor_name(char[128]* buf, String prefix, uint layer, Stri
     return (String)(*buf)[0..pos - 1];
 }
 
-fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::ClipConfig* config) {
+fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, ClipConfig* config) {
     io::printfn("\nLoading CLIP weights...");
     String pfx = config.prefix;
     char[128] buf;
@@ -160,7 +160,7 @@ fn ClipWeights? load_clip_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, pi
     };
 }
 
-fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, pipelines::ClipConfig* config) {
+fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, ClipConfig* config) {
     io::printfn("Allocating CLIP activation buffers...");
 
     ulong seq = config.max_tokens;  // 77
@@ -185,7 +185,7 @@ fn ClipActivations? allocate_clip_activations(llm::DeviceContext* ctx, pipelines
     };
 }
 
-fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::ClipConfig* config, pipelines::DiffusionKernels* kernels) {
+fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, ClipConfig* config, SDXSKernels* kernels) {
     ClipWeights weights = load_clip_weights(ctx, gf, config)!!;
     ClipActivations acts = allocate_clip_activations(ctx, config)!!;
 
@@ -203,10 +203,10 @@ fn ClipEncoder? load_clip_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pi
 fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    pipelines::ClipConfig* c = &self.config;
+    ClipConfig* c = &self.config;
     ClipWeights* w = &self.weights;
     ClipActivations* a = &self.acts;
-    pipelines::DiffusionKernels* k = self.kernels;
+    SDXSKernels* k = self.kernels;
     llm::SharedKernels* sk = &k.shared;
 
     uint seq = c.max_tokens;  // 77
@@ -279,17 +279,17 @@ llm::compute_barrier(cmd);
         // 2b. Q/K/V projections: batched matmul [77, 768] x [768, 768]^T -> [77, 768]
         // Weight is stored as [out_dim, in_dim], matmul is input * weight^T
         // output[seq, dim] = norm_out[seq, dim] x weight^T[dim, dim]
-        llm::BatchedMatMulPC qkv_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
-        llm::dispatch_batched_matmul_auto(cmd, k, &lw.q_proj, &a.norm_out, &a.q, &qkv_pc);
-        llm::dispatch_batched_matmul_auto(cmd, k, &lw.k_proj, &a.norm_out, &a.k, &qkv_pc);
-        llm::dispatch_batched_matmul_auto(cmd, k, &lw.v_proj, &a.norm_out, &a.v, &qkv_pc);
+        BatchedMatMulPC qkv_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
+        dispatch_batched_matmul_auto(cmd, k, &lw.q_proj, &a.norm_out, &a.q, &qkv_pc);
+        dispatch_batched_matmul_auto(cmd, k, &lw.k_proj, &a.norm_out, &a.k, &qkv_pc);
+        dispatch_batched_matmul_auto(cmd, k, &lw.v_proj, &a.norm_out, &a.v, &qkv_pc);
 llm::compute_barrier(cmd);
 
         // Add biases to Q, K, V
         llm::ResidualPC bias_pc = { .n = seq * dim };
         // TODO: broadcast add bias[dim] across seq positions
         // For now we need a broadcast add for [seq, dim] += [dim]
-        llm::BroadcastAddPC ba_pc = { .channels = dim, .spatial = seq };
+        BroadcastAddPC ba_pc = { .channels = dim, .spatial = seq };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.q.gpu_buffer.buffer, lw.q_proj_bias.gpu_buffer.buffer },
             { a.q.size_bytes, lw.q_proj_bias.size_bytes },
@@ -308,7 +308,7 @@ llm::compute_barrier(cmd);
         // Reshape Q/K/V from [seq, dim] to [n_heads, seq, head_dim]
         // The spatial_attention shader expects [n_heads, seq, head_dim] layout
         float scale = 1.0f / math::sqrt((float)c.head_dim);
-        llm::SpatialAttentionPC sa_pc = {
+        SpatialAttentionPC sa_pc = {
             .head_dim = c.head_dim,
             .n_heads = c.n_heads,
             .seq_len = seq,
@@ -323,8 +323,8 @@ llm::dispatch_kernel(cmd, &k.spatial_attention,
 llm::compute_barrier(cmd);
 
         // 2d. Output projection
-        llm::BatchedMatMulPC out_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
-        llm::dispatch_batched_matmul_auto(cmd, k, &lw.out_proj, &a.attn_out, &a.norm_out, &out_pc);
+        BatchedMatMulPC out_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
+        dispatch_batched_matmul_auto(cmd, k, &lw.out_proj, &a.attn_out, &a.norm_out, &out_pc);
 llm::compute_barrier(cmd);
 
         // Add output projection bias
@@ -354,12 +354,12 @@ llm::dispatch_kernel(cmd, &sk.layernorm,
 llm::compute_barrier(cmd);
 
         // 2g. FFN: fc1 -> GELU -> fc2
-        llm::BatchedMatMulPC fc1_pc = { .m_dim = seq, .n_dim = ffn_dim, .k_dim = dim };
-        llm::dispatch_batched_matmul_auto(cmd, k, &lw.fc1, &a.norm_out, &a.ffn_out, &fc1_pc);
+        BatchedMatMulPC fc1_pc = { .m_dim = seq, .n_dim = ffn_dim, .k_dim = dim };
+        dispatch_batched_matmul_auto(cmd, k, &lw.fc1, &a.norm_out, &a.ffn_out, &fc1_pc);
 llm::compute_barrier(cmd);
 
         // Add fc1 bias
-        llm::BroadcastAddPC fc1_ba = { .channels = ffn_dim, .spatial = seq };
+        BroadcastAddPC fc1_ba = { .channels = ffn_dim, .spatial = seq };
 llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.ffn_out.gpu_buffer.buffer, lw.fc1_bias.gpu_buffer.buffer },
             { a.ffn_out.size_bytes, lw.fc1_bias.size_bytes },
@@ -375,8 +375,8 @@ llm::dispatch_kernel(cmd, &sk.gelu,
 llm::compute_barrier(cmd);
 
         // fc2
-        llm::BatchedMatMulPC fc2_pc = { .m_dim = seq, .n_dim = dim, .k_dim = ffn_dim };
-        llm::dispatch_batched_matmul_auto(cmd, k, &lw.fc2, &a.ffn_out, &a.ffn_down_out, &fc2_pc);
+        BatchedMatMulPC fc2_pc = { .m_dim = seq, .n_dim = dim, .k_dim = ffn_dim };
+        dispatch_batched_matmul_auto(cmd, k, &lw.fc2, &a.ffn_out, &a.ffn_down_out, &fc2_pc);
 llm::compute_barrier(cmd);
 
         // Add fc2 bias

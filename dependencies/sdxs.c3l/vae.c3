@@ -2,6 +2,7 @@ module sdxs;
 
 import vk;
 import llm;
+import llm::pipelines;
 import std::io;
 import std::core::mem;
 
@@ -39,7 +40,7 @@ struct VaeResBlock {
 // --- VAE Decoder ---
 
 struct VaeDecoder {
-    pipelines::VaeConfig config;
+    VaeConfig config;
 
     // conv_in: 4 -> 64 channels
     VaeConvLayer conv_in;
@@ -59,14 +60,14 @@ struct VaeDecoder {
     VaeConvLayer[3] upsample_convs;  // 3 upsample layers
     VaeConvLayer conv_out;
 
-    pipelines::DiffusionKernels* kernels;
+    SDXSKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
 // --- VAE Encoder ---
 
 struct VaeEncoder {
-    pipelines::VaeConfig config;
+    VaeConfig config;
 
     // conv_in: 3 -> 64 channels
     VaeConvLayer conv_in;
@@ -84,7 +85,7 @@ struct VaeEncoder {
     VaeConvLayer[3] downsample_convs;
     VaeConvLayer conv_out;
 
-    pipelines::DiffusionKernels* kernels;
+    SDXSKernels* kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -147,7 +148,7 @@ fn VaeResBlock? load_vae_resblock(llm::DeviceContext* ctx, llm::GGUFFile* gf, St
 
 // --- Load VAE Decoder ---
 
-fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::VaeConfig* config, pipelines::DiffusionKernels* kernels) {
+fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, VaeConfig* config, SDXSKernels* kernels) {
     io::printfn("\nLoading VAE decoder weights...");
     String pfx = config.prefix_decoder;
 
@@ -185,7 +186,7 @@ fn VaeDecoder? load_vae_decoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipe
 
 // --- Load VAE Encoder ---
 
-fn VaeEncoder? load_vae_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, pipelines::VaeConfig* config, pipelines::DiffusionKernels* kernels) {
+fn VaeEncoder? load_vae_encoder(llm::DeviceContext* ctx, llm::GGUFFile* gf, VaeConfig* config, SDXSKernels* kernels) {
     io::printfn("\nLoading VAE encoder weights...");
     String pfx = config.prefix_encoder;
 
@@ -240,7 +241,7 @@ fn VaeActivations? allocate_vae_activations(llm::DeviceContext* ctx, uint max_sp
 
 fn void dispatch_vae_conv(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    SDXSKernels* k,
     VaeConvLayer* layer,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -249,7 +250,7 @@ fn void dispatch_vae_conv(
 ) {
     uint out_h = (in_h + 2 * pad - layer.kH) / stride + 1;
     uint out_w = (in_w + 2 * pad - layer.kW) / stride + 1;
-    llm::Conv2dPC pc = {
+    pipelines::Conv2dPC pc = {
         .in_c = layer.in_c,
         .out_c = layer.out_c,
         .in_h = in_h,
@@ -265,7 +266,7 @@ fn void dispatch_vae_conv(
     };
     // When no bias, pass weight buffer as dummy (shader won't read it with has_bias=0)
     llm::Tensor* bias_tensor = layer.has_bias ? &layer.bias : &layer.weight;
-	llm::dispatch_conv2d(cmd, k, &layer.weight, bias_tensor, input, output, &pc);
+	dispatch_conv2d(cmd, k, &layer.weight, bias_tensor, input, output, &pc);
 }
 
 // --- Helper: dispatch ResBlock ---
@@ -274,7 +275,7 @@ fn void dispatch_vae_conv(
 
 fn void dispatch_vae_resblock(
     CommandBuffer cmd,
-    pipelines::DiffusionKernels* k,
+    SDXSKernels* k,
     VaeResBlock* rb,
     llm::Tensor* input,     // buf_a
     llm::Tensor* temp,      // buf_b (temporary)
@@ -298,12 +299,12 @@ llm::dispatch_kernel(cmd, &k.shared.silu,
 llm::compute_barrier(cmd);
 
     // Conv3x3 (conv.0): temp -> skip_temp
-    llm::Conv2dPC pc0 = {
+    pipelines::Conv2dPC pc0 = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	llm::dispatch_conv2d(cmd, k, &rb.conv0_weight, &rb.conv0_bias, temp, skip_temp, &pc0);
+	dispatch_conv2d(cmd, k, &rb.conv0_weight, &rb.conv0_bias, temp, skip_temp, &pc0);
 llm::compute_barrier(cmd);
 
     // SiLU on skip_temp
@@ -314,17 +315,17 @@ llm::dispatch_kernel(cmd, &k.shared.silu,
 llm::compute_barrier(cmd);
 
     // Conv3x3 (conv.2): skip_temp -> temp
-	llm::dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, skip_temp, temp, &pc0);
+	dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, skip_temp, temp, &pc0);
 llm::compute_barrier(cmd);
 
     // Skip connection conv (conv.4): input -> skip_temp
     // This is typically a 3x3 conv that acts as identity or channel projection
-    llm::Conv2dPC pc_skip = {
+    pipelines::Conv2dPC pc_skip = {
         .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	llm::dispatch_conv2d(cmd, k, &rb.conv4_weight, &rb.conv4_bias, input, skip_temp, &pc_skip);
+	dispatch_conv2d(cmd, k, &rb.conv4_weight, &rb.conv4_bias, input, skip_temp, &pc_skip);
 llm::compute_barrier(cmd);
 
     // Residual add: skip_temp += temp, result in skip_temp
@@ -348,7 +349,7 @@ llm::compute_barrier(cmd);
 fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    pipelines::DiffusionKernels* k = self.kernels;
+    SDXSKernels* k = self.kernels;
 
     uint h = 64;  // latent height
     uint w = 64;  // latent width
@@ -369,7 +370,7 @@ llm::compute_barrier(cmd);
     }
 
     // Upsample 0 (layer 6): 64x64 -> 128x128
-    llm::UpsamplePC up_pc = { .channels = 64, .in_h = h, .in_w = w };
+    pipelines::UpsamplePC up_pc = { .channels = 64, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
@@ -423,7 +424,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // Scale + shift to [0,1] range: output = output * 0.5 + 0.5
-    llm::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
+    pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer },
         { acts.buf_b.size_bytes, acts.buf_a.size_bytes },
@@ -440,7 +441,7 @@ llm::submit_and_wait(ctx)!!;
 fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w) {
     llm::DeviceContext* ctx = self.ctx;
     CommandBuffer cmd = ctx.command_buffer;
-    pipelines::DiffusionKernels* k = self.kernels;
+    SDXSKernels* k = self.kernels;
 
     uint h = img_h;
     uint w = img_w;

@@ -332,7 +332,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     norm_scratch.free();
 
     // Load VAE/TAESD
-    pipelines::DiffusionKernels diff_kernels = pipelines::create_diffusion_kernels(ctx)!!;
+    VaeKernels vae_kernels = create_vae_kernels(ctx)!!;
     FluxVaeDecoder vae_decoder;
     FluxVaeActivations vae_acts;
     TAESDDecoder taesd_decoder;
@@ -342,7 +342,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
     if (self.taesd_path.len > 0) {
         llm::SafetensorsFile sf = llm::safetensors_open(self.taesd_path)!!;
-        taesd_decoder = load_taesd_decoder(ctx, &sf, &diff_kernels)!!;
+        taesd_decoder = load_taesd_decoder(ctx, &sf, &vae_kernels)!!;
         sf.close();
         taesd_acts = allocate_taesd_activations(ctx, img_size)!!;
         has_vae = true;
@@ -350,7 +350,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         io::printfn("  TAESD loaded from %s", self.taesd_path);
     } else if (self.vae_path.len > 0) {
         llm::SafetensorsFile sf = llm::safetensors_open(self.vae_path)!!;
-        vae_decoder = load_flux_vae_decoder(ctx, &sf, &diff_kernels)!!;
+        vae_decoder = load_flux_vae_decoder(ctx, &sf, &vae_kernels)!!;
         sf.close();
         vae_acts = allocate_flux_vae_activations(ctx, img_size)!!;
         has_vae = true;
@@ -713,7 +713,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     // Cleanup
     cond_projected.free();
     if (use_cfg) uncond_projected.free();
-    diff_kernels.free(ctx.device);
+    vae_kernels.free(ctx.device);
     dit_gf.free();
     dit_mm.destroy();
     dit.free();

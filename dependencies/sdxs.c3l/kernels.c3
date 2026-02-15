@@ -1,87 +1,18 @@
-module llm::pipelines;
+module sdxs;
 
 import vk;
+import llm;
+import llm::pipelines;
 import std::io;
-import std::io::file;
+import std::math;
 import std::core::mem;
 import std::encoding::json;
 import std::collections::object;
-import image;
-import image::png;
-import llm;
 
-// Embedded diffusion SPIR-V shader
-const char[*] DIFFUSION_SPV = $embed("../shaders/diffusion.spv");
+
 
 // Embedded SD config
-const char[*] SD_CONFIG_JSON = $embed("../configs/sd.json");
-
-// Fault definitions for pipeline errors
-faultdef PIPELINE_DEVICE_ERROR,
-         PIPELINE_GENERATION_FAILED,
-         PIPELINE_INVALID_INPUT,
-         PIPELINE_NOT_INITIALIZED;
-
-// --- Pluggable Pipeline Interface ---
-// Diffusers implement this interface. The engine delegates to the active impl.
-// Types implementing this interface: ZImageState, SDXSState
-interface Pipeline {
-    fn void? load(llm::DeviceContext* ctx, String model_path, PipelineOptions* opts);
-    fn image::Image? generate(llm::DeviceContext* ctx, GenerationInputs* inputs);
-    fn void free();
-}
-
-struct PipelineOptions {
-    String text_model_path;
-    String vae_path;
-    String taesd_path;
-}
-
-// --- Unified Generation Inputs ---
-
-struct GenerationInputs {
-    String prompt;
-    uint image_size;
-    uint num_steps;
-    float cfg_scale;
-    uint seed;
-
-    // Optional: for img2img mode (if null, does txt2img)
-    image::Image* input_image;
-    float strength;          // 0.0-1.0, only used with input_image
-}
-
-fn GenerationInputs generation_inputs_defaults() {
-    return {
-        .prompt = "",
-        .image_size = 512,
-        .num_steps = 4,
-        .cfg_scale = 7.0,
-        .seed = 42,
-        .input_image = null,
-        .strength = 0.75,
-    };
-}
-
-fn bool GenerationInputs.validate(GenerationInputs* self) {
-    if (self.prompt.len == 0) {
-        io::printfn("Error: prompt is required");
-        return false;
-    }
-    if (self.num_steps == 0) {
-        io::printfn("Error: num_steps must be > 0");
-        return false;
-    }
-    if (self.cfg_scale < 1.0) {
-        io::printfn("Error: cfg_scale must be >= 1.0");
-        return false;
-    }
-    if (self.input_image != null && (self.strength < 0.0 || self.strength > 1.0)) {
-        io::printfn("Error: strength must be in [0.0, 1.0]");
-        return false;
-    }
-    return true;
-}
+const char[*] SD_CONFIG_JSON = $embed("./configs/sd.json");
 
 // --- Diffusion Config ---
 
@@ -119,50 +50,16 @@ struct ImageConfig {
     uint latent_size;
 }
 
-struct SchedulerConfig {
-    uint num_train_timesteps;
-    float beta_start;
-    float beta_end;
-}
-
 struct DiffusionConfig {
     String name;
     ClipConfig clip;
     UnetConfig unet;
     VaeConfig vae;
     ImageConfig image;
-    SchedulerConfig scheduler;
+    pipelines::SchedulerConfig scheduler;
 }
 
-// --- Push constant structs matching Slang ---
-
-struct Conv2dPC {
-    uint in_c;
-    uint out_c;
-    uint in_h;
-    uint in_w;
-    uint kH;
-    uint kW;
-    uint stride;
-    uint pad;
-    uint groups;
-    uint out_h;
-    uint out_w;
-    uint has_bias;
-}
-
-struct GroupNormPC {
-    uint channels;
-    uint spatial;
-    uint num_groups;
-    float eps;
-}
-
-struct BatchedMatMulPC {
-    uint m_dim;
-    uint n_dim;
-    uint k_dim;
-}
+// --- SDXS-only push constant structs ---
 
 struct SpatialAttentionPC {
     uint head_dim;
@@ -177,12 +74,6 @@ struct CrossAttentionPC {
     uint q_len;
     uint kv_len;
     float scale;
-}
-
-struct UpsamplePC {
-    uint channels;
-    uint in_h;
-    uint in_w;
 }
 
 struct TimestepEmbedPC {
@@ -202,40 +93,19 @@ struct ChannelConcatPC {
     uint spatial;
 }
 
-struct DdimStepPC {
-    uint n;
-    float sqrt_alpha_t;
-    float sqrt_one_minus_alpha_t;
-    float sqrt_alpha_prev;
-    float sqrt_one_minus_alpha_prev;
-}
-
-struct EulerStepPC {
-    uint n;
-    float dt;
-}
-
-struct ScaleShiftPC {
-    uint n;
-    float scale;
-    float shift;
+struct BatchedMatMulPC {
+    uint m_dim;
+    uint n_dim;
+    uint k_dim;
 }
 
 struct F16ToF32PC {
     uint n;
 }
 
-struct ReluPC {
-    uint n;
-}
+// --- SDXS Kernels ---
 
-struct TanhClampPC {
-    uint n;
-}
-
-// --- Diffusion Kernels ---
-
-struct DiffusionKernels {
+struct SDXSKernels {
     llm::ComputeKernel conv2d;
     llm::ComputeKernel conv2d_q8;
     llm::ComputeKernel group_norm;
@@ -260,7 +130,7 @@ struct DiffusionKernels {
 
 struct DiffusionModel {
     DiffusionConfig config;
-    DiffusionKernels kernels;
+    SDXSKernels kernels;
     llm::DeviceContext* ctx;
 }
 
@@ -321,7 +191,7 @@ fn DiffusionConfig? load_diffusion_config(String json_text) {
 
     // Scheduler config
     Object* sched_obj = root.get("scheduler")!;
-    SchedulerConfig scheduler = {
+    pipelines::SchedulerConfig scheduler = {
         .num_train_timesteps = (uint)(sched_obj.get_float("num_train_timesteps") ?? 1000.0),
         .beta_start = (float)(sched_obj.get_float("beta_start") ?? 0.00085),
         .beta_end = (float)(sched_obj.get_float("beta_end") ?? 0.012),
@@ -344,32 +214,32 @@ fn DiffusionConfig? load_diffusion_config(String json_text) {
     };
 }
 
-fn DiffusionKernels? create_diffusion_kernels(llm::DeviceContext* ctx) {
-    io::printfn("Creating diffusion compute kernels...");
-    char[] spv = &DIFFUSION_SPV;
+fn SDXSKernels? create_sdxs_kernels(llm::DeviceContext* ctx) {
+    io::printfn("Creating SDXS compute kernels...");
+    char[] spv = &pipelines::DIFFUSION_SPV;
     vk::ShaderModule shader = vk::shaderModuleCreateInfo()
         .setCodeSize(spv.len)
         .setCode((uint*)&spv[0])
         .build(ctx.device)!!;
 
-    DiffusionKernels kernels = {
-        .conv2d           = llm::create_kernel(ctx, shader, 4, Conv2dPC.sizeof, "conv2d")!!,
-        .conv2d_q8        = llm::create_kernel(ctx, shader, 4, Conv2dPC.sizeof, "conv2d_q8")!!,
-        .group_norm       = llm::create_kernel(ctx, shader, 4, GroupNormPC.sizeof, "group_norm")!!,
+    SDXSKernels kernels = {
+        .conv2d           = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC.sizeof, "conv2d")!!,
+        .conv2d_q8        = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC.sizeof, "conv2d_q8")!!,
+        .group_norm       = llm::create_kernel(ctx, shader, 4, pipelines::GroupNormPC.sizeof, "group_norm")!!,
         .batched_matmul   = llm::create_kernel(ctx, shader, 3, BatchedMatMulPC.sizeof, "batched_matmul")!!,
         .batched_matmul_q8 = llm::create_kernel(ctx, shader, 3, BatchedMatMulPC.sizeof, "batched_matmul_q8")!!,
         .spatial_attention = llm::create_kernel(ctx, shader, 5, SpatialAttentionPC.sizeof, "spatial_attention")!!,
         .cross_attention  = llm::create_kernel(ctx, shader, 5, CrossAttentionPC.sizeof, "cross_attention")!!,
-        .upsample_nearest = llm::create_kernel(ctx, shader, 2, UpsamplePC.sizeof, "upsample_nearest")!!,
+        .upsample_nearest = llm::create_kernel(ctx, shader, 2, pipelines::UpsamplePC.sizeof, "upsample_nearest")!!,
         .timestep_embed   = llm::create_kernel(ctx, shader, 1, TimestepEmbedPC.sizeof, "timestep_embed")!!,
         .broadcast_add    = llm::create_kernel(ctx, shader, 2, BroadcastAddPC.sizeof, "broadcast_add")!!,
         .channel_concat   = llm::create_kernel(ctx, shader, 3, ChannelConcatPC.sizeof, "channel_concat")!!,
-        .ddim_step        = llm::create_kernel(ctx, shader, 2, DdimStepPC.sizeof, "ddim_step")!!,
-        .euler_step       = llm::create_kernel(ctx, shader, 2, EulerStepPC.sizeof, "euler_step")!!,
-        .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, ScaleShiftPC.sizeof, "scale_shift_clamp")!!,
+        .ddim_step        = llm::create_kernel(ctx, shader, 2, pipelines::DdimStepPC.sizeof, "ddim_step")!!,
+        .euler_step       = llm::create_kernel(ctx, shader, 2, pipelines::EulerStepPC.sizeof, "euler_step")!!,
+        .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, pipelines::ScaleShiftPC.sizeof, "scale_shift_clamp")!!,
         .f16_to_f32       = llm::create_kernel(ctx, shader, 2, F16ToF32PC.sizeof, "f16_to_f32")!!,
-        .relu             = llm::create_kernel(ctx, shader, 1, ReluPC.sizeof, "relu")!!,
-        .tanh_clamp       = llm::create_kernel(ctx, shader, 1, TanhClampPC.sizeof, "tanh_clamp")!!,
+        .relu             = llm::create_kernel(ctx, shader, 1, pipelines::ReluPC.sizeof, "relu")!!,
+        .tanh_clamp       = llm::create_kernel(ctx, shader, 1, pipelines::TanhClampPC.sizeof, "tanh_clamp")!!,
         .shared           = llm::create_shared_kernels(ctx, shader)!!,
     };
 
@@ -377,7 +247,7 @@ fn DiffusionKernels? create_diffusion_kernels(llm::DeviceContext* ctx) {
     return kernels;
 }
 
-fn void DiffusionKernels.free(&self, vk::Device device) {
+fn void SDXSKernels.free(&self, vk::Device device) {
     self.conv2d.free(device);
     self.conv2d_q8.free(device);
     self.group_norm.free(device);
@@ -398,14 +268,16 @@ fn void DiffusionKernels.free(&self, vk::Device device) {
     self.shared.free(device);
 }
 
+// --- Dispatch helpers ---
+
 fn void dispatch_conv2d(
     vk::CommandBuffer cmd,
-    DiffusionKernels* k,
+    SDXSKernels* k,
     llm::Tensor* weight,
     llm::Tensor* bias,
     llm::Tensor* input,
     llm::Tensor* output,
-    Conv2dPC* pc
+    pipelines::Conv2dPC* pc
 ) {
     llm::ComputeKernel* kernel;
     if (weight.dtype == llm::GGML_Q8_0) {
@@ -422,7 +294,7 @@ fn void dispatch_conv2d(
 
 fn void dispatch_batched_matmul_auto(
     vk::CommandBuffer cmd,
-    DiffusionKernels* k,
+    SDXSKernels* k,
     llm::Tensor* weight,
     llm::Tensor* input,
     llm::Tensor* output,
@@ -440,3 +312,44 @@ fn void dispatch_batched_matmul_auto(
         pc, llm::ceil_div(pc.m_dim, 16), llm::ceil_div(pc.n_dim, 16));
 }
 
+// --- Scheduler dispatch helpers ---
+
+fn void dispatch_ddim_step(
+    vk::CommandBuffer cmd,
+    SDXSKernels* k,
+    llm::Tensor* noisy,
+    llm::Tensor* predicted_noise,
+    uint n_elements,
+    float alpha_t,
+    float alpha_prev
+) {
+    pipelines::DdimStepPC pc = {
+        .n = n_elements,
+        .sqrt_alpha_t = math::sqrt(alpha_t),
+        .sqrt_one_minus_alpha_t = math::sqrt(1.0f - alpha_t),
+        .sqrt_alpha_prev = math::sqrt(alpha_prev),
+        .sqrt_one_minus_alpha_prev = math::sqrt(1.0f - alpha_prev),
+    };
+    llm::dispatch_kernel(cmd, &k.ddim_step,
+        { noisy.gpu_buffer.buffer, predicted_noise.gpu_buffer.buffer },
+        { noisy.size_bytes, predicted_noise.size_bytes },
+        &pc, llm::ceil_div(n_elements, 256));
+}
+
+fn void dispatch_euler_step(
+    vk::CommandBuffer cmd,
+    SDXSKernels* k,
+    llm::Tensor* noisy,
+    llm::Tensor* predicted_noise,
+    uint n_elements,
+    float dt
+) {
+    pipelines::EulerStepPC pc = {
+        .n = n_elements,
+        .dt = dt,
+    };
+    llm::dispatch_kernel(cmd, &k.euler_step,
+        { noisy.gpu_buffer.buffer, predicted_noise.gpu_buffer.buffer },
+        { noisy.size_bytes, predicted_noise.size_bytes },
+        &pc, llm::ceil_div(n_elements, 256));
+}
