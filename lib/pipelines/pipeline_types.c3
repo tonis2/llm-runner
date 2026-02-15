@@ -9,8 +9,7 @@ import image::png;
 import llm;
 
 // Fault definitions for pipeline errors
-faultdef PIPELINE_LOAD_FAILED,
-         PIPELINE_DEVICE_ERROR,
+faultdef PIPELINE_DEVICE_ERROR,
          PIPELINE_GENERATION_FAILED,
          PIPELINE_INVALID_INPUT,
          PIPELINE_NOT_INITIALIZED;
@@ -18,14 +17,12 @@ faultdef PIPELINE_LOAD_FAILED,
 // --- Pluggable Pipeline Interface ---
 // Diffusers implement this interface. The engine delegates to the active impl.
 
-alias CanHandleFn = fn bool(llm::GGUFFile* gf);
 alias LoadFn = fn void?(void* data, llm::DeviceContext* ctx, String model_path, PipelineOptions* opts);
 alias GenerateFn = fn image::Image?(void* data, llm::DeviceContext* ctx, GenerationInputs* inputs);
 alias FreeFn = fn void(void* data);
 
 struct PipelineImpl {
     void* data;                // Opaque pointer to diffuser state
-    CanHandleFn can_handle;    // Can this diffuser handle this model file?
     LoadFn load;               // Load model weights to GPU
     GenerateFn generate;       // Generate image from inputs
     FreeFn free_fn;            // Free all GPU resources
@@ -83,46 +80,3 @@ fn bool GenerationInputs.validate(GenerationInputs* self) {
     return true;
 }
 
-// --- Pipeline Registry ---
-// Engine maintains a list of registered pipeline implementations.
-// detect_pipeline() tries each until one returns can_handle=true.
-
-const MAX_PIPELINES = 8;
-
-struct PipelineRegistry {
-    PipelineImpl[MAX_PIPELINES] impls;
-    uint count;
-}
-
-fn void PipelineRegistry.register(PipelineRegistry* self, PipelineImpl impl) {
-    if (self.count < MAX_PIPELINES) {
-        self.impls[self.count] = impl;
-        self.count++;
-    }
-}
-
-fn PipelineImpl? PipelineRegistry.detect(PipelineRegistry* self, llm::GGUFFile* gf) {
-    for (uint i = 0; i < self.count; i++) {
-        if (self.impls[i].can_handle(gf)) {
-            return self.impls[i];
-        }
-    }
-    return PIPELINE_LOAD_FAILED~;
-}
-
-// Global registry
-PipelineRegistry g_registry;
-
-fn void register_pipeline(PipelineImpl impl) {
-    g_registry.register(impl);
-}
-
-fn PipelineImpl? detect_pipeline(String model_path) {
-    mmap::FileMmap mm = file::mmap_open(model_path, "rb")!!;
-    char[] data = mm.bytes();
-    llm::GGUFFile gf = llm::gguf_parse(data)!!;
-    defer gf.free();
-    defer mm.destroy();
-
-    return g_registry.detect(&gf);
-}

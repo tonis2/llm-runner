@@ -24,18 +24,6 @@ struct SDXSState {
     llm::DeviceContext* ctx;
 }
 
-fn bool sdxs_can_handle(llm::GGUFFile* gf) {
-    // SDXS model: detected by tensor prefix patterns
-    foreach (&t : gf.tensors) {
-        if (t.name.starts_with("cond_stage_model.") ||
-            t.name.starts_with("model.diffusion_model.") ||
-            t.name.starts_with("first_stage_model.")) {
-            return true;
-        }
-    }
-    return false;
-}
-
 fn void? sdxs_load(void* data, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) {
     SDXSState* state = (SDXSState*)data;
     state.ctx = ctx;
@@ -316,7 +304,6 @@ fn llm::pipelines::PipelineImpl create_pipeline() {
     *state = {};
     return {
         .data = state,
-        .can_handle = &sdxs_can_handle,
         .load = &sdxs_load,
         .generate = &sdxs_generate,
         .free_fn = &sdxs_free,

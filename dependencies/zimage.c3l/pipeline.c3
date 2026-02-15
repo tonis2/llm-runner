@@ -21,21 +21,6 @@ struct ZImageState {
     String taesd_path;
 }
 
-fn bool zimage_can_handle(llm::GGUFFile* gf) {
-    // Check for DiT/Lumina2 model
-    if (try arch = gf.get_string("general.architecture")) {
-        if (arch == "lumina2") return true;
-    }
-    foreach (&t : gf.tensors) {
-        if (t.name.starts_with("noise_refiner.") ||
-            t.name.starts_with("context_refiner.") ||
-            t.name.starts_with("x_pad_token")) {
-            return true;
-        }
-    }
-    return false;
-}
-
 fn void? zimage_load(void* data, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) {
     ZImageState* state = (ZImageState*)data;
     state.loaded = true;
@@ -691,7 +676,6 @@ fn llm::pipelines::PipelineImpl create_pipeline() {
     *state = {};
     return {
         .data = state,
-        .can_handle = &zimage_can_handle,
         .load = &zimage_load,
         .generate = &zimage_generate,
         .free_fn = &zimage_free,

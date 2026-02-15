@@ -2,7 +2,7 @@
   "langrev": "1",
   "warnings": [ "no-unused" ],
   "dependency-search-paths": [ "dependencies" ],
-  "dependencies": ["vk", "image", "llm_text", "zimage", "sdxs"],
+  "dependencies": ["vk", "image", "llm_text", "zimage"],
   "linked-libraries": ["vulkan"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",

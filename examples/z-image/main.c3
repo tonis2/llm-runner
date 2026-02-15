@@ -7,7 +7,6 @@ import image::png;
 import llm;
 import llm::pipelines;
 import zimage;
-import sdxs;
 
 fn int main(String[] args) {
     // Parse arguments
@@ -15,10 +14,6 @@ fn int main(String[] args) {
 
     io::printfn("Loading model from: %s", config.model_path);
     io::printfn("Prompt: %s", config.prompt);
-
-    // Register available diffusers
-    pipelines::register_pipeline(zimage::create_pipeline());
-    pipelines::register_pipeline(sdxs::create_pipeline());
 
     // Setup Vulkan context
     llm::DeviceContext ctx = llm::createContext()!!;
@@ -31,8 +26,8 @@ fn int main(String[] args) {
         .taesd_path = config.taesd_path,
     };
 
-    // Create pipeline (auto-detects model type from GGUF)
-    ImagePipeline pipeline = pipelines::create_image_pipeline(&ctx, config.model_path, &opts)!!;
+    // Create pipeline
+    ImagePipeline pipeline = pipelines::create_image_pipeline(&ctx, zimage::create_pipeline(), config.model_path, &opts)!!;
     defer pipeline.free();
 
     // Prepare inputs

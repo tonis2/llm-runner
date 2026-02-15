@@ -13,10 +13,8 @@ import llm;
 
 // ImagePipeline: Thin wrapper around PipelineImpl
 // Usage:
-//   register_pipeline(zimage::create_pipeline());
-//   register_pipeline(sdxs::create_pipeline());
-//
-//   ImagePipeline pipeline = create_image_pipeline(&ctx, "model.gguf", &opts)!!;
+//   PipelineImpl impl = zimage::create_pipeline();
+//   ImagePipeline pipeline = create_image_pipeline(&ctx, impl, "model.gguf", &opts)!!;
 //   image::Image output = pipeline.generate(&inputs)!!;
 //   pipeline.free();
 
@@ -26,21 +24,7 @@ struct ImagePipeline {
     bool loaded;
 }
 
-fn ImagePipeline? create_image_pipeline(llm::DeviceContext* ctx, String model_path, PipelineOptions* opts) {
-    // Auto-detect pipeline from model file
-    PipelineImpl impl = detect_pipeline(model_path)!!;
-
-    // Load the model
-    impl.load(impl.data, ctx, model_path, opts)!!;
-
-    return {
-        .ctx = ctx,
-        .impl = impl,
-        .loaded = true,
-    };
-}
-
-fn ImagePipeline? create_image_pipeline_with_impl(llm::DeviceContext* ctx, PipelineImpl impl, String model_path, PipelineOptions* opts) {
+fn ImagePipeline? create_image_pipeline(llm::DeviceContext* ctx, PipelineImpl impl, String model_path, PipelineOptions* opts) {
     impl.load(impl.data, ctx, model_path, opts)!!;
 
     return {
