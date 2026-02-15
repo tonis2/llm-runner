@@ -286,7 +286,7 @@ fn DiffusionKernels? create_diffusion_kernels(DeviceContext* ctx) {
         .build(ctx.device)!!;
 
     // Also create shared kernels from the LLM shader (for silu, gelu, layernorm, etc.)
-    char[] llm_spv = &LLM_SPV;
+    char[] llm_spv = &llm::diffusers::LLM_SPV;
     ShaderModule llm_shader = vk::shaderModuleCreateInfo()
         .setCodeSize(llm_spv.len)
         .setCode((uint*)&llm_spv[0])

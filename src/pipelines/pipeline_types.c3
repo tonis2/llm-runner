@@ -1,4 +1,4 @@
-module llm::pipeline;
+module llm::pipelines;
 
 import vk;
 import std::io;

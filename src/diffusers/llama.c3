@@ -1,6 +1,7 @@
-module llm;
+module llm::diffusers;
 
 import vk;
+import llm;
 import std::io;
 import std::math;
 import std::core::mem;
@@ -99,12 +100,12 @@ struct ElemwisePC { uint n; }
 
 fn Tensor load_tensor_by_name(DeviceContext* ctx, GGUFFile* gf, String name) {
     GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return upload_weight(ctx, info, gf.tensor_data_base)!!;
+    return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
 }
 
 fn Tensor load_tensor_as_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
     GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
+    return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
 }
 
 fn LlmWeights? load_llm_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* config, WeightNames* names, bool encode_only = false) {
@@ -138,7 +139,7 @@ fn LlmWeights? load_llm_weights(DeviceContext* ctx, GGUFFile* gf, ModelConfig* c
     if (encode_only) {
         io::printfn("  Skipping output weight (encode_only)");
     } else if (try output_info = gf.find_tensor(names.output)) {
-        output_weight = upload_weight(ctx, output_info, gf.tensor_data_base)!!;
+        output_weight = llm::upload_weight(ctx, output_info, gf.tensor_data_base)!!;
     } else {
         // Tied weights - use embedding
         output_weight = token_embedding;
@@ -208,7 +209,7 @@ fn Tensor load_layer_tensor(DeviceContext* ctx, GGUFFile* gf, String prefix, uin
     String name = (String)buf[0..len - 1];
 
     GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return upload_weight(ctx, info, gf.tensor_data_base)!!;
+    return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
 }
 
 fn usz format_layer_name(char[64]* buf, String prefix, uint layer, String suffix) {
@@ -312,21 +313,21 @@ fn LlmActivations? allocate_llm_activations(DeviceContext* ctx, ModelConfig* con
     Tensor logits;
     if (!encode_only) {
         ulong[4] vocab_shape = { (ulong)config.vocab_size, 0, 0, 0 };
-        logits = create_f32_tensor(ctx, vocab_shape, 1)!!;
+        logits = llm::create_f32_tensor(ctx, vocab_shape, 1)!!;
     }
 
     return {
-        .hidden = create_f32_tensor(ctx, dim_shape, 1)!!,
-        .norm_out = create_f32_tensor(ctx, dim_shape, 1)!!,
-        .q = create_f32_tensor(ctx, qkv_shape, 1)!!,
-        .k = create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
-        .v = create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
-        .attn_out = create_f32_tensor(ctx, dim_shape, 1)!!,
-        .ffn_gate_out = create_f32_tensor(ctx, ffn_shape, 1)!!,
-        .ffn_up_out = create_f32_tensor(ctx, ffn_shape, 1)!!,
-        .ffn_down_out = create_f32_tensor(ctx, dim_shape, 1)!!,
+        .hidden = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
+        .norm_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
+        .q = llm::create_f32_tensor(ctx, qkv_shape, 1)!!,
+        .k = llm::create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
+        .v = llm::create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
+        .attn_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
+        .ffn_gate_out = llm::create_f32_tensor(ctx, ffn_shape, 1)!!,
+        .ffn_up_out = llm::create_f32_tensor(ctx, ffn_shape, 1)!!,
+        .ffn_down_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
         .logits = logits,
-        .attn_scores = create_f32_tensor(ctx, scores_shape, 1)!!,
+        .attn_scores = llm::create_f32_tensor(ctx, scores_shape, 1)!!,
     };
 }
 
@@ -340,8 +341,8 @@ fn KVCache? allocate_kv_cache(DeviceContext* ctx, ModelConfig* config, uint max_
     ulong[4] cache_shape = { cache_size, 0, 0, 0 };
 
     for (uint l = 0; l < config.n_layers; l++) {
-        k_cache[l] = create_f32_tensor(ctx, cache_shape, 1)!!;
-        v_cache[l] = create_f32_tensor(ctx, cache_shape, 1)!!;
+        k_cache[l] = llm::create_f32_tensor(ctx, cache_shape, 1)!!;
+        v_cache[l] = llm::create_f32_tensor(ctx, cache_shape, 1)!!;
     }
 
     return {
@@ -359,10 +360,10 @@ fn LlmKernels? create_llm_kernels(DeviceContext* ctx) {
         .build(ctx.device)!!;
 
     LlmKernels kernels = {
-        .embedding    = create_kernel(ctx, shader, 2, EmbeddingPC.sizeof, "embedding")!!,
-        .rope         = create_kernel(ctx, shader, 1, RoPEPC.sizeof, "rope")!!,
-        .attention    = create_kernel(ctx, shader, 5, AttentionPC.sizeof, "attention")!!,
-        .shared       = create_shared_kernels(ctx, shader)!!,
+        .embedding    = llm::create_kernel(ctx, shader, 2, EmbeddingPC.sizeof, "embedding")!!,
+        .rope         = llm::create_kernel(ctx, shader, 1, RoPEPC.sizeof, "rope")!!,
+        .attention    = llm::create_kernel(ctx, shader, 5, AttentionPC.sizeof, "attention")!!,
+        .shared       = llm::create_shared_kernels(ctx, shader)!!,
     };
 
     shader.free(ctx.device);
@@ -417,25 +418,25 @@ fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint
     // Norm(hidden, attn_norm) -> norm_out
     if (c.norm_type == RMSNORM) {
         RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &sk.rmsnorm,
+llm::dispatch_kernel(cmd, &sk.rmsnorm,
             { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.attn_norm.size_bytes, a.norm_out.size_bytes },
             &rms_pc, 1);
     } else {
         LayerNormPC ln_pc = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &sk.layernorm,
+llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, lw.attn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.attn_norm.size_bytes, lw.attn_norm_bias.size_bytes, a.norm_out.size_bytes },
             &ln_pc, 1);
     }
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Q/K/V projections
     uint kv_dim = c.n_kv_heads * c.head_dim;
-    dispatch_matmul(cmd, sk, &lw.wq, &a.norm_out, &a.q, c.dim, c.dim);
-    dispatch_matmul(cmd, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
-    dispatch_matmul(cmd, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
-    compute_barrier(cmd);
+llm::dispatch_matmul(cmd, sk, &lw.wq, &a.norm_out, &a.q, c.dim, c.dim);
+llm::dispatch_matmul(cmd, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
+llm::dispatch_matmul(cmd, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
+llm::compute_barrier(cmd);
 
     // Q/K norm (per-head RMSNorm, e.g. Qwen3)
     if (lw.wq_norm.size_bytes > 0) {
@@ -443,47 +444,47 @@ fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint
             usz h_off = (usz)h * c.head_dim * 4;
             vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
             RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
-            dispatch_kernel(cmd, &sk.rmsnorm,
+llm::dispatch_kernel(cmd, &sk.rmsnorm,
                 { a.norm_out.gpu_buffer.buffer, lw.wq_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
                 { (usz)c.head_dim * 4, lw.wq_norm.size_bytes, (usz)c.head_dim * 4 },
                 &qn_pc, 1);
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
             vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
         }
         for (uint h = 0; h < c.n_kv_heads; h++) {
             usz h_off = (usz)h * c.head_dim * 4;
             vk::cmdCopyBuffer(cmd, a.k.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
             RMSNormPC kn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
-            dispatch_kernel(cmd, &sk.rmsnorm,
+llm::dispatch_kernel(cmd, &sk.rmsnorm,
                 { a.norm_out.gpu_buffer.buffer, lw.wk_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
                 { (usz)c.head_dim * 4, lw.wk_norm.size_bytes, (usz)c.head_dim * 4 },
                 &kn_pc, 1);
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
             vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
         }
     }
 
     // RoPE on Q and K
     RoPEPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .position = position, .theta = c.rope_theta };
-    dispatch_kernel(cmd, &k.rope,
+llm::dispatch_kernel(cmd, &k.rope,
         { a.q.gpu_buffer.buffer },
         { a.q.size_bytes },
-        &rope_q_pc, ceil_div(c.n_heads * (c.head_dim / 2), 128));
+        &rope_q_pc, llm::ceil_div(c.n_heads * (c.head_dim / 2), 128));
 
     RoPEPC rope_k_pc = { .dim = c.head_dim, .n_heads = c.n_kv_heads, .position = position, .theta = c.rope_theta };
-    dispatch_kernel(cmd, &k.rope,
+llm::dispatch_kernel(cmd, &k.rope,
         { a.k.gpu_buffer.buffer },
         { a.k.size_bytes },
-        &rope_k_pc, ceil_div(c.n_kv_heads * (c.head_dim / 2), 128));
-    compute_barrier(cmd);
+        &rope_k_pc, llm::ceil_div(c.n_kv_heads * (c.head_dim / 2), 128));
+llm::compute_barrier(cmd);
 
     // Copy K, V into KV cache at position
     usz kv_head_bytes = (usz)c.head_dim * 4;
@@ -496,7 +497,7 @@ fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint
         vk::cmdCopyBuffer(cmd, a.v.gpu_buffer.buffer, kv.v_cache[layer].gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = kv_head_bytes }});
     }
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Attention
     uint seq_len = position + 1;
@@ -508,84 +509,84 @@ fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint
         .scale = 1.0f / std::math::sqrt((float)c.head_dim),
         .max_seq_len = self.max_seq_len,
     };
-    dispatch_kernel(cmd, &k.attention,
+llm::dispatch_kernel(cmd, &k.attention,
         { a.q.gpu_buffer.buffer, kv.k_cache[layer].gpu_buffer.buffer, kv.v_cache[layer].gpu_buffer.buffer,
           a.attn_scores.gpu_buffer.buffer, a.attn_out.gpu_buffer.buffer },
         { a.q.size_bytes, kv.k_cache[layer].size_bytes, kv.v_cache[layer].size_bytes,
           a.attn_scores.size_bytes, a.attn_out.size_bytes },
         &attn_pc, c.n_heads);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Output projection
-    dispatch_matmul(cmd, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
-    compute_barrier(cmd);
+llm::dispatch_matmul(cmd, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
+llm::compute_barrier(cmd);
 
     // Residual add: hidden += attn_output
     ResidualPC res_pc = { .n = c.dim };
-    dispatch_kernel(cmd, &sk.residual_add,
+llm::dispatch_kernel(cmd, &sk.residual_add,
         { a.hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
         { a.hidden.size_bytes, a.norm_out.size_bytes },
-        &res_pc, ceil_div(c.dim, 256));
-    compute_barrier(cmd);
+        &res_pc, llm::ceil_div(c.dim, 256));
+llm::compute_barrier(cmd);
 
     // Norm for FFN
     if (c.norm_type == RMSNORM) {
         RMSNormPC rms_pc2 = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &sk.rmsnorm,
+llm::dispatch_kernel(cmd, &sk.rmsnorm,
             { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.ffn_norm.size_bytes, a.norm_out.size_bytes },
             &rms_pc2, 1);
     } else {
         LayerNormPC ln_pc2 = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &sk.layernorm,
+llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, lw.ffn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, lw.ffn_norm.size_bytes, lw.ffn_norm_bias.size_bytes, a.norm_out.size_bytes },
             &ln_pc2, 1);
     }
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // FFN
     if (c.ffn_type == SWIGLU) {
-        dispatch_matmul(cmd, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
-        dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
-        compute_barrier(cmd);
+llm::dispatch_matmul(cmd, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
+llm::dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
+llm::compute_barrier(cmd);
 
         SiluPC silu_pc = { .n = c.ffn_dim };
-        dispatch_kernel(cmd, &sk.silu,
+llm::dispatch_kernel(cmd, &sk.silu,
             { a.ffn_gate_out.gpu_buffer.buffer },
             { a.ffn_gate_out.size_bytes },
-            &silu_pc, ceil_div(c.ffn_dim, 256));
-        compute_barrier(cmd);
+            &silu_pc, llm::ceil_div(c.ffn_dim, 256));
+llm::compute_barrier(cmd);
 
         ElemwisePC emul_pc = { .n = c.ffn_dim };
-        dispatch_kernel(cmd, &sk.elemwise_mul,
+llm::dispatch_kernel(cmd, &sk.elemwise_mul,
             { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
             { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
-            &emul_pc, ceil_div(c.ffn_dim, 256));
-        compute_barrier(cmd);
+            &emul_pc, llm::ceil_div(c.ffn_dim, 256));
+llm::compute_barrier(cmd);
 
-        dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+llm::dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
     } else {
-        dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
-        compute_barrier(cmd);
+llm::dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
+llm::compute_barrier(cmd);
 
         GeluPC gelu_pc = { .n = c.ffn_dim };
-        dispatch_kernel(cmd, &sk.gelu,
+llm::dispatch_kernel(cmd, &sk.gelu,
             { a.ffn_up_out.gpu_buffer.buffer },
             { a.ffn_up_out.size_bytes },
-            &gelu_pc, ceil_div(c.ffn_dim, 256));
-        compute_barrier(cmd);
+            &gelu_pc, llm::ceil_div(c.ffn_dim, 256));
+llm::compute_barrier(cmd);
 
-        dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_up_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+llm::dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_up_out, &a.ffn_down_out, c.dim, c.ffn_dim);
     }
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Residual add: hidden += ffn_down_out
-    dispatch_kernel(cmd, &sk.residual_add,
+llm::dispatch_kernel(cmd, &sk.residual_add,
         { a.hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
         { a.hidden.size_bytes, a.ffn_down_out.size_bytes },
-        &res_pc, ceil_div(c.dim, 256));
-    compute_barrier(cmd);
+        &res_pc, llm::ceil_div(c.dim, 256));
+llm::compute_barrier(cmd);
 }
 
 fn void? LlmModel.forward(&self, uint token, uint position) {
@@ -602,7 +603,7 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
     if (self.encode_only) {
         // CPU-side dequant: dequant one row, upload via staging buffer
         float* staging_ptr = (float*)self.embedding_staging.data();
-        dequant_embedding_row(w.embedding_data, &w.embedding_info, token, staging_ptr, c.dim);
+        llm::dequant_embedding_row(w.embedding_data, &w.embedding_info, token, staging_ptr, c.dim);
 
         // Copy staging -> hidden on GPU
         ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer emb_cmd) {
@@ -611,15 +612,15 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
         }!!;
     }
 
-    begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
 
     if (!self.encode_only) {
         EmbeddingPC emb_pc = { .token_id = token, .dim = c.dim };
-        dispatch_kernel(cmd, &k.embedding,
+llm::dispatch_kernel(cmd, &k.embedding,
             { w.token_embedding.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
             { w.token_embedding.size_bytes, a.hidden.size_bytes },
-            &emb_pc, ceil_div(c.dim, 256));
-        compute_barrier(cmd);
+            &emb_pc, llm::ceil_div(c.dim, 256));
+llm::compute_barrier(cmd);
     }
 
     // 2. For each transformer layer
@@ -630,26 +631,26 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
     // 3. Final norm
     if (c.norm_type == RMSNORM) {
         RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &sk.rmsnorm,
+llm::dispatch_kernel(cmd, &sk.rmsnorm,
             { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, w.output_norm.size_bytes, a.norm_out.size_bytes },
             &final_rms, 1);
     } else {
         LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
-        dispatch_kernel(cmd, &sk.layernorm,
+llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, w.output_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, w.output_norm.size_bytes, w.output_norm_bias.size_bytes, a.norm_out.size_bytes },
             &final_ln, 1);
     }
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // 4. Output projection -> logits (skip in encode_only mode)
     if (!self.encode_only) {
-        dispatch_matmul(cmd, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
+llm::dispatch_matmul(cmd, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
     }
 
     // 5. Submit and wait
-    submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
 }
 
 // Encode text: run forward pass for each token, extract post-final-norm hidden states.
@@ -665,7 +666,7 @@ fn Tensor? LlmModel.encode_text(&self, uint[] tokens) {
 
     // Allocate output buffer: [seq_len, dim]
     ulong[4] out_shape = { (ulong)tokens.len, (ulong)c.dim, 0, 0 };
-    Tensor text_embeddings = create_f32_tensor(ctx, { (ulong)tokens.len * c.dim, 0, 0, 0 }, 1)!!;
+    Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)tokens.len * c.dim, 0, 0, 0 }, 1)!!;
 
     // Process BOS + each token
     self.forward(tokens[0], 0)!!;
@@ -701,12 +702,12 @@ fn Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
     uint seq_len = (uint)tokens.len;
 
     // Allocate intermediate hidden states: [seq_len, dim]
-    Tensor hidden_states = create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+    Tensor hidden_states = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
 
     // 1. Embed all tokens into hidden_states via CPU dequant
     for (uint pos = 0; pos < seq_len; pos++) {
         float* staging_ptr = (float*)self.embedding_staging.data();
-        dequant_embedding_row(self.weights.embedding_data, &self.weights.embedding_info, tokens[pos], staging_ptr, c.dim);
+        llm::dequant_embedding_row(self.weights.embedding_data, &self.weights.embedding_info, tokens[pos], staging_ptr, c.dim);
 
         ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer emb_cmd) {
             vk::cmdCopyBuffer(emb_cmd, self.embedding_staging.buffer, hidden_states.gpu_buffer.buffer, 1,
@@ -721,12 +722,12 @@ fn Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
         LayerWeights lw = load_single_layer(ctx, self.gf, self.names, c, l)!!;
 
         // Process all positions through this layer
-        begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
         for (uint pos = 0; pos < seq_len; pos++) {
             // Copy hidden_states[pos] → acts.hidden
             vk::cmdCopyBuffer(cmd, hidden_states.gpu_buffer.buffer, self.acts.hidden.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = (ulong)pos * c.dim * 4, .dstOffset = 0, .size = (ulong)c.dim * 4 }});
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
             // Process layer
             self.forward_layer(cmd, &lw, l, pos)!!;
@@ -734,9 +735,9 @@ fn Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
             // Copy acts.hidden → hidden_states[pos]
             vk::cmdCopyBuffer(cmd, self.acts.hidden.gpu_buffer.buffer, hidden_states.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
-            compute_barrier(cmd);
+llm::compute_barrier(cmd);
         }
-        submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
 
         // Free this layer's weights (space reused for next layer)
         free_layer_weights(&lw, c);
@@ -747,37 +748,37 @@ fn Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
     }
 
     // 3. Apply final norm to each position, build output
-    Tensor text_embeddings = create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+    Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
 
-    begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
     for (uint pos = 0; pos < seq_len; pos++) {
         // Copy hidden_states[pos] → acts.hidden
         vk::cmdCopyBuffer(cmd, hidden_states.gpu_buffer.buffer, self.acts.hidden.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = (ulong)pos * c.dim * 4, .dstOffset = 0, .size = (ulong)c.dim * 4 }});
-        compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
         // Final norm
         if (c.norm_type == RMSNORM) {
             RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
-            dispatch_kernel(cmd, &self.kernels.shared.rmsnorm,
+llm::dispatch_kernel(cmd, &self.kernels.shared.rmsnorm,
                 { self.acts.hidden.gpu_buffer.buffer, self.weights.output_norm.gpu_buffer.buffer, self.acts.norm_out.gpu_buffer.buffer },
                 { self.acts.hidden.size_bytes, self.weights.output_norm.size_bytes, self.acts.norm_out.size_bytes },
                 &final_rms, 1);
         } else {
             LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
-            dispatch_kernel(cmd, &self.kernels.shared.layernorm,
+llm::dispatch_kernel(cmd, &self.kernels.shared.layernorm,
                 { self.acts.hidden.gpu_buffer.buffer, self.weights.output_norm.gpu_buffer.buffer, self.weights.output_norm_bias.gpu_buffer.buffer, self.acts.norm_out.gpu_buffer.buffer },
                 { self.acts.hidden.size_bytes, self.weights.output_norm.size_bytes, self.weights.output_norm_bias.size_bytes, self.acts.norm_out.size_bytes },
                 &final_ln, 1);
         }
-        compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
         // Copy norm_out → text_embeddings[pos]
         vk::cmdCopyBuffer(cmd, self.acts.norm_out.gpu_buffer.buffer, text_embeddings.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
-        compute_barrier(cmd);
+llm::compute_barrier(cmd);
     }
-    submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
 
     hidden_states.free();
 

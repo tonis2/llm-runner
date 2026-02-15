@@ -5,8 +5,8 @@ import vk;
 import image;
 import image::png;
 import llm::args;
-import llm::pipeline;
-import llm::zimage;
+import llm::pipelines;
+import llm::diffusers;
 
 fn int main(String[] args) {
     // Parse arguments
@@ -20,9 +20,9 @@ fn int main(String[] args) {
     defer ctx.free();
     
     // Load pipeline (PyTorch-style)
-    ZImagePipeline pipeline = llm::zimage::zimage_pipeline_from_gguf(&ctx, config.model_path)!!;
+    llm::pipelines::ZImagePipeline pipeline = llm::pipelines::zimage_pipeline_from_gguf(&ctx, config.model_path)!!;
     defer pipeline.free();
-    
+
     // Configure pipeline
     if (config.text_model_path.len > 0) {
         pipeline.set_text_encoder(config.text_model_path);
@@ -33,9 +33,9 @@ fn int main(String[] args) {
     if (config.taesd_path.len > 0) {
         pipeline.set_taesd(config.taesd_path);
     }
-    
+
     // Prepare inputs
-    ZImageInputs inputs = pipeline::zimage_inputs_defaults();
+    llm::pipelines::ZImageInputs inputs = llm::pipelines::zimage_inputs_defaults();
     inputs.prompt = config.prompt;
     inputs.image_size = config.image_size;
     inputs.num_steps = config.num_steps;

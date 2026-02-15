@@ -1,6 +1,7 @@
-module llm;
+module llm::diffusers;
 
 import vk;
+import llm;
 import std::io;
 import std::core::mem;
 
@@ -57,11 +58,11 @@ struct TAESDActivations {
 // --- Loading ---
 
 fn Tensor load_taesd_tensor(DeviceContext* ctx, SafetensorsFile* sf, String name) {
-    return upload_safetensor_f32(ctx, sf, name)!!;
+    return llm::upload_safetensor_f32(ctx, sf, name)!!;
 }
 
 fn Tensor load_taesd_conv_weight(DeviceContext* ctx, SafetensorsFile* sf, String name) {
-    return upload_safetensor_conv_f32(ctx, sf, name)!!;
+    return llm::upload_safetensor_conv_f32(ctx, sf, name)!!;
 }
 
 fn TAESDConv load_taesd_conv(DeviceContext* ctx, SafetensorsFile* sf, String prefix, uint in_c, uint out_c, bool has_bias) {
@@ -181,9 +182,9 @@ fn TAESDActivations? allocate_taesd_activations(DeviceContext* ctx, uint max_img
     ulong max_elems = (ulong)TAESD_CHANNELS * max_img_size * max_img_size;
     ulong[4] shape = { max_elems, 0, 0, 0 };
     return {
-        .buf_a = create_f32_tensor(ctx, shape, 1)!!,
-        .buf_b = create_f32_tensor(ctx, shape, 1)!!,
-        .buf_c = create_f32_tensor(ctx, shape, 1)!!,
+        .buf_a = llm::create_f32_tensor(ctx, shape, 1)!!,
+        .buf_b = llm::create_f32_tensor(ctx, shape, 1)!!,
+        .buf_c = llm::create_f32_tensor(ctx, shape, 1)!!,
     };
 }
 
@@ -211,15 +212,15 @@ fn void dispatch_taesd_conv(
         .out_w = w,
         .has_bias = conv.has_bias ? 1 : 0,
     };
-    dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
+	llm::dispatch_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
 }
 
 fn void dispatch_taesd_relu(CommandBuffer cmd, DiffusionKernels* k, Tensor* buf, uint n) {
     ReluPC pc = { .n = n };
-    dispatch_kernel(cmd, &k.relu,
+llm::dispatch_kernel(cmd, &k.relu,
         { buf.gpu_buffer.buffer },
         { buf.size_bytes },
-        &pc, ceil_div(n, 256));
+        &pc, llm::ceil_div(n, 256));
 }
 
 // TAEBlock: conv.0 → relu → conv.2 → relu → conv.4 → residual_add → relu
@@ -240,35 +241,35 @@ fn void dispatch_taesd_block(
 
     // conv.0: input → temp1
     dispatch_taesd_conv(cmd, k, &block.conv0, input, temp1, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // relu(temp1)
     dispatch_taesd_relu(cmd, k, temp1, n);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // conv.2: temp1 → temp2
     dispatch_taesd_conv(cmd, k, &block.conv2, temp1, temp2, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // relu(temp2)
     dispatch_taesd_relu(cmd, k, temp2, n);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // conv.4: temp2 → temp1
     dispatch_taesd_conv(cmd, k, &block.conv4, temp2, temp1, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // residual: temp1 += input
     ResidualPC res_pc = { .n = n };
-    dispatch_kernel(cmd, &k.shared.residual_add,
+llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { temp1.gpu_buffer.buffer, input.gpu_buffer.buffer },
         { temp1.size_bytes, input.size_bytes },
-        &res_pc, ceil_div(n, 256));
-    compute_barrier(cmd);
+        &res_pc, llm::ceil_div(n, 256));
+llm::compute_barrier(cmd);
 
     // relu(temp1)
     dispatch_taesd_relu(cmd, k, temp1, n);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 }
 
 // --- Full Forward Pass ---
@@ -283,24 +284,24 @@ fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint la
     uint h = lat_h;
     uint w = lat_w;
 
-    begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
 
     // tanh_clamp: z = tanh(z/3) * 3  (in-place on buf_a)
     uint latent_n = TAESD_Z_CHANNELS * h * w;
     TanhClampPC tc_pc = { .n = latent_n };
-    dispatch_kernel(cmd, &k.tanh_clamp,
+llm::dispatch_kernel(cmd, &k.tanh_clamp,
         { acts.buf_a.gpu_buffer.buffer },
         { acts.buf_a.size_bytes },
-        &tc_pc, ceil_div(latent_n, 256));
-    compute_barrier(cmd);
+        &tc_pc, llm::ceil_div(latent_n, 256));
+llm::compute_barrier(cmd);
 
     // Conv_in: buf_a(16ch) → buf_b(64ch)
     dispatch_taesd_conv(cmd, k, &self.conv_in, &acts.buf_a, &acts.buf_b, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ReLU(buf_b)
     dispatch_taesd_relu(cmd, k, &acts.buf_b, TAESD_CHANNELS * h * w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Stage 1: 3 TAEBlocks, alternating buffers
     // Block 0: buf_b → buf_a (temp=buf_c)
@@ -313,19 +314,19 @@ fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint la
 
     // Upsample 2x: buf_a → buf_b
     UpsamplePC up_pc = { .channels = TAESD_CHANNELS, .in_h = h, .in_w = w };
-    dispatch_kernel(cmd, &k.upsample_nearest,
+llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, ceil_div(TAESD_CHANNELS * h * w * 4, 256));
-    compute_barrier(cmd);
+        &up_pc, llm::ceil_div(TAESD_CHANNELS * h * w * 4, 256));
+llm::compute_barrier(cmd);
     h *= 2; w *= 2;
 
     // Post-upsample conv: buf_b → buf_a
     dispatch_taesd_conv(cmd, k, &self.up1_conv, &acts.buf_b, &acts.buf_a, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
+llm::submit_and_wait(ctx)!!;
+llm::begin_compute(cmd)!!;
 
     // Stage 2: 3 TAEBlocks
     dispatch_taesd_block(cmd, k, &self.stage2[0], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
@@ -335,19 +336,19 @@ fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint la
 
     // Upsample 2x: buf_b → buf_a
     up_pc = { .channels = TAESD_CHANNELS, .in_h = h, .in_w = w };
-    dispatch_kernel(cmd, &k.upsample_nearest,
+llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer },
         { acts.buf_b.size_bytes, acts.buf_a.size_bytes },
-        &up_pc, ceil_div(TAESD_CHANNELS * h * w * 4, 256));
-    compute_barrier(cmd);
+        &up_pc, llm::ceil_div(TAESD_CHANNELS * h * w * 4, 256));
+llm::compute_barrier(cmd);
     h *= 2; w *= 2;
 
     // Post-upsample conv: buf_a → buf_b
     dispatch_taesd_conv(cmd, k, &self.up2_conv, &acts.buf_a, &acts.buf_b, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
+llm::submit_and_wait(ctx)!!;
+llm::begin_compute(cmd)!!;
 
     // Stage 3: 3 TAEBlocks
     dispatch_taesd_block(cmd, k, &self.stage3[0], &acts.buf_b, &acts.buf_a, &acts.buf_c, h, w);
@@ -357,19 +358,19 @@ fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint la
 
     // Upsample 2x: buf_a → buf_b
     up_pc = { .channels = TAESD_CHANNELS, .in_h = h, .in_w = w };
-    dispatch_kernel(cmd, &k.upsample_nearest,
+llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, ceil_div(TAESD_CHANNELS * h * w * 4, 256));
-    compute_barrier(cmd);
+        &up_pc, llm::ceil_div(TAESD_CHANNELS * h * w * 4, 256));
+llm::compute_barrier(cmd);
     h *= 2; w *= 2;
 
     // Post-upsample conv: buf_b → buf_a
     dispatch_taesd_conv(cmd, k, &self.up3_conv, &acts.buf_b, &acts.buf_a, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
-    submit_and_wait(ctx)!!;
-    begin_compute(cmd)!!;
+llm::submit_and_wait(ctx)!!;
+llm::begin_compute(cmd)!!;
 
     // Final TAEBlock: buf_a → buf_b (temp=buf_c)
     dispatch_taesd_block(cmd, k, &self.final_block, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
@@ -377,22 +378,22 @@ fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint la
 
     // Conv_out: buf_b(64ch) → buf_a(3ch)
     dispatch_taesd_conv(cmd, k, &self.conv_out, &acts.buf_b, &acts.buf_a, h, w);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Clamp to [0, 1]: buf_a → buf_b → copy back to buf_a
     uint out_n = TAESD_OUT_CHANNELS * h * w;
     ScaleShiftPC ss_pc = { .n = out_n, .scale = 1.0f, .shift = 0.0f };
-    dispatch_kernel(cmd, &k.scale_shift_clamp,
+llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &ss_pc, ceil_div(out_n, 256));
-    compute_barrier(cmd);
+        &ss_pc, llm::ceil_div(out_n, 256));
+llm::compute_barrier(cmd);
 
     // Copy result to buf_a
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)out_n * 4 }});
 
-    submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
     // Image [3, h, w] is now in buf_a
 }
 

@@ -1,6 +1,7 @@
-module llm;
+module llm::diffusers;
 
 import vk;
+import llm;
 import std::io;
 import std::math;
 import std::core::mem;
@@ -170,15 +171,15 @@ fn ClipActivations? allocate_clip_activations(DeviceContext* ctx, ClipConfig* co
     ulong[4] scores_shape = { n_heads * seq * seq, 0, 0, 0 };
 
     return {
-        .hidden = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .norm_out = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .q = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .k = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .v = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .attn_out = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .ffn_out = create_f32_tensor(ctx, ffn_shape, 1)!!,
-        .ffn_down_out = create_f32_tensor(ctx, hidden_shape, 1)!!,
-        .scores = create_f32_tensor(ctx, scores_shape, 1)!!,
+        .hidden = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .norm_out = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .q = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .k = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .v = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .attn_out = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .ffn_out = llm::create_f32_tensor(ctx, ffn_shape, 1)!!,
+        .ffn_down_out = llm::create_f32_tensor(ctx, hidden_shape, 1)!!,
+        .scores = llm::create_f32_tensor(ctx, scores_shape, 1)!!,
     };
 }
 
@@ -210,7 +211,7 @@ fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
     uint dim = c.dim;         // 768
     uint ffn_dim = dim * 4;   // 3072
 
-    begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
 
     // 1. Token embedding + position embedding -> hidden
     // For each position: hidden[pos] = token_emb[token_id] + pos_emb[pos]
@@ -241,15 +242,15 @@ fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
         vk::cmdCopyBuffer(cmd, w.token_embedding.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = row_bytes }});
     }
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Add position embedding: hidden += position_embedding (element-wise, full seq*dim)
     ResidualPC res_pc = { .n = seq * dim };
-    dispatch_kernel(cmd, &sk.residual_add,
+llm::dispatch_kernel(cmd, &sk.residual_add,
         { a.hidden.gpu_buffer.buffer, w.position_embedding.gpu_buffer.buffer },
         { a.hidden.size_bytes, w.position_embedding.size_bytes },
-        &res_pc, ceil_div(seq * dim, 256));
-    compute_barrier(cmd);
+        &res_pc, llm::ceil_div(seq * dim, 256));
+llm::compute_barrier(cmd);
 
     // 2. For each transformer layer
     for (uint l = 0; l < c.n_layers; l++) {
@@ -264,42 +265,42 @@ fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
             // but with an offset. Since our layernorm operates on binding 0 from start,
             // we'd need to offset the buffer. For now, dispatch per position.
             // TODO: optimize with a batched layernorm
-            dispatch_kernel(cmd, &sk.layernorm,
+llm::dispatch_kernel(cmd, &sk.layernorm,
                 { a.hidden.gpu_buffer.buffer, lw.ln1_weight.gpu_buffer.buffer,
                   lw.ln1_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
                 { a.hidden.size_bytes, lw.ln1_weight.size_bytes,
                   lw.ln1_bias.size_bytes, a.norm_out.size_bytes },
                 &ln_pc, 1);
         }
-        compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
         // 2b. Q/K/V projections: batched matmul [77, 768] x [768, 768]^T -> [77, 768]
         // Weight is stored as [out_dim, in_dim], matmul is input * weight^T
         // output[seq, dim] = norm_out[seq, dim] x weight^T[dim, dim]
         BatchedMatMulPC qkv_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
-        dispatch_batched_matmul_auto(cmd, k, &lw.q_proj, &a.norm_out, &a.q, &qkv_pc);
-        dispatch_batched_matmul_auto(cmd, k, &lw.k_proj, &a.norm_out, &a.k, &qkv_pc);
-        dispatch_batched_matmul_auto(cmd, k, &lw.v_proj, &a.norm_out, &a.v, &qkv_pc);
-        compute_barrier(cmd);
+        llm::dispatch_batched_matmul_auto(cmd, k, &lw.q_proj, &a.norm_out, &a.q, &qkv_pc);
+        llm::dispatch_batched_matmul_auto(cmd, k, &lw.k_proj, &a.norm_out, &a.k, &qkv_pc);
+        llm::dispatch_batched_matmul_auto(cmd, k, &lw.v_proj, &a.norm_out, &a.v, &qkv_pc);
+llm::compute_barrier(cmd);
 
         // Add biases to Q, K, V
         ResidualPC bias_pc = { .n = seq * dim };
         // TODO: broadcast add bias[dim] across seq positions
         // For now we need a broadcast add for [seq, dim] += [dim]
         BroadcastAddPC ba_pc = { .channels = dim, .spatial = seq };
-        dispatch_kernel(cmd, &k.broadcast_add,
+llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.q.gpu_buffer.buffer, lw.q_proj_bias.gpu_buffer.buffer },
             { a.q.size_bytes, lw.q_proj_bias.size_bytes },
-            &ba_pc, ceil_div(seq * dim, 256));
-        dispatch_kernel(cmd, &k.broadcast_add,
+            &ba_pc, llm::ceil_div(seq * dim, 256));
+llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.k.gpu_buffer.buffer, lw.k_proj_bias.gpu_buffer.buffer },
             { a.k.size_bytes, lw.k_proj_bias.size_bytes },
-            &ba_pc, ceil_div(seq * dim, 256));
-        dispatch_kernel(cmd, &k.broadcast_add,
+            &ba_pc, llm::ceil_div(seq * dim, 256));
+llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.v.gpu_buffer.buffer, lw.v_proj_bias.gpu_buffer.buffer },
             { a.v.size_bytes, lw.v_proj_bias.size_bytes },
-            &ba_pc, ceil_div(seq * dim, 256));
-        compute_barrier(cmd);
+            &ba_pc, llm::ceil_div(seq * dim, 256));
+llm::compute_barrier(cmd);
 
         // 2c. Self-attention (non-causal)
         // Reshape Q/K/V from [seq, dim] to [n_heads, seq, head_dim]
@@ -311,90 +312,90 @@ fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
             .seq_len = seq,
             .scale = scale,
         };
-        dispatch_kernel(cmd, &k.spatial_attention,
+llm::dispatch_kernel(cmd, &k.spatial_attention,
             { a.q.gpu_buffer.buffer, a.k.gpu_buffer.buffer, a.v.gpu_buffer.buffer,
               a.scores.gpu_buffer.buffer, a.attn_out.gpu_buffer.buffer },
             { a.q.size_bytes, a.k.size_bytes, a.v.size_bytes,
               a.scores.size_bytes, a.attn_out.size_bytes },
             &sa_pc, c.n_heads * seq);
-        compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
         // 2d. Output projection
         BatchedMatMulPC out_pc = { .m_dim = seq, .n_dim = dim, .k_dim = dim };
-        dispatch_batched_matmul_auto(cmd, k, &lw.out_proj, &a.attn_out, &a.norm_out, &out_pc);
-        compute_barrier(cmd);
+        llm::dispatch_batched_matmul_auto(cmd, k, &lw.out_proj, &a.attn_out, &a.norm_out, &out_pc);
+llm::compute_barrier(cmd);
 
         // Add output projection bias
-        dispatch_kernel(cmd, &k.broadcast_add,
+llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.norm_out.gpu_buffer.buffer, lw.out_proj_bias.gpu_buffer.buffer },
             { a.norm_out.size_bytes, lw.out_proj_bias.size_bytes },
-            &ba_pc, ceil_div(seq * dim, 256));
-        compute_barrier(cmd);
+            &ba_pc, llm::ceil_div(seq * dim, 256));
+llm::compute_barrier(cmd);
 
         // 2e. Residual: hidden += attn_output
-        dispatch_kernel(cmd, &sk.residual_add,
+llm::dispatch_kernel(cmd, &sk.residual_add,
             { a.hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, a.norm_out.size_bytes },
-            &res_pc, ceil_div(seq * dim, 256));
-        compute_barrier(cmd);
+            &res_pc, llm::ceil_div(seq * dim, 256));
+llm::compute_barrier(cmd);
 
         // 2f. LayerNorm2(hidden) -> norm_out
         for (uint pos = 0; pos < seq; pos++) {
             LayerNormPC ln_pc2 = { .dim = dim, .eps = c.eps };
-            dispatch_kernel(cmd, &sk.layernorm,
+llm::dispatch_kernel(cmd, &sk.layernorm,
                 { a.hidden.gpu_buffer.buffer, lw.ln2_weight.gpu_buffer.buffer,
                   lw.ln2_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
                 { a.hidden.size_bytes, lw.ln2_weight.size_bytes,
                   lw.ln2_bias.size_bytes, a.norm_out.size_bytes },
                 &ln_pc2, 1);
         }
-        compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
         // 2g. FFN: fc1 -> GELU -> fc2
         BatchedMatMulPC fc1_pc = { .m_dim = seq, .n_dim = ffn_dim, .k_dim = dim };
-        dispatch_batched_matmul_auto(cmd, k, &lw.fc1, &a.norm_out, &a.ffn_out, &fc1_pc);
-        compute_barrier(cmd);
+        llm::dispatch_batched_matmul_auto(cmd, k, &lw.fc1, &a.norm_out, &a.ffn_out, &fc1_pc);
+llm::compute_barrier(cmd);
 
         // Add fc1 bias
         BroadcastAddPC fc1_ba = { .channels = ffn_dim, .spatial = seq };
-        dispatch_kernel(cmd, &k.broadcast_add,
+llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.ffn_out.gpu_buffer.buffer, lw.fc1_bias.gpu_buffer.buffer },
             { a.ffn_out.size_bytes, lw.fc1_bias.size_bytes },
-            &fc1_ba, ceil_div(seq * ffn_dim, 256));
-        compute_barrier(cmd);
+            &fc1_ba, llm::ceil_div(seq * ffn_dim, 256));
+llm::compute_barrier(cmd);
 
         // GELU activation
         GeluPC gelu_pc = { .n = seq * ffn_dim };
-        dispatch_kernel(cmd, &sk.gelu,
+llm::dispatch_kernel(cmd, &sk.gelu,
             { a.ffn_out.gpu_buffer.buffer },
             { a.ffn_out.size_bytes },
-            &gelu_pc, ceil_div(seq * ffn_dim, 256));
-        compute_barrier(cmd);
+            &gelu_pc, llm::ceil_div(seq * ffn_dim, 256));
+llm::compute_barrier(cmd);
 
         // fc2
         BatchedMatMulPC fc2_pc = { .m_dim = seq, .n_dim = dim, .k_dim = ffn_dim };
-        dispatch_batched_matmul_auto(cmd, k, &lw.fc2, &a.ffn_out, &a.ffn_down_out, &fc2_pc);
-        compute_barrier(cmd);
+        llm::dispatch_batched_matmul_auto(cmd, k, &lw.fc2, &a.ffn_out, &a.ffn_down_out, &fc2_pc);
+llm::compute_barrier(cmd);
 
         // Add fc2 bias
-        dispatch_kernel(cmd, &k.broadcast_add,
+llm::dispatch_kernel(cmd, &k.broadcast_add,
             { a.ffn_down_out.gpu_buffer.buffer, lw.fc2_bias.gpu_buffer.buffer },
             { a.ffn_down_out.size_bytes, lw.fc2_bias.size_bytes },
-            &ba_pc, ceil_div(seq * dim, 256));
-        compute_barrier(cmd);
+            &ba_pc, llm::ceil_div(seq * dim, 256));
+llm::compute_barrier(cmd);
 
         // 2h. Residual: hidden += ffn_output
-        dispatch_kernel(cmd, &sk.residual_add,
+llm::dispatch_kernel(cmd, &sk.residual_add,
             { a.hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
             { a.hidden.size_bytes, a.ffn_down_out.size_bytes },
-            &res_pc, ceil_div(seq * dim, 256));
-        compute_barrier(cmd);
+            &res_pc, llm::ceil_div(seq * dim, 256));
+llm::compute_barrier(cmd);
     }
 
     // 3. Final LayerNorm
     for (uint pos = 0; pos < seq; pos++) {
         LayerNormPC final_ln = { .dim = dim, .eps = c.eps };
-        dispatch_kernel(cmd, &sk.layernorm,
+llm::dispatch_kernel(cmd, &sk.layernorm,
             { a.hidden.gpu_buffer.buffer, w.final_ln_weight.gpu_buffer.buffer,
               w.final_ln_bias.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
             { a.hidden.size_bytes, w.final_ln_weight.size_bytes,
@@ -402,7 +403,7 @@ fn void? ClipEncoder.forward(&self, uint[] tokens, uint n_tokens) {
             &final_ln, 1);
     }
 
-    submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
 }
 
 fn void ClipEncoder.free(&self) {

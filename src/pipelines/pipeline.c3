@@ -1,10 +1,11 @@
-module llm;
+module llm::pipelines;
 
 import vk;
 import std::io;
 import std::core::mem;
 import image;
-import llm::pipeline;
+import llm;
+import llm::diffusers;
 
 // Diffusion Pipeline: PyTorch-style API
 // Usage:
@@ -18,13 +19,13 @@ import llm::pipeline;
 //   pipeline.free();
 
 struct DiffusionPipeline {
-    DiffusionConfig config;
-    DiffusionKernels kernels;
-    ClipEncoder clip;
-    UnetModel unet;
-    VaeDecoder vae_decoder;
-    VaeEncoder vae_encoder;
-    VaeActivations vae_acts;
+    llm::DiffusionConfig config;
+    llm::DiffusionKernels kernels;
+    llm::diffusers::ClipEncoder clip;
+    llm::diffusers::UnetModel unet;
+    llm::diffusers::VaeDecoder vae_decoder;
+    llm::diffusers::VaeEncoder vae_encoder;
+    llm::diffusers::VaeActivations vae_acts;
     SchedulerState scheduler;
     DeviceContext* ctx;
 }
@@ -34,15 +35,15 @@ struct DiffusionPipeline {
 fn DiffusionPipeline? load_diffusion_pipeline(DeviceContext* ctx, GGUFFile* gf) {
     io::printfn("\n=== Loading Diffusion Pipeline ===");
 
-    DiffusionConfig config = load_diffusion_config((String)&SD_CONFIG_JSON)!!;
-    DiffusionKernels kernels = create_diffusion_kernels(ctx)!!;
+    llm::DiffusionConfig config = llm::load_diffusion_config((String)&llm::SD_CONFIG_JSON)!!;
+    llm::DiffusionKernels kernels = llm::create_diffusion_kernels(ctx)!!;
 
-    ClipEncoder clip = load_clip_encoder(ctx, gf, &config.clip, &kernels)!!;
-    UnetModel unet = load_unet_model(ctx, gf, &config.unet, &kernels)!!;
-    VaeDecoder vae_decoder = load_vae_decoder(ctx, gf, &config.vae, &kernels)!!;
-    VaeEncoder vae_encoder = load_vae_encoder(ctx, gf, &config.vae, &kernels)!!;
+    llm::diffusers::ClipEncoder clip = llm::diffusers::load_clip_encoder(ctx, gf, &config.clip, &kernels)!!;
+    llm::diffusers::UnetModel unet = llm::diffusers::load_unet_model(ctx, gf, &config.unet, &kernels)!!;
+    llm::diffusers::VaeDecoder vae_decoder = llm::diffusers::load_vae_decoder(ctx, gf, &config.vae, &kernels)!!;
+    llm::diffusers::VaeEncoder vae_encoder = llm::diffusers::load_vae_encoder(ctx, gf, &config.vae, &kernels)!!;
 
-    VaeActivations vae_acts = allocate_vae_activations(ctx, config.image.size, 64)!!;
+    llm::diffusers::VaeActivations vae_acts = llm::diffusers::allocate_vae_activations(ctx, config.image.size, 64)!!;
 
     SchedulerState scheduler = init_scheduler(
         &config.scheduler,
@@ -83,7 +84,7 @@ fn image::Image? DiffusionPipeline.generate(&self,
 ) {
     // Validate inputs
     if (!inputs.validate()) {
-        return pipeline::PIPELINE_INVALID_INPUT~;
+        return PIPELINE_INVALID_INPUT~;
     }
     
     bool is_img2img = inputs.input_image != null;
@@ -96,11 +97,11 @@ fn image::Image? DiffusionPipeline.generate(&self,
         if (inputs.input_image.width != 512 || inputs.input_image.height != 512) {
             io::printfn("Error: Input image must be 512x512 (got %dx%d)", 
                 inputs.input_image.width, inputs.input_image.height);
-            return pipeline::PIPELINE_INVALID_INPUT~;
+            return PIPELINE_INVALID_INPUT~;
         }
         
         // Convert input image to latent
-        float[] input_data = image_to_float_nchw(inputs.input_image)!!;
+        float[] input_data = llm::image_to_float_nchw(inputs.input_image)!!;
         
         for (usz i = 0; i < input_data.len; i++) {
             input_data[i] = input_data[i] * 2.0f - 1.0f;
@@ -115,9 +116,9 @@ fn image::Image? DiffusionPipeline.generate(&self,
             data_size: img_bytes,
         )!!;
 
-        self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+        self.ctx.device.@single_time_command(self.ctx.compute_queue; vk::CommandBuffer cmd) {
             vk::cmdCopyBuffer(cmd, img_staging.buffer, self.vae_acts.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = img_bytes }});
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = img_bytes }});
         }!!;
         img_staging.free();
         mem::free(input_data);
@@ -128,10 +129,10 @@ fn image::Image? DiffusionPipeline.generate(&self,
         
         // Copy encoded latent to UNet buf_a
         uint latent_elems = 4 * 64 * 64;
-        self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+        self.ctx.device.@single_time_command(self.ctx.compute_queue; vk::CommandBuffer cmd) {
             vk::cmdCopyBuffer(cmd, self.vae_acts.buf_a.gpu_buffer.buffer,
                 self.unet.acts.buf_a.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
         }!!;
         
         // Tokenize + CLIP
@@ -161,10 +162,10 @@ fn image::Image? DiffusionPipeline.generate(&self,
     io::printfn("[%s] VAE decoding...", is_img2img ? "4/4" : "3/3");
     
     uint latent_elems = 4 * 64 * 64;
-    self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+    self.ctx.device.@single_time_command(self.ctx.compute_queue; vk::CommandBuffer cmd) {
         vk::cmdCopyBuffer(cmd, self.unet.acts.buf_a.gpu_buffer.buffer,
             self.vae_acts.buf_a.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
     }!!;
 
     self.vae_decoder.forward(&self.vae_acts)!!;
@@ -181,9 +182,9 @@ fn image::Image? DiffusionPipeline.generate(&self,
         data_size: total_px * 4,
     )!!;
 
-    self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+    self.ctx.device.@single_time_command(self.ctx.compute_queue; vk::CommandBuffer cmd) {
         vk::cmdCopyBuffer(cmd, self.vae_acts.buf_a.gpu_buffer.buffer, download_staging.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = total_px * 4 }});
+            (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = total_px * 4 }});
     }!!;
 
     float* mapped = (float*)download_staging.data();
@@ -239,9 +240,9 @@ fn void generate_and_denoise(DiffusionPipeline* self, DiffusionInputs* inputs) {
         data_size: (usz)latent_elems * 4,
     )!!;
 
-    self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+    self.ctx.device.@single_time_command(self.ctx.compute_queue; vk::CommandBuffer cmd) {
         vk::cmdCopyBuffer(cmd, staging.buffer, self.unet.acts.buf_a.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
     }!!;
     staging.free();
     mem::free(latent_data);
@@ -269,8 +270,8 @@ fn void generate_and_denoise(DiffusionPipeline* self, DiffusionInputs* inputs) {
         float alpha_t = sched.get_alpha_cumprod(t);
         float alpha_prev = sched.get_prev_alpha_cumprod(step);
 
-        CommandBuffer cmd = self.ctx.command_buffer;
-        begin_compute(cmd)!!;
+        vk::CommandBuffer cmd = self.ctx.command_buffer;
+        llm::begin_compute(cmd)!!;
         if (sched.stype == DDIM) {
             dispatch_ddim_step(cmd, &self.kernels,
                 &self.unet.acts.buf_a,
@@ -285,7 +286,7 @@ fn void generate_and_denoise(DiffusionPipeline* self, DiffusionInputs* inputs) {
                 &self.unet.acts.buf_b,
                 latent_elems, dt);
         }
-        submit_and_wait(self.ctx)!!;
+        llm::submit_and_wait(self.ctx)!!;
     }
 }
 
@@ -303,12 +304,12 @@ fn void denoise(DiffusionPipeline* self, DiffusionInputs* inputs, uint start_ste
         float alpha_t = sched.get_alpha_cumprod(t);
         float alpha_prev = sched.get_prev_alpha_cumprod(step);
 
-        CommandBuffer cmd = self.ctx.command_buffer;
-        begin_compute(cmd)!!;
+        vk::CommandBuffer cmd = self.ctx.command_buffer;
+        llm::begin_compute(cmd)!!;
         dispatch_ddim_step(cmd, &self.kernels,
             &self.unet.acts.buf_a, &self.unet.acts.buf_b,
             latent_elems, alpha_t, alpha_prev);
-        submit_and_wait(self.ctx)!!;
+        llm::submit_and_wait(self.ctx)!!;
     }
 }
 
@@ -319,7 +320,7 @@ fn image::Image? float_tensor_to_image_sd(float[] data, uint width, uint height,
         case 1: format = PixelFormat.GRAYSCALE;
         case 3: format = PixelFormat.RGB;
         case 4: format = PixelFormat.RGBA;
-        default: return pipeline::PIPELINE_INVALID_INPUT~;
+        default: return PIPELINE_INVALID_INPUT~;
     }
     
     char[] pixels = mem::new_array(char, (usz)width * height * channels);

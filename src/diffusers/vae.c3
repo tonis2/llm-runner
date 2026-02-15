@@ -1,6 +1,7 @@
-module llm;
+module llm::diffusers;
 
 import vk;
+import llm;
 import std::io;
 import std::core::mem;
 
@@ -229,9 +230,9 @@ fn VaeActivations? allocate_vae_activations(DeviceContext* ctx, uint max_spatial
     ulong[4] shape = { max_elems, 0, 0, 0 };
 
     return {
-        .buf_a = create_f32_tensor(ctx, shape, 1)!!,
-        .buf_b = create_f32_tensor(ctx, shape, 1)!!,
-        .buf_c = create_f32_tensor(ctx, shape, 1)!!,
+        .buf_a = llm::create_f32_tensor(ctx, shape, 1)!!,
+        .buf_b = llm::create_f32_tensor(ctx, shape, 1)!!,
+        .buf_c = llm::create_f32_tensor(ctx, shape, 1)!!,
     };
 }
 
@@ -264,7 +265,7 @@ fn void dispatch_vae_conv(
     };
     // When no bias, pass weight buffer as dummy (shader won't read it with has_bias=0)
     Tensor* bias_tensor = layer.has_bias ? &layer.bias : &layer.weight;
-    dispatch_conv2d(cmd, k, &layer.weight, bias_tensor, input, output, &pc);
+	llm::dispatch_conv2d(cmd, k, &layer.weight, bias_tensor, input, output, &pc);
 }
 
 // --- Helper: dispatch ResBlock ---
@@ -288,13 +289,13 @@ fn void dispatch_vae_resblock(
     // Copy input to temp first, then apply SiLU in-place on temp
     vk::cmdCopyBuffer(cmd, input.gpu_buffer.buffer, temp.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)ch * spatial * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
-    dispatch_kernel(cmd, &k.shared.silu,
+llm::dispatch_kernel(cmd, &k.shared.silu,
         { temp.gpu_buffer.buffer },
         { temp.size_bytes },
-        &silu_pc, ceil_div(ch * spatial, 256));
-    compute_barrier(cmd);
+        &silu_pc, llm::ceil_div(ch * spatial, 256));
+llm::compute_barrier(cmd);
 
     // Conv3x3 (conv.0): temp -> skip_temp
     Conv2dPC pc0 = {
@@ -302,19 +303,19 @@ fn void dispatch_vae_resblock(
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-    dispatch_conv2d(cmd, k, &rb.conv0_weight, &rb.conv0_bias, temp, skip_temp, &pc0);
-    compute_barrier(cmd);
+	llm::dispatch_conv2d(cmd, k, &rb.conv0_weight, &rb.conv0_bias, temp, skip_temp, &pc0);
+llm::compute_barrier(cmd);
 
     // SiLU on skip_temp
-    dispatch_kernel(cmd, &k.shared.silu,
+llm::dispatch_kernel(cmd, &k.shared.silu,
         { skip_temp.gpu_buffer.buffer },
         { skip_temp.size_bytes },
-        &silu_pc, ceil_div(ch * spatial, 256));
-    compute_barrier(cmd);
+        &silu_pc, llm::ceil_div(ch * spatial, 256));
+llm::compute_barrier(cmd);
 
     // Conv3x3 (conv.2): skip_temp -> temp
-    dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, skip_temp, temp, &pc0);
-    compute_barrier(cmd);
+	llm::dispatch_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, skip_temp, temp, &pc0);
+llm::compute_barrier(cmd);
 
     // Skip connection conv (conv.4): input -> skip_temp
     // This is typically a 3x3 conv that acts as identity or channel projection
@@ -323,21 +324,21 @@ fn void dispatch_vae_resblock(
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-    dispatch_conv2d(cmd, k, &rb.conv4_weight, &rb.conv4_bias, input, skip_temp, &pc_skip);
-    compute_barrier(cmd);
+	llm::dispatch_conv2d(cmd, k, &rb.conv4_weight, &rb.conv4_bias, input, skip_temp, &pc_skip);
+llm::compute_barrier(cmd);
 
     // Residual add: skip_temp += temp, result in skip_temp
     ResidualPC res_pc = { .n = ch * spatial };
-    dispatch_kernel(cmd, &k.shared.residual_add,
+llm::dispatch_kernel(cmd, &k.shared.residual_add,
         { skip_temp.gpu_buffer.buffer, temp.gpu_buffer.buffer },
         { skip_temp.size_bytes, temp.size_bytes },
-        &res_pc, ceil_div(ch * spatial, 256));
-    compute_barrier(cmd);
+        &res_pc, llm::ceil_div(ch * spatial, 256));
+llm::compute_barrier(cmd);
 
     // Copy result back to input buffer for next layer
     vk::cmdCopyBuffer(cmd, skip_temp.gpu_buffer.buffer, input.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)ch * spatial * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 }
 
 // --- VAE Decoder Forward Pass ---
@@ -352,15 +353,15 @@ fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
     uint h = 64;  // latent height
     uint w = 64;  // latent width
 
-    begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
 
     // conv_in: [4, 64, 64] -> [64, 64, 64]
     dispatch_vae_conv(cmd, k, &self.conv_in, &acts.buf_a, &acts.buf_b, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
     // Copy result to buf_a
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)64 * h * w * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlocks 0,1,2 (layers 2,3,4) at 64x64
     for (uint i = 0; i < 3; i++) {
@@ -369,16 +370,16 @@ fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
 
     // Upsample 0 (layer 6): 64x64 -> 128x128
     UpsamplePC up_pc = { .channels = 64, .in_h = h, .in_w = w };
-    dispatch_kernel(cmd, &k.upsample_nearest,
+llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, ceil_div(64 * h * w * 4, 256));
-    compute_barrier(cmd);
+        &up_pc, llm::ceil_div(64 * h * w * 4, 256));
+llm::compute_barrier(cmd);
     h *= 2; w *= 2;  // 128x128
 
     // Conv after upsample (layer 6)
     dispatch_vae_conv(cmd, k, &self.upsample_convs[0], &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlocks 3,4,5 (layers 7,8,9) at 128x128
     for (uint i = 3; i < 6; i++) {
@@ -387,15 +388,15 @@ fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
 
     // Upsample 1 (layer 11): 128x128 -> 256x256
     up_pc = { .channels = 64, .in_h = h, .in_w = w };
-    dispatch_kernel(cmd, &k.upsample_nearest,
+llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, ceil_div(64 * h * w * 4, 256));
-    compute_barrier(cmd);
+        &up_pc, llm::ceil_div(64 * h * w * 4, 256));
+llm::compute_barrier(cmd);
     h *= 2; w *= 2;  // 256x256
 
     dispatch_vae_conv(cmd, k, &self.upsample_convs[1], &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlocks 6,7,8 (layers 12,13,14) at 256x256
     for (uint i = 6; i < 9; i++) {
@@ -404,31 +405,31 @@ fn void? VaeDecoder.forward(&self, VaeActivations* acts) {
 
     // Upsample 2 (layer 16): 256x256 -> 512x512
     up_pc = { .channels = 64, .in_h = h, .in_w = w };
-    dispatch_kernel(cmd, &k.upsample_nearest,
+llm::dispatch_kernel(cmd, &k.upsample_nearest,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, ceil_div(64 * h * w * 4, 256));
-    compute_barrier(cmd);
+        &up_pc, llm::ceil_div(64 * h * w * 4, 256));
+llm::compute_barrier(cmd);
     h *= 2; w *= 2;  // 512x512
 
     dispatch_vae_conv(cmd, k, &self.upsample_convs[2], &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlock 9 (layer 17) at 512x512
     dispatch_vae_resblock(cmd, k, &self.res_blocks[9], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
 
     // conv_out: [64, 512, 512] -> [3, 512, 512]
     dispatch_vae_conv(cmd, k, &self.conv_out, &acts.buf_a, &acts.buf_b, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Scale + shift to [0,1] range: output = output * 0.5 + 0.5
     ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
-    dispatch_kernel(cmd, &k.scale_shift_clamp,
+llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer },
         { acts.buf_b.size_bytes, acts.buf_a.size_bytes },
-        &ss_pc, ceil_div(3 * h * w, 256));
+        &ss_pc, llm::ceil_div(3 * h * w, 256));
 
-    submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
     // Result image [3, 512, 512] is in buf_a
 }
 
@@ -444,14 +445,14 @@ fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w)
     uint h = img_h;
     uint w = img_w;
 
-    begin_compute(cmd)!!;
+llm::begin_compute(cmd)!!;
 
     // conv_in: [3, H, W] -> [64, H, W]
     dispatch_vae_conv(cmd, k, &self.conv_in, &acts.buf_a, &acts.buf_b, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)64 * h * w * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlocks 0,1,2,3 (layers 1,3,4,5) at full res
     for (uint i = 0; i < 4; i++) {
@@ -460,11 +461,11 @@ fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w)
 
     // Downsample 0 (layer 2): stride-2 conv
     dispatch_vae_conv(cmd, k, &self.downsample_convs[0], &acts.buf_a, &acts.buf_b, h, w, 2, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
     h /= 2; w /= 2;
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)64 * h * w * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlocks 4,5,6 (layers 7,8,9) at half res
     for (uint i = 4; i < 7; i++) {
@@ -473,11 +474,11 @@ fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w)
 
     // Downsample 1 (layer 6): stride-2 conv
     dispatch_vae_conv(cmd, k, &self.downsample_convs[1], &acts.buf_a, &acts.buf_b, h, w, 2, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
     h /= 2; w /= 2;
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)64 * h * w * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // ResBlocks 7,8,9 (layers 11,12,13) at quarter res
     for (uint i = 7; i < 10; i++) {
@@ -486,21 +487,21 @@ fn void? VaeEncoder.forward(&self, VaeActivations* acts, uint img_h, uint img_w)
 
     // Downsample 2 (layer 10): stride-2 conv
     dispatch_vae_conv(cmd, k, &self.downsample_convs[2], &acts.buf_a, &acts.buf_b, h, w, 2, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
     h /= 2; w /= 2;
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)64 * h * w * 4 }});
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // conv_out: [64, H/8, W/8] -> [4, H/8, W/8]
     dispatch_vae_conv(cmd, k, &self.conv_out, &acts.buf_a, &acts.buf_b, h, w, 1, 1);
-    compute_barrier(cmd);
+llm::compute_barrier(cmd);
 
     // Copy to buf_a
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)4 * h * w * 4 }});
 
-    submit_and_wait(ctx)!!;
+llm::submit_and_wait(ctx)!!;
     // Result latent [4, H/8, W/8] is in buf_a
 }
 

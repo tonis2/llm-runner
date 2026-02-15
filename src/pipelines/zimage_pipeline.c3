@@ -1,4 +1,4 @@
-module llm::zimage;
+module llm::pipelines;
 
 import vk;
 import std::io;
@@ -10,7 +10,7 @@ import std::time::clock;
 import image;
 import image::png;
 import llm;
-import llm::pipeline;
+import llm::diffusers;
 
 // Z-Image Turbo Pipeline
 // PyTorch-style API: pipeline.generate(inputs) returns image::Image
@@ -38,7 +38,7 @@ fn image::Image? float_tensor_to_image(float[] data, uint width, uint height, ui
         case 1: format = PixelFormat.GRAYSCALE;
         case 3: format = PixelFormat.RGB;
         case 4: format = PixelFormat.RGBA;
-        default: return pipeline::PIPELINE_INVALID_INPUT~;
+        default: return PIPELINE_INVALID_INPUT~;
     }
     
     char[] pixels = mem::new_array(char, (usz)width * height * channels);
@@ -75,7 +75,7 @@ fn image::Image? zimage_generate(
 ) {
     // Validate inputs
     if (!inputs.validate()) {
-        return pipeline::PIPELINE_INVALID_INPUT~;
+        return PIPELINE_INVALID_INPUT~;
     }
     
     float cfg_scale = inputs.cfg_scale;
@@ -96,8 +96,8 @@ fn image::Image? zimage_generate(
     uint img_size = inputs.image_size;
     uint lat_h = img_size / 8;
     uint lat_w = img_size / 8;
-    uint n_patches = (lat_h / llm::DIT_PATCH_SIZE) * (lat_w / llm::DIT_PATCH_SIZE);
-    uint latent_elems = llm::DIT_LATENT_CHANNELS * lat_h * lat_w;
+    uint n_patches = (lat_h / llm::diffusers::DIT_PATCH_SIZE) * (lat_w / llm::diffusers::DIT_PATCH_SIZE);
+    uint latent_elems = llm::diffusers::DIT_LATENT_CHANNELS * lat_h * lat_w;
 
     // ============================================================
     // Phase 1: Text Encoding via Qwen3
@@ -106,7 +106,7 @@ fn image::Image? zimage_generate(
 
     if (inputs.text_model_path.len == 0) {
         io::printfn("Error: text_model_path required for DiT pipeline");
-        return pipeline::PIPELINE_INVALID_INPUT~;
+        return PIPELINE_INVALID_INPUT~;
     }
 
     // Load text encoder from separate GGUF file
@@ -121,11 +121,11 @@ fn image::Image? zimage_generate(
 
     String config_json;
     if (arch_name == "qwen3") {
-        config_json = (String)&llm::QWEN3_CONFIG_JSON;
+        config_json = (String)&llm::diffusers::QWEN3_CONFIG_JSON;
     } else if (arch_name == "qwen2") {
-        config_json = (String)&llm::QWEN2_CONFIG_JSON;
+        config_json = (String)&llm::diffusers::QWEN2_CONFIG_JSON;
     } else {
-        config_json = (String)&llm::QWEN3_CONFIG_JSON;
+        config_json = (String)&llm::diffusers::QWEN3_CONFIG_JSON;
     }
 
     llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
@@ -176,7 +176,7 @@ fn image::Image? zimage_generate(
     uint max_text_len = cond_text_len;
     if (use_cfg && uncond_text_len > max_text_len) max_text_len = uncond_text_len;
     uint enc_max_seq = max_text_len + 16;
-    llm::LlmModel text_model = llm::load_llm_model(ctx, &text_gf, &text_config, &text_names,
+    llm::diffusers::LlmModel text_model = llm::diffusers::load_llm_model(ctx, &text_gf, &text_config, &text_names,
         encode_only: true, max_seq_len: enc_max_seq)!!;
 
     Clock encode_start = clock::now();
@@ -208,23 +208,23 @@ fn image::Image? zimage_generate(
     // ============================================================
     io::printfn("\n[2/5] Loading DiT + VAE...");
 
-    llm::DiTWeights dit_weights = llm::load_dit_weights(ctx, dit_gf)!!;
-    llm::DiTKernels dit_kernels = llm::create_dit_kernels(ctx)!!;
+    llm::diffusers::DiTWeights dit_weights = llm::diffusers::load_dit_weights(ctx, dit_gf)!!;
+    llm::diffusers::DiTKernels dit_kernels = llm::diffusers::create_dit_kernels(ctx)!!;
 
-    uint cond_padded_text = llm::pad_to_multiple(cond_text_len, llm::SEQ_MULTI_OF);
-    uint padded_patches = llm::pad_to_multiple(n_patches, llm::SEQ_MULTI_OF);
+    uint cond_padded_text = llm::diffusers::pad_to_multiple(cond_text_len, llm::diffusers::SEQ_MULTI_OF);
+    uint padded_patches = llm::diffusers::pad_to_multiple(n_patches, llm::diffusers::SEQ_MULTI_OF);
     uint cond_n_text_pad = cond_padded_text - cond_text_len;
     uint n_img_pad = padded_patches - n_patches;
 
-    uint uncond_padded_text = use_cfg ? llm::pad_to_multiple(uncond_text_len, llm::SEQ_MULTI_OF) : 0;
+    uint uncond_padded_text = use_cfg ? llm::diffusers::pad_to_multiple(uncond_text_len, llm::diffusers::SEQ_MULTI_OF) : 0;
     uint uncond_n_text_pad = use_cfg ? uncond_padded_text - uncond_text_len : 0;
 
     uint max_padded_text = cond_padded_text;
     if (use_cfg && uncond_padded_text > max_padded_text) max_padded_text = uncond_padded_text;
     uint max_seq = padded_patches + max_padded_text;
-    llm::DiTActivations dit_acts = llm::allocate_dit_activations(ctx, max_seq)!!;
+    llm::diffusers::DiTActivations dit_acts = llm::diffusers::allocate_dit_activations(ctx, max_seq)!!;
 
-    llm::DiTModel* dit = mem::alloc(llm::DiTModel);
+    llm::diffusers::DiTModel* dit = mem::alloc(llm::diffusers::DiTModel);
     dit.weights = dit_weights;
     dit.acts = dit_acts;
     dit.kernels = dit_kernels;
@@ -237,31 +237,31 @@ fn image::Image? zimage_generate(
     dit.latent_w = lat_w;
 
     // Precompute mRoPE tables
-    uint patches_w = lat_w / llm::DIT_PATCH_SIZE;
-    uint patches_h = lat_h / llm::DIT_PATCH_SIZE;
+    uint patches_w = lat_w / llm::diffusers::DIT_PATCH_SIZE;
+    uint patches_h = lat_h / llm::diffusers::DIT_PATCH_SIZE;
     llm::Tensor cond_rope_cos_main;
     llm::Tensor cond_rope_sin_main;
-    llm::precompute_mrope_tables(ctx, &cond_rope_cos_main, &cond_rope_sin_main,
-        n_patches, patches_w, patches_h, cond_text_len, llm::MROPE_MODE_FULL)!!;
+    llm::diffusers::precompute_mrope_tables(ctx, &cond_rope_cos_main, &cond_rope_sin_main,
+        n_patches, patches_w, patches_h, cond_text_len, llm::diffusers::MROPE_MODE_FULL)!!;
     dit.rope_cos_main = cond_rope_cos_main;
     dit.rope_sin_main = cond_rope_sin_main;
-    llm::precompute_mrope_tables(ctx, &dit.rope_cos_refiner, &dit.rope_sin_refiner,
-        n_patches, patches_w, patches_h, cond_text_len, llm::MROPE_MODE_IMAGE)!!;
+    llm::diffusers::precompute_mrope_tables(ctx, &dit.rope_cos_refiner, &dit.rope_sin_refiner,
+        n_patches, patches_w, patches_h, cond_text_len, llm::diffusers::MROPE_MODE_IMAGE)!!;
 
     llm::Tensor cond_rope_cos_ctx;
     llm::Tensor cond_rope_sin_ctx;
-    llm::precompute_mrope_tables(ctx, &cond_rope_cos_ctx, &cond_rope_sin_ctx,
-        n_patches, patches_w, patches_h, cond_text_len, llm::MROPE_MODE_TEXT)!!;
+    llm::diffusers::precompute_mrope_tables(ctx, &cond_rope_cos_ctx, &cond_rope_sin_ctx,
+        n_patches, patches_w, patches_h, cond_text_len, llm::diffusers::MROPE_MODE_TEXT)!!;
 
     llm::Tensor uncond_rope_cos_main;
     llm::Tensor uncond_rope_sin_main;
     llm::Tensor uncond_rope_cos_ctx;
     llm::Tensor uncond_rope_sin_ctx;
     if (use_cfg) {
-        llm::precompute_mrope_tables(ctx, &uncond_rope_cos_main, &uncond_rope_sin_main,
-            n_patches, patches_w, patches_h, uncond_text_len, llm::MROPE_MODE_FULL)!!;
-        llm::precompute_mrope_tables(ctx, &uncond_rope_cos_ctx, &uncond_rope_sin_ctx,
-            n_patches, patches_w, patches_h, uncond_text_len, llm::MROPE_MODE_TEXT)!!;
+        llm::diffusers::precompute_mrope_tables(ctx, &uncond_rope_cos_main, &uncond_rope_sin_main,
+            n_patches, patches_w, patches_h, uncond_text_len, llm::diffusers::MROPE_MODE_FULL)!!;
+        llm::diffusers::precompute_mrope_tables(ctx, &uncond_rope_cos_ctx, &uncond_rope_sin_ctx,
+            n_patches, patches_w, patches_h, uncond_text_len, llm::diffusers::MROPE_MODE_TEXT)!!;
     }
 
     io::printfn("  DiT loaded: %d patches (pad %d), cond=%d tokens (pad %d)",
@@ -271,17 +271,17 @@ fn image::Image? zimage_generate(
     }
 
     // Project text through cap_embedder + context_refiner
-    llm::Tensor cond_projected = llm::create_f32_tensor(ctx, { (ulong)cond_padded_text * llm::DIT_DIM, 0, 0, 0 }, 1)!!;
+    llm::Tensor cond_projected = llm::create_f32_tensor(ctx, { (ulong)cond_padded_text * llm::diffusers::DIT_DIM, 0, 0, 0 }, 1)!!;
     llm::Tensor norm_scratch = llm::create_f32_tensor(ctx, { (ulong)text_config.dim, 0, 0, 0 }, 1)!!;
-    CommandBuffer cmd = ctx.command_buffer;
+    vk::CommandBuffer cmd = ctx.command_buffer;
 
     llm::begin_compute(cmd)!!;
     for (uint pos = 0; pos < cond_text_len; pos++) {
         usz in_off = (usz)pos * text_config.dim * 4;
         vk::cmdCopyBuffer(cmd, cond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
+            (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
         llm::compute_barrier(cmd);
-        llm::RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
+        llm::diffusers::RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
         llm::dispatch_kernel(cmd, &dit.kernels.shared.rmsnorm,
             { norm_scratch.gpu_buffer.buffer, dit.weights.cap_emb_norm.gpu_buffer.buffer,
               norm_scratch.gpu_buffer.buffer },
@@ -290,24 +290,24 @@ fn image::Image? zimage_generate(
             &rms_pc, 1);
         llm::compute_barrier(cmd);
         vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, cond_embeddings.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
+            (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
         llm::compute_barrier(cmd);
     }
-    llm::LinearProjPC cap_pc = { .out_dim = llm::DIT_DIM, .in_dim = text_config.dim, .seq_len = cond_text_len };
+    llm::diffusers::LinearProjPC cap_pc = { .out_dim = llm::diffusers::DIT_DIM, .in_dim = text_config.dim, .seq_len = cond_text_len };
     llm::dispatch_kernel(cmd, &dit.kernels.linear_proj,
         { dit.weights.cap_emb_weight.gpu_buffer.buffer, dit.weights.cap_emb_bias.gpu_buffer.buffer,
           cond_embeddings.gpu_buffer.buffer, cond_projected.gpu_buffer.buffer },
         { dit.weights.cap_emb_weight.size_bytes, dit.weights.cap_emb_bias.size_bytes,
           cond_embeddings.size_bytes, cond_projected.size_bytes },
-        &cap_pc, cond_text_len * llm::DIT_DIM);
+        &cap_pc, cond_text_len * llm::diffusers::DIT_DIM);
     llm::compute_barrier(cmd);
     if (cond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
         for (uint p = 0; p < cond_n_text_pad; p++) {
             vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
                 cond_projected.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0,
-                    .dstOffset = (ulong)(cond_text_len + p) * llm::DIT_DIM * 4,
-                    .size = (ulong)llm::DIT_DIM * 4 }});
+                (vk::BufferCopy[]){{ .srcOffset = 0,
+                    .dstOffset = (ulong)(cond_text_len + p) * llm::diffusers::DIT_DIM * 4,
+                    .size = (ulong)llm::diffusers::DIT_DIM * 4 }});
         }
         llm::compute_barrier(cmd);
     }
@@ -318,8 +318,8 @@ fn image::Image? zimage_generate(
     dit.rope_cos_context = cond_rope_cos_ctx;
     dit.rope_sin_context = cond_rope_sin_ctx;
     llm::begin_compute(cmd)!!;
-    for (uint l = 0; l < llm::DIT_NUM_REFINER_LAYERS; l++) {
-        llm::dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+    for (uint l = 0; l < llm::diffusers::DIT_NUM_REFINER_LAYERS; l++) {
+        llm::diffusers::dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
             &cond_projected, cond_padded_text, false,
             &dit.rope_cos_context, &dit.rope_sin_context)!!;
     }
@@ -329,15 +329,15 @@ fn image::Image? zimage_generate(
     // Process unconditioned text for CFG
     llm::Tensor uncond_projected;
     if (use_cfg) {
-        uncond_projected = llm::create_f32_tensor(ctx, { (ulong)uncond_padded_text * llm::DIT_DIM, 0, 0, 0 }, 1)!!;
+        uncond_projected = llm::create_f32_tensor(ctx, { (ulong)uncond_padded_text * llm::diffusers::DIT_DIM, 0, 0, 0 }, 1)!!;
 
         llm::begin_compute(cmd)!!;
         for (uint pos = 0; pos < uncond_text_len; pos++) {
             usz in_off = (usz)pos * text_config.dim * 4;
             vk::cmdCopyBuffer(cmd, uncond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
+                (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
             llm::compute_barrier(cmd);
-            llm::RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
+            llm::diffusers::RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
             llm::dispatch_kernel(cmd, &dit.kernels.shared.rmsnorm,
                 { norm_scratch.gpu_buffer.buffer, dit.weights.cap_emb_norm.gpu_buffer.buffer,
                   norm_scratch.gpu_buffer.buffer },
@@ -346,24 +346,24 @@ fn image::Image? zimage_generate(
                 &rms_pc, 1);
             llm::compute_barrier(cmd);
             vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, uncond_embeddings.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
             llm::compute_barrier(cmd);
         }
-        llm::LinearProjPC uncond_cap_pc = { .out_dim = llm::DIT_DIM, .in_dim = text_config.dim, .seq_len = uncond_text_len };
+        llm::diffusers::LinearProjPC uncond_cap_pc = { .out_dim = llm::diffusers::DIT_DIM, .in_dim = text_config.dim, .seq_len = uncond_text_len };
         llm::dispatch_kernel(cmd, &dit.kernels.linear_proj,
             { dit.weights.cap_emb_weight.gpu_buffer.buffer, dit.weights.cap_emb_bias.gpu_buffer.buffer,
               uncond_embeddings.gpu_buffer.buffer, uncond_projected.gpu_buffer.buffer },
             { dit.weights.cap_emb_weight.size_bytes, dit.weights.cap_emb_bias.size_bytes,
               uncond_embeddings.size_bytes, uncond_projected.size_bytes },
-            &uncond_cap_pc, uncond_text_len * llm::DIT_DIM);
+            &uncond_cap_pc, uncond_text_len * llm::diffusers::DIT_DIM);
         llm::compute_barrier(cmd);
         if (uncond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
             for (uint p = 0; p < uncond_n_text_pad; p++) {
                 vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
                     uncond_projected.gpu_buffer.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0,
-                        .dstOffset = (ulong)(uncond_text_len + p) * llm::DIT_DIM * 4,
-                        .size = (ulong)llm::DIT_DIM * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0,
+                        .dstOffset = (ulong)(uncond_text_len + p) * llm::diffusers::DIT_DIM * 4,
+                        .size = (ulong)llm::diffusers::DIT_DIM * 4 }});
             }
             llm::compute_barrier(cmd);
         }
@@ -374,8 +374,8 @@ fn image::Image? zimage_generate(
         dit.rope_cos_context = uncond_rope_cos_ctx;
         dit.rope_sin_context = uncond_rope_sin_ctx;
         llm::begin_compute(cmd)!!;
-        for (uint l = 0; l < llm::DIT_NUM_REFINER_LAYERS; l++) {
-            llm::dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+        for (uint l = 0; l < llm::diffusers::DIT_NUM_REFINER_LAYERS; l++) {
+            llm::diffusers::dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
                 &uncond_projected, uncond_padded_text, false,
                 &dit.rope_cos_context, &dit.rope_sin_context)!!;
         }
@@ -386,26 +386,26 @@ fn image::Image? zimage_generate(
 
     // Load VAE
     llm::DiffusionKernels diff_kernels = llm::create_diffusion_kernels(ctx)!!;
-    llm::FluxVaeDecoder vae_decoder;
-    llm::FluxVaeActivations vae_acts;
-    llm::TAESDDecoder taesd_decoder;
-    llm::TAESDActivations taesd_acts;
+    llm::diffusers::FluxVaeDecoder vae_decoder;
+    llm::diffusers::FluxVaeActivations vae_acts;
+    llm::diffusers::TAESDDecoder taesd_decoder;
+    llm::diffusers::TAESDActivations taesd_acts;
     bool has_vae = false;
     bool use_taesd = false;
 
     if (inputs.taesd_path.len > 0) {
         llm::SafetensorsFile sf = llm::safetensors_open(inputs.taesd_path)!!;
-        taesd_decoder = llm::load_taesd_decoder(ctx, &sf, &diff_kernels)!!;
+        taesd_decoder = llm::diffusers::load_taesd_decoder(ctx, &sf, &diff_kernels)!!;
         sf.close();
-        taesd_acts = llm::allocate_taesd_activations(ctx, img_size)!!;
+        taesd_acts = llm::diffusers::allocate_taesd_activations(ctx, img_size)!!;
         has_vae = true;
         use_taesd = true;
         io::printfn("  TAESD loaded from %s", inputs.taesd_path);
     } else if (inputs.vae_path.len > 0) {
         llm::SafetensorsFile sf = llm::safetensors_open(inputs.vae_path)!!;
-        vae_decoder = llm::load_flux_vae_decoder(ctx, &sf, &diff_kernels)!!;
+        vae_decoder = llm::diffusers::load_flux_vae_decoder(ctx, &sf, &diff_kernels)!!;
         sf.close();
-        vae_acts = llm::allocate_flux_vae_activations(ctx, img_size)!!;
+        vae_acts = llm::diffusers::allocate_flux_vae_activations(ctx, img_size)!!;
         has_vae = true;
         io::printfn("  Flux VAE loaded from %s", inputs.vae_path);
     } else {
@@ -426,10 +426,10 @@ fn image::Image? zimage_generate(
         // TODO: Implement img2img encoding
         // For now, generate random latent as placeholder
         io::printfn("  Warning: img2img encoding not fully implemented, using random latent");
-        llm::generate_random_latent(latent_data, inputs.seed);
+        generate_random_latent(latent_data, inputs.seed);
     } else {
         io::printfn("\n[3/5] Generating random latent...");
-        llm::generate_random_latent(latent_data, inputs.seed);
+        generate_random_latent(latent_data, inputs.seed);
     }
 
     // Upload to DiT latent buffer
@@ -441,9 +441,9 @@ fn image::Image? zimage_generate(
         data_size: (usz)latent_elems * 4,
     )!!;
 
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer xfer_cmd) {
+    ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer xfer_cmd) {
         vk::cmdCopyBuffer(xfer_cmd, staging.buffer, dit.acts.latent.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
     }!!;
     staging.free();
     mem::free(latent_data);
@@ -453,7 +453,7 @@ fn image::Image? zimage_generate(
     // ============================================================
     io::printfn("\n[4/5] Denoising (%d steps, CFG=%.1f)...", inputs.num_steps, cfg_scale);
 
-    llm::FlowMatchingState flow = llm::init_flow_matching(inputs.num_steps);
+    FlowMatchingState flow = init_flow_matching(inputs.num_steps);
 
     float[] cfg_cond_vel;
     float[] cfg_uncond_vel;
@@ -489,9 +489,9 @@ fn image::Image? zimage_generate(
 
         if (use_cfg) {
             // Save current latent
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer save_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer save_cmd) {
                 vk::cmdCopyBuffer(save_cmd, dit.acts.latent.gpu_buffer.buffer, latent_save.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
 
             // Conditioned forward
@@ -502,17 +502,17 @@ fn image::Image? zimage_generate(
             dit.forward(&cond_projected, t)!!;
 
             // Read cond velocity to CPU
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer read_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer read_cmd) {
                 vk::cmdCopyBuffer(read_cmd, dit.acts.velocity.gpu_buffer.buffer, cfg_staging.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
             float* stg_ptr = (float*)cfg_staging.data();
             for (uint i = 0; i < latent_elems; i++) cfg_cond_vel[i] = stg_ptr[i];
 
             // Restore latent for uncond forward
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer restore_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer restore_cmd) {
                 vk::cmdCopyBuffer(restore_cmd, latent_save.buffer, dit.acts.latent.gpu_buffer.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
 
             // Unconditioned forward
@@ -523,9 +523,9 @@ fn image::Image? zimage_generate(
             dit.forward(&uncond_projected, t)!!;
 
             // Read uncond velocity to CPU
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer read_cmd2) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer read_cmd2) {
                 vk::cmdCopyBuffer(read_cmd2, dit.acts.velocity.gpu_buffer.buffer, cfg_staging.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
             stg_ptr = (float*)cfg_staging.data();
             for (uint i = 0; i < latent_elems; i++) cfg_uncond_vel[i] = stg_ptr[i];
@@ -536,15 +536,15 @@ fn image::Image? zimage_generate(
             }
 
             // Upload combined velocity
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer write_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer write_cmd) {
                 vk::cmdCopyBuffer(write_cmd, cfg_staging.buffer, dit.acts.velocity.gpu_buffer.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
 
             // Restore latent for Euler step
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer restore_cmd2) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer restore_cmd2) {
                 vk::cmdCopyBuffer(restore_cmd2, latent_save.buffer, dit.acts.latent.gpu_buffer.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
         } else {
             // No CFG: single forward pass
@@ -553,7 +553,7 @@ fn image::Image? zimage_generate(
 
         // Euler step
         llm::begin_compute(cmd)!!;
-        FlowEulerPC euler_pc = { .n = latent_elems, .dt = dt };
+        llm::diffusers::FlowEulerPC euler_pc = { .n = latent_elems, .dt = dt };
         llm::dispatch_kernel(cmd, &dit.kernels.flow_euler_step,
             { dit.acts.latent.gpu_buffer.buffer, dit.acts.velocity.gpu_buffer.buffer },
             { dit.acts.latent.size_bytes, dit.acts.velocity.size_bytes },
@@ -586,10 +586,10 @@ fn image::Image? zimage_generate(
         io::printfn("  Using VAE: %s", use_taesd ? "TAESD" : "Flux VAE");
 
         if (use_taesd) {
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer copy_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
                 vk::cmdCopyBuffer(copy_cmd, dit.acts.latent.gpu_buffer.buffer,
                     taesd_acts.buf_a.gpu_buffer.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
 
             taesd_decoder.forward(&taesd_acts, lat_h, lat_w)!!;
@@ -613,15 +613,15 @@ fn image::Image? zimage_generate(
                 properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
                 data: null, data_size: (usz)latent_elems * 4,
             )!!;
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer rb_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer rb_cmd) {
                 vk::cmdCopyBuffer(rb_cmd, dit.acts.latent.gpu_buffer.buffer, lat_readback.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
 
             float* lat_cpu = (float*)lat_readback.data();
             
             // Apply denormalization
-            for (uint ch = 0; ch < llm::DIT_LATENT_CHANNELS; ch++) {
+            for (uint ch = 0; ch < llm::diffusers::DIT_LATENT_CHANNELS; ch++) {
                 float scale = LATENT_STDS[ch] / SCALE_FACTOR;
                 float mean = LATENT_MEANS[ch];
                 uint offset = ch * spatial;
@@ -631,10 +631,10 @@ fn image::Image? zimage_generate(
             }
 
             // Upload denormalized latent
-            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer copy_cmd) {
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
                 vk::cmdCopyBuffer(copy_cmd, lat_readback.buffer,
                     vae_acts.buf_a.gpu_buffer.buffer, 1,
-                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
             lat_readback.free();
 
@@ -654,9 +654,9 @@ fn image::Image? zimage_generate(
             data_size: total_px * 4,
         )!!;
 
-        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer download_cmd) {
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer download_cmd) {
             vk::cmdCopyBuffer(download_cmd, decode_output.gpu_buffer.buffer, download_staging.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = total_px * 4 }});
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = total_px * 4 }});
         }!!;
 
         float* mapped = (float*)download_staging.data();
@@ -687,9 +687,9 @@ fn image::Image? zimage_generate(
             data: null, data_size: (usz)latent_elems * 4,
         )!!;
         
-        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer rb_cmd) {
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer rb_cmd) {
             vk::cmdCopyBuffer(rb_cmd, dit.acts.latent.gpu_buffer.buffer, lat_readback.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
         }!!;
         
         float* lat_ptr = (float*)lat_readback.data();
@@ -728,7 +728,7 @@ fn image::Image? zimage_generate(
 
     return result;
 }
-module llm::zimage;
+module llm::pipelines;
 
 import vk;
 import std::io;
@@ -740,7 +740,7 @@ import std::time::clock;
 import image;
 import image::png;
 import llm;
-import llm::pipeline;
+import llm::diffusers;
 
 // Z-Image Pipeline - PyTorch-style API
 // Usage:
@@ -777,7 +777,7 @@ fn ZImagePipeline? zimage_pipeline_from_gguf(llm::DeviceContext* ctx, String mod
     // Verify it's a DiT model
     if (!is_dit_model(&gf)) {
         io::printfn("Error: Model is not a DiT/Z-Image model");
-        return pipeline::PIPELINE_LOAD_FAILED~;
+        return PIPELINE_LOAD_FAILED~;
     }
     
     mm.destroy();
@@ -810,12 +810,12 @@ fn void ZImagePipeline.set_taesd(ZImagePipeline* self, String path) {
 fn image::Image? ZImagePipeline.generate(ZImagePipeline* self, ZImageInputs* inputs) {
     // Validate
     if (!inputs.validate()) {
-        return pipeline::PIPELINE_INVALID_INPUT~;
+        return PIPELINE_INVALID_INPUT~;
     }
     
     if (self.text_encoder_path.len == 0) {
         io::printfn("Error: Text encoder path not set. Call set_text_encoder() first.");
-        return pipeline::PIPELINE_INVALID_INPUT~;
+        return PIPELINE_INVALID_INPUT~;
     }
     
     // Load GGUF file and run generation

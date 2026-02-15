@@ -1,10 +1,11 @@
-module llm;
+module llm::pipelines;
 
 import std::io;
 import std::math;
 import std::math::random;
 import std::core::mem;
 import vk;
+import llm;
 
 // Diffusion Schedulers: DDIM and Euler
 // For SDXS (1-step distilled model), the scheduler is essentially a single pass
@@ -100,8 +101,8 @@ fn void generate_random_latent(float[] latent, uint seed) {
 // --- DDIM Step on GPU ---
 
 fn void dispatch_ddim_step(
-    CommandBuffer cmd,
-    DiffusionKernels* k,
+    vk::CommandBuffer cmd,
+    llm::DiffusionKernels* k,
     Tensor* noisy,           // current noisy latent (read/write)
     Tensor* predicted_noise, // model output
     uint n_elements,
@@ -115,17 +116,17 @@ fn void dispatch_ddim_step(
         .sqrt_alpha_prev = math::sqrt(alpha_prev),
         .sqrt_one_minus_alpha_prev = math::sqrt(1.0f - alpha_prev),
     };
-    dispatch_kernel(cmd, &k.ddim_step,
+    llm::dispatch_kernel(cmd, &k.ddim_step,
         { noisy.gpu_buffer.buffer, predicted_noise.gpu_buffer.buffer },
         { noisy.size_bytes, predicted_noise.size_bytes },
-        &pc, ceil_div(n_elements, 256));
+        &pc, llm::ceil_div(n_elements, 256));
 }
 
 // --- Euler Step on GPU ---
 
 fn void dispatch_euler_step(
-    CommandBuffer cmd,
-    DiffusionKernels* k,
+    vk::CommandBuffer cmd,
+    llm::DiffusionKernels* k,
     Tensor* noisy,
     Tensor* predicted_noise,
     uint n_elements,
@@ -135,10 +136,10 @@ fn void dispatch_euler_step(
         .n = n_elements,
         .dt = dt,
     };
-    dispatch_kernel(cmd, &k.euler_step,
+    llm::dispatch_kernel(cmd, &k.euler_step,
         { noisy.gpu_buffer.buffer, predicted_noise.gpu_buffer.buffer },
         { noisy.size_bytes, predicted_noise.size_bytes },
-        &pc, ceil_div(n_elements, 256));
+        &pc, llm::ceil_div(n_elements, 256));
 }
 
 // --- Get alpha values for a timestep ---
