@@ -10,8 +10,8 @@ faultdef ARGS_INVALID,
          ARGS_MISSING_MODEL,
          ARGS_MISSING_PROMPT;
 
-// Configuration for Z-Image generation
-struct ZImageConfig {
+// Configuration for image generation
+struct AppConfig {
     String model_path;
     String prompt;
     String output_path;
@@ -26,8 +26,8 @@ struct ZImageConfig {
 }
 
 // Parse arguments and config files
-fn ZImageConfig? parse_args(String[] args) {
-    ZImageConfig config = {
+fn AppConfig? parse_args(String[] args) {
+    AppConfig config = {
         .model_path = "",
         .prompt = "",
         .output_path = "output.png",
@@ -61,7 +61,7 @@ fn ZImageConfig? parse_args(String[] args) {
     while (i < args.len) {
         if (args[i].len > 2 && args[i][0] == '-' && args[i][1] == '-') {
             if (i + 1 >= args.len) { i++; continue; }
-            
+
             if (args[i] == "--output") {
                 config.output_path = args[i + 1];
                 i += 2;
@@ -121,7 +121,7 @@ fn ZImageConfig? parse_args(String[] args) {
     return config;
 }
 
-fn bool load_config(String config_path, ZImageConfig* config) {
+fn bool load_config(String config_path, AppConfig* config) {
     char[] config_data = file::load(mem, config_path)!!;
     Object* cfg = json::parse_string(mem, (String)config_data)!!;
 

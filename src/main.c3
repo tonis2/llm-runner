@@ -10,17 +10,17 @@ import llm::diffusers;
 
 fn int main(String[] args) {
     // Parse arguments
-    ZImageConfig config = args::parse_args(args)!!;
-    
+    AppConfig config = args::parse_args(args)!!;
+
     io::printfn("Loading model from: %s", config.model_path);
     io::printfn("Prompt: %s", config.prompt);
-    
+
     // Setup Vulkan context
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
-    
-    // Load pipeline (PyTorch-style)
-    llm::pipelines::ZImagePipeline pipeline = llm::pipelines::zimage_pipeline_from_gguf(&ctx, config.model_path)!!;
+
+    // Load pipeline (auto-detects model type from GGUF)
+    llm::pipelines::ImagePipeline pipeline = llm::pipelines::pipeline_from_gguf(&ctx, config.model_path)!!;
     defer pipeline.free();
 
     // Configure pipeline
@@ -35,13 +35,13 @@ fn int main(String[] args) {
     }
 
     // Prepare inputs
-    llm::pipelines::ZImageInputs inputs = llm::pipelines::zimage_inputs_defaults();
+    llm::pipelines::GenerationInputs inputs = llm::pipelines::generation_inputs_defaults();
     inputs.prompt = config.prompt;
     inputs.image_size = config.image_size;
     inputs.num_steps = config.num_steps;
     inputs.cfg_scale = config.cfg_scale;
     inputs.seed = config.seed;
-    
+
     // Optional: img2img mode
     image::Image input_img;
     if (config.input_path.len > 0) {
@@ -49,27 +49,27 @@ fn int main(String[] args) {
         inputs.input_image = &input_img;
         inputs.strength = 0.75;
     }
-    
+
     // Generate image
     io::printfn("\nGenerating image...");
     image::Image output = pipeline.generate(&inputs)!!;
-    
+
     // Cleanup input if loaded
     if (config.input_path.len > 0) {
         input_img.free();
     }
-    
-    // Save output (user controls this, like in PyTorch)
+
+    // Save output
     if (catch err = png::save_file(&output, config.output_path)) {
         io::printfn("Error: Failed to save image to %s", config.output_path);
         output.free();
         return 1;
     }
-    
+
     io::printfn("Image saved to: %s", config.output_path);
-    
+
     // Cleanup
     output.free();
-    
+
     return 0;
 }
