@@ -9,8 +9,8 @@ import std::core::mem;
 import std::time::clock;
 
 // Embedded Z-Image SPIR-V shaders
-const char[*] ZIMAGE_SPV = $embed("../../shaders/zimage.spv");
-const char[*] MROPE_SPV = $embed("../../shaders/mrope.spv");
+const char[*] ZIMAGE_SPV = $embed("./shaders/zimage.spv");
+const char[*] MROPE_SPV = $embed("./shaders/mrope.spv");
 
 // DiT (Diffusion Transformer) for Z-Image Turbo / Lumina2 architecture
 // 30-layer transformer with AdaLN modulation, dual RMSNorm, SwiGLU FFN

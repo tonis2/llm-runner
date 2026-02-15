@@ -7,10 +7,10 @@ import std::encoding::json;
 import std::collections::object;
 
 // Embedded diffusion SPIR-V shader
-const char[*] DIFFUSION_SPV = $embed("../../shaders/diffusion.spv");
+const char[*] DIFFUSION_SPV = $embed("../shaders/diffusion.spv");
 
 // Embedded SD config
-const char[*] SD_CONFIG_JSON = $embed("../../configs/sd.json");
+const char[*] SD_CONFIG_JSON = $embed("../configs/sd.json");
 
 // --- Diffusion Config ---
 

@@ -9,13 +9,12 @@ import std::core::mem;
 const MAX_SEQ_LEN = 2048;
 
 // Embedded SPIR-V shader (single module with all entry points)
-const char[*] LLM_SPV = $embed("../../shaders/llm.spv");
+const char[*] LLM_SPV = $embed("./shaders/llm.spv");
 
 // Embedded architecture configs
-const char[*] LLAMA_CONFIG_JSON = $embed("../../configs/llama.json");
-const char[*] QWEN2_CONFIG_JSON = $embed("../../configs/qwen2.json");
-const char[*] QWEN3_CONFIG_JSON = $embed("../../configs/qwen3.json");
-const char[*] PHI3_CONFIG_JSON = $embed("../../configs/phi3.json");
+const char[*] LLAMA_CONFIG_JSON = $embed("./configs/llama.json");
+const char[*] QWEN2_CONFIG_JSON = $embed("./configs/qwen2.json");
+const char[*] QWEN3_CONFIG_JSON = $embed("./configs/qwen3.json");
 
 struct LayerWeights {
     llm::Tensor attn_norm;
