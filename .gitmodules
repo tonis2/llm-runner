@@ -1,3 +1,6 @@
 [submodule "dependencies/vulkan.c3l"]
 	path = dependencies/vulkan.c3l
 	url = git@github.com:tonis2/Vulkan.c3.git
+[submodule "dependencies/image.c3l"]
+	path = dependencies/image.c3l
+	url = git@github.com:tonis2/image.c3.git

@@ -431,21 +431,41 @@ fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* 
         mem::copy(f32_data, data_ptr, f32_size);
     }
 
+    // Transpose 2D weights: GGUF stores [in_dim, out_dim] (column-major implicit)
+    // but shaders expect [out_dim, in_dim] (row-major)
+    float* final_data = f32_data;
+    ulong[4] final_shape = info.shape;
+    if (info.n_dims == 2) {
+        uint in_dim = (uint)info.shape[0];
+        uint out_dim = (uint)info.shape[1];
+        float* transposed = (float*)mem::calloc(f32_size);
+        for (uint o = 0; o < out_dim; o++) {
+            for (uint i = 0; i < in_dim; i++) {
+                // transposed[o, i] = original[i, o]
+                transposed[o * in_dim + i] = f32_data[i * out_dim + o];
+            }
+        }
+        mem::free(f32_data);
+        final_data = transposed;
+        final_shape[0] = out_dim;
+        final_shape[1] = in_dim;
+    }
+
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: f32_data,
+        data: final_data,
         data_size: f32_size,
     )!!;
 
-    mem::free(f32_data);
+    mem::free(final_data);
 
     return {
         .gpu_buffer = gpu_buffer,
         .dtype = GGML_F32,
         .n_dims = info.n_dims,
-        .shape = info.shape,
+        .shape = final_shape,
         .size_bytes = f32_size,
     };
 }

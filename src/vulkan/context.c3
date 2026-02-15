@@ -132,10 +132,14 @@ fn DeviceContext? createContext() {
         .build(device)!!;
 
     // 256MB page size for model weights
+    DeviceQueue* queue_ptr = mem::alloc(DeviceQueue);
+    *queue_ptr = compute_queue;
+
+    // 256MB page size for model weights
     vk::MemoryAllocator allocator = (vk::MemoryAllocator){
         .device = device,
         .pdevice = physical_device,
-        .queue = &compute_queue,
+        .queue = queue_ptr,
         .default_page_size = 256_000_000,
         .flags = vk::MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | vk::MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT,
     }.init()!;
@@ -156,6 +160,7 @@ fn void DeviceContext.free(&self) {
     self.device.waitIdle();
     self.command_pool.free(self.device);
     vk::destroyFence(self.device, self.compute_fence, null);
+    mem::free(self.allocator.queue);
     self.allocator.free();
     self.device.free();
     self.instance.free();

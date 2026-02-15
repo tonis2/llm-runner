@@ -585,11 +585,13 @@ fn DiTLayerWeights load_dit_layer_weights(DeviceContext* ctx, GGUFFile* gf, Stri
     String qkv_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.qkv.weight");
     io::printfn("    [%s%d] loading qkv...", prefix, layer);
     if (try info = gf.find_tensor(qkv_name)) {
+        io::printfn("    [DEBUG] QKV GGUF type: %d (GGML_Q5_K=%d, GGML_BF16=%d)", info.type, GGML_Q5_K, GGML_BF16);
         if (info.type == GGML_F16 || info.type == GGML_BF16 || info.type == GGML_F32) {
             lw.wqkv = upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
         } else {
             lw.wqkv = upload_weight(ctx, info, gf.tensor_data_base)!!;
         }
+        io::printfn("    [DEBUG] QKV loaded dtype: %d (GGML_F32=%d, GGML_BF16=%d)", lw.wqkv.dtype, GGML_F32, GGML_BF16);
     } else {
         io::printfn("    Warning: QKV not found: %s", qkv_name);
     }
@@ -1133,16 +1135,80 @@ fn void? dit_transformer_layer(
 
     // === Phase B: QKV batch matmul (3 dispatches) ===
     // wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
+    if (profiling) {
+        io::printfn("      [DEBUG] QKV weight: size=%d bytes, dtype=%d, expected=%d", 
+            lw.wqkv.size_bytes, lw.wqkv.dtype, 11520 * 15 * 176);
+        io::printfn("      [DEBUG] QKV matmul: seq_len=%d, dim=%d", seq_len, dim);
+    }
+    
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
     compute_barrier(cmd);
 
-    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
+    if (profiling) {
+        submit_and_wait(ctx)!!;
+        // Debug: Check Q/K/V stats after matmul
+        vk::Memory q_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, q_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        submit_and_wait(ctx)!!;
+        float* q_ptr = (float*)q_stg.data();
+        float q_min = q_ptr[0];
+        float q_max = q_ptr[0];
+        float q_sum = 0;
+        for (uint i = 0; i < seq_len * dim; i++) {
+            if (q_ptr[i] < q_min) q_min = q_ptr[i];
+            if (q_ptr[i] > q_max) q_max = q_ptr[i];
+            q_sum += q_ptr[i];
+        }
+        io::printfn("      [DEBUG] After QKV matmul - Q: min=%.4f max=%.4f mean=%.4f", q_min, q_max, (float)q_sum / (float)(seq_len * dim));
+        q_stg.free();
+        begin_compute(cmd)!!;
+        io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
+    }
 
     // === Phase C: Head norm + Forward Transpose + Flash Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
+
+    if (profiling) {
+        submit_and_wait(ctx)!!;
+        // Debug: Check Q after head norm
+        vk::Memory q_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, q_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        submit_and_wait(ctx)!!;
+        float* q_ptr = (float*)q_stg.data();
+        float q_min = q_ptr[0];
+        float q_max = q_ptr[0];
+        float q_sum = 0;
+        float q_sq_sum = 0;
+        for (uint i = 0; i < seq_len * dim; i++) {
+            float v = q_ptr[i];
+            if (v < q_min) { q_min = v; }
+            if (v > q_max) { q_max = v; }
+            q_sum += v;
+            q_sq_sum += v * v;
+        }
+        float q_mean = (float)q_sum / (float)(seq_len * dim);
+        float q_std = math::sqrt(q_sq_sum / (float)(seq_len * dim) - q_mean * q_mean);
+        io::printfn("      [DEBUG] After QK-norm - Q: min=%.4f max=%.4f mean=%.4f std=%.4f", q_min, q_max, q_mean, q_std);
+        q_stg.free();
+        begin_compute(cmd)!!;
+    }
 
     // Forward transpose Q/K/V: [seq_len, dim] -> [n_heads, seq_len, head_dim]
     uint total_elems = seq_len * dim;
@@ -1214,7 +1280,38 @@ fn void? dit_transformer_layer(
         &fa_pc, DIT_HEADS * seq_len);
     compute_barrier(cmd);
 
-    if (profiling) { submit_and_wait(ctx)!!; io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); begin_compute(cmd)!!; }
+    if (profiling) {
+        submit_and_wait(ctx)!!;
+        // Debug: Check attention output
+        vk::Memory attn_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, attn_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        submit_and_wait(ctx)!!;
+        float* attn_ptr = (float*)attn_stg.data();
+        float attn_min = attn_ptr[0];
+        float attn_max = attn_ptr[0];
+        float attn_sum = 0;
+        float attn_sq_sum = 0;
+        for (uint i = 0; i < seq_len * dim; i++) {
+            float v = attn_ptr[i];
+            if (v < attn_min) { attn_min = v; }
+            if (v > attn_max) { attn_max = v; }
+            attn_sum += v;
+            attn_sq_sum += v * v;
+        }
+        float attn_mean = (float)attn_sum / (float)(seq_len * dim);
+        float attn_std = math::sqrt(attn_sq_sum / (float)(seq_len * dim) - attn_mean * attn_mean);
+        io::printfn("      [DEBUG] After flash_attention: min=%.4f max=%.4f mean=%.4f std=%.4f", attn_min, attn_max, attn_mean, attn_std);
+        attn_stg.free();
+        begin_compute(cmd)!!;
+        io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
+    }
 
     // === Phase D: Output projection + Post-attention norm + Gated residual ===
     // Output projection: buf_b -> buf_a
@@ -1552,6 +1649,16 @@ fn void? DiTModel.forward(&self, Tensor* text_embeddings, float timestep) {
             submit_and_wait(ctx)!!;
             if (l == 0) {
                 debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 0")!!;
+                // Debug: Save Q, K, V, attention output from first main layer
+                // These buffers still contain the values from layer 0
+                debug_save_npy(ctx, a.q.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_q.bin")!!;
+                debug_save_npy(ctx, a.k.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_k.bin")!!;
+                debug_save_npy(ctx, a.v.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_v.bin")!!;
+                // Attention output is in buf_b (before it gets overwritten by FFN)
+                // Actually, buf_b is reused, so we can't read it here
+                // Save hidden state instead
+                debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_after_layer0_hidden.bin")!!;
+                io::printfn("      Saved layer 0 Q/K/V and hidden state");
             } else if (l == 1) {
                 debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 1")!!;
             } else if (l == 5) {
