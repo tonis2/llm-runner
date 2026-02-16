@@ -431,25 +431,10 @@ fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* 
         mem::copy(f32_data, data_ptr, f32_size);
     }
 
-    // Transpose 2D weights: GGUF stores [in_dim, out_dim] (column-major implicit)
-    // but shaders expect [out_dim, in_dim] (row-major)
+    // GGML stores 2D weights as [out_dim, in_dim] row-major (ne[0]=in_dim, ne[1]=out_dim)
+    // This matches our shader convention (W[out_idx * in_dim + in_idx]), no transpose needed.
     float* final_data = f32_data;
     ulong[4] final_shape = info.shape;
-    if (info.n_dims == 2) {
-        uint in_dim = (uint)info.shape[0];
-        uint out_dim = (uint)info.shape[1];
-        float* transposed = (float*)mem::calloc(f32_size);
-        for (uint o = 0; o < out_dim; o++) {
-            for (uint i = 0; i < in_dim; i++) {
-                // transposed[o, i] = original[i, o]
-                transposed[o * in_dim + i] = f32_data[i * out_dim + o];
-            }
-        }
-        mem::free(f32_data);
-        final_data = transposed;
-        final_shape[0] = out_dim;
-        final_shape[1] = in_dim;
-    }
 
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,

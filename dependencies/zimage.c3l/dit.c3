@@ -1503,9 +1503,12 @@ llm::submit_and_wait(ctx)!!;
 
 llm::begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: sigma * 1000 (model expects timestep in [0,1000])
-    // sigma=1.0 -> timestep=1000 (noisy), sigma=0.0 -> timestep=0 (clean)
-    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = DIT_T_PERIOD * timestep };
+    // 3. Timestep embedding: (1 - sigma) * 1000
+    // Diffusers ZImage: pipeline passes (1000-t)/1000, transformer multiplies by t_scale=1000
+    // So sinusoidal receives (1-sigma)*1000: sigma=1.0 -> 0 (noisy), sigma=0.0 -> 1000 (clean)
+    float actual_timestep = DIT_T_PERIOD * (1.0f - timestep);
+    io::printfn("  [DEBUG] Timestep: sigma=%.6f, passed to sinusoidal embedding=%.3f", timestep, actual_timestep);
+    DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
 llm::dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
         { a.t_emb.size_bytes },
@@ -1541,6 +1544,50 @@ llm::compute_barrier(cmd);
 
     // NOTE: No SiLU here — JointTransformerBlock's adaLN uses t_emb directly (weight at .0)
     // Only FinalLayer applies SiLU before its adaLN Linear (weight at .1 in Sequential(SiLU, Linear))
+
+    // Debug: export t_emb to file for PyTorch comparison
+    if (try _f = io::file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
+        _f.close()!;
+llm::submit_and_wait(ctx)!!;
+        vk::Memory temb_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)DIT_T_EMB_DIM * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer temb_cmd) {
+            vk::cmdCopyBuffer(temb_cmd, a.t_emb.gpu_buffer.buffer, temb_stg.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
+        }!!;
+        float* temb_ptr = (float*)temb_stg.data();
+        // Write with timestep in filename (e.g. t_emb_sigma_0.750_c3.bin)
+        char[256] temb_fn;
+        usz temb_fn_len = 0;
+        String temb_prefix = "/tmp/zimage_debug/t_emb_sigma_";
+        for (usz i = 0; i < temb_prefix.len; i++) temb_fn[temb_fn_len++] = temb_prefix[i];
+        // Encode sigma*1000 as integer for filename
+        uint sigma_int = (uint)(timestep * 1000.0f + 0.5f);
+        if (sigma_int >= 1000) { temb_fn[temb_fn_len++] = (char)('0' + sigma_int / 1000); }
+        if (sigma_int >= 100) { temb_fn[temb_fn_len++] = (char)('0' + (sigma_int / 100) % 10); }
+        if (sigma_int >= 10) { temb_fn[temb_fn_len++] = (char)('0' + (sigma_int / 10) % 10); }
+        temb_fn[temb_fn_len++] = (char)('0' + sigma_int % 10);
+        String temb_suffix = "_c3.bin";
+        for (usz i = 0; i < temb_suffix.len; i++) temb_fn[temb_fn_len++] = temb_suffix[i];
+        temb_fn[temb_fn_len] = 0;
+        if (try f_temb = io::file::open((String)temb_fn[0..temb_fn_len - 1], "wb")) {
+            uint n_temb = DIT_T_EMB_DIM;
+            char[4] temb_hdr = {
+                (char)(n_temb & 0xFF), (char)((n_temb >> 8) & 0xFF),
+                (char)((n_temb >> 16) & 0xFF), (char)((n_temb >> 24) & 0xFF)
+            };
+            f_temb.write(&temb_hdr)!;
+            f_temb.write(((char*)temb_ptr)[0..DIT_T_EMB_DIM * 4 - 1])!;
+            f_temb.close()!;
+            io::printfn("  [DEBUG] Saved t_emb to %s", (String)temb_fn[0..temb_fn_len - 1]);
+        }
+        temb_stg.free();
+llm::begin_compute(cmd)!!;
+    }
 
     // Debug: readback t_emb after MLP + SiLU
     if (dit_profile_layer) {

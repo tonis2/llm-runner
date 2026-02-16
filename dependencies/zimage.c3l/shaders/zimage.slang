@@ -171,11 +171,11 @@ void linear_proj(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     if (seq_pos >= linear_proj_pc.seq_len || out_idx >= linear_proj_pc.out_dim) return;
 
     // Parallel dot product: each thread handles a stride of elements
-    // GGUF stores weights as [in_dim, out_dim], so access as weight[k, out_idx]
+    // GGML stores weights as [out_dim, in_dim] row-major (same as batch_matmul)
     float partial = 0.0;
     for (uint k = gi; k < linear_proj_pc.in_dim; k += 256) {
         partial += lp_input[seq_pos * linear_proj_pc.in_dim + k] *
-                   lp_weight[k * linear_proj_pc.out_dim + out_idx];
+                   lp_weight[out_idx * linear_proj_pc.in_dim + k];
     }
 
     // Tree reduction in shared memory
@@ -228,8 +228,8 @@ void linear_proj_debug(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         float sum = 0.0;
         for (uint k = 0; k < linear_proj_pc.in_dim; k++) {
             float input_val = lp_input[seq_pos * linear_proj_pc.in_dim + k];
-            // Weight layout: [in_dim, out_dim] from GGUF
-            float weight_val = lp_weight[k * linear_proj_pc.out_dim + out_idx];
+            // Weight layout: [out_dim, in_dim] row-major from GGML
+            float weight_val = lp_weight[out_idx * linear_proj_pc.in_dim + k];
             sum += input_val * weight_val;
         }
         

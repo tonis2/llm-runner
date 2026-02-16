@@ -699,6 +699,11 @@ fn llm::Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
     io::printfn("  Embedded %d tokens", seq_len);
 
     // 2. Process layers one at a time (streaming weights)
+    // Diffusers uses hidden_states[-2] (second-to-last layer output, no final norm).
+    // We save hidden_states after layer n_layers-2 and return those directly.
+    uint penultimate_layer = c.n_layers >= 2 ? c.n_layers - 2 : 0;
+    llm::Tensor text_embeddings;
+
     for (uint l = 0; l < c.n_layers; l++) {
         // Upload this layer's weights
         LayerWeights lw = load_single_layer(ctx, self.gf, self.names, c, l)!!;
@@ -727,41 +732,20 @@ llm::submit_and_wait(ctx)!!;
         if ((l + 1) % 4 == 0 || l == c.n_layers - 1) {
             io::printfn("  Processed layer %d / %d", l + 1, c.n_layers);
         }
-    }
 
-    // 3. Apply final norm to each position, build output
-    llm::Tensor text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
-
-llm::begin_compute(cmd)!!;
-    for (uint pos = 0; pos < seq_len; pos++) {
-        // Copy hidden_states[pos] → acts.hidden
-        vk::cmdCopyBuffer(cmd, hidden_states.gpu_buffer.buffer, self.acts.hidden.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = (ulong)pos * c.dim * 4, .dstOffset = 0, .size = (ulong)c.dim * 4 }});
-llm::compute_barrier(cmd);
-
-        // Final norm
-        if (c.norm_type == RMSNORM) {
-            llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &self.kernels.shared.rmsnorm,
-                { self.acts.hidden.gpu_buffer.buffer, self.weights.output_norm.gpu_buffer.buffer, self.acts.norm_out.gpu_buffer.buffer },
-                { self.acts.hidden.size_bytes, self.weights.output_norm.size_bytes, self.acts.norm_out.size_bytes },
-                &final_rms, 1);
-        } else {
-            llm::LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &self.kernels.shared.layernorm,
-                { self.acts.hidden.gpu_buffer.buffer, self.weights.output_norm.gpu_buffer.buffer, self.weights.output_norm_bias.gpu_buffer.buffer, self.acts.norm_out.gpu_buffer.buffer },
-                { self.acts.hidden.size_bytes, self.weights.output_norm.size_bytes, self.weights.output_norm_bias.size_bytes, self.acts.norm_out.size_bytes },
-                &final_ln, 1);
+        // Snapshot hidden_states after second-to-last layer (hidden_states[-2])
+        if (l == penultimate_layer) {
+            text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer snap_cmd) {
+                vk::cmdCopyBuffer(snap_cmd, hidden_states.gpu_buffer.buffer,
+                    text_embeddings.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * c.dim * 4 }});
+            }!!;
+            io::printfn("  Captured hidden_states[-2] from layer %d (diffusers-compatible)", l + 1);
         }
-llm::compute_barrier(cmd);
-
-        // Copy norm_out → text_embeddings[pos]
-        vk::cmdCopyBuffer(cmd, self.acts.norm_out.gpu_buffer.buffer, text_embeddings.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
-llm::compute_barrier(cmd);
     }
-llm::submit_and_wait(ctx)!!;
 
+    // Skip final norm — diffusers uses raw hidden_states[-2] without normalization
     hidden_states.free();
 
     text_embeddings.n_dims = 2;

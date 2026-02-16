@@ -1167,8 +1167,8 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     // Each thread computes a partial sum
     float partial = 0.0;
     for (uint k = gi; k < bm_simple_pc.in_dim; k += 256) {
-        // Weight layout: [in_dim, out_dim] - weight[k, actual_out]
-        partial += bm_simple_weight[k * (bm_simple_pc.row_offset + bm_simple_pc.out_dim) + actual_out] 
+        // Weight layout: [out_dim, in_dim] row-major (GGML convention)
+        partial += bm_simple_weight[actual_out * bm_simple_pc.in_dim + k]
                    * bm_simple_input[in_base + k];
     }
     
