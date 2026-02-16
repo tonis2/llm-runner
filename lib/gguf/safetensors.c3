@@ -56,6 +56,7 @@ fn SafetensorsFile? safetensors_open(String path) {
 
     // Get keys to count tensors and iterate
     String[] keys = root.map.keys(mem);
+	defer mem::free(keys);
 
     // Count actual tensor entries (skip __metadata__)
     usz tensor_count = 0;
@@ -99,7 +100,6 @@ fn SafetensorsFile? safetensors_open(String path) {
         n_tensors++;
     }
 
-    mem::free(keys);
     root.free();
 
     char* data_base = &data[8 + (usz)header_len];
