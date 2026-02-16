@@ -173,7 +173,7 @@ fn image::Image? float_tensor_to_image(float[] data, uint width, uint height, ui
             }
         }
     }
-
+    
     return {
         .width = width,
         .height = height,

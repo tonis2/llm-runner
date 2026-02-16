@@ -392,6 +392,7 @@ llm::compute_barrier(cmd);
     // Copy result to buf_a
     vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
         (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)out_n * 4 }});
+llm::compute_barrier(cmd);
 
 llm::submit_and_wait(ctx)!!;
     // Image [3, h, w] is now in buf_a
