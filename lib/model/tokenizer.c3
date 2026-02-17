@@ -286,6 +286,44 @@ fn int gpt2_byte_decode(uint cp) {
     return -1;
 }
 
+// GPT-2 byte encoding: maps raw byte values to unicode codepoints.
+// This is the reverse of gpt2_byte_decode.
+// Pass-through: 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF map to themselves.
+// Remapped: 0x00-0x20 -> U+0100..U+0120, 0x7F-0xA0 -> U+0121..U+0142, 0xAD -> U+0143.
+fn uint gpt2_byte_encode(char byte_val) {
+    uint b = (uint)byte_val;
+    if (b >= 0x21 && b <= 0x7E) return b;
+    if (b >= 0xA1 && b <= 0xAC) return b;
+    if (b >= 0xAE && b <= 0xFF) return b;
+    if (b <= 0x20) return 0x100 + b;
+    if (b >= 0x7F && b <= 0xA0) return 0x100 + 33 + (b - 0x7F);
+    return 0x143; // 0xAD
+}
+
+// Convert raw bytes to GPT-2 byte-encoded UTF-8 string.
+// Each input byte maps to a unicode codepoint, then encoded as UTF-8.
+// Returns the number of bytes written to buf.
+fn usz gpt2_encode_to_buf(String raw, char[] buf) {
+    usz out = 0;
+    for (usz i = 0; i < raw.len; i++) {
+        uint cp = gpt2_byte_encode(raw[i]);
+        if (cp < 0x80) {
+            buf[out] = (char)cp;
+            out++;
+        } else if (cp < 0x800) {
+            buf[out] = (char)(0xC0 | (cp >> 6));
+            buf[out + 1] = (char)(0x80 | (cp & 0x3F));
+            out += 2;
+        } else {
+            buf[out] = (char)(0xE0 | (cp >> 12));
+            buf[out + 1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            buf[out + 2] = (char)(0x80 | (cp & 0x3F));
+            out += 3;
+        }
+    }
+    return out;
+}
+
 fn String Tokenizer.decode_token(&self, uint token_id, char[] buf) {
     if (token_id >= self.vocab_size) return "";
 
@@ -580,10 +618,17 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
         }
 
         char c = text[pos];
+        usz start = pos;
+
+        // Optionally consume a single leading space (0x20) before non-whitespace.
+        // This matches GPT-2 regex patterns like ` ?\p{L}+` which group space with word.
+        if (c == ' ' && pos + 1 < text.len && !ascii::is_space_m(text[pos + 1])) {
+            pos++;
+            c = text[pos];
+        }
 
         // Letters (including UTF-8 multi-byte sequences)
         if (ascii::is_alpha_m(c) || (c & 0x80) != 0) {
-            usz start = pos;
             pos++;
             while (pos < text.len) {
                 char nc = text[pos];
@@ -600,7 +645,6 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
 
         // Digits (1-3 at a time)
         if (ascii::is_digit_m(c)) {
-            usz start = pos;
             usz count = 0;
             while (pos < text.len && ascii::is_digit_m(text[pos]) && count < 3) {
                 pos++;
@@ -613,7 +657,6 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
 
         // Whitespace
         if (ascii::is_space_m(c)) {
-            usz start = pos;
             while (pos < text.len && ascii::is_space_m(text[pos])) {
                 pos++;
             }
@@ -622,10 +665,10 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
             continue;
         }
 
-        // Punctuation / other (single char)
-        words[n_words] = { .start = pos, .len = 1 };
-        n_words++;
+        // Punctuation / other (single char, possibly with leading space)
         pos++;
+        words[n_words] = { .start = start, .len = pos - start };
+        n_words++;
     }
 
     *out_count = n_words;
@@ -669,7 +712,7 @@ fn void bpe_merge_word(BPESymbol[] syms, usz n_syms, char[] text, MergeMap* merg
 fn uint[]? Tokenizer.encode_bpe(&self, String text) {
     if (text.len == 0) return mem::new_array(uint, 0);
 
-    // Pre-tokenize into words
+    // Pre-tokenize into words (on raw text)
     usz n_words;
     WordSpan[] words = pre_tokenize(text, &n_words);
     defer mem::free(words);
@@ -679,32 +722,42 @@ fn uint[]? Tokenizer.encode_bpe(&self, String text) {
     uint[] all_tokens = mem::new_array(uint, max_tokens);
     usz total_tokens = 0;
 
+    // Buffer for GPT-2 byte encoding (each raw byte -> up to 2 UTF-8 bytes)
+    usz enc_buf_size = text.len * 3 + 16;
+    char[] enc_buf = mem::new_array(char, enc_buf_size);
+    defer mem::free(enc_buf);
+
     // Allocate shared BPE symbol buffer
-    usz max_syms = text.len * 2;
+    usz max_syms = text.len * 4;
     BPESymbol[] syms = mem::new_array(BPESymbol, max_syms);
     defer mem::free(syms);
 
     for (usz w = 0; w < n_words; w++) {
         String word = (String)text[words[w].start .. words[w].start + words[w].len - 1];
 
-        // Try ignore_merges: look up whole word in vocab first
+        // GPT-2 byte encode the word: raw bytes -> unicode codepoints -> UTF-8
+        // The vocab stores GPT-2-encoded strings (e.g. space=Ġ, newline=Ċ)
+        usz enc_len = gpt2_encode_to_buf(word, enc_buf);
+        String enc_word = (String)enc_buf[0..enc_len - 1];
+
+        // Try ignore_merges: look up whole encoded word in vocab first
         if (self.ignore_merges) {
             uint word_id;
-            if (self.vocab_map.lookup_id(word, &word_id)) {
+            if (self.vocab_map.lookup_id(enc_word, &word_id)) {
                 all_tokens[total_tokens] = word_id;
                 total_tokens++;
                 continue;
             }
         }
 
-        // Split word into UTF-8 codepoints as initial symbols
+        // Split encoded word into UTF-8 codepoints as initial BPE symbols
         usz n_syms = 0;
         usz pos = 0;
-        while (pos < word.len) {
-            usz cplen = utf8_codepoint_len(word[pos]);
-            if (pos + cplen > word.len) cplen = 1;
+        while (pos < enc_len) {
+            usz cplen = utf8_codepoint_len(enc_buf[pos]);
+            if (pos + cplen > enc_len) cplen = 1;
             syms[n_syms] = {
-                .text_start = words[w].start + pos,
+                .text_start = pos,
                 .text_len = cplen,
                 .prev = (int)n_syms - 1,
                 .next = (int)n_syms + 1,
@@ -716,25 +769,26 @@ fn uint[]? Tokenizer.encode_bpe(&self, String text) {
         if (n_syms == 0) continue;
         syms[n_syms - 1].next = -1;
 
-        // Run BPE merges
-        bpe_merge_word(syms, n_syms, text, &self.merge_map);
+        // Run BPE merges on encoded form
+        bpe_merge_word(syms, n_syms, enc_buf, &self.merge_map);
 
         // Collect resulting tokens
         int s = 0;
         while (s != -1) {
             usz sym_start = syms[(usz)s].text_start;
             usz sym_len = syms[(usz)s].text_len;
-            String piece = (String)text[sym_start .. sym_start + sym_len - 1];
+            String piece = (String)enc_buf[sym_start .. sym_start + sym_len - 1];
 
             uint id;
             if (self.vocab_map.lookup_id(piece, &id)) {
                 all_tokens[total_tokens] = id;
             } else if (sym_len == 1) {
-                all_tokens[total_tokens] = self.byte_tokens[(usz)text[sym_start]];
+                // Single encoded byte not in vocab — try byte token fallback
+                all_tokens[total_tokens] = self.byte_tokens[(usz)enc_buf[sym_start]];
             } else {
-                // Multi-byte unknown: fall back to individual bytes
+                // Multi-byte unknown: fall back to individual codepoints
                 for (usz b = 0; b < sym_len; b++) {
-                    all_tokens[total_tokens] = self.byte_tokens[(usz)text[sym_start + b]];
+                    all_tokens[total_tokens] = self.byte_tokens[(usz)enc_buf[sym_start + b]];
                     total_tokens++;
                 }
                 s = syms[(usz)s].next;

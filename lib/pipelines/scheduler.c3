@@ -131,13 +131,14 @@ fn float time_snr_shift(float alpha, float t) {
     return alpha * t / (1.0f + (alpha - 1.0f) * t);
 }
 
-fn FlowMatchingState init_flow_matching(uint num_steps) {
+fn FlowMatchingState init_flow_matching(uint num_steps, uint image_seq_len = 0) {
     float[] sigmas = mem::new_array(float, (usz)num_steps + 1);
 
-    // Match KoboldCpp DiscreteScheduler::get_sigmas with DiscreteFlowDenoiser
-    // t_to_sigma(t) = time_snr_shift(3.0, (t+1)/1000)
-    // Linearly space n timestep indices from t_max=999 to 0, then append sigma=0
-    float shift = 3.0f;
+    // Shift factor for sigma schedule:
+    // - shift=1.0: identity (linear schedule, used by Z-Image Turbo / diffusers default)
+    // - shift=3.0: KoboldCpp default for Flux models
+    // For image_seq_len > 0, use shift=1.0 (matching diffusers FlowMatchEulerDiscreteScheduler default)
+    float shift = image_seq_len > 0 ? 1.0f : 3.0f;
     float t_max = 999.0f;
 
     if (num_steps == 1) {
