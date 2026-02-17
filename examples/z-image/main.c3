@@ -24,6 +24,7 @@ fn int main(String[] args) {
         .text_model_path = config.text_model_path,
         .vae_path = config.vae_path,
         .taesd_path = config.taesd_path,
+        .offload = config.offload,
     };
 
     // Create and load pipeline

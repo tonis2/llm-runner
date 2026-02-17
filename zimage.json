@@ -1,8 +1,8 @@
   {
-    "model": "/home/tonis/Documents/AI/models/z_image_turbo-Q4_K_M.gguf",
+    "model": "/home/tonis/Documents/AI/models/z_image_turbo-bf16.gguf",
     "prompt": "a photo of a cat",
-    "text_model": "/home/tonis/Documents/AI/models/Qwen3-4B-Instruct-2507-Q4_K_S.gguf",
-    "taesd": "/home/tonis/Documents/c/koboldcpp/embd_res/taesd_f.embd",
+    "text_model": "/home/tonis/Documents/AI/models/Qwen3-4B-Q8_0.gguf",
+    "vae": "/home/tonis/Documents/AI/models/ae.safetensors",
     "steps": 4,
     "seed": 42,
     "size": 512,

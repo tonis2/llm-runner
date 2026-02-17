@@ -29,6 +29,7 @@ struct PipelineOptions {
     String text_model_path;
     String vae_path;
     String taesd_path;
+    bool offload;     // Stream DiT layers from CPU RAM to save VRAM
 }
 
 // --- Unified Generation Inputs ---

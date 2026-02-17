@@ -1145,20 +1145,10 @@ groupshared float bm_simple_shared[256];
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
-    // Support both 1D and 2D dispatch
     // 2D dispatch: gid.x = pos, gid.y = out_idx
-    // 1D dispatch: gid.x = pos * out_dim + out_idx, gid.y = 0
-    uint pos, out_idx;
-    if (gid.y == 0 && gid.x >= bm_simple_pc.seq_len) {
-        // Assume 1D dispatch
-        pos = gid.x / bm_simple_pc.out_dim;
-        out_idx = gid.x % bm_simple_pc.out_dim;
-    } else {
-        // 2D dispatch
-        pos = gid.x;
-        out_idx = gid.y;
-    }
-    
+    uint pos = gid.x;
+    uint out_idx = gid.y;
+
     if (pos >= bm_simple_pc.seq_len) return;
     
     uint actual_out = bm_simple_pc.row_offset + out_idx;
@@ -1186,12 +1176,6 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     // Thread 0 writes final result
     if (gi == 0) {
         bm_simple_output[pos * bm_simple_pc.out_dim + out_idx] = bm_simple_shared[0];
-        
-        // Debug: Also store gid.x in a separate location to trace workgroup mapping
-        // Use last row (pos 1023) columns 0-4 to store debug info
-        if (pos == 0 && out_idx < 5 && bm_simple_pc.seq_len > 1023) {
-            bm_simple_output[1023 * bm_simple_pc.out_dim + out_idx] = float(gid.x);
-        }
     }
 }
 

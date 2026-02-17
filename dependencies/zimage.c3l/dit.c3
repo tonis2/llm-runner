@@ -146,7 +146,7 @@ struct BatchMatMulPC {
 }
 
 // Profile flag: when true, the next transformer layer call inserts GPU syncs per phase
-bool dit_profile_layer = false;
+bool dit_profile_layer = true;
 
 // Compile-time flag to enable CPU verification for x_embedder
 // Set to true to enable detailed CPU vs GPU comparison for debugging
@@ -176,6 +176,29 @@ struct DiTLayerWeights {
     llm::Tensor adaln_bias;
 }
 
+// CPU-cached layer weights for streaming/offloading mode.
+// Mirrors DiTLayerWeights but holds CPU data + original GGML dtype.
+struct DiTLayerCPUWeights {
+    llm::CpuTensorData wqkv;
+    llm::GGMLType wqkv_dtype;
+    llm::CpuTensorData q_norm;
+    llm::CpuTensorData k_norm;
+    llm::CpuTensorData wo;
+    llm::GGMLType wo_dtype;
+    llm::CpuTensorData ffn_gate;
+    llm::GGMLType ffn_gate_dtype;
+    llm::CpuTensorData ffn_up;
+    llm::GGMLType ffn_up_dtype;
+    llm::CpuTensorData ffn_down;
+    llm::GGMLType ffn_down_dtype;
+    llm::CpuTensorData attn_norm1;
+    llm::CpuTensorData attn_norm2;
+    llm::CpuTensorData ffn_norm1;
+    llm::CpuTensorData ffn_norm2;
+    llm::CpuTensorData adaln_linear;
+    llm::CpuTensorData adaln_bias;
+}
+
 struct DiTWeights {
     DiTLayerWeights[DIT_NUM_LAYERS] layers;
 
@@ -183,6 +206,12 @@ struct DiTWeights {
     DiTLayerWeights[DIT_NUM_REFINER_LAYERS] noise_refiner;
     // Context refiner (2 layers, plain transformer - no adaLN)
     DiTLayerWeights[DIT_NUM_REFINER_LAYERS] context_refiner;
+
+    // Streaming/offload mode: CPU-cached layer weights
+    bool streaming;
+    DiTLayerCPUWeights[DIT_NUM_LAYERS]* cpu_layers;
+    DiTLayerCPUWeights[DIT_NUM_REFINER_LAYERS]* cpu_noise_refiner;
+    DiTLayerCPUWeights[DIT_NUM_REFINER_LAYERS]* cpu_context_refiner;
 
     // cap_embedder: Sequential(RMSNorm(text_dim), Linear(text_dim, dim))
     llm::Tensor cap_emb_norm;    // RMSNorm weight [text_dim]
@@ -438,9 +467,9 @@ fn void? precompute_mrope_tables(
     float* cos_data = (float*)mem::calloc(table_size * 4);
     float* sin_data = (float*)mem::calloc(table_size * 4);
 
-    // Image text-axis position = actual_text_len (not padded)
-    // Python: position_ids[i, cap_seq_len:seq_len, 0] = cap_seq_len
-    uint image_index = text_len;
+    // Image text-axis position = padded_text + 1 (matches KoboldCpp gen_z_image_ids)
+    // KoboldCpp: padded_context_len + 1
+    uint image_index = padded_text + 1;
 
     // For each token, compute rotation angles for all 3 axes
     for (uint t = 0; t < seq_len; t++) {
@@ -648,30 +677,184 @@ fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile
     return lw;
 }
 
-fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf) {
-    io::printfn("\nLoading DiT weights...");
+// --- Streaming helpers: load to CPU, upload to GPU, free GPU layer ---
 
-    DiTWeights w;
+// Helper: load a tensor to CPU. For F16/BF16/F32 → dequant to F32. For quantized → raw copy.
+fn llm::CpuTensorData load_tensor_to_cpu(llm::GGUFFile* gf, String name, bool force_f32) {
+    if (try info = gf.find_tensor(name)) {
+        if (force_f32 || info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32) {
+            return llm::dequant_to_cpu(info, gf.tensor_data_base)!!;
+        }
+        return llm::copy_raw_to_cpu(info, gf.tensor_data_base)!!;
+    }
+    return (llm::CpuTensorData){};
+}
 
-    // Main layers (0-29)
-    for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
-        io::printf("  DiT layer %d / %d...\r", l + 1, DIT_NUM_LAYERS);
-        w.layers[l] = load_dit_layer_weights(ctx, gf, "layers.", l, true);
-        if ((l + 1) % 5 == 0 || l == DIT_NUM_LAYERS - 1) {
-            io::printfn("  DiT layer %d / %d loaded", l + 1, DIT_NUM_LAYERS);
+// Helper: get GGML type for a tensor (returns F32 if not found or if it's F16/BF16)
+fn llm::GGMLType get_tensor_dtype(llm::GGUFFile* gf, String name) {
+    if (try info = gf.find_tensor(name)) {
+        if (info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32) {
+            return llm::GGML_F32;
+        }
+        return info.type;
+    }
+    return llm::GGML_F32;
+}
+
+// Load a DiT layer's weights to CPU RAM (for streaming mode)
+fn DiTLayerCPUWeights load_dit_layer_cpu(llm::GGUFFile* gf, String prefix, uint layer, bool has_adaln) {
+    char[128] buf;
+    DiTLayerCPUWeights cw;
+
+    String qkv_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.qkv.weight");
+    cw.wqkv = load_tensor_to_cpu(gf, qkv_name, false);
+    cw.wqkv_dtype = get_tensor_dtype(gf, qkv_name);
+
+    cw.q_norm = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.q_norm.weight"), true);
+    cw.k_norm = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.k_norm.weight"), true);
+
+    String wo_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight");
+    cw.wo = load_tensor_to_cpu(gf, wo_name, false);
+    cw.wo_dtype = get_tensor_dtype(gf, wo_name);
+
+    String gate_name = dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w1.weight");
+    cw.ffn_gate = load_tensor_to_cpu(gf, gate_name, false);
+    cw.ffn_gate_dtype = get_tensor_dtype(gf, gate_name);
+
+    String up_name = dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w3.weight");
+    cw.ffn_up = load_tensor_to_cpu(gf, up_name, false);
+    cw.ffn_up_dtype = get_tensor_dtype(gf, up_name);
+
+    String down_name = dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w2.weight");
+    cw.ffn_down = load_tensor_to_cpu(gf, down_name, false);
+    cw.ffn_down_dtype = get_tensor_dtype(gf, down_name);
+
+    cw.attn_norm1 = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "attention_norm1.weight"), true);
+    cw.attn_norm2 = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "attention_norm2.weight"), true);
+    cw.ffn_norm1 = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "ffn_norm1.weight"), true);
+    cw.ffn_norm2 = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "ffn_norm2.weight"), true);
+
+    if (has_adaln) {
+        cw.adaln_linear = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.weight"), true);
+        cw.adaln_bias = load_tensor_to_cpu(gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.bias"), true);
+    }
+
+    return cw;
+}
+
+// Upload a CPU-cached layer to GPU, returning GPU tensor handles
+fn DiTLayerWeights upload_dit_layer(llm::DeviceContext* ctx, DiTLayerCPUWeights* cw) {
+    DiTLayerWeights lw;
+    if (cw.wqkv.data != null) {
+        if (cw.wqkv_dtype == llm::GGML_F32) {
+            lw.wqkv = llm::upload_cpu_data(ctx, &cw.wqkv)!!;
+        } else {
+            lw.wqkv = llm::upload_cpu_data_raw(ctx, &cw.wqkv, cw.wqkv_dtype)!!;
         }
     }
-
-    // Noise refiner layers
-    io::printfn("  Loading noise refiner...");
-    for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        w.noise_refiner[l] = load_dit_layer_weights(ctx, gf, "noise_refiner.", l, true);
+    if (cw.q_norm.data != null) lw.q_norm = llm::upload_cpu_data(ctx, &cw.q_norm)!!;
+    if (cw.k_norm.data != null) lw.k_norm = llm::upload_cpu_data(ctx, &cw.k_norm)!!;
+    if (cw.wo.data != null) {
+        if (cw.wo_dtype == llm::GGML_F32) {
+            lw.wo = llm::upload_cpu_data(ctx, &cw.wo)!!;
+        } else {
+            lw.wo = llm::upload_cpu_data_raw(ctx, &cw.wo, cw.wo_dtype)!!;
+        }
     }
+    if (cw.ffn_gate.data != null) {
+        if (cw.ffn_gate_dtype == llm::GGML_F32) {
+            lw.ffn_gate = llm::upload_cpu_data(ctx, &cw.ffn_gate)!!;
+        } else {
+            lw.ffn_gate = llm::upload_cpu_data_raw(ctx, &cw.ffn_gate, cw.ffn_gate_dtype)!!;
+        }
+    }
+    if (cw.ffn_up.data != null) {
+        if (cw.ffn_up_dtype == llm::GGML_F32) {
+            lw.ffn_up = llm::upload_cpu_data(ctx, &cw.ffn_up)!!;
+        } else {
+            lw.ffn_up = llm::upload_cpu_data_raw(ctx, &cw.ffn_up, cw.ffn_up_dtype)!!;
+        }
+    }
+    if (cw.ffn_down.data != null) {
+        if (cw.ffn_down_dtype == llm::GGML_F32) {
+            lw.ffn_down = llm::upload_cpu_data(ctx, &cw.ffn_down)!!;
+        } else {
+            lw.ffn_down = llm::upload_cpu_data_raw(ctx, &cw.ffn_down, cw.ffn_down_dtype)!!;
+        }
+    }
+    if (cw.attn_norm1.data != null) lw.attn_norm1 = llm::upload_cpu_data(ctx, &cw.attn_norm1)!!;
+    if (cw.attn_norm2.data != null) lw.attn_norm2 = llm::upload_cpu_data(ctx, &cw.attn_norm2)!!;
+    if (cw.ffn_norm1.data != null) lw.ffn_norm1 = llm::upload_cpu_data(ctx, &cw.ffn_norm1)!!;
+    if (cw.ffn_norm2.data != null) lw.ffn_norm2 = llm::upload_cpu_data(ctx, &cw.ffn_norm2)!!;
+    if (cw.adaln_linear.data != null) lw.adaln_linear = llm::upload_cpu_data(ctx, &cw.adaln_linear)!!;
+    if (cw.adaln_bias.data != null) lw.adaln_bias = llm::upload_cpu_data(ctx, &cw.adaln_bias)!!;
+    return lw;
+}
 
-    // Context refiner layers (no adaLN)
-    io::printfn("  Loading context refiner...");
-    for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        w.context_refiner[l] = load_dit_layer_weights(ctx, gf, "context_refiner.", l, false);
+fn void DiTLayerCPUWeights.free(&self) {
+    self.wqkv.free();
+    self.q_norm.free();
+    self.k_norm.free();
+    self.wo.free();
+    self.ffn_gate.free();
+    self.ffn_up.free();
+    self.ffn_down.free();
+    self.attn_norm1.free();
+    self.attn_norm2.free();
+    self.ffn_norm1.free();
+    self.ffn_norm2.free();
+    self.adaln_linear.free();
+    self.adaln_bias.free();
+}
+
+fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, bool streaming) {
+    io::printfn("\nLoading DiT weights%s...", streaming ? " (streaming/offload mode)" : "");
+
+    DiTWeights w;
+    w.streaming = streaming;
+
+    if (streaming) {
+        // Streaming mode: load layer weights to CPU RAM
+        w.cpu_layers = mem::alloc(DiTLayerCPUWeights[DIT_NUM_LAYERS]);
+        w.cpu_noise_refiner = mem::alloc(DiTLayerCPUWeights[DIT_NUM_REFINER_LAYERS]);
+        w.cpu_context_refiner = mem::alloc(DiTLayerCPUWeights[DIT_NUM_REFINER_LAYERS]);
+
+        for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+            io::printf("  DiT layer %d / %d (CPU)...\r", l + 1, DIT_NUM_LAYERS);
+            (*w.cpu_layers)[l] = load_dit_layer_cpu(gf, "layers.", l, true);
+            if ((l + 1) % 5 == 0 || l == DIT_NUM_LAYERS - 1) {
+                io::printfn("  DiT layer %d / %d cached to CPU", l + 1, DIT_NUM_LAYERS);
+            }
+        }
+
+        io::printfn("  Loading noise refiner (CPU)...");
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            (*w.cpu_noise_refiner)[l] = load_dit_layer_cpu(gf, "noise_refiner.", l, true);
+        }
+
+        io::printfn("  Loading context refiner (CPU)...");
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            (*w.cpu_context_refiner)[l] = load_dit_layer_cpu(gf, "context_refiner.", l, false);
+        }
+    } else {
+        // Normal mode: load directly to GPU
+        for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+            io::printf("  DiT layer %d / %d...\r", l + 1, DIT_NUM_LAYERS);
+            w.layers[l] = load_dit_layer_weights(ctx, gf, "layers.", l, true);
+            if ((l + 1) % 5 == 0 || l == DIT_NUM_LAYERS - 1) {
+                io::printfn("  DiT layer %d / %d loaded", l + 1, DIT_NUM_LAYERS);
+            }
+        }
+
+        io::printfn("  Loading noise refiner...");
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            w.noise_refiner[l] = load_dit_layer_weights(ctx, gf, "noise_refiner.", l, true);
+        }
+
+        io::printfn("  Loading context refiner...");
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            w.context_refiner[l] = load_dit_layer_weights(ctx, gf, "context_refiner.", l, false);
+        }
     }
 
     // Embedders
@@ -794,16 +977,18 @@ fn void dispatch_batch_matmul(
     } else if (weight.dtype == llm::GGML_Q4_0) {
         kernel = &dk.batch_matmul_q4_0;
     } else {
-        // Fallback to tiled version for other types (including F32/F16/BF16)
-        // Note: x_embedder uses Q8 workaround, so F32 weights should be rare
-        kernel = &dk.batch_matmul;
-        tiled_2d = true;
-        io::printfn("[DEBUG] Using batch_matmul (tiled) for dtype=%d (not Q8)", weight.dtype);
+        // Use batch_matmul_simple for F32 weights (avoids tiled indexing bugs)
+        // 2D dispatch: (seq_len, out_dim) workgroups
+        kernel = &dk.batch_matmul_simple;
+llm::dispatch_kernel(cmd, kernel,
+            { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
+            { weight.size_bytes, input.size_bytes, output.size_bytes },
+            &pc, seq_len, out_dim);
+        return;
     }
     // 2D tiled GEMM: ceil(seq_len/64) * ceil(out_dim/64) workgroups
     // Legacy (Q8_0, Q4_0): seq_len * out_dim workgroups
     uint groups = tiled_2d ? ((seq_len + 63) / 64) * ((out_dim + 63) / 64) : seq_len * out_dim;
-    io::printfn("[DEBUG] Dispatch: seq_len=%d, out_dim=%d, groups=%d (tiled_2d=%d)", seq_len, out_dim, groups, tiled_2d);
 llm::dispatch_kernel(cmd, kernel,
         { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
         { weight.size_bytes, input.size_bytes, output.size_bytes },
@@ -1148,23 +1333,37 @@ llm::dispatch_kernel(cmd, &dk.scale_modulate,
 llm::compute_barrier(cmd);
     }
 
-    if (profiling) { llm::submit_and_wait(ctx)!!; io::printfn("      norm+adaln: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); llm::begin_compute(cmd)!!; }
+    if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        io::printfn("      norm+adaln: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
+        // Save normed+scaled input (buf_a) before QKV matmul
+        debug_save_npy(ctx, a.buf_a.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_normed_scaled.bin")!!;
+        io::printfn("      Saved noise_refiner.0 normed_scaled [%d x %d]", seq_len, dim);
+        llm::begin_compute(cmd)!!;
+    }
 
     // === Phase B: QKV batch matmul (3 dispatches) ===
     // wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
     if (profiling) {
-        io::printfn("      [DEBUG] QKV weight: size=%d bytes, dtype=%d, expected=%d", 
+        io::printfn("      [DEBUG] QKV weight: size=%d bytes, dtype=%d, expected=%d",
             lw.wqkv.size_bytes, lw.wqkv.dtype, 11520 * 15 * 176);
         io::printfn("      [DEBUG] QKV matmul: seq_len=%d, dim=%d", seq_len, dim);
     }
-    
+
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
 llm::compute_barrier(cmd);
 
     if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        // Save Q, K, V for noise refiner layer 0
+        debug_save_npy(ctx, a.q.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_q.bin")!!;
+        debug_save_npy(ctx, a.k.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_k.bin")!!;
+        debug_save_npy(ctx, a.v.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_v.bin")!!;
+        io::printfn("      Saved noise_refiner.0 Q/K/V [%d x %d]", seq_len, dim);
         io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
+        llm::begin_compute(cmd)!!;
     }
 
     // === Phase C: Head norm + Forward Transpose + Flash Attention ===
@@ -1228,8 +1427,7 @@ llm::compute_barrier(cmd);
     }
 
     // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
-    // Standard attention scale: 1/sqrt(head_dim) = 1/sqrt(128)
-    // With QK-norm, Q·K are bounded, but we still use standard scaling
+    // Standard 1/sqrt(head_dim) scaling, matching official diffusers
     float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
     FlashAttentionPC fa_pc = {
         .head_dim = DIT_HEAD_DIM,
@@ -1503,9 +1701,8 @@ llm::submit_and_wait(ctx)!!;
 
 llm::begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: (1 - sigma) * 1000
-    // Diffusers ZImage: pipeline passes (1000-t)/1000, transformer multiplies by t_scale=1000
-    // So sinusoidal receives (1-sigma)*1000: sigma=1.0 -> 0 (noisy), sigma=0.0 -> 1000 (clean)
+    // 3. Timestep embedding: (1-sigma) * 1000 (matches official diffusers)
+    // sigma=1.0 (full noise) -> t_emb=0, sigma≈0 (clean) -> t_emb≈1000
     float actual_timestep = DIT_T_PERIOD * (1.0f - timestep);
     io::printfn("  [DEBUG] Timestep: sigma=%.6f, passed to sinusoidal embedding=%.3f", timestep, actual_timestep);
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
@@ -1618,13 +1815,35 @@ llm::submit_and_wait(ctx)!!;
 llm::begin_compute(cmd)!!;
     }
 
-    // Save debug flag before noise refiner consumes it
-    bool want_layer_debug = dit_profile_layer;
+    // Save debug flag before noise refiner consumes it (must be before first dit_transformer_layer call)
+    static bool first_forward_call = true;
+    bool want_layer_debug = first_forward_call;
+
+    // Debug: save x_embedder output BEFORE noise refiner (only on first call)
+    if (want_layer_debug) {
+llm::submit_and_wait(ctx)!!;
+        debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, n_patches * dim, "debug_output/c3_pre_noise_refiner.bin")!!;
+        io::printfn("      Saved pre-noise-refiner hidden [%d x %d]", n_patches, dim);
+llm::begin_compute(cmd)!!;
+    }
 
     // 4. Noise refiner (2 layers on padded image tokens, with adaLN)
-    for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, padded_patches, true,
-            &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
+    // Re-enable profiling for noise refiner layer 0 (context_refiner may have consumed it)
+    dit_profile_layer = want_layer_debug;
+    if (w.streaming) {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_noise_refiner)[l]);
+            dit_transformer_layer(self, cmd, &lw, &a.hidden, padded_patches, true,
+                &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
+            llm::submit_and_wait(ctx)!!;
+            lw.free();
+            llm::begin_compute(cmd)!!;
+        }
+    } else {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, padded_patches, true,
+                &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
+        }
     }
 
 llm::submit_and_wait(ctx)!!;
@@ -1646,52 +1865,77 @@ llm::compute_barrier(cmd);
     uint total_seq = padded_patches + padded_text;
 
     // 6. Main DiT (30 layers with adaLN, post-norm, tanh gating)
+    // Debug: save joint hidden BEFORE main layers
+    io::printfn("    [DBG] want_layer_debug=%d, total_seq=%d, dim=%d", (int)want_layer_debug, total_seq, dim);
+    if (want_layer_debug) {
+        io::printfn("    [DBG] About to save joint hidden...");
+llm::submit_and_wait(ctx)!!;
+        io::printfn("    [DBG] submit_and_wait done");
+        debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_joint_hidden.bin")!!;
+        io::printfn("      Saved joint hidden [%d x %d] before main layers", total_seq, dim);
+llm::begin_compute(cmd)!!;
+    }
+
     double[16] batch_times;
     uint batch_idx = 0;
     Clock batch_start = clock::now();
-    for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
-        if (l == 0 && dit_profile_layer) {
-            io::printfn("    --- Layer profile (layer 1, seq=%d) ---", total_seq);
-        }
-        dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, true,
-            &self.rope_cos_main, &self.rope_sin_main)!!;
 
-        // Debug: readback after layers 0, 1, 5, 10, 20, 29
-        if (want_layer_debug && (l == 0 || l == 1 || l == 5 || l == 10 || l == 20 || l == 29)) {
-llm::submit_and_wait(ctx)!!;
-            if (l == 0) {
-                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 0")!!;
-                // Debug: Save Q, K, V, attention output from first main layer
-                // These buffers still contain the values from layer 0
-                debug_save_npy(ctx, a.q.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_q.bin")!!;
-                debug_save_npy(ctx, a.k.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_k.bin")!!;
-                debug_save_npy(ctx, a.v.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_v.bin")!!;
-                // Attention output is in buf_b (before it gets overwritten by FFN)
-                // Actually, buf_b is reused, so we can't read it here
-                // Save hidden state instead
-                debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_after_layer0_hidden.bin")!!;
-                io::printfn("      Saved layer 0 Q/K/V and hidden state");
-            } else if (l == 1) {
-                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 1")!!;
-            } else if (l == 5) {
-                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 5")!!;
-            } else if (l == 10) {
-                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 10")!!;
-            } else if (l == 20) {
-                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 20")!!;
-            } else if (l == 29) {
-                debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 29")!!;
+    if (w.streaming) {
+        // Streaming mode: upload each layer, run, free
+        for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+            DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_layers)[l]);
+            dit_transformer_layer(self, cmd, &lw, &a.hidden, total_seq, true,
+                &self.rope_cos_main, &self.rope_sin_main)!!;
+            llm::submit_and_wait(ctx)!!;
+            lw.free();
+
+            if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {
+                batch_times[batch_idx] = batch_start.to_now().to_sec();
+                batch_idx++;
+                batch_start = clock::now();
             }
-            batch_start = clock::now();
-llm::begin_compute(cmd)!!;
+            llm::begin_compute(cmd)!!;
         }
+    } else {
+        for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+            if (l == 0 && dit_profile_layer) {
+                io::printfn("    --- Layer profile (layer 1, seq=%d) ---", total_seq);
+            }
+            dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, true,
+                &self.rope_cos_main, &self.rope_sin_main)!!;
 
-        if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {
+            // Debug: readback after layers 0, 1, 5, 10, 20, 29
+            if (want_layer_debug && (l == 0 || l == 1 || l == 5 || l == 10 || l == 20 || l == 29)) {
 llm::submit_and_wait(ctx)!!;
-            batch_times[batch_idx] = batch_start.to_now().to_sec();
-            batch_idx++;
-            batch_start = clock::now();
+                if (l == 0) {
+                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 0")!!;
+                    debug_save_npy(ctx, a.q.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_q.bin")!!;
+                    debug_save_npy(ctx, a.k.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_k.bin")!!;
+                    debug_save_npy(ctx, a.v.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_v.bin")!!;
+                    debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_after_layer0_hidden.bin")!!;
+                    io::printfn("      Saved layer 0 Q/K/V and hidden state");
+                } else if (l == 1) {
+                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 1")!!;
+                } else if (l == 5) {
+                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 5")!!;
+                } else if (l == 10) {
+                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 10")!!;
+                } else if (l == 20) {
+                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 20")!!;
+                } else if (l == 29) {
+                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 29")!!;
+                }
+                batch_start = clock::now();
 llm::begin_compute(cmd)!!;
+            }
+
+            if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {
+llm::submit_and_wait(ctx)!!;
+                batch_times[batch_idx] = batch_start.to_now().to_sec();
+                batch_idx++;
+                batch_start = clock::now();
+llm::begin_compute(cmd)!!;
+            }
         }
     }
     double dit_sec = phase_start.to_now().to_sec();
@@ -1846,6 +2090,8 @@ llm::submit_and_wait(ctx)!!;
     double total_sec = step_start.to_now().to_sec();
     io::printfn("    setup+refiner: %.2fs | dit_layers: %.2fs | final: %.2fs | total: %.2fs",
         setup_sec, dit_sec, final_sec, total_sec);
+
+    first_forward_call = false;
 }
 
 // --- Free ---
@@ -1867,13 +2113,34 @@ fn void DiTLayerWeights.free(&self) {
 }
 
 fn void DiTModel.free(&self) {
-    // Free layer weights
-    for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
-        self.weights.layers[l].free();
-    }
-    for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        self.weights.noise_refiner[l].free();
-        self.weights.context_refiner[l].free();
+    // Free layer weights (CPU or GPU depending on streaming mode)
+    if (self.weights.streaming) {
+        if (self.weights.cpu_layers != null) {
+            for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+                (*self.weights.cpu_layers)[l].free();
+            }
+            mem::free(self.weights.cpu_layers);
+        }
+        if (self.weights.cpu_noise_refiner != null) {
+            for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+                (*self.weights.cpu_noise_refiner)[l].free();
+            }
+            mem::free(self.weights.cpu_noise_refiner);
+        }
+        if (self.weights.cpu_context_refiner != null) {
+            for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+                (*self.weights.cpu_context_refiner)[l].free();
+            }
+            mem::free(self.weights.cpu_context_refiner);
+        }
+    } else {
+        for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+            self.weights.layers[l].free();
+        }
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            self.weights.noise_refiner[l].free();
+            self.weights.context_refiner[l].free();
+        }
     }
 
     // Free embedder weights

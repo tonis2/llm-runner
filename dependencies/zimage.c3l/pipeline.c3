@@ -19,6 +19,7 @@ struct ZImageState (llm::pipelines::Pipeline) {
     String text_model_path;
     String vae_path;
     String taesd_path;
+    bool offload;
 }
 
 fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) @dynamic {
@@ -27,6 +28,7 @@ fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String mod
     self.text_model_path = opts.text_model_path;
     self.vae_path = opts.vae_path;
     self.taesd_path = opts.taesd_path;
+    self.offload = opts.offload;
 }
 
 fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) @dynamic {
@@ -155,7 +157,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     char[] dit_data = dit_mm.bytes();
     llm::GGUFFile dit_gf = llm::gguf_parse(dit_data)!!;
 
-    DiTWeights dit_weights = load_dit_weights(ctx, &dit_gf)!!;
+    DiTWeights dit_weights = load_dit_weights(ctx, &dit_gf, self.offload)!!;
     DiTKernels dit_kernels = create_dit_kernels(ctx)!!;
 
     uint cond_padded_text = pad_to_multiple(cond_text_len, SEQ_MULTI_OF);
@@ -265,12 +267,25 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     dit.rope_cos_context = cond_rope_cos_ctx;
     dit.rope_sin_context = cond_rope_sin_ctx;
     llm::begin_compute(cmd)!!;
-    for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-        dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-            &cond_projected, cond_padded_text, false,
-            &dit.rope_cos_context, &dit.rope_sin_context)!!;
+    if (dit.weights.streaming) {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
+            dit_transformer_layer(dit, cmd, &lw,
+                &cond_projected, cond_padded_text, false,
+                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+            llm::submit_and_wait(ctx)!!;
+            lw.free();
+            llm::begin_compute(cmd)!!;
+        }
+        llm::submit_and_wait(ctx)!!;
+    } else {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+                &cond_projected, cond_padded_text, false,
+                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+        }
+        llm::submit_and_wait(ctx)!!;
     }
-    llm::submit_and_wait(ctx)!!;
     io::printfn("  Cond context refiner complete (padded=%d).", cond_padded_text);
 
     // Debug: export text embeddings after cap_embedder + context_refiner
@@ -349,12 +364,25 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         dit.rope_cos_context = uncond_rope_cos_ctx;
         dit.rope_sin_context = uncond_rope_sin_ctx;
         llm::begin_compute(cmd)!!;
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-                &uncond_projected, uncond_padded_text, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+        if (dit.weights.streaming) {
+            for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+                DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
+                dit_transformer_layer(dit, cmd, &lw,
+                    &uncond_projected, uncond_padded_text, false,
+                    &dit.rope_cos_context, &dit.rope_sin_context)!!;
+                llm::submit_and_wait(ctx)!!;
+                lw.free();
+                llm::begin_compute(cmd)!!;
+            }
+            llm::submit_and_wait(ctx)!!;
+        } else {
+            for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+                dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+                    &uncond_projected, uncond_padded_text, false,
+                    &dit.rope_cos_context, &dit.rope_sin_context)!!;
+            }
+            llm::submit_and_wait(ctx)!!;
         }
-        llm::submit_and_wait(ctx)!!;
         io::printfn("  Uncond context refiner complete (padded=%d).", uncond_padded_text);
     }
     norm_scratch.free();
@@ -678,18 +706,10 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             taesd_decoder.forward(&taesd_acts, lat_h, lat_w)!!;
             decode_output = &taesd_acts.buf_a;
         } else {
-            // Flux VAE denormalization
+            // Z-Image VAE denormalization: latent / scale_factor + shift_factor
             const float SCALE_FACTOR = 0.3611f;
-            const float[16] LATENT_MEANS = {
-                -0.7571f, -0.7089f, -0.9113f,  0.1075f, -0.1745f,  0.9653f, -0.1517f,  1.5508f,
-                 0.4134f, -0.0715f,  0.5517f, -0.3632f, -0.1922f, -0.9497f,  0.2503f, -0.2921f,
-            };
-            const float[16] LATENT_STDS = {
-                2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
-                3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f,
-            };
+            const float SHIFT_FACTOR = 0.1159f;
 
-            uint spatial = lat_h * lat_w;
             vk::Memory lat_readback = vk::new_buffer(
                 allocator: &ctx.allocator,
                 usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -703,13 +723,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
             float* lat_cpu = (float*)lat_readback.data();
 
-            for (uint ch = 0; ch < DIT_LATENT_CHANNELS; ch++) {
-                float scale = LATENT_STDS[ch] / SCALE_FACTOR;
-                float mean = LATENT_MEANS[ch];
-                uint offset = ch * spatial;
-                for (uint i = 0; i < spatial; i++) {
-                    lat_cpu[offset + i] = lat_cpu[offset + i] * scale + mean;
-                }
+            for (uint i = 0; i < latent_elems; i++) {
+                lat_cpu[i] = lat_cpu[i] / SCALE_FACTOR + SHIFT_FACTOR;
             }
 
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {

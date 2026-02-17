@@ -23,6 +23,7 @@ struct AppConfig {
     uint num_steps;
     float cfg_scale;
     uint seed;
+    bool offload;        // Stream DiT layers from CPU RAM
 }
 
 // Parse arguments and config files
@@ -60,6 +61,12 @@ fn AppConfig? parse_args(String[] args) {
     usz i = 1;
     while (i < args.len) {
         if (args[i].len > 2 && args[i][0] == '-' && args[i][1] == '-') {
+            // Flags without arguments
+            if (args[i] == "--offload") {
+                config.offload = true;
+                i++;
+                continue;
+            }
             if (i + 1 >= args.len) { i++; continue; }
 
             if (args[i] == "--output") {
@@ -136,6 +143,7 @@ fn bool load_config(String config_path, AppConfig* config) {
     if (try v = cfg.get_float("cfg_scale")) config.cfg_scale = (float)v;
     if (try v = cfg.get_uint("seed")) config.seed = v;
     if (try v = cfg.get_uint("size")) config.image_size = v;
+    if (try v = cfg.get_bool("offload")) config.offload = v;
 
     io::printfn("Config loaded from: %s", config_path);
     return true;
@@ -155,5 +163,6 @@ fn void print_usage() {
     io::printfn("  --steps        Number of steps (default: 4)");
     io::printfn("  --cfg-scale    CFG scale (default: 7.0)");
     io::printfn("  --seed         Random seed (default: 42)");
+    io::printfn("  --offload      Stream DiT layers from CPU RAM (saves VRAM)");
     io::printfn("  --config       Load from JSON config file");
 }
