@@ -2,26 +2,28 @@
   "langrev": "1",
   "warnings": [ "no-unused" ],
   "dependency-search-paths": [ "dependencies" ],
-  "dependencies": ["vk"],
+  "dependencies": ["vk", "image", "llm_text", "zimage"],
   "linked-libraries": ["vulkan"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
-  "sources": [ "src/**"],
+  "sources": [ "lib/**"],
   "test-sources": [ "test/**" ],
   "build-dir": "build",
   "script-dir": "./",
   "output": "build",
   "targets": {
-    "llm": {
-      "type": "executable",
-    },
     "shaders": {
 			"type": "prepare",
 			"exec": [
-				"slangc ./shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/llm.spv",
-				"slangc ./shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/diffusion.spv",
-				"slangc ./shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./shaders/zimage.spv"
+				"slangc ./lib/shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./lib/shaders/diffusion.spv",
+				"slangc ./dependencies/llm_text.c3l/shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./dependencies/llm_text.c3l/shaders/llm.spv",
+				"slangc ./dependencies/zimage.c3l/shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./dependencies/zimage.c3l/shaders/zimage.spv",
+				"slangc ./dependencies/zimage.c3l/shaders/mrope.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./dependencies/zimage.c3l/shaders/mrope.spv"
 			]
+		},
+    "zimage": {
+			"type": "executable",
+      "sources": ["examples/z-image/**"]
 		}
   },
   "cpu": "generic",

@@ -1,6 +1,7 @@
 module llm;
 
 import vk;
+import llm_text;
 import std::io;
 import std::io::file;
 import std::io::file::mmap;
@@ -22,7 +23,7 @@ fn void test_stories260k_forward() @test {
     String arch_name = detect_architecture(&gf);
     test::eq("llama", arch_name);
 
-    String config_json = (String)&LLAMA_CONFIG_JSON;
+    String config_json = (String)&llm_text::LLAMA_CONFIG_JSON;
     ModelConfig config = load_arch_config(config_json, &gf)!!;
     WeightNames names = load_weight_names(config_json)!!;
 

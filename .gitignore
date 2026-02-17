@@ -3,3 +3,8 @@ assets/*
 compile.sh
 test/models/
 test/data/
+.ruff_cache
+.claude
+debug_output/
+venv_debug/*
+__pycache__
