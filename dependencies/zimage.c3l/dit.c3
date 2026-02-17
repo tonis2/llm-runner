@@ -1371,7 +1371,13 @@ llm::compute_barrier(cmd);
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
 
     if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        // Save Q/K after head norm, before transpose+RoPE
+        debug_save_npy(ctx, a.q.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_profiled_q_after_hnorm.bin")!!;
+        debug_save_npy(ctx, a.k.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_profiled_k_after_hnorm.bin")!!;
+        io::printfn("      Saved Q/K after head_norm [%d x %d]", seq_len, dim);
         io::printfn("      head_norm: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
+        llm::begin_compute(cmd)!!;
     }
 
     // Forward transpose Q/K/V: [seq_len, dim] -> [n_heads, seq_len, head_dim]
@@ -1472,6 +1478,13 @@ llm::submit_and_wait(ctx)!!;
         float attn_std = math::sqrt(attn_sq_sum / (float)(seq_len * dim) - attn_mean * attn_mean);
         io::printfn("      [DEBUG] After flash_attention: min=%.4f max=%.4f mean=%.4f std=%.4f", attn_min, attn_max, attn_mean, attn_std);
         attn_stg.free();
+        // Save attention output for comparison
+        debug_save_npy(ctx, a.buf_b.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_attn_out.bin")!!;
+        io::printfn("      Saved attention output [%d x %d]", seq_len, dim);
+        // Save Q/K after head norm + RoPE (they're in [n_heads, seq_len, head_dim] format now)
+        debug_save_npy(ctx, a.q.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_q_after_rope.bin")!!;
+        debug_save_npy(ctx, a.k.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_k_after_rope.bin")!!;
+        io::printfn("      Saved Q/K after head_norm+RoPE [%d, %d, %d]", DIT_HEADS, seq_len, DIT_HEAD_DIM);
 llm::begin_compute(cmd)!!;
         io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
     }
@@ -1516,7 +1529,14 @@ llm::dispatch_kernel(cmd, &sk.residual_add,
 llm::compute_barrier(cmd);
     }
 
-    if (profiling) { llm::submit_and_wait(ctx)!!; io::printfn("      out_proj:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); llm::begin_compute(cmd)!!; }
+    if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        io::printfn("      out_proj:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
+        // Save hidden after attention half (output proj + post-norm + gated residual)
+        debug_save_npy(ctx, hidden.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_after_attn.bin")!!;
+        io::printfn("      Saved hidden after attention half [%d x %d]", seq_len, dim);
+        llm::begin_compute(cmd)!!;
+    }
 
     // === Phase E: FFN pre-norm + scale ===
     if (has_adaln) {
@@ -1701,10 +1721,11 @@ llm::submit_and_wait(ctx)!!;
 
 llm::begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: (1-sigma) * 1000 (matches official diffusers)
-    // sigma=1.0 (full noise) -> t_emb=0, sigma≈0 (clean) -> t_emb≈1000
-    float actual_timestep = DIT_T_PERIOD * (1.0f - timestep);
-    io::printfn("  [DEBUG] Timestep: sigma=%.6f, passed to sinusoidal embedding=%.3f", timestep, actual_timestep);
+    // 3. Timestep embedding: pass sigma directly (matches diffusers TimestepEmbedder)
+    // The model's sinusoidal embedding uses: args = sigma * exp(-log(10000) * j / half_dim)
+    // NOT (1-sigma)*1000 — that was incorrect and produced wrong t_emb for all steps
+    float actual_timestep = timestep;
+    io::printfn("  [DEBUG] Timestep: sigma=%.6f, passed to sinusoidal embedding=%.6f", timestep, actual_timestep);
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
 llm::dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
@@ -1836,6 +1857,19 @@ llm::begin_compute(cmd)!!;
             dit_transformer_layer(self, cmd, &lw, &a.hidden, padded_patches, true,
                 &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
             llm::submit_and_wait(ctx)!!;
+            // Debug: save hidden after each noise refiner layer
+            if (want_layer_debug) {
+                char[128] nr_fn;
+                usz nr_fn_len = 0;
+                String nr_prefix = "debug_output/c3_nr";
+                for (usz i = 0; i < nr_prefix.len; i++) nr_fn[nr_fn_len++] = nr_prefix[i];
+                nr_fn[nr_fn_len++] = (char)('0' + l);
+                String nr_suffix = "_output.bin";
+                for (usz i = 0; i < nr_suffix.len; i++) nr_fn[nr_fn_len++] = nr_suffix[i];
+                nr_fn[nr_fn_len] = 0;
+                debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, padded_patches * dim, (String)nr_fn[0..nr_fn_len - 1])!!;
+                io::printfn("      Saved noise_refiner layer %d output [%d x %d]", l, padded_patches, dim);
+            }
             lw.free();
             llm::begin_compute(cmd)!!;
         }
@@ -1883,10 +1917,19 @@ llm::begin_compute(cmd)!!;
     if (w.streaming) {
         // Streaming mode: upload each layer, run, free
         for (uint l = 0; l < DIT_NUM_LAYERS; l++) {
+            // Enable profiling for main layer 0 on first forward call
+            if (l == 0 && want_layer_debug) {
+                dit_profile_layer = true;
+            }
             DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_layers)[l]);
             dit_transformer_layer(self, cmd, &lw, &a.hidden, total_seq, true,
                 &self.rope_cos_main, &self.rope_sin_main)!!;
             llm::submit_and_wait(ctx)!!;
+            // Save intermediates for main layer 0
+            if (l == 0 && want_layer_debug) {
+                debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_after_layer0_hidden.bin")!!;
+                io::printfn("      Saved main layer 0 output [%d x %d]", total_seq, dim);
+            }
             lw.free();
 
             if ((l + 1) % 10 == 0 || l == DIT_NUM_LAYERS - 1) {

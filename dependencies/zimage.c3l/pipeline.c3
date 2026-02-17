@@ -593,6 +593,38 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             dit.forward(&cond_projected, t)!!;
         }
 
+        // Debug: export velocity before Euler step
+        if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
+            _f.close()!;
+            vk::Memory vel_dump = vk::new_buffer(
+                allocator: &ctx.allocator,
+                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                data: null, data_size: (usz)latent_elems * 4,
+            )!!;
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer vel_cmd) {
+                vk::cmdCopyBuffer(vel_cmd, dit.acts.velocity.gpu_buffer.buffer, vel_dump.buffer, 1,
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            }!!;
+            float* vel_ptr = (float*)vel_dump.data();
+            char[64] vel_fn;
+            usz vl = 0;
+            String vp = "/tmp/zimage_debug/velocity_step_";
+            for (usz i = 0; i < vp.len; i++) vel_fn[vl++] = vp[i];
+            vel_fn[vl++] = (char)('0' + (step + 1) / 10);
+            vel_fn[vl++] = (char)('0' + (step + 1) % 10);
+            String vs = "_c3.bin";
+            for (usz i = 0; i < vs.len; i++) vel_fn[vl++] = vs[i];
+            File f_vel = file::open((String)vel_fn[0..vl-1], "wb")!!;
+            uint n_vel = (uint)latent_elems;
+            char[4] vel_hdr = { (char)(n_vel & 0xFF), (char)((n_vel >> 8) & 0xFF),
+                                (char)((n_vel >> 16) & 0xFF), (char)((n_vel >> 24) & 0xFF) };
+            f_vel.write(&vel_hdr)!;
+            f_vel.write(((char*)vel_ptr)[0..latent_elems * 4 - 1])!;
+            f_vel.close()!;
+            vel_dump.free();
+        }
+
         // Euler step
         llm::begin_compute(cmd)!!;
         FlowEulerPC euler_pc = { .n = latent_elems, .dt = dt };
@@ -601,6 +633,38 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             { dit.acts.latent.size_bytes, dit.acts.velocity.size_bytes },
             &euler_pc, llm::ceil_div(latent_elems, 256));
         llm::submit_and_wait(ctx)!!;
+
+        // Debug: export latent after Euler step
+        if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
+            _f.close()!;
+            vk::Memory lat_stg = vk::new_buffer(
+                allocator: &ctx.allocator,
+                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                data: null, data_size: (usz)latent_elems * 4,
+            )!!;
+            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer lat_cmd) {
+                vk::cmdCopyBuffer(lat_cmd, dit.acts.latent.gpu_buffer.buffer, lat_stg.buffer, 1,
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+            }!!;
+            float* lat_ptr = (float*)lat_stg.data();
+            char[64] lat_fn;
+            usz ll = 0;
+            String lp = "/tmp/zimage_debug/latent_step_";
+            for (usz i = 0; i < lp.len; i++) lat_fn[ll++] = lp[i];
+            lat_fn[ll++] = (char)('0' + (step + 1) / 10);
+            lat_fn[ll++] = (char)('0' + (step + 1) % 10);
+            String ls = "_c3.bin";
+            for (usz i = 0; i < ls.len; i++) lat_fn[ll++] = ls[i];
+            File f_lat = file::open((String)lat_fn[0..ll-1], "wb")!!;
+            uint n_lat = (uint)latent_elems;
+            char[4] lat_hdr = { (char)(n_lat & 0xFF), (char)((n_lat >> 8) & 0xFF),
+                                (char)((n_lat >> 16) & 0xFF), (char)((n_lat >> 24) & 0xFF) };
+            f_lat.write(&lat_hdr)!;
+            f_lat.write(((char*)lat_ptr)[0..latent_elems * 4 - 1])!;
+            f_lat.close()!;
+            lat_stg.free();
+        }
 
     }
 

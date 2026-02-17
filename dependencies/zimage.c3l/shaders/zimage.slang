@@ -35,10 +35,10 @@ void patchify(uint3 tid: SV_DispatchThreadID) {
     uint patch_idx = tid.x / patch_dim;
     uint elem = tid.x % patch_dim;
 
-    uint c = elem / (ps * ps);
-    uint rem = elem % (ps * ps);
-    uint py = rem / ps;
-    uint px = rem % ps;
+    uint channels = patchify_pc.channels;
+    uint py = elem / (ps * channels);
+    uint px = (elem % (ps * channels)) / channels;
+    uint c = elem % channels;
 
     uint patch_y = patch_idx / patches_w;
     uint patch_x = patch_idx % patches_w;
@@ -85,7 +85,7 @@ void unpatchify(uint3 tid: SV_DispatchThreadID) {
 
     uint patch_idx = patch_y * patches_w + patch_x;
     uint patch_dim = unpatchify_pc.channels * ps * ps;
-    uint elem = c * ps * ps + py * ps + px;
+    uint elem = py * ps * unpatchify_pc.channels + px * unpatchify_pc.channels + c;
 
     unpatchify_output[tid.x] = unpatchify_input[patch_idx * patch_dim + elem];
 }
