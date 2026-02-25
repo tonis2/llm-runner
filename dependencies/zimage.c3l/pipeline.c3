@@ -255,30 +255,15 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     llm::submit_and_wait(ctx)!!;
     cond_embeddings.free();
 
-    // Context refiner on cond text
+    // WORKAROUND: Disable context refiner to prevent text embedding explosion
+    // The context refiner causes extreme amplification (30-40x) of text embeddings
+    // This workaround uses raw text embeddings instead
+    io::printfn("  [WORKAROUND] Skipping context refiner - using raw text embeddings");
     dit.rope_cos_context = cond_rope_cos_ctx;
     dit.rope_sin_context = cond_rope_sin_ctx;
     llm::begin_compute(cmd)!!;
-    if (dit.weights.streaming) {
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
-            dit_transformer_layer(dit, cmd, &lw,
-                &cond_projected, cond_padded_text, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
-            llm::submit_and_wait(ctx)!!;
-            lw.free();
-            llm::begin_compute(cmd)!!;
-        }
-        llm::submit_and_wait(ctx)!!;
-    } else {
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-                &cond_projected, cond_padded_text, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
-        }
-        llm::submit_and_wait(ctx)!!;
-    }
-    io::printfn("  Cond context refiner complete (padded=%d).", cond_padded_text);
+    // Skip context refiner - text embeddings are already in cond_projected
+    llm::submit_and_wait(ctx)!!;
 
     // Debug: export text embeddings after cap_embedder + context_refiner
     if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {

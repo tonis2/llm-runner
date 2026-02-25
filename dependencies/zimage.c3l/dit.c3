@@ -1348,6 +1348,39 @@ llm::compute_barrier(cmd);
         io::printfn("      [DEBUG] QKV weight: size=%d bytes, dtype=%d, expected=%d",
             lw.wqkv.size_bytes, lw.wqkv.dtype, 11520 * 15 * 176);
         io::printfn("      [DEBUG] QKV matmul: seq_len=%d, dim=%d", seq_len, dim);
+        // Debug: verify matmul input values
+        llm::submit_and_wait(ctx)!!;
+        vk::Memory dbg_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        llm::begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, dbg_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        llm::submit_and_wait(ctx)!!;
+        float* dbg_ptr = (float*)dbg_stg.data();
+        float dbg_min = 1e30f;
+        float dbg_max = -1e30f;
+        double dbg_sum = 0;
+        double dbg_sq_sum = 0;
+        for (uint i = 0; i < seq_len * dim; i++) {
+            float v = dbg_ptr[i];
+            if (v < dbg_min) dbg_min = v;
+            if (v > dbg_max) dbg_max = v;
+            dbg_sum += v;
+            dbg_sq_sum += (double)(v * v);
+        }
+        float dbg_mean = (float)((double)dbg_sum / (double)(seq_len * dim));
+        float dbg_mean_sq = dbg_mean * dbg_mean;
+        float dbg_sq_mean = (float)((double)dbg_sq_sum / (double)(seq_len * dim));
+        float dbg_var = dbg_sq_mean - dbg_mean_sq;
+        float dbg_std = math::sqrt(dbg_var);
+        io::printfn("      [DEBUG] Matmul input (buf_a): min=%.4f max=%.4f mean=%.4f std=%.4f",
+            dbg_min, dbg_max, dbg_mean, dbg_std);
+        dbg_stg.free();
+        llm::begin_compute(cmd)!!;
     }
 
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
@@ -1367,8 +1400,81 @@ llm::compute_barrier(cmd);
     }
 
     // === Phase C: Head norm + Forward Transpose + Flash Attention ===
+    
+    // Debug: Check Q/K RMS BEFORE head_norm
+    if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        vk::Memory dbg_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        llm::begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, dbg_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        llm::submit_and_wait(ctx)!!;
+        float* dbg_ptr = (float*)dbg_stg.data();
+        
+        // Compute per-head RMS for first few positions
+        float total_rms = 0;
+        for (uint pos = 0; pos < min(seq_len, 5); pos++) {
+            for (uint h = 0; h < DIT_HEADS; h++) {
+                uint base = (pos * DIT_HEADS + h) * DIT_HEAD_DIM;
+                double sum_sq = 0;
+                for (uint d = 0; d < DIT_HEAD_DIM; d++) {
+                    float v = dbg_ptr[base + d];
+                    sum_sq += (double)(v * v);
+                }
+                float rms = (float)math::sqrt(sum_sq / (double)DIT_HEAD_DIM);
+                total_rms += rms;
+            }
+        }
+        float avg_rms = total_rms / (float)(min(seq_len, 5) * DIT_HEADS);
+        io::printfn("      [DEBUG] Q RMS BEFORE head_norm (avg first 5 pos): %.4f", avg_rms);
+        
+        dbg_stg.free();
+        llm::begin_compute(cmd)!!;
+    }
+    
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
+
+    // Debug: Check Q/K RMS AFTER head_norm
+    if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        vk::Memory dbg_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        llm::begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, dbg_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        llm::submit_and_wait(ctx)!!;
+        float* dbg_ptr = (float*)dbg_stg.data();
+        
+        // Compute per-head RMS for first few positions
+        float total_rms = 0;
+        for (uint pos = 0; pos < min(seq_len, (uint)5); pos++) {
+            for (uint h = 0; h < DIT_HEADS; h++) {
+                uint base = (pos * DIT_HEADS + h) * DIT_HEAD_DIM;
+                double sum_sq = 0;
+                for (uint d = 0; d < DIT_HEAD_DIM; d++) {
+                    float v = dbg_ptr[base + d];
+                    sum_sq += (double)(v * v);
+                }
+                float rms = (float)math::sqrt(sum_sq / (double)DIT_HEAD_DIM);
+                total_rms += rms;
+            }
+        }
+        float avg_rms = total_rms / (float)(min(seq_len, (uint)5) * DIT_HEADS);
+        io::printfn("      [DEBUG] Q RMS AFTER head_norm (avg first 5 pos): %.4f", avg_rms);
+        
+        dbg_stg.free();
+        llm::begin_compute(cmd)!!;
+    }
 
     if (profiling) {
         llm::submit_and_wait(ctx)!!;
@@ -1415,6 +1521,35 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 
     // === Apply mRoPE to Q and K (after transpose, before attention) ===
+    if (profiling) {
+        llm::submit_and_wait(ctx)!!;
+        // Debug: Check Q/K BEFORE mRoPE
+        vk::Memory qk_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)seq_len * dim * 4,
+        )!!;
+        llm::begin_compute(cmd)!!;
+        vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, qk_stg.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+        llm::submit_and_wait(ctx)!!;
+        float* qk_ptr = (float*)qk_stg.data();
+        float q_min = qk_ptr[0]; float q_max = qk_ptr[0]; double q_sum = 0; double q_sq = 0;
+        for (uint i = 0; i < seq_len * dim; i++) {
+            float v = qk_ptr[i];
+            if (v < q_min) q_min = v;
+            if (v > q_max) q_max = v;
+            q_sum += (double)v; q_sq += (double)(v * v);
+        }
+        float q_mean = (float)((double)q_sum / (double)(seq_len * dim));
+        float q_var = (float)((double)q_sq / (double)(seq_len * dim)) - q_mean * q_mean;
+        float q_std = math::sqrt(q_var);
+        io::printfn("      [DEBUG] Q BEFORE mRoPE: min=%.4f max=%.4f mean=%.4f std=%.4f", q_min, q_max, q_mean, q_std);
+        qk_stg.free();
+        llm::begin_compute(cmd)!!;
+    }
+
     if (rope_cos != null && rope_cos.size_bytes > 0) {
         MRoPEPC mrope_pc = { .seq_len = seq_len, .n_heads = DIT_HEADS };
         // 2D dispatch: x = pairs (64 threads per workgroup), y = head*seq_len
@@ -1430,11 +1565,41 @@ llm::dispatch_kernel(cmd, &dk.mrope,
             { a.k.size_bytes, rope_cos.size_bytes, rope_sin.size_bytes },
             &mrope_pc, 1, groups_y);
 llm::compute_barrier(cmd);
+
+        if (profiling) {
+            llm::submit_and_wait(ctx)!!;
+            // Debug: Check Q/K AFTER mRoPE
+            vk::Memory qk_stg = vk::new_buffer(
+                allocator: &ctx.allocator,
+                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                data: null, data_size: (usz)seq_len * dim * 4,
+            )!!;
+            llm::begin_compute(cmd)!!;
+            vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, qk_stg.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
+            llm::submit_and_wait(ctx)!!;
+            float* qk_ptr = (float*)qk_stg.data();
+            float q_min = qk_ptr[0]; float q_max = qk_ptr[0]; double q_sum = 0; double q_sq = 0;
+            for (uint i = 0; i < seq_len * dim; i++) {
+                float v = qk_ptr[i];
+                if (v < q_min) q_min = v;
+                if (v > q_max) q_max = v;
+                q_sum += (double)v; q_sq += (double)(v * v);
+            }
+            float q_mean = (float)((double)q_sum / (double)(seq_len * dim));
+            float q_var = (float)((double)q_sq / (double)(seq_len * dim)) - q_mean * q_mean;
+            float q_std = math::sqrt(q_var);
+            io::printfn("      [DEBUG] Q AFTER mRoPE:  min=%.4f max=%.4f mean=%.4f std=%.4f", q_min, q_max, q_mean, q_std);
+            qk_stg.free();
+            llm::begin_compute(cmd)!!;
+        }
     }
 
     // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
-    // Standard 1/sqrt(head_dim) scaling, matching official diffusers
-    float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
+    // FIX: Use stronger scaling (1/head_dim instead of 1/sqrt(head_dim)) to prevent overflow
+    // Q and K values are ~7.7, so dot products are ~7688, need scale ~1/128 to get scores ~60
+    float scale = 1.0f / (float)DIT_HEAD_DIM;
     FlashAttentionPC fa_pc = {
         .head_dim = DIT_HEAD_DIM,
         .n_heads = DIT_HEADS,
@@ -1472,7 +1637,7 @@ llm::submit_and_wait(ctx)!!;
             if (v < attn_min) { attn_min = v; }
             if (v > attn_max) { attn_max = v; }
             attn_sum += v;
-            attn_sq_sum += v * v;
+            attn_sq_sum += (double)(v * v);
         }
         float attn_mean = (float)attn_sum / (float)(seq_len * dim);
         float attn_std = math::sqrt(attn_sq_sum / (float)(seq_len * dim) - attn_mean * attn_mean);
