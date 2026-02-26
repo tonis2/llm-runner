@@ -1,8 +1,9 @@
   {
-    "model": "/home/tonis/Documents/AI/models/z_image_turbo-bf16.gguf",
+    "model": "/home/tonis/Documents/AI/models/z_image_turbo-Q4_K_M.gguf",
     "prompt": "a photo of a cat",
     "text_model": "/home/tonis/Documents/AI/models/Qwen3-4B-Q8_0.gguf",
     "vae": "/home/tonis/Documents/AI/models/ae.safetensors",
+    "taesd": "/home/tonis/Documents/AI/models/taef1_decoder.safetensors",
     "steps": 4,
     "cfg_scale": 0.0,
     "seed": 42,

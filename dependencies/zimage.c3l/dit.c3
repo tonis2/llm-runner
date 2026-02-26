@@ -1597,9 +1597,8 @@ llm::compute_barrier(cmd);
     }
 
     // Flash attention: Q/K/V in [n_heads, seq_len, head_dim], output to buf_b in [seq_len, dim]
-    // FIX: Use stronger scaling (1/head_dim instead of 1/sqrt(head_dim)) to prevent overflow
-    // Q and K values are ~7.7, so dot products are ~7688, need scale ~1/128 to get scores ~60
-    float scale = 1.0f / (float)DIT_HEAD_DIM;
+    // Standard attention scale: 1/sqrt(head_dim), matching PyTorch reference
+    float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
     FlashAttentionPC fa_pc = {
         .head_dim = DIT_HEAD_DIM,
         .n_heads = DIT_HEADS,
@@ -1886,11 +1885,12 @@ llm::submit_and_wait(ctx)!!;
 
 llm::begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: pass sigma directly (matches diffusers TimestepEmbedder)
-    // The model's sinusoidal embedding uses: args = sigma * exp(-log(10000) * j / half_dim)
-    // NOT (1-sigma)*1000 — that was incorrect and produced wrong t_emb for all steps
-    float actual_timestep = timestep;
-    io::printfn("  [DEBUG] Timestep: sigma=%.6f, passed to sinusoidal embedding=%.6f", timestep, actual_timestep);
+    // 3. Timestep embedding: diffusers ZImagePipeline does:
+    //    pipeline: timestep = (1000 - scheduler_t) / 1000 = 1 - sigma
+    //    model:    t = t * self.t_scale (t_scale=1000)
+    //    So sinusoidal embedding receives: (1 - sigma) * 1000
+    float actual_timestep = (1.0f - timestep) * DIT_T_PERIOD;
+    io::printfn("  [DEBUG] Timestep: sigma=%.6f, model_input=(1-sigma)*1000=%.6f", timestep, actual_timestep);
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
 llm::dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },

@@ -4,6 +4,7 @@ import vk;
 import llm;
 import std::io;
 import std::core::mem;
+import std::math;
 
 // TAESD (Tiny AutoEncoder for Stable Diffusion) Decoder
 // Architecture from madebyollin/taesd3 (16 latent channels for DiT/Flux)
@@ -286,7 +287,7 @@ fn void? TAESDDecoder.forward(&self, TAESDActivations* acts, uint lat_h, uint la
 
 llm::begin_compute(cmd)!!;
 
-    // tanh_clamp: z = tanh(z/3) * 3  (in-place on buf_a)
+    // tanh_clamp: z = tanh(z/3) * 3 (matching diffusers DecoderTiny.forward)
     uint latent_n = TAESD_Z_CHANNELS * h * w;
     pipelines::TanhClampPC tc_pc = { .n = latent_n };
 llm::dispatch_kernel(cmd, &k.tanh_clamp,
@@ -299,6 +300,31 @@ llm::compute_barrier(cmd);
     dispatch_taesd_conv(cmd, k, &self.conv_in, &acts.buf_a, &acts.buf_b, h, w);
 llm::compute_barrier(cmd);
 
+    // Debug: readback conv_in output
+llm::submit_and_wait(ctx)!!;
+    {
+        uint conv_n = TAESD_CHANNELS * h * w;
+        vk::Memory dbg_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)conv_n * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dbg_cmd) {
+            vk::cmdCopyBuffer(dbg_cmd, acts.buf_b.gpu_buffer.buffer, dbg_stg.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)conv_n * 4 }});
+        }!!;
+        float* dbg_ptr = (float*)dbg_stg.data();
+        double sum = 0; double sum2 = 0;
+        for (uint i = 0; i < conv_n; i++) { sum += (double)dbg_ptr[i]; sum2 += (double)dbg_ptr[i] * (double)dbg_ptr[i]; }
+        double mean = sum / conv_n;
+        double std = math::sqrt(sum2 / conv_n - mean * mean);
+        io::printfn("  [TAESD DEBUG] conv_in output: n=%d, mean=%.4f, std=%.4f, first5=[%.4f %.4f %.4f %.4f %.4f]",
+            conv_n, mean, std, dbg_ptr[0], dbg_ptr[1], dbg_ptr[2], dbg_ptr[3], dbg_ptr[4]);
+        dbg_stg.free();
+    }
+llm::begin_compute(cmd)!!;
+
     // ReLU(buf_b)
     dispatch_taesd_relu(cmd, k, &acts.buf_b, TAESD_CHANNELS * h * w);
 llm::compute_barrier(cmd);
@@ -306,6 +332,27 @@ llm::compute_barrier(cmd);
     // Stage 1: 3 TAEBlocks, alternating buffers
     // Block 0: buf_b → buf_a (temp=buf_c)
     dispatch_taesd_block(cmd, k, &self.stage1[0], &acts.buf_b, &acts.buf_a, &acts.buf_c, h, w);
+
+    // Debug: after stage1 block0
+llm::submit_and_wait(ctx)!!;
+    {
+        uint dbg_n = TAESD_CHANNELS * h * w;
+        vk::Memory s = vk::new_buffer(allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)dbg_n * 4)!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer c) {
+            vk::cmdCopyBuffer(c, acts.buf_a.gpu_buffer.buffer, s.buffer, 1,
+                (vk::BufferCopy[]){{ .size = (ulong)dbg_n * 4 }});
+        }!!;
+        float* p = (float*)s.data();
+        double sm = 0; for (uint i = 0; i < dbg_n; i++) sm += (double)p[i];
+        io::printfn("  [TAESD DEBUG] stage1_block0: mean=%.4f, first5=[%.4f %.4f %.4f %.4f %.4f]",
+            sm / dbg_n, p[0], p[1], p[2], p[3], p[4]);
+        s.free();
+    }
+llm::begin_compute(cmd)!!;
+
     // Block 1: buf_a → buf_b (temp=buf_c)
     dispatch_taesd_block(cmd, k, &self.stage1[1], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
     // Block 2: buf_b → buf_a (temp=buf_c)
@@ -379,6 +426,35 @@ llm::begin_compute(cmd)!!;
     // Conv_out: buf_b(64ch) → buf_a(3ch)
     dispatch_taesd_conv(cmd, k, &self.conv_out, &acts.buf_b, &acts.buf_a, h, w);
 llm::compute_barrier(cmd);
+
+    // Debug: readback conv_out output (pre-clamp)
+llm::submit_and_wait(ctx)!!;
+    {
+        uint out_n_dbg = TAESD_OUT_CHANNELS * h * w;
+        vk::Memory dbg_stg2 = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)out_n_dbg * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dbg_cmd2) {
+            vk::cmdCopyBuffer(dbg_cmd2, acts.buf_a.gpu_buffer.buffer, dbg_stg2.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)out_n_dbg * 4 }});
+        }!!;
+        float* dbg_ptr2 = (float*)dbg_stg2.data();
+        double sum = 0; double sum2 = 0; float mn = 999; float mx = -999;
+        for (uint i = 0; i < out_n_dbg; i++) {
+            sum += (double)dbg_ptr2[i]; sum2 += (double)dbg_ptr2[i] * (double)dbg_ptr2[i];
+            if (dbg_ptr2[i] < mn) mn = dbg_ptr2[i];
+            if (dbg_ptr2[i] > mx) mx = dbg_ptr2[i];
+        }
+        double mean = sum / out_n_dbg;
+        double std = math::sqrt(sum2 / out_n_dbg - mean * mean);
+        io::printfn("  [TAESD DEBUG] conv_out (pre-clamp): n=%d, mean=%.4f, std=%.4f, min=%.4f, max=%.4f",
+            out_n_dbg, mean, std, mn, mx);
+        dbg_stg2.free();
+    }
+llm::begin_compute(cmd)!!;
 
     // Clamp to [0, 1]: buf_a → buf_b → copy back to buf_a
     uint out_n = TAESD_OUT_CHANNELS * h * w;

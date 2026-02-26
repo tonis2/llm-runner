@@ -135,6 +135,32 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     double encode_sec = encode_start.to_now().to_sec();
     io::printfn("  Text encoding complete in %.2fs", encode_sec);
 
+    // Debug: export raw text embeddings (before cap_embedder) for PyTorch comparison
+    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
+        _f.close()!;
+        io::printfn("  [DEBUG] Exporting raw text embeddings to /tmp/zimage_debug/text_raw_c3.bin");
+        vk::Memory raw_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)cond_text_len * text_config.dim * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer raw_cmd) {
+            vk::cmdCopyBuffer(raw_cmd, cond_embeddings.gpu_buffer.buffer, raw_stg.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)cond_text_len * text_config.dim * 4 }});
+        }!!;
+        float* raw_ptr = (float*)raw_stg.data();
+        uint n_raw = cond_text_len * text_config.dim;
+        File f_raw = file::open("/tmp/zimage_debug/text_raw_c3.bin", "wb")!!;
+        // Write header: text_len, dim (2x uint32)
+        uint[2] raw_hdr = { cond_text_len, text_config.dim };
+        f_raw.write(((char*)&raw_hdr)[0..7])!;
+        f_raw.write(((char*)raw_ptr)[0..n_raw * 4 - 1])!;
+        f_raw.close()!;
+        raw_stg.free();
+        io::printfn("  [DEBUG] Saved raw text: [%d, %d]", cond_text_len, text_config.dim);
+    }
+
     mem::free(cond_tokens);
     if (use_cfg) mem::free(uncond_tokens);
     tok.free();
@@ -255,15 +281,28 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     llm::submit_and_wait(ctx)!!;
     cond_embeddings.free();
 
-    // WORKAROUND: Disable context refiner to prevent text embedding explosion
-    // The context refiner causes extreme amplification (30-40x) of text embeddings
-    // This workaround uses raw text embeddings instead
-    io::printfn("  [WORKAROUND] Skipping context refiner - using raw text embeddings");
+    // Context refiner: 2 plain transformer layers (no adaLN) on text embeddings
     dit.rope_cos_context = cond_rope_cos_ctx;
     dit.rope_sin_context = cond_rope_sin_ctx;
     llm::begin_compute(cmd)!!;
-    // Skip context refiner - text embeddings are already in cond_projected
+    if (dit.weights.streaming) {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
+            dit_transformer_layer(dit, cmd, &lw, &cond_projected, cond_padded_text, false,
+                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+            llm::submit_and_wait(ctx)!!;
+            lw.free();
+            llm::begin_compute(cmd)!!;
+        }
+    } else {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+                &cond_projected, cond_padded_text, false,
+                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+        }
+    }
     llm::submit_and_wait(ctx)!!;
+    io::printfn("  Context refiner complete (padded=%d).", cond_padded_text);
 
     // Debug: export text embeddings after cap_embedder + context_refiner
     if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
