@@ -134,11 +134,22 @@ fn float time_snr_shift(float alpha, float t) {
 fn FlowMatchingState init_flow_matching(uint num_steps, uint image_seq_len = 0) {
     float[] sigmas = mem::new_array(float, (usz)num_steps + 1);
 
-    // Shift factor for sigma schedule:
-    // - shift=1.0: identity (linear schedule, used by Z-Image Turbo / diffusers default)
-    // - shift=3.0: KoboldCpp default for Flux models
-    // For image_seq_len > 0, use shift=1.0 (matching diffusers FlowMatchEulerDiscreteScheduler default)
-    float shift = image_seq_len > 0 ? 1.0f : 3.0f;
+    // Dynamic shift factor for sigma schedule (Z-Image / Flux convention):
+    // mu = linear_interp(base_shift=0.5, max_shift=1.15, base_seq=256, max_seq=4096, image_seq_len)
+    // For 512x512 (seq=1024): mu ≈ 0.63
+    // For 1024x1024 (seq=4096): mu ≈ 1.15
+    float shift;
+    if (image_seq_len > 0) {
+        float base_seq = 256.0f;
+        float max_seq = 4096.0f;
+        float base_shift = 0.5f;
+        float max_shift_val = 1.15f;
+        float m = (max_shift_val - base_shift) / (max_seq - base_seq);
+        float b = base_shift - m * base_seq;
+        shift = (float)image_seq_len * m + b;
+    } else {
+        shift = 3.0f;  // KoboldCpp default for Flux
+    }
     float t_max = 999.0f;
 
     if (num_steps == 1) {

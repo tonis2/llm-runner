@@ -216,6 +216,50 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     llm::Tensor norm_scratch = llm::create_f32_tensor(ctx, { (ulong)text_config.dim, 0, 0, 0 }, 1)!!;
     vk::CommandBuffer cmd = ctx.command_buffer;
 
+    // Debug: dump raw LLM hidden states before cap_embedder
+    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
+        _f.close()!;
+        io::printfn("  [DEBUG] Dumping raw LLM embeddings (%d tokens x %d dims)...", cond_text_len, text_config.dim);
+        vk::Memory raw_stg = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)cond_text_len * text_config.dim * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dbg_cmd) {
+            vk::cmdCopyBuffer(dbg_cmd, cond_embeddings.gpu_buffer.buffer, raw_stg.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)cond_text_len * text_config.dim * 4 }});
+        }!!;
+        float* raw_ptr = (float*)raw_stg.data();
+        // Write raw embeddings
+        if (try f_raw = file::open("/tmp/zimage_debug/raw_llm_emb_c3.bin", "wb")) {
+            uint n_raw = cond_text_len * text_config.dim;
+            char[4] raw_hdr = {
+                (char)(n_raw & 0xFF), (char)((n_raw >> 8) & 0xFF),
+                (char)((n_raw >> 16) & 0xFF), (char)((n_raw >> 24) & 0xFF)
+            };
+            f_raw.write(&raw_hdr)!;
+            f_raw.write(((char*)raw_ptr)[0..n_raw * 4 - 1])!;
+            f_raw.close()!;
+            io::printfn("  [DEBUG] Saved raw LLM embeddings to /tmp/zimage_debug/raw_llm_emb_c3.bin");
+            // Print stats for first 3 tokens
+            for (uint t = 0; t < 3 && t < cond_text_len; t++) {
+                float* tok_data = raw_ptr + t * text_config.dim;
+                float tmin = tok_data[0]; float tmax = tok_data[0]; float tsum = 0; float tsq = 0;
+                for (uint d = 0; d < text_config.dim; d++) {
+                    float v = tok_data[d];
+                    if (v < tmin) tmin = v;
+                    if (v > tmax) tmax = v;
+                    tsum += v; tsq += v * v;
+                }
+                float tmean = tsum / (float)text_config.dim;
+                float tstd = math::sqrt(tsq / (float)text_config.dim - tmean * tmean);
+                io::printfn("  [DEBUG] raw token %d: min=%.4f max=%.4f mean=%.4f std=%.4f", t, tmin, tmax, tmean, tstd);
+            }
+        }
+        raw_stg.free();
+    }
+
     llm::begin_compute(cmd)!!;
     for (uint pos = 0; pos < cond_text_len; pos++) {
         usz in_off = (usz)pos * text_config.dim * 4;
@@ -242,6 +286,38 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
           cond_embeddings.size_bytes, cond_projected.size_bytes },
         &cap_pc, cond_text_len * DIT_DIM);
     llm::compute_barrier(cmd);
+    llm::submit_and_wait(ctx)!!;
+    cond_embeddings.free();
+
+    // Context refiner on REAL text tokens only (no padding)
+    // Padding tokens without attention mask would contaminate real tokens via self-attention
+    // We'll add pad tokens AFTER the context refiner
+    dit.rope_cos_context = cond_rope_cos_ctx;
+    dit.rope_sin_context = cond_rope_sin_ctx;
+    llm::begin_compute(cmd)!!;
+    if (dit.weights.streaming) {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
+            dit_transformer_layer(dit, cmd, &lw,
+                &cond_projected, cond_text_len, false,
+                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+            llm::submit_and_wait(ctx)!!;
+            lw.free();
+            llm::begin_compute(cmd)!!;
+        }
+        llm::submit_and_wait(ctx)!!;
+    } else {
+        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+                &cond_projected, cond_text_len, false,
+                &dit.rope_cos_context, &dit.rope_sin_context)!!;
+        }
+        llm::submit_and_wait(ctx)!!;
+    }
+    io::printfn("  Cond context refiner complete (real=%d, padded=%d).", cond_text_len, cond_padded_text);
+
+    // Add pad tokens AFTER context refiner
+    llm::begin_compute(cmd)!!;
     if (cond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
         for (uint p = 0; p < cond_n_text_pad; p++) {
             vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
@@ -253,32 +329,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         llm::compute_barrier(cmd);
     }
     llm::submit_and_wait(ctx)!!;
-    cond_embeddings.free();
-
-    // Context refiner on cond text
-    dit.rope_cos_context = cond_rope_cos_ctx;
-    dit.rope_sin_context = cond_rope_sin_ctx;
-    llm::begin_compute(cmd)!!;
-    if (dit.weights.streaming) {
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
-            dit_transformer_layer(dit, cmd, &lw,
-                &cond_projected, cond_padded_text, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
-            llm::submit_and_wait(ctx)!!;
-            lw.free();
-            llm::begin_compute(cmd)!!;
-        }
-        llm::submit_and_wait(ctx)!!;
-    } else {
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-                &cond_projected, cond_padded_text, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
-        }
-        llm::submit_and_wait(ctx)!!;
-    }
-    io::printfn("  Cond context refiner complete (padded=%d).", cond_padded_text);
 
     // Debug: export text embeddings after cap_embedder + context_refiner
     if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {

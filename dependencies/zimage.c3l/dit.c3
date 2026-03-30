@@ -467,9 +467,9 @@ fn void? precompute_mrope_tables(
     float* cos_data = (float*)mem::calloc(table_size * 4);
     float* sin_data = (float*)mem::calloc(table_size * 4);
 
-    // Image text-axis position = padded_text + 1 (matches KoboldCpp gen_z_image_ids)
-    // KoboldCpp: padded_context_len + 1
-    uint image_index = padded_text + 1;
+    // Image text-axis position = text_len (matches official Lumina2 position_ids)
+    // Official: position_ids[:, cap_len:cap_len+img_len, 0] = cap_len
+    uint image_index = text_len;
 
     // For each token, compute rotation angles for all 3 axes
     for (uint t = 0; t < seq_len; t++) {
@@ -478,8 +478,8 @@ fn void? precompute_mrope_tables(
         uint pos_col;    // axis 2
 
         if (mode == MROPE_MODE_TEXT) {
-            // All tokens are text (real + pad), 1-indexed
-            pos_text = t + 1;
+            // All tokens are text (real + pad), 0-indexed (matches official)
+            pos_text = t;
             pos_row = 0;
             pos_col = 0;
         } else if (mode == MROPE_MODE_IMAGE) {
@@ -494,20 +494,27 @@ fn void? precompute_mrope_tables(
                 pos_col = 0;
             }
         } else {
-            // FULL mode: [image_real, image_pad, text_real, text_pad]
-            if (t < n_patches) {
-                pos_text = image_index;
-                pos_row = t / patches_w;
-                pos_col = t % patches_w;
-            } else if (t < padded_patches) {
-                // Image padding
+            // FULL mode: [text_real, text_pad, image_real, image_pad]
+            // Official Lumina2 ordering: caption tokens first, then image tokens
+            if (t < text_len) {
+                // Real text token, 0-indexed (matches official: arange(cap_len))
+                pos_text = t;
+                pos_row = 0;
+                pos_col = 0;
+            } else if (t < padded_text) {
+                // Text padding
                 pos_text = 0;
                 pos_row = 0;
                 pos_col = 0;
+            } else if (t < padded_text + n_patches) {
+                // Real image token
+                uint img_idx = t - padded_text;
+                pos_text = image_index;
+                pos_row = img_idx / patches_w;
+                pos_col = img_idx % patches_w;
             } else {
-                // Text (real + pad), 1-indexed
-                uint text_idx = t - padded_patches;
-                pos_text = text_idx + 1;
+                // Image padding
+                pos_text = 0;
                 pos_row = 0;
                 pos_col = 0;
             }
@@ -1266,6 +1273,8 @@ fn void? dit_transformer_layer(
 
     // === Phase A: AdaLN params + Pre-attention norm + scale ===
     if (has_adaln && lw.adaln_linear.size_bytes > 0) {
+        // Z-Image: per-layer adaLN does NOT apply SiLU (Sequential(Linear) only, weight at .0)
+        // Only FinalLayer applies SiLU (Sequential(SiLU, Linear), weight at .1)
         // Project t_emb -> 4 modulation params: [scale_msa, gate_msa, scale_mlp, gate_mlp]
         LinearProjPC adaln_proj_pc = { .out_dim = 4 * dim, .in_dim = DIT_T_EMB_DIM, .seq_len = 1 };
 llm::dispatch_kernel(cmd, &dk.linear_proj,
@@ -1721,11 +1730,9 @@ llm::submit_and_wait(ctx)!!;
 
 llm::begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: pass sigma directly (matches diffusers TimestepEmbedder)
-    // The model's sinusoidal embedding uses: args = sigma * exp(-log(10000) * j / half_dim)
-    // NOT (1-sigma)*1000 — that was incorrect and produced wrong t_emb for all steps
-    float actual_timestep = timestep;
-    io::printfn("  [DEBUG] Timestep: sigma=%.6f, passed to sinusoidal embedding=%.6f", timestep, actual_timestep);
+    // 3. Timestep embedding: scale sigma by 1000 (matches diffusers FluxTransformer2DModel)
+    float actual_timestep = timestep * DIT_T_PERIOD;
+    io::printfn("  [DEBUG] Timestep: sigma=%.6f, scaled to=%.6f", timestep, actual_timestep);
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
 llm::dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
@@ -1887,13 +1894,27 @@ llm::submit_and_wait(ctx)!!;
     phase_start = clock::now();
 llm::begin_compute(cmd)!!;
 
-    // 5. Concat padded_image + padded_text -> [padded_patches + padded_text, dim]
-    // hidden already has image tokens [padded_patches, dim] at offset 0
-    // Copy padded text embeddings after padded image tokens
-    // text_embeddings is [padded_text, dim] (already padded by pipeline)
+    // 5. Concat [padded_text, padded_image] -> [padded_text + padded_patches, dim]
+    // Official Lumina2 ordering: text tokens first, then image tokens
+    // hidden currently has image tokens [padded_patches, dim] at offset 0 (from noise_refiner)
+    // Need to rearrange to [text, image] order
+
+    // Step 1: Save image tokens from hidden to buf_a (temporary)
+    vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0,
+                         .size = (ulong)padded_patches * dim * 4 }});
+llm::compute_barrier(cmd);
+
+    // Step 2: Copy text embeddings to the BEGINNING of hidden
     vk::cmdCopyBuffer(cmd, text_embeddings.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)padded_patches * dim * 4,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0,
                          .size = (ulong)padded_text * dim * 4 }});
+llm::compute_barrier(cmd);
+
+    // Step 3: Copy image tokens AFTER text in hidden
+    vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)padded_text * dim * 4,
+                         .size = (ulong)padded_patches * dim * 4 }});
 llm::compute_barrier(cmd);
 
     uint total_seq = padded_patches + padded_text;
@@ -2012,9 +2033,10 @@ llm::dispatch_kernel(cmd, &dk.linear_proj,
         &final_adaln_pc, dim);
 llm::compute_barrier(cmd);
 
-    // Copy only real image portion to buf_a (first n_patches tokens, skip img/text padding)
+    // Copy only real image portion to buf_a (image tokens start after padded_text)
+    // Official Lumina2: begin = cap_size, end = begin + n_patches
     vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
+        (BufferCopy[]){{ .srcOffset = (ulong)padded_text * dim * 4, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
 llm::compute_barrier(cmd);
 
     // Apply LayerNorm (no affine) to image portion — Lumina2 FinalLayer uses elementwise_affine=False

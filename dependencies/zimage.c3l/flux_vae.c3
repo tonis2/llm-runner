@@ -107,7 +107,7 @@ fn FluxVaeConv load_flux_conv(llm::DeviceContext* ctx, llm::SafetensorsFile* sf,
     String w_name = (String)wname[0..pos + w_suffix.len - 1];
     String b_name = (String)bname[0..pos + b_suffix.len - 1];
 
-    llm::Tensor w = llm::upload_safetensor_f32(ctx, sf, w_name)!!;
+    llm::Tensor w = llm::upload_safetensor_conv_f32(ctx, sf, w_name)!!;
     llm::Tensor b = llm::upload_safetensor_f32(ctx, sf, b_name)!!;
 
     return {
@@ -130,18 +130,18 @@ fn FluxVaeResBlock load_flux_resblock(llm::DeviceContext* ctx, llm::SafetensorsF
     // Build tensor names with prefix
     rb.norm1_weight = load_flux_vae_tensor(ctx, sf, prefix, "norm1.weight");
     rb.norm1_bias = load_flux_vae_tensor(ctx, sf, prefix, "norm1.bias");
-    rb.conv1_weight = load_flux_vae_tensor(ctx, sf, prefix, "conv1.weight");
+    rb.conv1_weight = load_flux_vae_conv_weight(ctx, sf, prefix, "conv1.weight");
     rb.conv1_bias = load_flux_vae_tensor(ctx, sf, prefix, "conv1.bias");
     rb.norm2_weight = load_flux_vae_tensor(ctx, sf, prefix, "norm2.weight");
     rb.norm2_bias = load_flux_vae_tensor(ctx, sf, prefix, "norm2.bias");
-    rb.conv2_weight = load_flux_vae_tensor(ctx, sf, prefix, "conv2.weight");
+    rb.conv2_weight = load_flux_vae_conv_weight(ctx, sf, prefix, "conv2.weight");
     rb.conv2_bias = load_flux_vae_tensor(ctx, sf, prefix, "conv2.bias");
 
     // Check for nin_shortcut (channel change)
     char[256] nin_buf;
     String nin_name = flux_vae_name(&nin_buf, prefix, "nin_shortcut.weight");
     if (try info = sf.find_tensor(nin_name)) {
-        rb.nin_shortcut_weight = llm::upload_safetensor_f32(ctx, sf, nin_name)!!;
+        rb.nin_shortcut_weight = llm::upload_safetensor_conv_f32(ctx, sf, nin_name)!!;
         rb.nin_shortcut_bias = load_flux_vae_tensor(ctx, sf, prefix, "nin_shortcut.bias");
         rb.has_nin_shortcut = true;
     } else {
@@ -162,6 +162,12 @@ fn llm::Tensor load_flux_vae_tensor(llm::DeviceContext* ctx, llm::SafetensorsFil
     char[256] buf;
     String name = flux_vae_name(&buf, prefix, suffix);
     return llm::upload_safetensor_f32(ctx, sf, name)!!;
+}
+
+fn llm::Tensor load_flux_vae_conv_weight(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, String suffix) {
+    char[256] buf;
+    String name = flux_vae_name(&buf, prefix, suffix);
+    return llm::upload_safetensor_conv_f32(ctx, sf, name)!!;
 }
 
 fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint channels) {
