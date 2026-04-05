@@ -8,3 +8,4 @@ test/data/
 debug_output/
 venv_debug/*
 __pycache__
+analyze/
