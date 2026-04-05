@@ -104,7 +104,6 @@ fn SafetensorsFile? safetensors_open(String path) {
 
     char* data_base = &data[8 + (usz)header_len];
 
-    io::printfn("Safetensors: %d tensors loaded from %s", n_tensors, path);
 
     return {
         .tensors = tensors,

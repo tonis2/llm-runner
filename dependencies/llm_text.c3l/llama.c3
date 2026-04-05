@@ -101,7 +101,6 @@ fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm:
         llm::GGUFTensorInfo* info = gf.find_tensor(names.embedding)!!;
         embedding_info = *info;
         embedding_data = gf.tensor_data_base + (usz)info.offset;
-        io::printfn("  Embedding: CPU-side dequant (encode_only), type=%d", info.type);
     } else {
         // Embedding must be F32 for the embedding lookup shader
         token_embedding = llm::load_tensor_as_f32(ctx, gf, names.embedding)!!;
@@ -118,7 +117,6 @@ fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm:
     // Output weight - skip entirely in encode_only mode (saves ~200-700MB)
     llm::Tensor output_weight;
     if (encode_only) {
-        io::printfn("  Skipping output weight (encode_only)");
     } else if (try output_info = gf.find_tensor(names.output)) {
         output_weight = llm::upload_weight(ctx, output_info, gf.tensor_data_base)!!;
     } else {
@@ -130,7 +128,6 @@ fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm:
 
     if (encode_only) {
         // Streaming mode: layers loaded on-demand during encode_text
-        io::printfn("  Layers: streaming mode (loaded per-layer during encoding)");
     } else {
         layers = mem::new_array(LayerWeights, config.n_layers);
 

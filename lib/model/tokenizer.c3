@@ -237,7 +237,6 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
                     }
                 }
             }
-            io::printfn("  Loaded %d BPE merges", merges_result.len);
             mem::free(merges_result);
         } else {
             merge_map = create_merge_map(0);
@@ -249,8 +248,6 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
         ignore_merges = vocab_size >= 100000;
     }
 
-    io::printfn("Tokenizer loaded: %d tokens (%s), BOS=%d, EOS=%d",
-        vocab_size, is_bpe ? "BPE" : "SPM", bos_id, eos_id);
 
     return {
         .vocab = vocab,

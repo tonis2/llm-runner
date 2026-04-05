@@ -179,7 +179,6 @@ fn GGUFFile? gguf_parse(char[] data) {
     ulong n_tensors = reader.read_u64();
     ulong n_kv = reader.read_u64();
 
-    io::printfn("GGUF v%d: %d metadata entries, %d tensors", version, n_kv, n_tensors);
 
     // Allocate metadata array
     GGUFMetaKV[] metadata = mem::new_array(GGUFMetaKV, (usz)n_kv);

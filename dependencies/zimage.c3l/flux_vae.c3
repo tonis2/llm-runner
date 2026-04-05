@@ -189,22 +189,16 @@ fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf,
 // --- Load Flux VAE Decoder ---
 
 fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, VaeKernels* kernels) {
-    io::printfn("\nLoading Flux VAE decoder...");
     String pfx = "decoder.";
 
     FluxVaeDecoder dec;
     dec.ctx = ctx;
     dec.kernels = kernels;
 
-    // conv_in: [512, 16, 3, 3]
     dec.conv_in = load_flux_conv(ctx, sf, "decoder.conv_in.", 16, 512);
-    io::printfn("  conv_in loaded");
-
-    // Mid block
     dec.mid_block1 = load_flux_resblock(ctx, sf, "decoder.mid.block_1.", 512, 512);
     dec.mid_attn = load_flux_attn(ctx, sf, "decoder.mid.attn_1.", 512);
     dec.mid_block2 = load_flux_resblock(ctx, sf, "decoder.mid.block_2.", 512, 512);
-    io::printfn("  mid block loaded");
 
     // up.3: 3 resblocks at 512 + upsample
     for (uint i = 0; i < 3; i++) {
@@ -217,7 +211,6 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
         dec.up3_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], 512, 512);
     }
     dec.up3_upsample = load_flux_conv(ctx, sf, "decoder.up.3.upsample.conv.", 512, 512);
-    io::printfn("  up.3 loaded");
 
     // up.2: 3 resblocks at 512 + upsample
     for (uint i = 0; i < 3; i++) {
@@ -231,7 +224,6 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
         dec.up2_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], in_c, 512);
     }
     dec.up2_upsample = load_flux_conv(ctx, sf, "decoder.up.2.upsample.conv.", 512, 512);
-    io::printfn("  up.2 loaded");
 
     // up.1: 3 resblocks 512->256 + upsample
     for (uint i = 0; i < 3; i++) {
@@ -245,7 +237,6 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
         dec.up1_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], in_c, 256);
     }
     dec.up1_upsample = load_flux_conv(ctx, sf, "decoder.up.1.upsample.conv.", 256, 256);
-    io::printfn("  up.1 loaded");
 
     // up.0: 3 resblocks 256->128
     for (uint i = 0; i < 3; i++) {
@@ -258,7 +249,6 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
         uint in_c = (i == 0) ? 256 : 128;
         dec.up0_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], in_c, 128);
     }
-    io::printfn("  up.0 loaded");
 
     // Output
     dec.norm_out_weight = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.weight");
