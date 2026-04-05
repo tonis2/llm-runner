@@ -207,6 +207,10 @@ struct DiTWeights {
     // Context refiner (2 layers, plain transformer - no adaLN)
     DiTLayerWeights[DIT_NUM_REFINER_LAYERS] context_refiner;
 
+    // Actual layer counts (may differ from constants if GGUF has fewer layers)
+    uint actual_num_layers;
+    uint actual_num_refiner_layers;
+
     // Streaming/offload mode: CPU-cached layer weights
     bool streaming;
     DiTLayerCPUWeights[DIT_NUM_LAYERS]* cpu_layers;
@@ -238,10 +242,6 @@ struct DiTWeights {
     // Pad tokens: [dim] (learnable padding for text)
     llm::Tensor x_pad_token;
     llm::Tensor cap_pad_token;
-
-    // Actual layer counts (may be less than compile-time max, read from GGUF metadata)
-    uint actual_num_layers;
-    uint actual_num_refiner_layers;
 }
 
 // --- DiT Activations ---
@@ -319,9 +319,6 @@ struct DiTModel {
     llm::Tensor rope_sin_refiner; // [n_patches, head_dim/2]
     llm::Tensor rope_cos_context; // [text_len, head_dim/2] for context refiner
     llm::Tensor rope_sin_context; // [text_len, head_dim/2]
-    // Actual layer counts (from DiTWeights, for forward pass loop bounds)
-    uint actual_num_layers;
-    uint actual_num_refiner_layers;
 }
 
 // --- Kernel Creation ---
@@ -1896,7 +1893,7 @@ llm::begin_compute(cmd)!!;
     // Re-enable profiling for noise refiner layer 0 (context_refiner may have consumed it)
     dit_profile_layer = want_layer_debug;
     if (w.streaming) {
-        for (uint l = 0; l < self.actual_num_refiner_layers; l++) {
+        for (uint l = 0; l < self.weights.actual_num_refiner_layers; l++) {
             DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_noise_refiner)[l]);
             dit_transformer_layer(self, cmd, &lw, &a.hidden, padded_patches, true,
                 &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
@@ -1918,7 +1915,7 @@ llm::begin_compute(cmd)!!;
             llm::begin_compute(cmd)!!;
         }
     } else {
-        for (uint l = 0; l < self.actual_num_refiner_layers; l++) {
+        for (uint l = 0; l < self.weights.actual_num_refiner_layers; l++) {
             dit_transformer_layer(self, cmd, &w.noise_refiner[l], &a.hidden, padded_patches, true,
                 &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
         }
@@ -1972,7 +1969,7 @@ llm::begin_compute(cmd)!!;
     uint batch_idx = 0;
     Clock batch_start = clock::now();
 
-    uint actual_layers = self.actual_num_layers;
+    uint actual_layers = self.weights.actual_num_layers;
     if (w.streaming) {
         // Streaming mode: upload each layer, run, free
         for (uint l = 0; l < actual_layers; l++) {
@@ -2212,8 +2209,8 @@ fn void DiTLayerWeights.free(&self) {
 
 fn void DiTModel.free(&self) {
     // Free layer weights (CPU or GPU depending on streaming mode)
-    uint num_layers = self.actual_num_layers;
-    uint num_refiner = self.actual_num_refiner_layers;
+    uint num_layers = self.weights.actual_num_layers;
+    uint num_refiner = self.weights.actual_num_refiner_layers;
     if (self.weights.streaming) {
         if (self.weights.cpu_layers != null) {
             for (uint l = 0; l < num_layers; l++) {

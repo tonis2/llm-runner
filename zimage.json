@@ -1,5 +1,5 @@
   {
-    "model": "/home/tonis/Documents/AI/models/z-image-Q8_0.gguf",
+    "model": "/home/tonis/Documents/AI/models/z-image-turbo-Q8_0.gguf",
     "prompt": "a photo of a cat",
     "text_model": "/home/tonis/Documents/AI/models/Qwen3-4B-Q8_0.gguf",
     "vae": "/home/tonis/Documents/AI/models/ae.safetensors",
