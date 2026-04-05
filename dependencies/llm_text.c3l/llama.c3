@@ -91,7 +91,6 @@ struct RoPEPC { uint dim; uint n_heads; uint position; float theta; }
 struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_len; float scale; uint max_seq_len; }
 
 fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ModelConfig* config, llm::WeightNames* names, bool encode_only = false) {
-    io::printfn("\nLoading weights...");
 
     llm::Tensor token_embedding;
     char* embedding_data = null;
@@ -281,7 +280,6 @@ fn void free_layer_weights(LayerWeights* lw, llm::ModelConfig* config) {
 }
 
 fn LlmActivations? allocate_llm_activations(llm::DeviceContext* ctx, llm::ModelConfig* config, uint max_seq_len = MAX_SEQ_LEN, bool encode_only = false) {
-    io::printfn("Allocating activation buffers (max_seq=%d)...", max_seq_len);
 
     ulong dim = config.dim;
     ulong ffn_dim = config.ffn_dim;
@@ -315,7 +313,6 @@ fn LlmActivations? allocate_llm_activations(llm::DeviceContext* ctx, llm::ModelC
 }
 
 fn KVCache? allocate_kv_cache(llm::DeviceContext* ctx, llm::ModelConfig* config, uint max_seq_len = MAX_SEQ_LEN) {
-    io::printfn("Allocating KV cache (max_seq=%d, %d layers)...", max_seq_len, config.n_layers);
 
     llm::Tensor[] k_cache = mem::new_array(llm::Tensor, config.n_layers);
     llm::Tensor[] v_cache = mem::new_array(llm::Tensor, config.n_layers);
@@ -335,7 +332,6 @@ fn KVCache? allocate_kv_cache(llm::DeviceContext* ctx, llm::ModelConfig* config,
 }
 
 fn LlmKernels? create_llm_kernels(llm::DeviceContext* ctx) {
-    io::printfn("Creating compute kernels...");
     char[] spv = &LLM_SPV;
     ShaderModule shader = vk::shaderModuleCreateInfo()
         .setCodeSize(spv.len)
@@ -371,8 +367,6 @@ fn LlmModel? load_llm_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::Mod
         )!!;
     }
 
-    io::printfn("\nModel loaded successfully!");
-    io::printfn("GPU memory used: %d MB", ctx.allocator.total_used() / (1024 * 1024));
 
     return {
         .config = *config,
@@ -699,7 +693,6 @@ fn llm::Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
         }!!;
     }
-    io::printfn("  Embedded %d tokens", seq_len);
 
     // 2. Process layers one at a time (streaming weights)
     // Diffusers uses hidden_states[-2] (second-to-last layer output, no final norm).
@@ -732,10 +725,6 @@ llm::submit_and_wait(ctx)!!;
         // Free this layer's weights (space reused for next layer)
         free_layer_weights(&lw, c);
 
-        if ((l + 1) % 4 == 0 || l == c.n_layers - 1) {
-            io::printfn("  Processed layer %d / %d", l + 1, c.n_layers);
-        }
-
         // Snapshot hidden_states after second-to-last layer (hidden_states[-2])
         if (l == penultimate_layer) {
             text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
@@ -744,7 +733,6 @@ llm::submit_and_wait(ctx)!!;
                     text_embeddings.gpu_buffer.buffer, 1,
                     (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * c.dim * 4 }});
             }!!;
-            io::printfn("  Captured hidden_states[-2] from layer %d (diffusers-compatible)", l + 1);
         }
     }
 

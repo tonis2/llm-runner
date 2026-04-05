@@ -264,7 +264,6 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
     dec.norm_out_weight = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.weight");
     dec.norm_out_bias = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.bias");
     dec.conv_out = load_flux_conv(ctx, sf, "decoder.conv_out.", 128, 3);
-    io::printfn("  Flux VAE decoder loaded.");
 
     return dec;
 }

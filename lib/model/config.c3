@@ -127,19 +127,6 @@ fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
         .rms_eps = rms_eps,
     };
 
-    io::printfn("\n=== Model Config ===");
-    io::printfn("  architecture: %s", config.name);
-    io::printfn("  norm: %s", norm_str);
-    io::printfn("  ffn: %s", ffn_str);
-    io::printfn("  dim: %d", config.dim);
-    io::printfn("  n_layers: %d", config.n_layers);
-    io::printfn("  n_heads: %d", config.n_heads);
-    io::printfn("  n_kv_heads: %d", config.n_kv_heads);
-    io::printfn("  ffn_dim: %d", config.ffn_dim);
-    io::printfn("  vocab_size: %d", config.vocab_size);
-    io::printfn("  head_dim: %d", config.head_dim);
-    io::printfn("  rope_theta: %f", config.rope_theta);
-    io::printfn("  rms_eps: %f", config.rms_eps);
 
     // Don't free root - strings in ModelConfig reference JSON-allocated memory
     return config;

@@ -19,7 +19,6 @@ struct VaeKernels {
 }
 
 fn VaeKernels? create_vae_kernels(llm::DeviceContext* ctx) {
-    io::printfn("Creating VAE compute kernels...");
     char[] spv = &pipelines::DIFFUSION_SPV;
     vk::ShaderModule shader = vk::shaderModuleCreateInfo()
         .setCodeSize(spv.len)

@@ -318,7 +318,6 @@ struct DiTModel {
 // --- Kernel Creation ---
 
 fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
-    io::printfn("Creating DiT compute kernels...");
 
     char[] zi_spv = &ZIMAGE_SPV;
     vk::ShaderModule zi_shader = vk::shaderModuleCreateInfo()
@@ -588,8 +587,6 @@ fn void? precompute_mrope_tables(
         case MROPE_MODE_TEXT: mode_name = "context_refiner";
         default: mode_name = "unknown";
     }
-    io::printfn("  mRoPE tables: seq_len=%d, half_dim=%d, pad=%d (%s)",
-        seq_len, half_dim, seq_len - (mode == MROPE_MODE_TEXT ? text_len : mode == MROPE_MODE_IMAGE ? n_patches : n_patches + text_len), mode_name);
 }
 
 // --- Weight Loading ---
@@ -633,30 +630,17 @@ fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile
 
     // Fused QKV: prefix.L.attention.qkv.weight
     String qkv_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.qkv.weight");
-    io::printfn("    [%s%d] loading qkv...", prefix, layer);
     if (try info = gf.find_tensor(qkv_name)) {
-        io::printfn("    [DEBUG] QKV GGUF type: %d (llm::GGML_Q5_K=%d, llm::GGML_BF16=%d)", info.type, llm::GGML_Q5_K, llm::GGML_BF16);
         if (info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32) {
             lw.wqkv = llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
         } else {
             lw.wqkv = llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
         }
-        io::printfn("    [DEBUG] QKV loaded dtype: %d (llm::GGML_F32=%d, llm::GGML_BF16=%d)", lw.wqkv.dtype, llm::GGML_F32, llm::GGML_BF16);
-    } else {
-        io::printfn("    Warning: QKV not found: %s", qkv_name);
     }
 
-    io::printfn("    [%s%d] loading norms + out...", prefix, layer);
     lw.q_norm = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.q_norm.weight"));
     lw.k_norm = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.k_norm.weight"));
-    String wo_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight");
-    if (try wo_info = gf.find_tensor(wo_name)) {
-        io::printfn("    [DEBUG] Wo GGUF type: %d (%s)", wo_info.type, wo_info.type == llm::GGML_Q5_K ? "Q5_K" : (wo_info.type == llm::GGML_Q4_K ? "Q4_K" : (wo_info.type == llm::GGML_F32 ? "F32" : "other")));
-    }
-    lw.wo = load_dit_tensor(ctx, gf, wo_name);
-    io::printfn("    [DEBUG] Wo loaded dtype: %d", lw.wo.dtype);
-
-    io::printfn("    [%s%d] loading ffn...", prefix, layer);
+    lw.wo = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight"));
     lw.ffn_gate = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w1.weight"));
     lw.ffn_up = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w3.weight"));
     lw.ffn_down = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w2.weight"));
@@ -677,7 +661,6 @@ fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile
     }
 
     if (has_adaln) {
-        io::printfn("    [%s%d] loading adaln...", prefix, layer);
         // Must load as F32 since linear_proj shader expects F32 weights
         lw.adaln_linear = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.weight"));
         lw.adaln_bias = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "adaLN_modulation.0.bias"));
@@ -817,7 +800,6 @@ fn void DiTLayerCPUWeights.free(&self) {
 }
 
 fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, bool streaming) {
-    io::printfn("\nLoading DiT weights%s...", streaming ? " (streaming/offload mode)" : "");
 
     DiTWeights w;
     w.streaming = streaming;
@@ -843,45 +825,25 @@ fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, bool
         w.cpu_context_refiner = mem::alloc(DiTLayerCPUWeights[DIT_NUM_REFINER_LAYERS]);
 
         for (uint l = 0; l < num_layers; l++) {
-            io::printf("  DiT layer %d / %d (CPU)...\r", l + 1, num_layers);
             (*w.cpu_layers)[l] = load_dit_layer_cpu(gf, "layers.", l, true);
-            if ((l + 1) % 5 == 0 || l == num_layers - 1) {
-                io::printfn("  DiT layer %d / %d cached to CPU", l + 1, num_layers);
-            }
         }
-
-        io::printfn("  Loading noise refiner (CPU)...");
         for (uint l = 0; l < num_refiner; l++) {
             (*w.cpu_noise_refiner)[l] = load_dit_layer_cpu(gf, "noise_refiner.", l, true);
         }
-
-        io::printfn("  Loading context refiner (CPU)...");
         for (uint l = 0; l < num_refiner; l++) {
             (*w.cpu_context_refiner)[l] = load_dit_layer_cpu(gf, "context_refiner.", l, false);
         }
     } else {
-        // Normal mode: load directly to GPU
         for (uint l = 0; l < num_layers; l++) {
-            io::printf("  DiT layer %d / %d...\r", l + 1, num_layers);
             w.layers[l] = load_dit_layer_weights(ctx, gf, "layers.", l, true);
-            if ((l + 1) % 5 == 0 || l == num_layers - 1) {
-                io::printfn("  DiT layer %d / %d loaded", l + 1, num_layers);
-            }
         }
-
-        io::printfn("  Loading noise refiner...");
         for (uint l = 0; l < num_refiner; l++) {
             w.noise_refiner[l] = load_dit_layer_weights(ctx, gf, "noise_refiner.", l, true);
         }
-
-        io::printfn("  Loading context refiner...");
         for (uint l = 0; l < num_refiner; l++) {
             w.context_refiner[l] = load_dit_layer_weights(ctx, gf, "context_refiner.", l, false);
         }
     }
-
-    // Embedders
-    io::printfn("  Loading embedders...");
     // cap_embedder = Sequential(RMSNorm(text_dim), Linear(text_dim, dim))
     w.cap_emb_norm = load_dit_tensor_f32(ctx, gf, "cap_embedder.0.weight");
     w.cap_emb_weight = load_dit_tensor_f32(ctx, gf, "cap_embedder.1.weight");
@@ -893,33 +855,11 @@ fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, bool
     w.t_emb_mlp2_weight = load_dit_tensor_f32(ctx, gf, "t_embedder.mlp.2.weight");
     w.t_emb_mlp2_bias = load_dit_tensor_f32(ctx, gf, "t_embedder.mlp.2.bias");
 
-    // Verify tensor shapes for t_embedder and adaLN
-    if (try info = gf.find_tensor("t_embedder.mlp.0.weight")) {
-        io::printfn("  [shape] t_emb.mlp.0.weight: [%d, %d]", info.shape[0], info.shape[1]);
-    }
-    if (try info = gf.find_tensor("t_embedder.mlp.2.weight")) {
-        io::printfn("  [shape] t_emb.mlp.2.weight: [%d, %d]", info.shape[0], info.shape[1]);
-    }
-    if (try info = gf.find_tensor("layers.0.adaLN_modulation.0.weight")) {
-        io::printfn("  [shape] layers.0.adaLN_modulation.0.weight: [%d, %d]", info.shape[0], info.shape[1]);
-    }
-    if (try info = gf.find_tensor("noise_refiner.0.adaLN_modulation.0.weight")) {
-        io::printfn("  [shape] noise_refiner.0.adaLN_modulation.0.weight: [%d, %d]", info.shape[0], info.shape[1]);
-    }
-    if (try info = gf.find_tensor("layers.0.attention_norm2.weight")) {
-        io::printfn("  [shape] layers.0.attention_norm2.weight: [%d]", info.shape[0]);
-    }
-    if (try info = gf.find_tensor("final_layer.adaLN_modulation.1.weight")) {
-        io::printfn("  [shape] final_layer.adaLN_modulation.1.weight: [%d, %d]", info.shape[0], info.shape[1]);
-    }
-
-    // Load x_embedder weights as F32 (using simple shader to avoid tiling bugs)
+    // Load x_embedder weights as F32
     w.x_emb_weight = load_dit_tensor_f32(ctx, gf, "x_embedder.weight");
     w.x_emb_bias = load_dit_tensor_f32(ctx, gf, "x_embedder.bias");
 
     // Final layer: norm + adaLN (scale-only) + linear projection
-    io::printfn("  Loading final layer...");
-    // Try loading final norm weight (Lumina2: LuminaLayerNormContinuous has RMSNorm)
     w.final_norm = load_dit_tensor(ctx, gf, "final_layer.norm.weight");
     if (w.final_norm.size_bytes == 0) {
         w.final_norm = load_dit_tensor(ctx, gf, "norm_out.norm.weight");
