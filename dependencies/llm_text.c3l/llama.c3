@@ -286,10 +286,11 @@ fn LlmActivations? allocate_llm_activations(llm::DeviceContext* ctx, llm::ModelC
     ulong dim = config.dim;
     ulong ffn_dim = config.ffn_dim;
     ulong n_heads = config.n_heads;
+    ulong q_dim = (ulong)config.n_heads * config.head_dim;  // may differ from dim (e.g. Qwen3)
 
     ulong[4] dim_shape = { dim, 0, 0, 0 };
     ulong[4] ffn_shape = { ffn_dim, 0, 0, 0 };
-    ulong[4] qkv_shape = { dim, 0, 0, 0 };  // n_heads * head_dim = dim
+    ulong[4] q_shape = { q_dim, 0, 0, 0 };
     ulong[4] scores_shape = { n_heads * max_seq_len, 0, 0, 0 };
 
     llm::Tensor logits;
@@ -301,10 +302,10 @@ fn LlmActivations? allocate_llm_activations(llm::DeviceContext* ctx, llm::ModelC
     return {
         .hidden = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
         .norm_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
-        .q = llm::create_f32_tensor(ctx, qkv_shape, 1)!!,
+        .q = llm::create_f32_tensor(ctx, q_shape, 1)!!,
         .k = llm::create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
         .v = llm::create_f32_tensor(ctx, { (ulong)config.n_kv_heads * config.head_dim, 0, 0, 0 }, 1)!!,
-        .attn_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
+        .attn_out = llm::create_f32_tensor(ctx, q_shape, 1)!!,
         .ffn_gate_out = llm::create_f32_tensor(ctx, ffn_shape, 1)!!,
         .ffn_up_out = llm::create_f32_tensor(ctx, ffn_shape, 1)!!,
         .ffn_down_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
@@ -414,8 +415,10 @@ llm::dispatch_kernel(cmd, &sk.layernorm,
 llm::compute_barrier(cmd);
 
     // Q/K/V projections
+    // Q output = n_heads * head_dim (may differ from dim, e.g. Qwen3: dim=2560 but Q=32*128=4096)
+    uint q_dim = c.n_heads * c.head_dim;
     uint kv_dim = c.n_kv_heads * c.head_dim;
-llm::dispatch_matmul(cmd, sk, &lw.wq, &a.norm_out, &a.q, c.dim, c.dim);
+llm::dispatch_matmul(cmd, sk, &lw.wq, &a.norm_out, &a.q, q_dim, c.dim);
 llm::dispatch_matmul(cmd, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
 llm::dispatch_matmul(cmd, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
 llm::compute_barrier(cmd);
@@ -499,8 +502,8 @@ llm::dispatch_kernel(cmd, &k.attention,
         &attn_pc, c.n_heads);
 llm::compute_barrier(cmd);
 
-    // Output projection
-llm::dispatch_matmul(cmd, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, c.dim);
+    // Output projection: attn_out [q_dim] -> norm_out [dim]
+llm::dispatch_matmul(cmd, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, q_dim);
 llm::compute_barrier(cmd);
 
     // Residual add: hidden += attn_output

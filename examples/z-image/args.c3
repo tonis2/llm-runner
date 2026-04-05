@@ -19,6 +19,8 @@ struct AppConfig {
     String vae_path;
     String taesd_path;
     String text_model_path;
+    String text_embeddings_file;  // Pre-computed text embeddings (bypasses text model)
+    String latent_file;           // Pre-computed initial latent (bypasses RNG)
     uint image_size;
     uint num_steps;
     float cfg_scale;
@@ -36,6 +38,8 @@ fn AppConfig? parse_args(String[] args) {
         .vae_path = "",
         .taesd_path = "",
         .text_model_path = "",
+        .text_embeddings_file = "",
+        .latent_file = "",
         .image_size = 512,
         .num_steps = 4,
         .cfg_scale = 7.0,
@@ -83,6 +87,12 @@ fn AppConfig? parse_args(String[] args) {
                 i += 2;
             } else if (args[i] == "--text-model") {
                 config.text_model_path = args[i + 1];
+                i += 2;
+            } else if (args[i] == "--text-embeddings") {
+                config.text_embeddings_file = args[i + 1];
+                i += 2;
+            } else if (args[i] == "--latent-file") {
+                config.latent_file = args[i + 1];
                 i += 2;
             } else if (args[i] == "--size") {
                 config.image_size = args[i + 1].to_uint() ?? 512;
@@ -137,6 +147,8 @@ fn bool load_config(String config_path, AppConfig* config) {
     if (try v = cfg.get_string("vae")) config.vae_path = v;
     if (try v = cfg.get_string("taesd")) config.taesd_path = v;
     if (try v = cfg.get_string("text_model")) config.text_model_path = v;
+    if (try v = cfg.get_string("text_embeddings")) config.text_embeddings_file = v;
+    if (try v = cfg.get_string("latent_file")) config.latent_file = v;
     if (try v = cfg.get_string("output")) config.output_path = v;
     if (try v = cfg.get_string("input")) config.input_path = v;
     if (try v = cfg.get_uint("steps")) config.num_steps = v;

@@ -20,6 +20,8 @@ struct ZImageState (llm::pipelines::Pipeline) {
     String vae_path;
     String taesd_path;
     bool offload;
+    String text_embeddings_file;
+    String latent_file;
 }
 
 fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) @dynamic {
@@ -29,6 +31,8 @@ fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String mod
     self.vae_path = opts.vae_path;
     self.taesd_path = opts.taesd_path;
     self.offload = opts.offload;
+    self.text_embeddings_file = opts.text_embeddings_file;
+    self.latent_file = opts.latent_file;
 }
 
 fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) @dynamic {
@@ -53,95 +57,10 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     uint n_patches = (lat_h / DIT_PATCH_SIZE) * (lat_w / DIT_PATCH_SIZE);
     uint latent_elems = DIT_LATENT_CHANNELS * lat_h * lat_w;
 
-    // ---- Phase 1: Text Encoding via LLM ----
-    io::printfn("\n[1/5] Text encoding (LLM)...");
-
-    if (self.text_model_path.len == 0) {
-        io::printfn("Error: text_model_path required for DiT pipeline");
-        return llm::pipelines::PIPELINE_INVALID_INPUT~;
-    }
-
-    mmap::FileMmap text_mm = file::mmap_open(self.text_model_path, "rb")!!;
-    char[] text_data = text_mm.bytes();
-    io::printfn("  Text model: %s (%d bytes)", self.text_model_path, text_data.len);
-
-    llm::GGUFFile text_gf = llm::gguf_parse(text_data)!!;
-
-    String arch_name = llm::detect_architecture(&text_gf);
-    io::printfn("  Text encoder architecture: %s", arch_name);
-
-    String config_json;
-    if (arch_name == "qwen3") {
-        config_json = (String)&llm_text::QWEN3_CONFIG_JSON;
-    } else if (arch_name == "qwen2") {
-        config_json = (String)&llm_text::QWEN2_CONFIG_JSON;
-    } else {
-        config_json = (String)&llm_text::QWEN3_CONFIG_JSON;
-    }
-
-    llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
-    llm::WeightNames text_names = llm::load_weight_names(config_json)!!;
-
-    llm::Tokenizer tok = llm::load_tokenizer(&text_gf)!!;
-
-    // Build conditioned prompt with chat template
-    char[4096] cond_buf;
-    usz cond_len = 0;
-    String cond_parts = "<|im_start|>user\n";
-    for (usz i = 0; i < cond_parts.len; i++) { cond_buf[cond_len] = cond_parts[i]; cond_len++; }
-    for (usz i = 0; i < inputs.prompt.len; i++) { cond_buf[cond_len] = inputs.prompt[i]; cond_len++; }
-    String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n";
-    for (usz i = 0; i < cond_suffix.len; i++) { cond_buf[cond_len] = cond_suffix[i]; cond_len++; }
-    String cond_prompt = (String)cond_buf[0..cond_len - 1];
-
-    uint[] cond_tokens = tok.encode_with_specials(cond_prompt)!!;
-    uint cond_text_len = (uint)cond_tokens.len;
-    io::printfn("  Cond prompt: %d tokens (with chat template)", cond_text_len);
-    // Debug: print token IDs
-    io::printf("  Token IDs:");
-    for (usz i = 0; i < cond_tokens.len; i++) {
-        io::printf(" %d", cond_tokens[i]);
-    }
-    io::printn("");
-
-    // Build unconditioned prompt for CFG
-    uint[] uncond_tokens;
+    // ---- Phase 1: Text Encoding ----
+    bool use_precomputed_text = self.text_embeddings_file.len > 0;
+    uint cond_text_len;
     uint uncond_text_len = 0;
-    if (use_cfg) {
-        String uncond_prompt = "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n";
-        uncond_tokens = tok.encode_with_specials(uncond_prompt)!!;
-        uncond_text_len = (uint)uncond_tokens.len;
-        io::printfn("  Uncond prompt: %d tokens (empty chat template)", uncond_text_len);
-    }
-
-    // Load LLM model for text encoding
-    uint max_text_len = cond_text_len;
-    if (use_cfg && uncond_text_len > max_text_len) max_text_len = uncond_text_len;
-    uint enc_max_seq = max_text_len + 16;
-    llm_text::LlmModel text_model = llm_text::load_llm_model(ctx, &text_gf, &text_config, &text_names,
-        encode_only: true, max_seq_len: enc_max_seq)!!;
-
-    Clock encode_start = clock::now();
-
-    llm::Tensor cond_embeddings = text_model.encode_text(cond_tokens)!!;
-    io::printfn("  Cond encoded: [%d, %d]", cond_text_len, text_config.dim);
-
-    llm::Tensor uncond_embeddings;
-    if (use_cfg) {
-        uncond_embeddings = text_model.encode_text(uncond_tokens)!!;
-        io::printfn("  Uncond encoded: [%d, %d]", uncond_text_len, text_config.dim);
-    }
-
-    double encode_sec = encode_start.to_now().to_sec();
-    io::printfn("  Text encoding complete in %.2fs", encode_sec);
-
-    mem::free(cond_tokens);
-    if (use_cfg) mem::free(uncond_tokens);
-    tok.free();
-    text_model.free();
-    text_gf.free();
-    text_mm.destroy();
-
     // ---- Phase 2: Load DiT + VAE ----
     io::printfn("\n[2/5] Loading DiT + VAE...");
 
@@ -152,6 +71,245 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     DiTWeights dit_weights = load_dit_weights(ctx, &dit_gf, self.offload)!!;
     DiTKernels dit_kernels = create_dit_kernels(ctx)!!;
 
+    llm::Tensor cond_projected;
+    llm::Tensor uncond_projected;
+    llm::Tensor uncond_rope_cos_main;
+    llm::Tensor uncond_rope_sin_main;
+    vk::CommandBuffer cmd = ctx.command_buffer;
+
+    if (use_precomputed_text) {
+        // --- Pre-computed text embeddings mode ---
+        // Embeddings are already in DIT_DIM space (post-cap_embedder, post-context_refiner)
+        io::printfn("\n[1/5] Loading pre-computed text embeddings...");
+        io::printfn("  File: %s", self.text_embeddings_file);
+
+        char[] emb_data = file::load(mem, self.text_embeddings_file)!!;
+        uint n_floats = *(uint*)emb_data.ptr;
+        float* emb_floats = (float*)(emb_data.ptr + 4);
+        cond_text_len = n_floats / DIT_DIM;
+        io::printfn("  Loaded %d floats -> %d text tokens x %d dims", n_floats, cond_text_len, DIT_DIM);
+
+        // No CFG in precomputed mode
+        use_cfg = false;
+
+        uint cond_padded_text_tmp = pad_to_multiple(cond_text_len, SEQ_MULTI_OF);
+        uint cond_n_text_pad_tmp = cond_padded_text_tmp - cond_text_len;
+
+        // Upload embeddings to GPU (padded size)
+        cond_projected = llm::create_f32_tensor(ctx, { (ulong)cond_padded_text_tmp * DIT_DIM, 0, 0, 0 }, 1)!!;
+        vk::Memory emb_staging = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: emb_floats, data_size: (usz)n_floats * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer xfer_cmd) {
+            vk::cmdCopyBuffer(xfer_cmd, emb_staging.buffer, cond_projected.gpu_buffer.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_floats * 4 }});
+        }!!;
+        emb_staging.free();
+
+        // Fill padding with cap_pad_token if available
+        if (cond_n_text_pad_tmp > 0 && dit_weights.cap_pad_token.size_bytes > 0) {
+            vk::CommandBuffer cmd_pad = ctx.command_buffer;
+            llm::begin_compute(cmd_pad)!!;
+            for (uint p = 0; p < cond_n_text_pad_tmp; p++) {
+                vk::cmdCopyBuffer(cmd_pad, dit_weights.cap_pad_token.gpu_buffer.buffer,
+                    cond_projected.gpu_buffer.buffer, 1,
+                    (vk::BufferCopy[]){{ .srcOffset = 0,
+                        .dstOffset = (ulong)(cond_text_len + p) * DIT_DIM * 4,
+                        .size = (ulong)DIT_DIM * 4 }});
+            }
+            llm::submit_and_wait(ctx)!!;
+        }
+        mem::free(emb_data);
+        io::printfn("  Pre-computed text embeddings loaded (real=%d, padded=%d).", cond_text_len, cond_padded_text_tmp);
+
+    } else {
+        // --- Standard LLM text encoding mode ---
+        io::printfn("\n[1/5] Text encoding (LLM)...");
+
+        if (self.text_model_path.len == 0) {
+            io::printfn("Error: text_model_path or text_embeddings_file required for DiT pipeline");
+            return llm::pipelines::PIPELINE_INVALID_INPUT~;
+        }
+
+        mmap::FileMmap text_mm = file::mmap_open(self.text_model_path, "rb")!!;
+        char[] text_data = text_mm.bytes();
+        io::printfn("  Text model: %s (%d bytes)", self.text_model_path, text_data.len);
+
+        llm::GGUFFile text_gf = llm::gguf_parse(text_data)!!;
+
+        String arch_name = llm::detect_architecture(&text_gf);
+        io::printfn("  Text encoder architecture: %s", arch_name);
+
+        String config_json;
+        if (arch_name == "qwen3") {
+            config_json = (String)&llm_text::QWEN3_CONFIG_JSON;
+        } else if (arch_name == "qwen2") {
+            config_json = (String)&llm_text::QWEN2_CONFIG_JSON;
+        } else {
+            config_json = (String)&llm_text::QWEN3_CONFIG_JSON;
+        }
+
+        llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
+        llm::WeightNames text_names = llm::load_weight_names(config_json)!!;
+
+        llm::Tokenizer tok = llm::load_tokenizer(&text_gf)!!;
+
+        // Build conditioned prompt with chat template
+        char[4096] cond_buf;
+        usz cond_len = 0;
+        String cond_parts = "<|im_start|>user\n";
+        for (usz i = 0; i < cond_parts.len; i++) { cond_buf[cond_len] = cond_parts[i]; cond_len++; }
+        for (usz i = 0; i < inputs.prompt.len; i++) { cond_buf[cond_len] = inputs.prompt[i]; cond_len++; }
+        String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+        for (usz i = 0; i < cond_suffix.len; i++) { cond_buf[cond_len] = cond_suffix[i]; cond_len++; }
+        String cond_prompt = (String)cond_buf[0..cond_len - 1];
+
+        uint[] cond_tokens = tok.encode_with_specials(cond_prompt)!!;
+        cond_text_len = (uint)cond_tokens.len;
+        io::printfn("  Cond prompt: %d tokens (with chat template)", cond_text_len);
+
+        // Build unconditioned prompt for CFG
+        uint[] uncond_tokens;
+        if (use_cfg) {
+            String uncond_prompt = "<|im_start|>user\n\n<|im_end|>\n<|im_start|>assistant\n";
+            uncond_tokens = tok.encode_with_specials(uncond_prompt)!!;
+            uncond_text_len = (uint)uncond_tokens.len;
+            io::printfn("  Uncond prompt: %d tokens (empty chat template)", uncond_text_len);
+        }
+
+        // Load LLM model for text encoding
+        uint max_text_len = cond_text_len;
+        if (use_cfg && uncond_text_len > max_text_len) max_text_len = uncond_text_len;
+        uint enc_max_seq = max_text_len + 16;
+        llm_text::LlmModel text_model = llm_text::load_llm_model(ctx, &text_gf, &text_config, &text_names,
+            encode_only: true, max_seq_len: enc_max_seq)!!;
+
+        Clock encode_start = clock::now();
+
+        llm::Tensor cond_embeddings = text_model.encode_text(cond_tokens)!!;
+        io::printfn("  Cond encoded: [%d, %d]", cond_text_len, text_config.dim);
+
+        llm::Tensor uncond_embeddings;
+        if (use_cfg) {
+            uncond_embeddings = text_model.encode_text(uncond_tokens)!!;
+            io::printfn("  Uncond encoded: [%d, %d]", uncond_text_len, text_config.dim);
+        }
+
+        double encode_sec = encode_start.to_now().to_sec();
+        io::printfn("  Text encoding complete in %.2fs", encode_sec);
+
+        mem::free(cond_tokens);
+        if (use_cfg) mem::free(uncond_tokens);
+        tok.free();
+        text_model.free();
+        text_gf.free();
+        text_mm.destroy();
+
+        // Cap embedder + context refiner
+        uint cond_padded_text_tmp = pad_to_multiple(cond_text_len, SEQ_MULTI_OF);
+        uint cond_n_text_pad_tmp = cond_padded_text_tmp - cond_text_len;
+
+        cond_projected = llm::create_f32_tensor(ctx, { (ulong)cond_padded_text_tmp * DIT_DIM, 0, 0, 0 }, 1)!!;
+        llm::Tensor norm_scratch = llm::create_f32_tensor(ctx, { (ulong)text_config.dim, 0, 0, 0 }, 1)!!;
+
+        llm::begin_compute(cmd)!!;
+        for (uint pos = 0; pos < cond_text_len; pos++) {
+            usz in_off = (usz)pos * text_config.dim * 4;
+            vk::cmdCopyBuffer(cmd, cond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
+            llm::compute_barrier(cmd);
+            RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
+            llm::dispatch_kernel(cmd, &dit_kernels.shared.rmsnorm,
+                { norm_scratch.gpu_buffer.buffer, dit_weights.cap_emb_norm.gpu_buffer.buffer,
+                  norm_scratch.gpu_buffer.buffer },
+                { norm_scratch.size_bytes, dit_weights.cap_emb_norm.size_bytes,
+                  norm_scratch.size_bytes },
+                &rms_pc, 1);
+            llm::compute_barrier(cmd);
+            vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, cond_embeddings.gpu_buffer.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
+            llm::compute_barrier(cmd);
+        }
+        LinearProjPC cap_pc = { .out_dim = DIT_DIM, .in_dim = text_config.dim, .seq_len = cond_text_len };
+        llm::dispatch_kernel(cmd, &dit_kernels.linear_proj,
+            { dit_weights.cap_emb_weight.gpu_buffer.buffer, dit_weights.cap_emb_bias.gpu_buffer.buffer,
+              cond_embeddings.gpu_buffer.buffer, cond_projected.gpu_buffer.buffer },
+            { dit_weights.cap_emb_weight.size_bytes, dit_weights.cap_emb_bias.size_bytes,
+              cond_embeddings.size_bytes, cond_projected.size_bytes },
+            &cap_pc, cond_text_len * DIT_DIM);
+        llm::compute_barrier(cmd);
+        llm::submit_and_wait(ctx)!!;
+        cond_embeddings.free();
+
+        // Add pad tokens AFTER context refiner
+        llm::begin_compute(cmd)!!;
+        if (cond_n_text_pad_tmp > 0 && dit_weights.cap_pad_token.size_bytes > 0) {
+            for (uint p = 0; p < cond_n_text_pad_tmp; p++) {
+                vk::cmdCopyBuffer(cmd, dit_weights.cap_pad_token.gpu_buffer.buffer,
+                    cond_projected.gpu_buffer.buffer, 1,
+                    (vk::BufferCopy[]){{ .srcOffset = 0,
+                        .dstOffset = (ulong)(cond_text_len + p) * DIT_DIM * 4,
+                        .size = (ulong)DIT_DIM * 4 }});
+            }
+            llm::compute_barrier(cmd);
+        }
+        llm::submit_and_wait(ctx)!!;
+
+        // Process unconditioned text for CFG
+        if (use_cfg) {
+            uint uncond_padded_text_tmp = pad_to_multiple(uncond_text_len, SEQ_MULTI_OF);
+            uint uncond_n_text_pad_tmp = uncond_padded_text_tmp - uncond_text_len;
+            uncond_projected = llm::create_f32_tensor(ctx, { (ulong)uncond_padded_text_tmp * DIT_DIM, 0, 0, 0 }, 1)!!;
+
+            llm::begin_compute(cmd)!!;
+            for (uint pos = 0; pos < uncond_text_len; pos++) {
+                usz in_off = (usz)pos * text_config.dim * 4;
+                vk::cmdCopyBuffer(cmd, uncond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
+                    (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
+                llm::compute_barrier(cmd);
+                RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
+                llm::dispatch_kernel(cmd, &dit_kernels.shared.rmsnorm,
+                    { norm_scratch.gpu_buffer.buffer, dit_weights.cap_emb_norm.gpu_buffer.buffer,
+                      norm_scratch.gpu_buffer.buffer },
+                    { norm_scratch.size_bytes, dit_weights.cap_emb_norm.size_bytes,
+                      norm_scratch.size_bytes },
+                    &rms_pc, 1);
+                llm::compute_barrier(cmd);
+                vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, uncond_embeddings.gpu_buffer.buffer, 1,
+                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
+                llm::compute_barrier(cmd);
+            }
+            LinearProjPC uncond_cap_pc = { .out_dim = DIT_DIM, .in_dim = text_config.dim, .seq_len = uncond_text_len };
+            llm::dispatch_kernel(cmd, &dit_kernels.linear_proj,
+                { dit_weights.cap_emb_weight.gpu_buffer.buffer, dit_weights.cap_emb_bias.gpu_buffer.buffer,
+                  uncond_embeddings.gpu_buffer.buffer, uncond_projected.gpu_buffer.buffer },
+                { dit_weights.cap_emb_weight.size_bytes, dit_weights.cap_emb_bias.size_bytes,
+                  uncond_embeddings.size_bytes, uncond_projected.size_bytes },
+                &uncond_cap_pc, uncond_text_len * DIT_DIM);
+            llm::compute_barrier(cmd);
+            if (uncond_n_text_pad_tmp > 0 && dit_weights.cap_pad_token.size_bytes > 0) {
+                for (uint p = 0; p < uncond_n_text_pad_tmp; p++) {
+                    vk::cmdCopyBuffer(cmd, dit_weights.cap_pad_token.gpu_buffer.buffer,
+                        uncond_projected.gpu_buffer.buffer, 1,
+                        (vk::BufferCopy[]){{ .srcOffset = 0,
+                            .dstOffset = (ulong)(uncond_text_len + p) * DIT_DIM * 4,
+                            .size = (ulong)DIT_DIM * 4 }});
+                }
+                llm::compute_barrier(cmd);
+            }
+            llm::submit_and_wait(ctx)!!;
+            uncond_embeddings.free();
+
+            precompute_mrope_tables(ctx, &uncond_rope_cos_main, &uncond_rope_sin_main,
+                n_patches, lat_w / DIT_PATCH_SIZE, lat_h / DIT_PATCH_SIZE, uncond_text_len, MROPE_MODE_FULL)!!;
+        }
+        norm_scratch.free();
+    }
+
+    // Common setup after text encoding (both paths)
     uint cond_padded_text = pad_to_multiple(cond_text_len, SEQ_MULTI_OF);
     uint padded_patches = pad_to_multiple(n_patches, SEQ_MULTI_OF);
     uint cond_n_text_pad = cond_padded_text - cond_text_len;
@@ -176,6 +334,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     dit.padded_text = cond_padded_text;
     dit.latent_h = lat_h;
     dit.latent_w = lat_w;
+    dit.actual_num_layers = dit_weights.actual_num_layers;
+    dit.actual_num_refiner_layers = dit_weights.actual_num_refiner_layers;
 
     // Precompute mRoPE tables
     uint patches_w = lat_w / DIT_PATCH_SIZE;
@@ -189,245 +349,44 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     precompute_mrope_tables(ctx, &dit.rope_cos_refiner, &dit.rope_sin_refiner,
         n_patches, patches_w, patches_h, cond_text_len, MROPE_MODE_IMAGE)!!;
 
-    llm::Tensor cond_rope_cos_ctx;
-    llm::Tensor cond_rope_sin_ctx;
-    precompute_mrope_tables(ctx, &cond_rope_cos_ctx, &cond_rope_sin_ctx,
-        n_patches, patches_w, patches_h, cond_text_len, MROPE_MODE_TEXT)!!;
-
-    llm::Tensor uncond_rope_cos_main;
-    llm::Tensor uncond_rope_sin_main;
-    llm::Tensor uncond_rope_cos_ctx;
-    llm::Tensor uncond_rope_sin_ctx;
-    if (use_cfg) {
-        precompute_mrope_tables(ctx, &uncond_rope_cos_main, &uncond_rope_sin_main,
-            n_patches, patches_w, patches_h, uncond_text_len, MROPE_MODE_FULL)!!;
-        precompute_mrope_tables(ctx, &uncond_rope_cos_ctx, &uncond_rope_sin_ctx,
-            n_patches, patches_w, patches_h, uncond_text_len, MROPE_MODE_TEXT)!!;
-    }
-
     io::printfn("  DiT loaded: %d patches (pad %d), cond=%d tokens (pad %d)",
         n_patches, n_img_pad, cond_text_len, cond_n_text_pad);
     if (use_cfg) {
         io::printfn("  CFG uncond: %d tokens (pad %d)", uncond_text_len, uncond_n_text_pad);
     }
 
-    // Project text through cap_embedder + context_refiner
-    llm::Tensor cond_projected = llm::create_f32_tensor(ctx, { (ulong)cond_padded_text * DIT_DIM, 0, 0, 0 }, 1)!!;
-    llm::Tensor norm_scratch = llm::create_f32_tensor(ctx, { (ulong)text_config.dim, 0, 0, 0 }, 1)!!;
-    vk::CommandBuffer cmd = ctx.command_buffer;
+    // Context refiner on REAL text tokens only (skip for precomputed embeddings)
+    if (!use_precomputed_text && dit.actual_num_refiner_layers > 0) {
+        llm::Tensor cond_rope_cos_ctx;
+        llm::Tensor cond_rope_sin_ctx;
+        precompute_mrope_tables(ctx, &cond_rope_cos_ctx, &cond_rope_sin_ctx,
+            n_patches, patches_w, patches_h, cond_text_len, MROPE_MODE_TEXT)!!;
+        dit.rope_cos_context = cond_rope_cos_ctx;
+        dit.rope_sin_context = cond_rope_sin_ctx;
 
-    // Debug: dump raw LLM hidden states before cap_embedder
-    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-        _f.close()!;
-        io::printfn("  [DEBUG] Dumping raw LLM embeddings (%d tokens x %d dims)...", cond_text_len, text_config.dim);
-        vk::Memory raw_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)cond_text_len * text_config.dim * 4,
-        )!!;
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dbg_cmd) {
-            vk::cmdCopyBuffer(dbg_cmd, cond_embeddings.gpu_buffer.buffer, raw_stg.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)cond_text_len * text_config.dim * 4 }});
-        }!!;
-        float* raw_ptr = (float*)raw_stg.data();
-        // Write raw embeddings
-        if (try f_raw = file::open("/tmp/zimage_debug/raw_llm_emb_c3.bin", "wb")) {
-            uint n_raw = cond_text_len * text_config.dim;
-            char[4] raw_hdr = {
-                (char)(n_raw & 0xFF), (char)((n_raw >> 8) & 0xFF),
-                (char)((n_raw >> 16) & 0xFF), (char)((n_raw >> 24) & 0xFF)
-            };
-            f_raw.write(&raw_hdr)!;
-            f_raw.write(((char*)raw_ptr)[0..n_raw * 4 - 1])!;
-            f_raw.close()!;
-            io::printfn("  [DEBUG] Saved raw LLM embeddings to /tmp/zimage_debug/raw_llm_emb_c3.bin");
-            // Print stats for first 3 tokens
-            for (uint t = 0; t < 3 && t < cond_text_len; t++) {
-                float* tok_data = raw_ptr + t * text_config.dim;
-                float tmin = tok_data[0]; float tmax = tok_data[0]; float tsum = 0; float tsq = 0;
-                for (uint d = 0; d < text_config.dim; d++) {
-                    float v = tok_data[d];
-                    if (v < tmin) tmin = v;
-                    if (v > tmax) tmax = v;
-                    tsum += v; tsq += v * v;
-                }
-                float tmean = tsum / (float)text_config.dim;
-                float tstd = math::sqrt(tsq / (float)text_config.dim - tmean * tmean);
-                io::printfn("  [DEBUG] raw token %d: min=%.4f max=%.4f mean=%.4f std=%.4f", t, tmin, tmax, tmean, tstd);
-            }
-        }
-        raw_stg.free();
-    }
-
-    llm::begin_compute(cmd)!!;
-    for (uint pos = 0; pos < cond_text_len; pos++) {
-        usz in_off = (usz)pos * text_config.dim * 4;
-        vk::cmdCopyBuffer(cmd, cond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
-            (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
-        llm::compute_barrier(cmd);
-        RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
-        llm::dispatch_kernel(cmd, &dit.kernels.shared.rmsnorm,
-            { norm_scratch.gpu_buffer.buffer, dit.weights.cap_emb_norm.gpu_buffer.buffer,
-              norm_scratch.gpu_buffer.buffer },
-            { norm_scratch.size_bytes, dit.weights.cap_emb_norm.size_bytes,
-              norm_scratch.size_bytes },
-            &rms_pc, 1);
-        llm::compute_barrier(cmd);
-        vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, cond_embeddings.gpu_buffer.buffer, 1,
-            (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
-        llm::compute_barrier(cmd);
-    }
-    LinearProjPC cap_pc = { .out_dim = DIT_DIM, .in_dim = text_config.dim, .seq_len = cond_text_len };
-    llm::dispatch_kernel(cmd, &dit.kernels.linear_proj,
-        { dit.weights.cap_emb_weight.gpu_buffer.buffer, dit.weights.cap_emb_bias.gpu_buffer.buffer,
-          cond_embeddings.gpu_buffer.buffer, cond_projected.gpu_buffer.buffer },
-        { dit.weights.cap_emb_weight.size_bytes, dit.weights.cap_emb_bias.size_bytes,
-          cond_embeddings.size_bytes, cond_projected.size_bytes },
-        &cap_pc, cond_text_len * DIT_DIM);
-    llm::compute_barrier(cmd);
-    llm::submit_and_wait(ctx)!!;
-    cond_embeddings.free();
-
-    // Context refiner on REAL text tokens only (no padding)
-    // Padding tokens without attention mask would contaminate real tokens via self-attention
-    // We'll add pad tokens AFTER the context refiner
-    dit.rope_cos_context = cond_rope_cos_ctx;
-    dit.rope_sin_context = cond_rope_sin_ctx;
-    llm::begin_compute(cmd)!!;
-    if (dit.weights.streaming) {
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
-            dit_transformer_layer(dit, cmd, &lw,
-                &cond_projected, cond_text_len, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
-            llm::submit_and_wait(ctx)!!;
-            lw.free();
-            llm::begin_compute(cmd)!!;
-        }
-        llm::submit_and_wait(ctx)!!;
-    } else {
-        for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-                &cond_projected, cond_text_len, false,
-                &dit.rope_cos_context, &dit.rope_sin_context)!!;
-        }
-        llm::submit_and_wait(ctx)!!;
-    }
-    io::printfn("  Cond context refiner complete (real=%d, padded=%d).", cond_text_len, cond_padded_text);
-
-    // Add pad tokens AFTER context refiner
-    llm::begin_compute(cmd)!!;
-    if (cond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
-        for (uint p = 0; p < cond_n_text_pad; p++) {
-            vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
-                cond_projected.gpu_buffer.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0,
-                    .dstOffset = (ulong)(cond_text_len + p) * DIT_DIM * 4,
-                    .size = (ulong)DIT_DIM * 4 }});
-        }
-        llm::compute_barrier(cmd);
-    }
-    llm::submit_and_wait(ctx)!!;
-
-    // Debug: export text embeddings after cap_embedder + context_refiner
-    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-        _f.close()!;
-        io::printfn("  [DEBUG] Exporting text embeddings to /tmp/zimage_debug/text_emb_c3.bin");
-        vk::Memory text_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)cond_padded_text * DIT_DIM * 4,
-        )!!;
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dbg_cmd) {
-            vk::cmdCopyBuffer(dbg_cmd, cond_projected.gpu_buffer.buffer, text_stg.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)cond_padded_text * DIT_DIM * 4 }});
-        }!!;
-        float* text_ptr = (float*)text_stg.data();
-        uint n_text = cond_padded_text * DIT_DIM;
-        File f_text = file::open("/tmp/zimage_debug/text_emb_c3.bin", "wb")!!;
-        char[4] text_hdr = {
-            (char)(n_text & 0xFF), (char)((n_text >> 8) & 0xFF),
-            (char)((n_text >> 16) & 0xFF), (char)((n_text >> 24) & 0xFF)
-        };
-        f_text.write(&text_hdr)!;
-        f_text.write(((char*)text_ptr)[0..n_text * 4 - 1])!;
-        f_text.close()!;
-        text_stg.free();
-        io::printfn("  [DEBUG] Saved %d floats", n_text);
-    }
-
-    // Process unconditioned text for CFG
-    llm::Tensor uncond_projected;
-    if (use_cfg) {
-        uncond_projected = llm::create_f32_tensor(ctx, { (ulong)uncond_padded_text * DIT_DIM, 0, 0, 0 }, 1)!!;
-
-        llm::begin_compute(cmd)!!;
-        for (uint pos = 0; pos < uncond_text_len; pos++) {
-            usz in_off = (usz)pos * text_config.dim * 4;
-            vk::cmdCopyBuffer(cmd, uncond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
-            llm::compute_barrier(cmd);
-            RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
-            llm::dispatch_kernel(cmd, &dit.kernels.shared.rmsnorm,
-                { norm_scratch.gpu_buffer.buffer, dit.weights.cap_emb_norm.gpu_buffer.buffer,
-                  norm_scratch.gpu_buffer.buffer },
-                { norm_scratch.size_bytes, dit.weights.cap_emb_norm.size_bytes,
-                  norm_scratch.size_bytes },
-                &rms_pc, 1);
-            llm::compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, uncond_embeddings.gpu_buffer.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
-            llm::compute_barrier(cmd);
-        }
-        LinearProjPC uncond_cap_pc = { .out_dim = DIT_DIM, .in_dim = text_config.dim, .seq_len = uncond_text_len };
-        llm::dispatch_kernel(cmd, &dit.kernels.linear_proj,
-            { dit.weights.cap_emb_weight.gpu_buffer.buffer, dit.weights.cap_emb_bias.gpu_buffer.buffer,
-              uncond_embeddings.gpu_buffer.buffer, uncond_projected.gpu_buffer.buffer },
-            { dit.weights.cap_emb_weight.size_bytes, dit.weights.cap_emb_bias.size_bytes,
-              uncond_embeddings.size_bytes, uncond_projected.size_bytes },
-            &uncond_cap_pc, uncond_text_len * DIT_DIM);
-        llm::compute_barrier(cmd);
-        if (uncond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
-            for (uint p = 0; p < uncond_n_text_pad; p++) {
-                vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
-                    uncond_projected.gpu_buffer.buffer, 1,
-                    (vk::BufferCopy[]){{ .srcOffset = 0,
-                        .dstOffset = (ulong)(uncond_text_len + p) * DIT_DIM * 4,
-                        .size = (ulong)DIT_DIM * 4 }});
-            }
-            llm::compute_barrier(cmd);
-        }
-        llm::submit_and_wait(ctx)!!;
-        uncond_embeddings.free();
-
-        // Context refiner on uncond text
-        dit.rope_cos_context = uncond_rope_cos_ctx;
-        dit.rope_sin_context = uncond_rope_sin_ctx;
-        llm::begin_compute(cmd)!!;
+        vk::CommandBuffer cmd_cr = ctx.command_buffer;
+        llm::begin_compute(cmd_cr)!!;
         if (dit.weights.streaming) {
-            for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
+            for (uint l = 0; l < dit.actual_num_refiner_layers; l++) {
                 DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
-                dit_transformer_layer(dit, cmd, &lw,
-                    &uncond_projected, uncond_padded_text, false,
+                dit_transformer_layer(dit, cmd_cr, &lw,
+                    &cond_projected, cond_text_len, false,
                     &dit.rope_cos_context, &dit.rope_sin_context)!!;
                 llm::submit_and_wait(ctx)!!;
                 lw.free();
-                llm::begin_compute(cmd)!!;
+                llm::begin_compute(cmd_cr)!!;
             }
             llm::submit_and_wait(ctx)!!;
         } else {
-            for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-                dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
-                    &uncond_projected, uncond_padded_text, false,
+            for (uint l = 0; l < dit.actual_num_refiner_layers; l++) {
+                dit_transformer_layer(dit, cmd_cr, &dit.weights.context_refiner[l],
+                    &cond_projected, cond_text_len, false,
                     &dit.rope_cos_context, &dit.rope_sin_context)!!;
             }
             llm::submit_and_wait(ctx)!!;
         }
-        io::printfn("  Uncond context refiner complete (padded=%d).", uncond_padded_text);
+        io::printfn("  Context refiner complete (real=%d, padded=%d).", cond_text_len, cond_padded_text);
     }
-    norm_scratch.free();
 
     // Load VAE/TAESD
     VaeKernels vae_kernels = create_vae_kernels(ctx)!!;
@@ -464,7 +423,19 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     // ---- Phase 3: Generate or encode initial latent ----
     float[] latent_data = mem::new_array(float, latent_elems);
 
-    if (is_img2img) {
+    if (self.latent_file.len > 0) {
+        io::printfn("\n[3/5] Loading latent from file: %s", self.latent_file);
+        char[] lat_file_data = file::load(mem, self.latent_file)!!;
+        uint lat_n_floats = *(uint*)lat_file_data.ptr;
+        float* lat_floats = (float*)(lat_file_data.ptr + 4);
+        if (lat_n_floats != latent_elems) {
+            io::printfn("  Warning: latent file has %d floats, expected %d", lat_n_floats, latent_elems);
+        }
+        uint copy_n = lat_n_floats < latent_elems ? lat_n_floats : latent_elems;
+        for (uint i = 0; i < copy_n; i++) latent_data[i] = lat_floats[i];
+        mem::free(lat_file_data);
+        io::printfn("  Loaded %d latent floats from file", copy_n);
+    } else if (is_img2img) {
         io::printfn("\n[3/5] Encoding input image...");
         io::printfn("  Warning: img2img encoding not fully implemented, using random latent");
         llm::pipelines::generate_random_latent(latent_data, inputs.seed);

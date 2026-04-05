@@ -25,6 +25,8 @@ fn int main(String[] args) {
         .vae_path = config.vae_path,
         .taesd_path = config.taesd_path,
         .offload = config.offload,
+        .text_embeddings_file = config.text_embeddings_file,
+        .latent_file = config.latent_file,
     };
 
     // Create and load pipeline

@@ -30,6 +30,8 @@ struct PipelineOptions {
     String vae_path;
     String taesd_path;
     bool offload;     // Stream DiT layers from CPU RAM to save VRAM
+    String text_embeddings_file;  // Pre-computed text embeddings (bypasses text model)
+    String latent_file;           // Pre-computed initial latent (bypasses RNG)
 }
 
 // --- Unified Generation Inputs ---

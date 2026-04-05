@@ -105,7 +105,12 @@ fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
         }
     }
 
-    uint head_dim = n_heads > 0 ? dim / n_heads : 0;
+    // head_dim: try GGUF metadata first (e.g. qwen3.attention.key_length=128),
+    // fall back to dim/n_heads. Qwen3-4B has dim=2560, n_heads=32, head_dim=128 (not 80).
+    uint head_dim = read_param_u32(params, "head_dim", gf);
+    if (head_dim == 0) {
+        head_dim = n_heads > 0 ? dim / n_heads : 0;
+    }
 
     ModelConfig config = {
         .name = name,

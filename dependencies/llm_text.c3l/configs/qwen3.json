@@ -8,6 +8,7 @@
         "n_kv_heads": { "key": "qwen3.attention.head_count_kv", "default": 4 },
         "n_layers": { "key": "qwen3.block_count", "default": 36 },
         "ffn_dim": { "key": "qwen3.feed_forward_length", "default": 6912 },
+        "head_dim": { "key": "qwen3.attention.key_length", "default": 0 },
         "rope_theta": { "key": "qwen3.rope.freq_base", "default": 1000000.0 },
         "rms_eps": { "key": "qwen3.attention.layer_norm_rms_epsilon", "default": 1e-6 }
     },
