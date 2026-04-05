@@ -485,13 +485,14 @@ fn void? precompute_mrope_tables(
         uint pos_col;    // axis 2
 
         if (mode == MROPE_MODE_TEXT) {
-            // All tokens are text (real + pad), 0-indexed (matches official)
-            pos_text = t;
+            // All tokens are text (real + pad), 1-indexed (Diffusers: pos_start=(1,0,0))
+            pos_text = t + 1;
             pos_row = 0;
             pos_col = 0;
         } else if (mode == MROPE_MODE_IMAGE) {
             if (t < n_patches) {
-                pos_text = image_index;
+                // Image text-axis: padded_text + 1 (Diffusers: pos_start=(cap_len+1, 0, 0))
+                pos_text = padded_text + 1;
                 pos_row = t / patches_w;
                 pos_col = t % patches_w;
             } else {
@@ -502,21 +503,24 @@ fn void? precompute_mrope_tables(
             }
         } else {
             // FULL mode: [text_real, text_pad, image_real, image_pad]
-            // Official Lumina2 ordering: caption tokens first, then image tokens
+            // C3 ordering: caption tokens first, then image tokens
+            // Matches Diffusers position IDs:
+            //   Text: axis0 = 1..padded_text (1-indexed, padding gets sequential positions)
+            //   Image: axis0 = padded_text + 1 (constant), axis1/2 = row/col
             if (t < text_len) {
-                // Real text token, 0-indexed (matches official: arange(cap_len))
-                pos_text = t;
+                // Real text token, 1-indexed (Diffusers: pos_start=(1,0,0))
+                pos_text = t + 1;
                 pos_row = 0;
                 pos_col = 0;
             } else if (t < padded_text) {
-                // Text padding
-                pos_text = 0;
+                // Text padding: sequential positions (Diffusers gives padding real positions)
+                pos_text = t + 1;
                 pos_row = 0;
                 pos_col = 0;
             } else if (t < padded_text + n_patches) {
-                // Real image token
+                // Real image token: text-axis = padded_text + 1
                 uint img_idx = t - padded_text;
-                pos_text = image_index;
+                pos_text = padded_text + 1;
                 pos_row = img_idx / patches_w;
                 pos_col = img_idx % patches_w;
             } else {
@@ -1313,6 +1317,15 @@ llm::compute_barrier(cmd);
             (BufferCopy[]){{ .srcOffset = (ulong)dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 }});
 llm::compute_barrier(cmd);
 
+        // Debug: save adaln params to file for validation
+        if (profiling) {
+llm::submit_and_wait(ctx)!!;
+            debug_save_npy(ctx, a.adaln_params.gpu_buffer.buffer, 4 * dim, "debug_output/c3_adaln_params.bin")!!;
+            debug_save_npy(ctx, a.t_emb.gpu_buffer.buffer, DIT_T_EMB_DIM, "debug_output/c3_t_emb_profiled.bin")!!;
+            io::printfn("      [DEBUG] Saved adaln_params [%d] and t_emb [%d]", 4 * dim, DIT_T_EMB_DIM);
+llm::begin_compute(cmd)!!;
+        }
+
         // Debug: dump adaln modulation values for first call
         if (profiling) {
 llm::submit_and_wait(ctx)!!;
@@ -1751,10 +1764,10 @@ llm::submit_and_wait(ctx)!!;
 
 llm::begin_compute(cmd)!!;
 
-    // 3. Timestep embedding: Z-Image uses normalized time = 1 - sigma (range [0, 1])
-    // Official: timestep = (1000 - scheduler_t) / 1000 = 1 - sigma
-    // At sigma=1.0 (noisy start): model_t = 0.0
-    // At sigma=0.0 (clean end): model_t = 1.0
+    // 3. Timestep embedding: Z-Image pipeline passes (1000-t)/1000 = 1-sigma to model.
+    // Model computes: t_embedder(timestep * t_scale) = sincos((1-sigma) * 1000)
+    // At sigma=1.0 (noisy): model_t = 0
+    // At sigma=0.0 (clean): model_t = 1000
     float actual_timestep = (1.0f - timestep) * DIT_T_PERIOD;
     io::printfn("  [DEBUG] Timestep: sigma=%.6f, model_t=%.6f", timestep, actual_timestep);
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
@@ -2010,11 +2023,14 @@ llm::submit_and_wait(ctx)!!;
 llm::begin_compute(cmd)!!;
             }
 
-            if ((l + 1) % 10 == 0 || l == actual_layers - 1) {
+            // Flush GPU every 5 layers to prevent command buffer overflow / GPU timeout
+            if ((l + 1) % 5 == 0 || l == actual_layers - 1) {
 llm::submit_and_wait(ctx)!!;
-                batch_times[batch_idx] = batch_start.to_now().to_sec();
-                batch_idx++;
-                batch_start = clock::now();
+                if ((l + 1) % 10 == 0 || l == actual_layers - 1) {
+                    batch_times[batch_idx] = batch_start.to_now().to_sec();
+                    batch_idx++;
+                    batch_start = clock::now();
+                }
 llm::begin_compute(cmd)!!;
             }
         }

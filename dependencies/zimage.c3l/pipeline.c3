@@ -785,9 +785,21 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
             float* lat_cpu = (float*)lat_readback.data();
 
+            // Debug: check latent before denorm
+            float pre_min = lat_cpu[0]; float pre_max = lat_cpu[0];
+            for (uint i = 1; i < latent_elems; i++) {
+                if (lat_cpu[i] < pre_min) pre_min = lat_cpu[i];
+                if (lat_cpu[i] > pre_max) pre_max = lat_cpu[i];
+            }
+            io::printfn("  [VAE] Pre-denorm latent: min=%.4f max=%.4f first5=[%.3f %.3f %.3f %.3f %.3f]",
+                pre_min, pre_max, lat_cpu[0], lat_cpu[1], lat_cpu[2], lat_cpu[3], lat_cpu[4]);
+
             for (uint i = 0; i < latent_elems; i++) {
                 lat_cpu[i] = lat_cpu[i] / SCALE_FACTOR + SHIFT_FACTOR;
             }
+
+            io::printfn("  [VAE] Post-denorm: first5=[%.3f %.3f %.3f %.3f %.3f]",
+                lat_cpu[0], lat_cpu[1], lat_cpu[2], lat_cpu[3], lat_cpu[4]);
 
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
                 vk::cmdCopyBuffer(copy_cmd, lat_readback.buffer,
@@ -795,6 +807,23 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
                     (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
             lat_readback.free();
+
+            // Debug: verify buf_a contains the denormed latent
+            {
+                vk::Memory check_stg = vk::new_buffer(
+                    allocator: &ctx.allocator,
+                    usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+                    properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    data: null, data_size: 20,
+                )!!;
+                ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer chk_cmd) {
+                    vk::cmdCopyBuffer(chk_cmd, vae_acts.buf_a.gpu_buffer.buffer, check_stg.buffer, 1,
+                        (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 20 }});
+                }!!;
+                float* chk = (float*)check_stg.data();
+                io::printfn("  [VAE] buf_a first5: [%.3f %.3f %.3f %.3f %.3f]", chk[0], chk[1], chk[2], chk[3], chk[4]);
+                check_stg.free();
+            }
 
             vae_decoder.forward(&vae_acts, lat_h, lat_w)!!;
             decode_output = &vae_acts.buf_a;
