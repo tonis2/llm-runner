@@ -101,12 +101,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     uint[] cond_tokens = tok.encode_with_specials(cond_prompt)!!;
     uint cond_text_len = (uint)cond_tokens.len;
     io::printfn("  Cond prompt: %d tokens (with chat template)", cond_text_len);
-    // Debug: print token IDs
-    io::printf("  Token IDs:");
-    for (usz i = 0; i < cond_tokens.len; i++) {
-        io::printf(" %d", cond_tokens[i]);
-    }
-    io::printn("");
 
     // Build unconditioned prompt for CFG
     uint[] uncond_tokens;
@@ -138,32 +132,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
     double encode_sec = encode_start.to_now().to_sec();
     io::printfn("  Text encoding complete in %.2fs", encode_sec);
-
-    // Debug: export raw text embeddings (before cap_embedder) for PyTorch comparison
-    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-        _f.close()!;
-        io::printfn("  [DEBUG] Exporting raw text embeddings to /tmp/zimage_debug/text_raw_c3.bin");
-        vk::Memory raw_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)cond_text_len * text_config.dim * 4,
-        )!!;
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer raw_cmd) {
-            vk::cmdCopyBuffer(raw_cmd, cond_embeddings.gpu_buffer.buffer, raw_stg.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)cond_text_len * text_config.dim * 4 }});
-        }!!;
-        float* raw_ptr = (float*)raw_stg.data();
-        uint n_raw = cond_text_len * text_config.dim;
-        File f_raw = file::open("/tmp/zimage_debug/text_raw_c3.bin", "wb")!!;
-        // Write header: text_len, dim (2x uint32)
-        uint[2] raw_hdr = { cond_text_len, text_config.dim };
-        f_raw.write(((char*)&raw_hdr)[0..7])!;
-        f_raw.write(((char*)raw_ptr)[0..n_raw * 4 - 1])!;
-        f_raw.close()!;
-        raw_stg.free();
-        io::printfn("  [DEBUG] Saved raw text: [%d, %d]", cond_text_len, text_config.dim);
-    }
 
     mem::free(cond_tokens);
     if (use_cfg) mem::free(uncond_tokens);
@@ -308,34 +276,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     llm::submit_and_wait(ctx)!!;
     io::printfn("  Context refiner complete (padded=%d).", cond_padded_text);
 
-    // Debug: export text embeddings after cap_embedder + context_refiner
-    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-        _f.close()!;
-        io::printfn("  [DEBUG] Exporting text embeddings to /tmp/zimage_debug/text_emb_c3.bin");
-        vk::Memory text_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)cond_padded_text * DIT_DIM * 4,
-        )!!;
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dbg_cmd) {
-            vk::cmdCopyBuffer(dbg_cmd, cond_projected.gpu_buffer.buffer, text_stg.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)cond_padded_text * DIT_DIM * 4 }});
-        }!!;
-        float* text_ptr = (float*)text_stg.data();
-        uint n_text = cond_padded_text * DIT_DIM;
-        File f_text = file::open("/tmp/zimage_debug/text_emb_c3.bin", "wb")!!;
-        char[4] text_hdr = {
-            (char)(n_text & 0xFF), (char)((n_text >> 8) & 0xFF),
-            (char)((n_text >> 16) & 0xFF), (char)((n_text >> 24) & 0xFF)
-        };
-        f_text.write(&text_hdr)!;
-        f_text.write(((char*)text_ptr)[0..n_text * 4 - 1])!;
-        f_text.close()!;
-        text_stg.free();
-        io::printfn("  [DEBUG] Saved %d floats", n_text);
-    }
-
     // Process unconditioned text for CFG
     llm::Tensor uncond_projected;
     if (use_cfg) {
@@ -465,22 +405,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     }!!;
     staging.free();
 
-    // Debug: export initial latent
-    if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-        _f.close()!;
-        io::printfn("  [DEBUG] Exporting initial latent to /tmp/zimage_debug/latent_initial_c3.bin");
-        File f_lat = file::open("/tmp/zimage_debug/latent_initial_c3.bin", "wb")!!;
-        uint n_lat = (uint)latent_elems;
-        char[4] lat_hdr = {
-            (char)(n_lat & 0xFF), (char)((n_lat >> 8) & 0xFF),
-            (char)((n_lat >> 16) & 0xFF), (char)((n_lat >> 24) & 0xFF)
-        };
-        f_lat.write(&lat_hdr)!;
-        f_lat.write(((char*)latent_data.ptr)[0..latent_elems * 4 - 1])!;
-        f_lat.close()!;
-        io::printfn("  [DEBUG] Saved %d floats", latent_elems);
-    }
-
     mem::free(latent_data);
 
     // ---- Phase 4: Denoising loop ----
@@ -563,43 +487,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             stg_ptr = (float*)cfg_staging.data();
             for (uint i = 0; i < latent_elems; i++) cfg_uncond_vel[i] = stg_ptr[i];
 
-            // Debug: save individual cond/uncond velocities for step 0
-            if (step == 0) {
-                if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-                    _f.close()!;
-                    // Compute cosine similarity between cond and uncond
-                    float dot = 0; float norm_c = 0; float norm_u = 0;
-                    for (uint i = 0; i < latent_elems; i++) {
-                        dot += cfg_cond_vel[i] * cfg_uncond_vel[i];
-                        norm_c += cfg_cond_vel[i] * cfg_cond_vel[i];
-                        norm_u += cfg_uncond_vel[i] * cfg_uncond_vel[i];
-                    }
-                    float cos_sim = dot / (math::sqrt(norm_c) * math::sqrt(norm_u) + 1e-12f);
-                    float diff_mean = 0;
-                    for (uint i = 0; i < latent_elems; i++) {
-                        float d = cfg_cond_vel[i] - cfg_uncond_vel[i];
-                        diff_mean += d * d;
-                    }
-                    diff_mean = math::sqrt(diff_mean / (float)latent_elems);
-                    io::printfn("  [DEBUG] CFG analysis step 0: cond_uncond_cos=%.6f, rms_diff=%.6f", cos_sim, diff_mean);
-
-                    // Save individual velocities
-                    File f_cond = file::open("/tmp/zimage_debug/velocity_cond_step_01_c3.bin", "wb")!!;
-                    uint n_v = (uint)latent_elems;
-                    char[4] v_hdr = { (char)(n_v & 0xFF), (char)((n_v >> 8) & 0xFF),
-                                      (char)((n_v >> 16) & 0xFF), (char)((n_v >> 24) & 0xFF) };
-                    f_cond.write(&v_hdr)!;
-                    f_cond.write(((char*)cfg_cond_vel.ptr)[0..latent_elems * 4 - 1])!;
-                    f_cond.close()!;
-
-                    File f_uncond = file::open("/tmp/zimage_debug/velocity_uncond_step_01_c3.bin", "wb")!!;
-                    f_uncond.write(&v_hdr)!;
-                    f_uncond.write(((char*)cfg_uncond_vel.ptr)[0..latent_elems * 4 - 1])!;
-                    f_uncond.close()!;
-                    io::printfn("  [DEBUG] Saved cond/uncond velocities for step 0");
-                }
-            }
-
             // CFG combine
             for (uint i = 0; i < latent_elems; i++) {
                 stg_ptr[i] = cfg_uncond_vel[i] + cfg_scale * (cfg_cond_vel[i] - cfg_uncond_vel[i]);
@@ -621,38 +508,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             dit.forward(&cond_projected, t)!!;
         }
 
-        // Debug: export velocity before Euler step
-        if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-            _f.close()!;
-            vk::Memory vel_dump = vk::new_buffer(
-                allocator: &ctx.allocator,
-                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                data: null, data_size: (usz)latent_elems * 4,
-            )!!;
-            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer vel_cmd) {
-                vk::cmdCopyBuffer(vel_cmd, dit.acts.velocity.gpu_buffer.buffer, vel_dump.buffer, 1,
-                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
-            }!!;
-            float* vel_ptr = (float*)vel_dump.data();
-            char[64] vel_fn;
-            usz vl = 0;
-            String vp = "/tmp/zimage_debug/velocity_step_";
-            for (usz i = 0; i < vp.len; i++) vel_fn[vl++] = vp[i];
-            vel_fn[vl++] = (char)('0' + (step + 1) / 10);
-            vel_fn[vl++] = (char)('0' + (step + 1) % 10);
-            String vs = "_c3.bin";
-            for (usz i = 0; i < vs.len; i++) vel_fn[vl++] = vs[i];
-            File f_vel = file::open((String)vel_fn[0..vl-1], "wb")!!;
-            uint n_vel = (uint)latent_elems;
-            char[4] vel_hdr = { (char)(n_vel & 0xFF), (char)((n_vel >> 8) & 0xFF),
-                                (char)((n_vel >> 16) & 0xFF), (char)((n_vel >> 24) & 0xFF) };
-            f_vel.write(&vel_hdr)!;
-            f_vel.write(((char*)vel_ptr)[0..latent_elems * 4 - 1])!;
-            f_vel.close()!;
-            vel_dump.free();
-        }
-
         // Euler step
         llm::begin_compute(cmd)!!;
         FlowEulerPC euler_pc = { .n = latent_elems, .dt = dt };
@@ -661,38 +516,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             { dit.acts.latent.size_bytes, dit.acts.velocity.size_bytes },
             &euler_pc, llm::ceil_div(latent_elems, 256));
         llm::submit_and_wait(ctx)!!;
-
-        // Debug: export latent after Euler step
-        if (try _f = file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-            _f.close()!;
-            vk::Memory lat_stg = vk::new_buffer(
-                allocator: &ctx.allocator,
-                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                data: null, data_size: (usz)latent_elems * 4,
-            )!!;
-            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer lat_cmd) {
-                vk::cmdCopyBuffer(lat_cmd, dit.acts.latent.gpu_buffer.buffer, lat_stg.buffer, 1,
-                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
-            }!!;
-            float* lat_ptr = (float*)lat_stg.data();
-            char[64] lat_fn;
-            usz ll = 0;
-            String lp = "/tmp/zimage_debug/latent_step_";
-            for (usz i = 0; i < lp.len; i++) lat_fn[ll++] = lp[i];
-            lat_fn[ll++] = (char)('0' + (step + 1) / 10);
-            lat_fn[ll++] = (char)('0' + (step + 1) % 10);
-            String ls = "_c3.bin";
-            for (usz i = 0; i < ls.len; i++) lat_fn[ll++] = ls[i];
-            File f_lat = file::open((String)lat_fn[0..ll-1], "wb")!!;
-            uint n_lat = (uint)latent_elems;
-            char[4] lat_hdr = { (char)(n_lat & 0xFF), (char)((n_lat >> 8) & 0xFF),
-                                (char)((n_lat >> 16) & 0xFF), (char)((n_lat >> 24) & 0xFF) };
-            f_lat.write(&lat_hdr)!;
-            f_lat.write(((char*)lat_ptr)[0..latent_elems * 4 - 1])!;
-            f_lat.close()!;
-            lat_stg.free();
-        }
 
     }
 
@@ -707,32 +530,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     }
 
     flow.free();
-
-    // Debug: dump final latent for PyTorch cross-validation
-    {
-        vk::Memory lat_dump = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)latent_elems * 4,
-        )!!;
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dump_cmd) {
-            vk::cmdCopyBuffer(dump_cmd, dit.acts.latent.gpu_buffer.buffer, lat_dump.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
-        }!!;
-        float* dump_ptr = (float*)lat_dump.data();
-        File f_dump = file::open("/tmp/c3_final_latent.bin", "wb")!!;
-        uint n_dump = (uint)latent_elems;
-        char[4] dump_hdr = {
-            (char)(n_dump & 0xFF), (char)((n_dump >> 8) & 0xFF),
-            (char)((n_dump >> 16) & 0xFF), (char)((n_dump >> 24) & 0xFF)
-        };
-        f_dump.write(&dump_hdr)!;
-        f_dump.write(((char*)dump_ptr)[0..latent_elems * 4 - 1])!;
-        f_dump.close()!;
-        lat_dump.free();
-        io::printfn("  [DEBUG] Saved final latent to /tmp/c3_final_latent.bin (%d floats)", n_dump);
-    }
 
     // ---- Phase 5: VAE decode and return image ----
     io::printfn("\n[5/5] VAE decoding...");
@@ -781,23 +578,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
                     (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
             lat_readback.free();
-
-            // Debug: verify buf_a contains the denormed latent
-            {
-                vk::Memory check_stg = vk::new_buffer(
-                    allocator: &ctx.allocator,
-                    usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-                    properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                    data: null, data_size: 20,
-                )!!;
-                ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer chk_cmd) {
-                    vk::cmdCopyBuffer(chk_cmd, vae_acts.buf_a.gpu_buffer.buffer, check_stg.buffer, 1,
-                        (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 20 }});
-                }!!;
-                float* chk = (float*)check_stg.data();
-                io::printfn("  [VAE] buf_a first5: [%.3f %.3f %.3f %.3f %.3f]", chk[0], chk[1], chk[2], chk[3], chk[4]);
-                check_stg.free();
-            }
 
             vae_decoder.forward(&vae_acts, lat_h, lat_w)!!;
             decode_output = &vae_acts.buf_a;

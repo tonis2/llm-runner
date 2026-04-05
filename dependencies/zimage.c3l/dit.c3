@@ -145,12 +145,6 @@ struct BatchMatMulPC {
     uint row_offset;
 }
 
-// Profile flag: when true, the next transformer layer call inserts GPU syncs per phase
-bool dit_profile_layer = true;
-
-// Compile-time flag to enable CPU verification for x_embedder
-// Set to true to enable detailed CPU vs GPU comparison for debugging
-const bool DEBUG_X_EMBEDDER_CPU_VERIFY = false;
 
 // --- DiT Layer Weights ---
 
@@ -1024,253 +1018,6 @@ llm::dispatch_kernel(cmd, kernel,
         &pc, groups);
 }
 
-// Check if float bits represent NaN (fast-math safe)
-fn bool is_nan_bits(float v) {
-    uint bits = bitcast(v, uint);
-    return (bits & 0x7FFFFFFF) > 0x7F800000;
-}
-
-// Check if float bits represent Inf (fast-math safe)
-fn bool is_inf_bits(float v) {
-    uint bits = bitcast(v, uint);
-    return (bits & 0x7FFFFFFF) == 0x7F800000;
-}
-
-// Debug: readback hidden states and compare positions to detect spatial uniformity
-// Reads back [n_rows, dim] buffer and computes cross-position variance
-fn void? debug_position_variance(llm::DeviceContext* ctx, vk::Buffer src_buffer, uint n_rows, uint dim, String label) {
-    usz total = (usz)n_rows * dim;
-    vk::Memory stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: total * 4,
-    )!!;
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
-        vk::cmdCopyBuffer(dbg_cmd, src_buffer, stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)total * 4 }});
-    }!!;
-    float* ptr = (float*)stg.data();
-
-    // Print first 5 elements of 4 sample positions
-    uint[4] sample_pos = { 0, n_rows / 4, n_rows / 2, 3 * n_rows / 4 };
-    io::printfn("  [POS] %s (%d rows x %d dim):", label, n_rows, dim);
-    for (uint si = 0; si < 4; si++) {
-        uint p = sample_pos[si];
-        if (p >= n_rows) continue;
-        float row_sum = 0;
-        for (uint d = 0; d < dim; d++) row_sum += ptr[p * dim + d];
-        float row_mean = row_sum / (float)dim;
-        float row_sq = 0;
-        for (uint d = 0; d < dim; d++) {
-            float diff = ptr[p * dim + d] - row_mean;
-            row_sq += diff * diff;
-        }
-        float row_std = math::sqrt(row_sq / (float)dim);
-        io::printfn("    pos[%d]: mean=%.6f std=%.6f first5=[%.3f %.3f %.3f %.3f %.3f]",
-            p, row_mean, row_std,
-            ptr[p * dim + 0], ptr[p * dim + 1], ptr[p * dim + 2],
-            ptr[p * dim + 3], ptr[p * dim + 4]);
-    }
-
-    // Compute cross-position variance: for each dim, compute variance across all positions
-    double cross_var_sum = 0;
-    for (uint d = 0; d < 10; d++) {  // Sample first 10 dims
-        double col_sum = 0;
-        for (uint r = 0; r < n_rows; r++) col_sum += ptr[r * dim + d];
-        double col_mean = col_sum / (double)n_rows;
-        double col_var = 0;
-        for (uint r = 0; r < n_rows; r++) {
-            double diff = ptr[r * dim + d] - col_mean;
-            col_var += diff * diff;
-        }
-        cross_var_sum += col_var / (double)n_rows;
-    }
-    io::printfn("    cross-pos variance (avg first 10 dims): %.6f", cross_var_sum / 10.0);
-    stg.free();
-}
-
-// Debug: readback a GPU buffer and print stats (min/max/mean/nan count)
-// Must be called OUTSIDE an active command buffer recording (after submit_and_wait)
-fn void? debug_readback_stats(llm::DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String label) {
-    vk::Memory stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: (usz)n_floats * 4,
-    )!!;
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
-        vk::cmdCopyBuffer(dbg_cmd, src_buffer, stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_floats * 4 }});
-    }!!;
-    float* ptr = (float*)stg.data();
-    float mn = 1e30; float mx = -1e30; double sm = 0;
-    uint nan_count = 0; uint inf_count = 0;
-    for (uint i = 0; i < n_floats; i++) {
-        float v = ptr[i];
-        if (is_nan_bits(v)) { nan_count++; continue; }
-        if (is_inf_bits(v)) { inf_count++; continue; }
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
-        sm += v;
-    }
-    uint valid = n_floats - nan_count - inf_count;
-    float mean = valid > 0 ? (float)(sm / (double)valid) : 0;
-    io::printfn("  [DBG] %s: min=%.6f max=%.6f mean=%.6f nan=%d inf=%d (%d elems)",
-        label, mn, mx, mean, nan_count, inf_count, n_floats);
-    stg.free();
-}
-
-// Debug: save a GPU buffer to .npy file for comparison with PyTorch
-// Format: little-endian float32, C-contiguous
-fn void? debug_save_npy(llm::DeviceContext* ctx, vk::Buffer src_buffer, uint n_floats, String filename) {
-    vk::Memory stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: (usz)n_floats * 4,
-    )!!;
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
-        vk::cmdCopyBuffer(dbg_cmd, src_buffer, stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_floats * 4 }});
-    }!!;
-    float* ptr = (float*)stg.data();
-
-    // Write raw binary data (numpy can load this with np.fromfile)
-    if (try f = io::file::open(filename, "wb")) {
-        char[] header = "C3_DEBUG_TENSOR\x00";
-        f.write(header.ptr[:header.len])!;
-        // Cast float pointer to char pointer for binary write
-        char* cptr = (char*)ptr;
-        f.write(cptr[:n_floats * 4])!;
-        f.close()!;
-    } else {
-        io::printfn("Warning: Could not open %s for writing", filename);
-    }
-
-    stg.free();
-}
-
-// CPU-based verification for x_embedder (first row only)
-// Computes expected output on CPU and compares with GPU result
-// This helps identify permutation bugs in GPU shaders
-fn void? verify_x_embedder_cpu(
-    llm::DeviceContext* ctx,
-    llm::Tensor* patches,      // [n_patches, 64] - input
-    llm::Tensor* weight,       // [64, 3840] - weight (GGUF format)
-    llm::Tensor* gpu_output,   // [n_patches, 3840] - GPU result
-    uint n_patches,
-    uint out_dim,
-    uint in_dim
-) {
-    // Read back input patches (first row only)
-    vk::Memory patches_stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: (usz)in_dim * 4,
-    )!!;
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
-        vk::cmdCopyBuffer(dbg_cmd, patches.gpu_buffer.buffer, patches_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)in_dim * 4 }});
-    }!!;
-    float* patches_cpu = (float*)patches_stg.data();
-
-    // Read back weights (all rows x cols)
-    vk::Memory weight_stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: weight.size_bytes,
-    )!!;
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
-        vk::cmdCopyBuffer(dbg_cmd, weight.gpu_buffer.buffer, weight_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = weight.size_bytes }});
-    }!!;
-
-    // Dequantize weights to F32 if needed
-    float* weight_f32;
-    if (weight.dtype == llm::GGML_Q8_0) {
-        // Q8_0: 34 bytes per 32 elements (2 bytes scale + 32 bytes int8)
-        weight_f32 = (float*)mem::malloc((usz)in_dim * out_dim * 4);
-        char* q8_data = (char*)weight_stg.data();
-        uint n_blocks = (in_dim * out_dim) / 32;
-        for (uint b = 0; b < n_blocks; b++) {
-            llm::dequant_q8_0_block(q8_data + b * 34, weight_f32 + b * 32);
-        }
-    } else {
-        // Already F32
-        weight_f32 = (float*)weight_stg.data();
-    }
-
-    // Read back GPU output (first row only)
-    vk::Memory output_stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: (usz)out_dim * 4,
-    )!!;
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer dbg_cmd) {
-        vk::cmdCopyBuffer(dbg_cmd, gpu_output.gpu_buffer.buffer, output_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)out_dim * 4 }});
-    }!!;
-    float* gpu_out_cpu = (float*)output_stg.data();
-
-    // Compute expected output on CPU (first row only)
-    // output[0, out_idx] = sum_k patches[0, k] * weight[k, out_idx]
-    // Weight is stored as [in_dim, out_dim] row-major
-    // Limit to first 100 columns to keep computation reasonable
-    uint check_cols = out_dim < 100 ? out_dim : 100;
-    float* expected = (float*)mem::malloc((usz)check_cols * 4);
-    for (uint out_idx = 0; out_idx < check_cols; out_idx++) {
-        float sum = 0.0;
-        for (uint k = 0; k < in_dim; k++) {
-            // weight[k, out_idx] = weight_f32[k * out_dim + out_idx]
-            sum += patches_cpu[k] * weight_f32[k * out_dim + out_idx];
-        }
-        expected[out_idx] = sum;
-    }
-
-    // Compare and find permutation
-    io::printfn("[CPU VERIFY] x_embedder first row comparison (first %d columns):", check_cols);
-    io::printfn("  Weight dtype: %d (0=F32, 8=Q8_0)", weight.dtype);
-    io::printfn("  Col | GPU Value   | Expected    | Diff       | Matches Col");
-    io::printfn("  ----|-------------|-------------|------------|------------");
-    for (uint out_idx = 0; out_idx < 10 && out_idx < check_cols; out_idx++) {
-        float gpu_val = gpu_out_cpu[out_idx];
-        float exp_val = expected[out_idx];
-        float diff = gpu_val - exp_val;
-        if (diff < 0) diff = -diff;
-        
-        // Find which expected column this GPU value matches
-        uint matched_col = out_dim;  // out_dim means no match
-        float best_diff = 1e30;
-        for (uint search_col = 0; search_col < check_cols; search_col++) {
-            float search_diff = gpu_val - expected[search_col];
-            if (search_diff < 0) search_diff = -search_diff;
-            if (search_diff < best_diff && search_diff < 0.001) {
-                best_diff = search_diff;
-                matched_col = search_col;
-            }
-        }
-        
-        if (matched_col < out_dim) {
-            io::printfn("  %3d | %11.6f | %11.6f | %10.6f | -> [%4d]", out_idx, gpu_val, exp_val, diff, matched_col);
-        } else {
-            io::printfn("  %3d | %11.6f | %11.6f | %10.6f | (no match)", out_idx, gpu_val, exp_val, diff);
-        }
-    }
-    
-    mem::free(expected);
-    if (weight.dtype == llm::GGML_Q8_0) {
-        mem::free(weight_f32);
-    }
-
-    patches_stg.free();
-    weight_stg.free();
-    output_stg.free();
-}
-
 // Run a single DiT transformer layer (Lumina2 architecture)
 // Lumina2 adaLN: 4 params = [scale_msa, gate_msa, scale_mlp, gate_mlp]
 // Pre-norm + scale modulation (no shift), post-norm + tanh-gated residual
@@ -1289,9 +1036,6 @@ fn void? dit_transformer_layer(
     DiTKernels* dk = &model.kernels;
     DiTActivations* a = &model.acts;
     uint dim = DIT_DIM;
-    bool profiling = dit_profile_layer;
-    Clock prof_t;
-    if (profiling) { prof_t = clock::now(); }
 
     // === Phase A: AdaLN params + Pre-attention norm + scale ===
     if (has_adaln && lw.adaln_linear.size_bytes > 0) {
@@ -1313,46 +1057,6 @@ llm::compute_barrier(cmd);
         vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, a.adaln_shift.gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = (ulong)dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 }});
 llm::compute_barrier(cmd);
-
-        // Debug: save adaln params to file for validation
-        if (profiling) {
-llm::submit_and_wait(ctx)!!;
-            debug_save_npy(ctx, a.adaln_params.gpu_buffer.buffer, 4 * dim, "debug_output/c3_adaln_params.bin")!!;
-            debug_save_npy(ctx, a.t_emb.gpu_buffer.buffer, DIT_T_EMB_DIM, "debug_output/c3_t_emb_profiled.bin")!!;
-            io::printfn("      [DEBUG] Saved adaln_params [%d] and t_emb [%d]", 4 * dim, DIT_T_EMB_DIM);
-llm::begin_compute(cmd)!!;
-        }
-
-        // Debug: dump adaln modulation values for first call
-        if (profiling) {
-llm::submit_and_wait(ctx)!!;
-            vk::Memory adaln_stg = vk::new_buffer(
-                allocator: &ctx.allocator,
-                usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                data: null, data_size: (usz)4 * dim * 4,
-            )!!;
-llm::begin_compute(cmd)!!;
-            vk::cmdCopyBuffer(cmd, a.adaln_params.gpu_buffer.buffer, adaln_stg.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)4 * dim * 4 }});
-llm::submit_and_wait(ctx)!!;
-            float* ap = (float*)adaln_stg.data();
-            String[4] names = { "scale_msa", "gate_msa", "scale_mlp", "gate_mlp" };
-            for (uint c = 0; c < 4; c++) {
-                float cmin = ap[c*dim]; float cmax = cmin; float csum = 0; float csq = 0;
-                for (uint i = 0; i < dim; i++) {
-                    float v = ap[c * dim + i];
-                    if (v < cmin) { cmin = v; }
-                    if (v > cmax) { cmax = v; }
-                    csum += v; csq += v * v;
-                }
-                float cmean = csum / (float)dim;
-                io::printfn("      adaln[%s]: min=%.4f max=%.4f mean=%.4f std=%.4f",
-                    names[c], cmin, cmax, cmean, math::sqrt(csq / (float)dim - cmean * cmean));
-            }
-            adaln_stg.free();
-llm::begin_compute(cmd)!!;
-        }
     }
 
     // Pre-attention RMSNorm: all tokens get same norm1
@@ -1373,52 +1077,16 @@ llm::dispatch_kernel(cmd, &dk.scale_modulate,
 llm::compute_barrier(cmd);
     }
 
-    if (profiling) {
-        llm::submit_and_wait(ctx)!!;
-        io::printfn("      norm+adaln: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
-        // Save normed+scaled input (buf_a) before QKV matmul
-        debug_save_npy(ctx, a.buf_a.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_normed_scaled.bin")!!;
-        io::printfn("      Saved noise_refiner.0 normed_scaled [%d x %d]", seq_len, dim);
-        llm::begin_compute(cmd)!!;
-    }
-
     // === Phase B: QKV batch matmul (3 dispatches) ===
     // wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
-    if (profiling) {
-        io::printfn("      [DEBUG] QKV weight: size=%d bytes, dtype=%d, expected=%d",
-            lw.wqkv.size_bytes, lw.wqkv.dtype, 11520 * 15 * 176);
-        io::printfn("      [DEBUG] QKV matmul: seq_len=%d, dim=%d", seq_len, dim);
-    }
-
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
 llm::compute_barrier(cmd);
 
-    if (profiling) {
-        llm::submit_and_wait(ctx)!!;
-        // Save Q, K, V for noise refiner layer 0
-        debug_save_npy(ctx, a.q.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_q.bin")!!;
-        debug_save_npy(ctx, a.k.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_k.bin")!!;
-        debug_save_npy(ctx, a.v.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_v.bin")!!;
-        io::printfn("      Saved noise_refiner.0 Q/K/V [%d x %d]", seq_len, dim);
-        io::printfn("      qkv_matmul: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
-        llm::begin_compute(cmd)!!;
-    }
-
     // === Phase C: Head norm + Forward Transpose + Flash Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
     dit_apply_head_norm(model, cmd, &a.k, &lw.k_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
-
-    if (profiling) {
-        llm::submit_and_wait(ctx)!!;
-        // Save Q/K after head norm, before transpose+RoPE
-        debug_save_npy(ctx, a.q.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_profiled_q_after_hnorm.bin")!!;
-        debug_save_npy(ctx, a.k.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_profiled_k_after_hnorm.bin")!!;
-        io::printfn("      Saved Q/K after head_norm [%d x %d]", seq_len, dim);
-        io::printfn("      head_norm: %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
-        llm::begin_compute(cmd)!!;
-    }
 
     // Forward transpose Q/K/V: [seq_len, dim] -> [n_heads, seq_len, head_dim]
     uint total_elems = seq_len * dim;
@@ -1489,46 +1157,6 @@ llm::dispatch_kernel(cmd, &dk.flash_attention,
         &fa_pc, DIT_HEADS * seq_len);
 llm::compute_barrier(cmd);
 
-    if (profiling) {
-llm::submit_and_wait(ctx)!!;
-        // Debug: Check attention output
-        vk::Memory attn_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)seq_len * dim * 4,
-        )!!;
-llm::begin_compute(cmd)!!;
-        vk::cmdCopyBuffer(cmd, a.buf_b.gpu_buffer.buffer, attn_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 }});
-llm::submit_and_wait(ctx)!!;
-        float* attn_ptr = (float*)attn_stg.data();
-        float attn_min = attn_ptr[0];
-        float attn_max = attn_ptr[0];
-        float attn_sum = 0;
-        float attn_sq_sum = 0;
-        for (uint i = 0; i < seq_len * dim; i++) {
-            float v = attn_ptr[i];
-            if (v < attn_min) { attn_min = v; }
-            if (v > attn_max) { attn_max = v; }
-            attn_sum += v;
-            attn_sq_sum += v * v;
-        }
-        float attn_mean = (float)attn_sum / (float)(seq_len * dim);
-        float attn_std = math::sqrt(attn_sq_sum / (float)(seq_len * dim) - attn_mean * attn_mean);
-        io::printfn("      [DEBUG] After flash_attention: min=%.4f max=%.4f mean=%.4f std=%.4f", attn_min, attn_max, attn_mean, attn_std);
-        attn_stg.free();
-        // Save attention output for comparison
-        debug_save_npy(ctx, a.buf_b.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_attn_out.bin")!!;
-        io::printfn("      Saved attention output [%d x %d]", seq_len, dim);
-        // Save Q/K after head norm + RoPE (they're in [n_heads, seq_len, head_dim] format now)
-        debug_save_npy(ctx, a.q.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_q_after_rope.bin")!!;
-        debug_save_npy(ctx, a.k.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_k_after_rope.bin")!!;
-        io::printfn("      Saved Q/K after head_norm+RoPE [%d, %d, %d]", DIT_HEADS, seq_len, DIT_HEAD_DIM);
-llm::begin_compute(cmd)!!;
-        io::printfn("      attention:  %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
-    }
-
     // === Phase D: Output projection + Post-attention norm + Gated residual ===
     // Output projection: buf_b -> buf_a
     dispatch_batch_matmul(cmd, dk, &lw.wo, &a.buf_b, &a.buf_a, dim, dim, seq_len, 0);
@@ -1569,15 +1197,6 @@ llm::dispatch_kernel(cmd, &sk.residual_add,
 llm::compute_barrier(cmd);
     }
 
-    if (profiling) {
-        llm::submit_and_wait(ctx)!!;
-        io::printfn("      out_proj:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now();
-        // Save hidden after attention half (output proj + post-norm + gated residual)
-        debug_save_npy(ctx, hidden.gpu_buffer.buffer, seq_len * dim, "debug_output/c3_nr0_after_attn.bin")!!;
-        io::printfn("      Saved hidden after attention half [%d x %d]", seq_len, dim);
-        llm::begin_compute(cmd)!!;
-    }
-
     // === Phase E: FFN pre-norm + scale ===
     if (has_adaln) {
         // Extract scale_mlp (chunk 2) and gate_mlp (chunk 3) from adaln_params
@@ -1605,8 +1224,6 @@ llm::dispatch_kernel(cmd, &dk.scale_modulate,
             &smod_pc, llm::ceil_div(seq_len * dim, 256));
 llm::compute_barrier(cmd);
     }
-
-    if (profiling) { llm::submit_and_wait(ctx)!!; io::printfn("      ffn_norm:   %.3fs", prof_t.to_now().to_sec()); prof_t = clock::now(); llm::begin_compute(cmd)!!; }
 
     // === Phase F: SwiGLU FFN batch matmul ===
     // Gate and Up projections (both read buf_a, write to different outputs)
@@ -1669,7 +1286,6 @@ llm::dispatch_kernel(cmd, &sk.residual_add,
 llm::compute_barrier(cmd);
     }
 
-    if (profiling) { llm::submit_and_wait(ctx)!!; io::printfn("      ffn:        %.3fs", prof_t.to_now().to_sec()); dit_profile_layer = false; llm::begin_compute(cmd)!!; }
 }
 
 // --- Main DiT Forward Pass ---
@@ -1711,25 +1327,15 @@ llm::compute_barrier(cmd);
 
     // 2. x_embedder: [n_patches, 64] -> [n_patches, 3840]
     // Use batch_matmul_simple (1D dispatch, no tiling bugs) + separate bias add
-    io::printfn("[DEBUG] x_embedder using batch_matmul_simple: seq_len=%d, out_dim=%d, in_dim=%d", n_patches, dim, DIT_PATCH_DIM);
-    
-    // Use batch_matmul_simple for F32 weights (avoids tiled indexing bugs)
     BatchMatMulPC x_emb_pc = { .out_dim = dim, .in_dim = DIT_PATCH_DIM, .seq_len = n_patches, .row_offset = 0 };
-    // Try 2D dispatch to see if workgroup ordering is more predictable
-    uint groups_x = n_patches;  // 1024
-    uint groups_y = dim;        // 3840
-    io::printfn("[DEBUG] x_embedder dispatch: groups_x=%d, groups_y=%d", groups_x, groups_y);
+    uint groups_x = n_patches;
+    uint groups_y = dim;
 llm::dispatch_kernel(cmd, &dk.batch_matmul_simple,
         { w.x_emb_weight.gpu_buffer.buffer, a.patches.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
         { w.x_emb_weight.size_bytes, a.patches.size_bytes, a.hidden.size_bytes },
         &x_emb_pc, groups_x, groups_y);
 llm::compute_barrier(cmd);
-    
-    // CPU verification for x_embedder (first row only) - compile-time flag
-    if (DEBUG_X_EMBEDDER_CPU_VERIFY) {
-        verify_x_embedder_cpu(ctx, &a.patches, &w.x_emb_weight, &a.hidden, n_patches, dim, DIT_PATCH_DIM)!!;
-    }
-    
+
     // Then add bias using broadcast_add_dim
 llm::dispatch_kernel(cmd, &dk.broadcast_add_dim,
         { a.hidden.gpu_buffer.buffer, w.x_emb_bias.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
@@ -1749,24 +1355,11 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
     }
 
-    // Debug: check spatial diversity after x_embedder
-llm::submit_and_wait(ctx)!!;
-    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after x_embedder")!!;
-
-    // Debug: Save tensors for PyTorch comparison
-    uint latent_elems = DIT_LATENT_CHANNELS * self.latent_h * self.latent_w;
-    debug_save_npy(ctx, a.latent.gpu_buffer.buffer, latent_elems, "debug_output/c3_latent.bin")!!;
-    debug_save_npy(ctx, a.patches.gpu_buffer.buffer, n_patches * DIT_PATCH_DIM, "debug_output/c3_patches.bin")!!;
-    debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, n_patches * dim, "debug_output/c3_hidden.bin")!!;
-
-llm::begin_compute(cmd)!!;
-
     // 3. Timestep embedding: Z-Image pipeline passes (1000-t)/1000 = 1-sigma to model.
     // Model computes: t_embedder(timestep * t_scale) = sincos((1-sigma) * 1000)
     // At sigma=1.0 (noisy): model_t = 0
     // At sigma=0.0 (clean): model_t = 1000
     float actual_timestep = (1.0f - timestep) * DIT_T_PERIOD;
-    io::printfn("  [DEBUG] Timestep: sigma=%.6f, model_t=%.6f", timestep, actual_timestep);
     DiTTimestepPC t_pc = { .dim = DIT_T_EMB_DIM, .timestep = actual_timestep };
 llm::dispatch_kernel(cmd, &dk.dit_timestep_embed,
         { a.t_emb.gpu_buffer.buffer },
@@ -1804,113 +1397,13 @@ llm::compute_barrier(cmd);
     // NOTE: No SiLU here — JointTransformerBlock's adaLN uses t_emb directly (weight at .0)
     // Only FinalLayer applies SiLU before its adaLN Linear (weight at .1 in Sequential(SiLU, Linear))
 
-    // Debug: export t_emb to file for PyTorch comparison
-    if (try _f = io::file::open("/tmp/zimage_debug/.debug_enabled", "rb")) {
-        _f.close()!;
-llm::submit_and_wait(ctx)!!;
-        vk::Memory temb_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)DIT_T_EMB_DIM * 4,
-        )!!;
-        ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer temb_cmd) {
-            vk::cmdCopyBuffer(temb_cmd, a.t_emb.gpu_buffer.buffer, temb_stg.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
-        }!!;
-        float* temb_ptr = (float*)temb_stg.data();
-        // Write with timestep in filename (e.g. t_emb_sigma_0.750_c3.bin)
-        char[256] temb_fn;
-        usz temb_fn_len = 0;
-        String temb_prefix = "/tmp/zimage_debug/t_emb_sigma_";
-        for (usz i = 0; i < temb_prefix.len; i++) temb_fn[temb_fn_len++] = temb_prefix[i];
-        // Encode sigma*1000 as integer for filename
-        uint sigma_int = (uint)(timestep * 1000.0f + 0.5f);
-        if (sigma_int >= 1000) { temb_fn[temb_fn_len++] = (char)('0' + sigma_int / 1000); }
-        if (sigma_int >= 100) { temb_fn[temb_fn_len++] = (char)('0' + (sigma_int / 100) % 10); }
-        if (sigma_int >= 10) { temb_fn[temb_fn_len++] = (char)('0' + (sigma_int / 10) % 10); }
-        temb_fn[temb_fn_len++] = (char)('0' + sigma_int % 10);
-        String temb_suffix = "_c3.bin";
-        for (usz i = 0; i < temb_suffix.len; i++) temb_fn[temb_fn_len++] = temb_suffix[i];
-        temb_fn[temb_fn_len] = 0;
-        if (try f_temb = io::file::open((String)temb_fn[0..temb_fn_len - 1], "wb")) {
-            uint n_temb = DIT_T_EMB_DIM;
-            char[4] temb_hdr = {
-                (char)(n_temb & 0xFF), (char)((n_temb >> 8) & 0xFF),
-                (char)((n_temb >> 16) & 0xFF), (char)((n_temb >> 24) & 0xFF)
-            };
-            f_temb.write(&temb_hdr)!;
-            f_temb.write(((char*)temb_ptr)[0..DIT_T_EMB_DIM * 4 - 1])!;
-            f_temb.close()!;
-            io::printfn("  [DEBUG] Saved t_emb to %s", (String)temb_fn[0..temb_fn_len - 1]);
-        }
-        temb_stg.free();
-llm::begin_compute(cmd)!!;
-    }
-
-    // Debug: readback t_emb after MLP + SiLU
-    if (dit_profile_layer) {
-llm::submit_and_wait(ctx)!!;
-        vk::Memory t_stg = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)DIT_T_EMB_DIM * 4,
-        )!!;
-llm::begin_compute(cmd)!!;
-        vk::cmdCopyBuffer(cmd, a.t_emb.gpu_buffer.buffer, t_stg.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)DIT_T_EMB_DIM * 4 }});
-llm::submit_and_wait(ctx)!!;
-        float* t_data = (float*)t_stg.data();
-        io::printf("  [DBG] t_emb (after MLP+SiLU, 256d): first10=[");
-        float t_min = t_data[0]; float t_max = t_data[0]; float t_sum = 0; float t_sq = 0;
-        for (uint i = 0; i < DIT_T_EMB_DIM; i++) {
-            if (i < 10) { io::printf("%.4f ", t_data[i]); }
-            if (t_data[i] < t_min) { t_min = t_data[i]; }
-            if (t_data[i] > t_max) { t_max = t_data[i]; }
-            t_sum += t_data[i]; t_sq += t_data[i] * t_data[i];
-        }
-        io::printfn("] min=%.4f max=%.4f mean=%.4f std=%.4f",
-            t_min, t_max, t_sum / DIT_T_EMB_DIM,
-            math::sqrt(t_sq / DIT_T_EMB_DIM - (t_sum / DIT_T_EMB_DIM) * (t_sum / DIT_T_EMB_DIM)));
-        t_stg.free();
-llm::begin_compute(cmd)!!;
-    }
-
-    // Save debug flag before noise refiner consumes it (must be before first dit_transformer_layer call)
-    static bool first_forward_call = true;
-    bool want_layer_debug = first_forward_call;
-
-    // Debug: save x_embedder output BEFORE noise refiner (only on first call)
-    if (want_layer_debug) {
-llm::submit_and_wait(ctx)!!;
-        debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, n_patches * dim, "debug_output/c3_pre_noise_refiner.bin")!!;
-        io::printfn("      Saved pre-noise-refiner hidden [%d x %d]", n_patches, dim);
-llm::begin_compute(cmd)!!;
-    }
-
     // 4. Noise refiner (2 layers on padded image tokens, with adaLN)
-    // Re-enable profiling for noise refiner layer 0 (context_refiner may have consumed it)
-    dit_profile_layer = want_layer_debug;
     if (w.streaming) {
         for (uint l = 0; l < self.weights.actual_num_refiner_layers; l++) {
             DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_noise_refiner)[l]);
             dit_transformer_layer(self, cmd, &lw, &a.hidden, padded_patches, true,
                 &self.rope_cos_refiner, &self.rope_sin_refiner)!!;
             llm::submit_and_wait(ctx)!!;
-            // Debug: save hidden after each noise refiner layer
-            if (want_layer_debug) {
-                char[128] nr_fn;
-                usz nr_fn_len = 0;
-                String nr_prefix = "debug_output/c3_nr";
-                for (usz i = 0; i < nr_prefix.len; i++) nr_fn[nr_fn_len++] = nr_prefix[i];
-                nr_fn[nr_fn_len++] = (char)('0' + l);
-                String nr_suffix = "_output.bin";
-                for (usz i = 0; i < nr_suffix.len; i++) nr_fn[nr_fn_len++] = nr_suffix[i];
-                nr_fn[nr_fn_len] = 0;
-                debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, padded_patches * dim, (String)nr_fn[0..nr_fn_len - 1])!!;
-                io::printfn("      Saved noise_refiner layer %d output [%d x %d]", l, padded_patches, dim);
-            }
             lw.free();
             llm::begin_compute(cmd)!!;
         }
@@ -1922,8 +1415,6 @@ llm::begin_compute(cmd)!!;
     }
 
 llm::submit_and_wait(ctx)!!;
-    // Debug: check spatial diversity after noise refiner
-    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after noise_refiner")!!;
     double setup_sec = phase_start.to_now().to_sec();
     phase_start = clock::now();
 llm::begin_compute(cmd)!!;
@@ -1954,17 +1445,6 @@ llm::compute_barrier(cmd);
     uint total_seq = padded_patches + padded_text;
 
     // 6. Main DiT (30 layers with adaLN, post-norm, tanh gating)
-    // Debug: save joint hidden BEFORE main layers
-    io::printfn("    [DBG] want_layer_debug=%d, total_seq=%d, dim=%d", (int)want_layer_debug, total_seq, dim);
-    if (want_layer_debug) {
-        io::printfn("    [DBG] About to save joint hidden...");
-llm::submit_and_wait(ctx)!!;
-        io::printfn("    [DBG] submit_and_wait done");
-        debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_joint_hidden.bin")!!;
-        io::printfn("      Saved joint hidden [%d x %d] before main layers", total_seq, dim);
-llm::begin_compute(cmd)!!;
-    }
-
     double[16] batch_times;
     uint batch_idx = 0;
     Clock batch_start = clock::now();
@@ -1973,19 +1453,10 @@ llm::begin_compute(cmd)!!;
     if (w.streaming) {
         // Streaming mode: upload each layer, run, free
         for (uint l = 0; l < actual_layers; l++) {
-            // Enable profiling for main layer 0 on first forward call
-            if (l == 0 && want_layer_debug) {
-                dit_profile_layer = true;
-            }
             DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_layers)[l]);
             dit_transformer_layer(self, cmd, &lw, &a.hidden, total_seq, true,
                 &self.rope_cos_main, &self.rope_sin_main)!!;
             llm::submit_and_wait(ctx)!!;
-            // Save intermediates for main layer 0
-            if (l == 0 && want_layer_debug) {
-                debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_after_layer0_hidden.bin")!!;
-                io::printfn("      Saved main layer 0 output [%d x %d]", total_seq, dim);
-            }
             lw.free();
 
             if ((l + 1) % 10 == 0 || l == actual_layers - 1) {
@@ -1997,28 +1468,8 @@ llm::begin_compute(cmd)!!;
         }
     } else {
         for (uint l = 0; l < actual_layers; l++) {
-            if (l == 0 && dit_profile_layer) {
-                io::printfn("    --- Layer profile (layer 1, seq=%d) ---", total_seq);
-            }
             dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, true,
                 &self.rope_cos_main, &self.rope_sin_main)!!;
-
-            // Debug: readback after layers 0, 1, 5, 10, 20, 29
-            if (want_layer_debug && (l == 0 || l == 1 || l == 5 || l == 10 || l == 20 || l == actual_layers - 1)) {
-llm::submit_and_wait(ctx)!!;
-                if (l == 0) {
-                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer 0")!!;
-                    debug_save_npy(ctx, a.q.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_q.bin")!!;
-                    debug_save_npy(ctx, a.k.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_k.bin")!!;
-                    debug_save_npy(ctx, a.v.gpu_buffer.buffer, DIT_HEADS * total_seq * DIT_HEAD_DIM, "debug_output/c3_layer0_v.bin")!!;
-                    debug_save_npy(ctx, a.hidden.gpu_buffer.buffer, total_seq * dim, "debug_output/c3_after_layer0_hidden.bin")!!;
-                    io::printfn("      Saved layer 0 Q/K/V and hidden state");
-                } else {
-                    debug_position_variance(ctx, a.hidden.gpu_buffer.buffer, n_patches, dim, "after main layer")!!;
-                }
-                batch_start = clock::now();
-llm::begin_compute(cmd)!!;
-            }
 
             // Flush GPU every 5 layers to prevent command buffer overflow / GPU timeout
             if ((l + 1) % 5 == 0 || l == actual_layers - 1) {
@@ -2114,15 +1565,6 @@ llm::dispatch_kernel(cmd, &dk.broadcast_add_dim,
         &bias_pc, llm::ceil_div(n_patches * DIT_PATCH_DIM, 256));
 llm::compute_barrier(cmd);
 
-    // Debug: check velocity (patch space) after final layer
-    if (want_layer_debug) {
-llm::submit_and_wait(ctx)!!;
-        debug_position_variance(ctx, a.velocity.gpu_buffer.buffer, n_patches, DIT_PATCH_DIM, "velocity (patch space)")!!;
-        // Also check hidden state after final layernorm+scale
-        debug_position_variance(ctx, a.buf_a.gpu_buffer.buffer, n_patches, dim, "after final layer (pre-linear)")!!;
-llm::begin_compute(cmd)!!;
-    }
-
     // 8. Unpatchify velocity -> [16, h, w]
     UnpatchifyPC unpatch_pc = {
         .channels = DIT_LATENT_CHANNELS,
@@ -2153,40 +1595,10 @@ llm::dispatch_kernel(cmd, &dk.scale_buffer,
 
 llm::submit_and_wait(ctx)!!;
 
-    // DEBUG: Check final velocity statistics
-    vk::Memory vel_stg = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null, data_size: (usz)latent_total * 4,
-    )!!;
-    llm::begin_compute(cmd)!!;
-    vk::cmdCopyBuffer(cmd, a.velocity.gpu_buffer.buffer, vel_stg.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_total * 4 }});
-    llm::submit_and_wait(ctx)!!;
-    float* vel_ptr = (float*)vel_stg.data();
-    float vel_min = vel_ptr[0];
-    float vel_max = vel_ptr[0];
-    float vel_sum = 0;
-    float vel_sq_sum = 0;
-    for (uint i = 0; i < latent_total; i++) {
-        float val = vel_ptr[i];
-        if (val < vel_min) vel_min = val;
-        if (val > vel_max) vel_max = val;
-        vel_sum += val;
-        vel_sq_sum += val * val;
-    }
-    float vel_mean = vel_sum / (float)latent_total;
-    float vel_std = math::sqrt(vel_sq_sum / (float)latent_total - vel_mean * vel_mean);
-    io::printfn("    [DEBUG] Final velocity: min=%.4f max=%.4f mean=%.4f std=%.4f", vel_min, vel_max, vel_mean, vel_std);
-    vel_stg.free();
-
     double final_sec = phase_start.to_now().to_sec();
     double total_sec = step_start.to_now().to_sec();
     io::printfn("    setup+refiner: %.2fs | dit_layers: %.2fs | final: %.2fs | total: %.2fs",
         setup_sec, dit_sec, final_sec, total_sec);
-
-    first_forward_call = false;
 }
 
 // --- Free ---
