@@ -134,10 +134,11 @@ fn float time_snr_shift(float alpha, float t) {
 fn FlowMatchingState init_flow_matching(uint num_steps, uint image_seq_len = 0) {
     float[] sigmas = mem::new_array(float, (usz)num_steps + 1);
 
-    // Dynamic shift factor for sigma schedule (Z-Image / Flux convention):
+    // Dynamic shift for sigma schedule (Lumina2 / Diffusers convention):
     // mu = linear_interp(base_shift=0.5, max_shift=1.15, base_seq=256, max_seq=4096, image_seq_len)
-    // For 512x512 (seq=1024): mu ≈ 0.63
-    // For 1024x1024 (seq=4096): mu ≈ 1.15
+    // Diffusers uses exp(mu) as the shift factor in time_shift(mu, 1.0, sigma):
+    //   shifted_sigma = exp(mu) * sigma / (1 + (exp(mu) - 1) * sigma)
+    // For 512x512 (seq=1024): mu ≈ 0.63, shift = exp(0.63) ≈ 1.88
     float shift;
     if (image_seq_len > 0) {
         float base_seq = 256.0f;
@@ -146,20 +147,20 @@ fn FlowMatchingState init_flow_matching(uint num_steps, uint image_seq_len = 0) 
         float max_shift_val = 1.15f;
         float m = (max_shift_val - base_shift) / (max_seq - base_seq);
         float b = base_shift - m * base_seq;
-        shift = (float)image_seq_len * m + b;
+        float mu = (float)image_seq_len * m + b;
+        shift = math::exp(mu);  // Diffusers: exp(mu) for dynamic shifting
     } else {
         shift = 3.0f;  // KoboldCpp default for Flux
     }
-    float t_max = 999.0f;
 
+    // Generate linearly spaced sigmas then apply shift (Diffusers convention)
     if (num_steps == 1) {
-        sigmas[0] = time_snr_shift(shift, (t_max + 1.0f) / 1000.0f);
+        sigmas[0] = time_snr_shift(shift, 1.0f);
         sigmas[1] = 0.0f;
     } else {
-        float step = t_max / (float)(num_steps - 1);
         for (uint i = 0; i < num_steps; i++) {
-            float t = t_max - step * (float)i;
-            sigmas[i] = time_snr_shift(shift, (t + 1.0f) / 1000.0f);
+            float t = 1.0f - (float)i * (1.0f - 1.0f / (float)num_steps) / (float)(num_steps - 1);
+            sigmas[i] = time_snr_shift(shift, t);
         }
         sigmas[num_steps] = 0.0f;
     }

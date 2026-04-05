@@ -163,7 +163,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         String cond_parts = "<|im_start|>user\n";
         for (usz i = 0; i < cond_parts.len; i++) { cond_buf[cond_len] = cond_parts[i]; cond_len++; }
         for (usz i = 0; i < inputs.prompt.len; i++) { cond_buf[cond_len] = inputs.prompt[i]; cond_len++; }
-        String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+        // Z-Image uses enable_thinking=True in chat template
+        String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
         for (usz i = 0; i < cond_suffix.len; i++) { cond_buf[cond_len] = cond_suffix[i]; cond_len++; }
         String cond_prompt = (String)cond_buf[0..cond_len - 1];
 
@@ -191,6 +192,11 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
         llm::Tensor cond_embeddings = text_model.encode_text(cond_tokens)!!;
         io::printfn("  Cond encoded: [%d, %d]", cond_text_len, text_config.dim);
+
+        // Debug: dump raw text embeddings
+        debug_save_npy(ctx, cond_embeddings.gpu_buffer.buffer,
+            cond_text_len * text_config.dim, "debug_output/c3_text_raw.bin")!!;
+        io::printfn("  [DEBUG] Saved raw text embeddings [%d x %d]", cond_text_len, text_config.dim);
 
         llm::Tensor uncond_embeddings;
         if (use_cfg) {
@@ -243,6 +249,11 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         llm::compute_barrier(cmd);
         llm::submit_and_wait(ctx)!!;
         cond_embeddings.free();
+
+        // Debug: dump text embeddings after cap_embedder (before context refiner)
+        debug_save_npy(ctx, cond_projected.gpu_buffer.buffer,
+            cond_text_len * DIT_DIM, "debug_output/c3_text_after_cap.bin")!!;
+        io::printfn("  [DEBUG] Saved cap_embedder output [%d x %d]", cond_text_len, DIT_DIM);
 
         // Add pad tokens AFTER context refiner
         llm::begin_compute(cmd)!!;
@@ -386,6 +397,10 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             llm::submit_and_wait(ctx)!!;
         }
         io::printfn("  Context refiner complete (real=%d, padded=%d).", cond_text_len, cond_padded_text);
+        // Debug: dump text embeddings after context refiner
+        debug_save_npy(ctx, cond_projected.gpu_buffer.buffer,
+            cond_text_len * DIT_DIM, "debug_output/c3_text_after_refiner.bin")!!;
+        io::printfn("  [DEBUG] Saved context refiner output [%d x %d]", cond_text_len, DIT_DIM);
     }
 
     // Load VAE/TAESD
