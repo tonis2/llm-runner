@@ -163,8 +163,9 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         String cond_parts = "<|im_start|>user\n";
         for (usz i = 0; i < cond_parts.len; i++) { cond_buf[cond_len] = cond_parts[i]; cond_len++; }
         for (usz i = 0; i < inputs.prompt.len; i++) { cond_buf[cond_len] = inputs.prompt[i]; cond_len++; }
-        // Z-Image uses enable_thinking=True in chat template
-        String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        // Z-Image uses enable_thinking=True in chat template, but the Qwen3 tokenizer
+        // bundled with Z-Image-Turbo does not add <think> tokens — just the standard format.
+        String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n";
         for (usz i = 0; i < cond_suffix.len; i++) { cond_buf[cond_len] = cond_suffix[i]; cond_len++; }
         String cond_prompt = (String)cond_buf[0..cond_len - 1];
 
@@ -521,6 +522,11 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             data: null, data_size: (usz)latent_elems * 4,
         )!!;
+    }
+
+    // Skip denoising when steps=0 (VAE-only mode for latent decoding)
+    if (inputs.num_steps == 0) {
+        io::printfn("  Skipping denoising (steps=0, VAE-only mode)");
     }
 
     for (uint step = 0; step < inputs.num_steps; step++) {

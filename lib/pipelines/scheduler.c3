@@ -134,36 +134,20 @@ fn float time_snr_shift(float alpha, float t) {
 fn FlowMatchingState init_flow_matching(uint num_steps, uint image_seq_len = 0) {
     float[] sigmas = mem::new_array(float, (usz)num_steps + 1);
 
-    // Dynamic shift for sigma schedule (Lumina2 / Diffusers convention):
-    // mu = linear_interp(base_shift=0.5, max_shift=1.15, base_seq=256, max_seq=4096, image_seq_len)
-    // Diffusers uses exp(mu) as the shift factor in time_shift(mu, 1.0, sigma):
-    //   shifted_sigma = exp(mu) * sigma / (1 + (exp(mu) - 1) * sigma)
-    // For 512x512 (seq=1024): mu ≈ 0.63, shift = exp(0.63) ≈ 1.88
-    float shift;
-    if (image_seq_len > 0) {
-        float base_seq = 256.0f;
-        float max_seq = 4096.0f;
-        float base_shift = 0.5f;
-        float max_shift_val = 1.15f;
-        float m = (max_shift_val - base_shift) / (max_seq - base_seq);
-        float b = base_shift - m * base_seq;
-        float mu = (float)image_seq_len * m + b;
-        shift = math::exp(mu);  // Diffusers: exp(mu) for dynamic shifting
-    } else {
-        shift = 3.0f;  // KoboldCpp default for Flux
-    }
+    // Z-Image-Turbo uses static shift=3.0 (FlowMatchEulerDiscreteScheduler config).
+    // The pipeline computes mu via calculate_shift() but the scheduler config has
+    // use_dynamic_shifting=False, so mu is ignored and shift=3.0 is used.
+    // Formula: shifted_sigma = shift * sigma / (1 + (shift - 1) * sigma)
+    float shift = 3.0f;
 
-    // Generate linearly spaced sigmas then apply shift (Diffusers convention)
-    if (num_steps == 1) {
-        sigmas[0] = time_snr_shift(shift, 1.0f);
-        sigmas[1] = 0.0f;
-    } else {
-        for (uint i = 0; i < num_steps; i++) {
-            float t = 1.0f - (float)i * (1.0f - 1.0f / (float)num_steps) / (float)(num_steps - 1);
-            sigmas[i] = time_snr_shift(shift, t);
-        }
-        sigmas[num_steps] = 0.0f;
+    // Generate linearly spaced sigmas from 1.0 to 0.0, then apply shift (Diffusers convention).
+    // Diffusers: linspace(sigma_max=1.0, sigma_min=0.0, num_steps) then shift, then append terminal 0.
+    // Note: the last sigma will be 0.0, so the last Euler step has dt=0 (no-op).
+    for (uint i = 0; i < num_steps; i++) {
+        float t = (num_steps > 1) ? 1.0f - (float)i / (float)(num_steps - 1) : 1.0f;
+        sigmas[i] = time_snr_shift(shift, t);
     }
+    sigmas[num_steps] = 0.0f;
 
     io::printfn("Flow Matching: %d steps (shift=%.1f)", num_steps, shift);
     io::printf("  sigmas:");
