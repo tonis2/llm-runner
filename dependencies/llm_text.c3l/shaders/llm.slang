@@ -1179,7 +1179,9 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
-// --- Q8_0 batch matmul ---
+// --- Q8_0 batch matmul (tiled 2D GEMM) ---
+// Tile sizes: BM=64, BN=64, BK=32 (BK matches Q8_0 block size exactly)
+// Dequantizes Q8_0 weights into shared memory as F32 before accumulation
 
 [vk_push_constant] const BatchMatMulParams bmq8_pc;
 
@@ -1187,64 +1189,108 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 [vk_binding(1, 0)] RWStructuredBuffer<float> bmq8_input;
 [vk_binding(2, 0)] RWStructuredBuffer<float> bmq8_output;
 
-groupshared float bmq8_shared[256];
+groupshared float q8_A[32 * 65];  // [BK=32][BM=64+1] padding avoids bank conflicts
+groupshared float q8_B[32 * 65];  // [BK=32][BN=64+1]
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
-    uint pos = gid.x / bmq8_pc.out_dim;
-    uint row = gid.x % bmq8_pc.out_dim;
-    if (pos >= bmq8_pc.seq_len) return;
-    uint actual_row = bmq8_pc.row_offset + row;
+    uint tiles_n = (bmq8_pc.out_dim + 63) / 64;
+    uint tile_m = gid.x / tiles_n;
+    uint tile_n = gid.x % tiles_n;
+    uint pos_base = tile_m * 64;
+    uint row_base = bmq8_pc.row_offset + tile_n * 64;
+
+    uint tm = gi / 16;   // 0..15 — thread's M position within tile
+    uint tn = gi % 16;   // 0..15 — thread's N position within tile
+
+    float acc[16];
+    for (uint i = 0; i < 16; i++) acc[i] = 0.0;
 
     uint blocks_per_row = bmq8_pc.in_dim / 32;
-    uint bytes_per_row = blocks_per_row * 34;
-    uint row_byte_offset = actual_row * bytes_per_row;
-    uint in_base = pos * bmq8_pc.in_dim;
-    float sum = 0.0;
+    uint k_tiles = bmq8_pc.in_dim / 32;
 
-    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += 256) {
-        uint block_byte = row_byte_offset + block_idx * 34;
-        uint scale_uint_idx = block_byte / 4;
-        uint scale_byte_offset = block_byte % 4;
-        uint scale_word = bmq8_weight[scale_uint_idx];
-        uint scale_bits;
-        if (scale_byte_offset == 0) {
-            scale_bits = scale_word & 0xFFFFu;
-        } else if (scale_byte_offset == 2) {
-            scale_bits = (scale_word >> 16) & 0xFFFFu;
-        } else {
-            uint next_word = bmq8_weight[scale_uint_idx + 1];
-            scale_bits = ((scale_word >> (scale_byte_offset * 8)) | (next_word << (32 - scale_byte_offset * 8))) & 0xFFFFu;
+    for (uint t = 0; t < k_tiles; t++) {
+        uint k_base = t * 32;
+
+        // Load A tile (F32 input): 256 threads load 64*32 = 2048 elements (8 per thread)
+        for (uint i = 0; i < 8; i++) {
+            uint flat = gi + i * 256;
+            uint m_local = flat >> 5;
+            uint k_local = flat & 31u;
+            uint gm = pos_base + m_local;
+            q8_A[k_local * 65 + m_local] = (gm < bmq8_pc.seq_len) ?
+                bmq8_input[gm * bmq8_pc.in_dim + k_base + k_local] : 0.0;
         }
-        float scale = unpack_f16(scale_bits);
-        uint qs_byte = block_byte + 2;
-        uint input_offset = in_base + block_idx * 32;
 
-        for (uint j = 0; j < 32; j += 4) {
-            uint byte_pos = qs_byte + j;
-            uint uint_idx = byte_pos / 4;
-            uint byte_off = byte_pos % 4;
-            uint word = bmq8_weight[uint_idx];
-            if (byte_off != 0) {
-                uint next_word = bmq8_weight[uint_idx + 1];
-                word = (word >> (byte_off * 8)) | (next_word << (32 - byte_off * 8));
+        // Load B tile (Q8_0 dequantize into shared memory)
+        // Each Q8_0 block is 34 bytes: 2-byte F16 scale + 32 int8 values
+        // Since BK=32 = Q8_0 block size, tile t reads block t for each weight row
+        for (uint i = 0; i < 8; i++) {
+            uint flat = gi + i * 256;
+            uint n_local = flat >> 5;
+            uint k_local = flat & 31u;
+            uint gn = row_base + n_local;
+            if (gn < bmq8_pc.row_offset + bmq8_pc.out_dim) {
+                // Byte offset of Q8_0 block for row gn, block t
+                uint bb = gn * blocks_per_row * 34 + t * 34;
+
+                // Read F16 scale (2 bytes at offset bb)
+                uint scale_uint_idx = bb / 4;
+                uint scale_byte_off = bb % 4;
+                uint scale_word = bmq8_weight[scale_uint_idx];
+                uint scale_bits;
+                if (scale_byte_off == 0) {
+                    scale_bits = scale_word & 0xFFFFu;
+                } else if (scale_byte_off == 2) {
+                    scale_bits = (scale_word >> 16) & 0xFFFFu;
+                } else {
+                    uint next_word = bmq8_weight[scale_uint_idx + 1];
+                    scale_bits = ((scale_word >> (scale_byte_off * 8)) | (next_word << (32 - scale_byte_off * 8))) & 0xFFFFu;
+                }
+                float scale = unpack_f16(scale_bits);
+
+                // Read int8 quantized value at offset bb + 2 + k_local
+                int q = sign_extend_i8(read_byte(bmq8_weight, bb + 2 + k_local));
+
+                q8_B[k_local * 65 + n_local] = scale * float(q);
+            } else {
+                q8_B[k_local * 65 + n_local] = 0.0;
             }
-            sum += scale * float(sign_extend_i8(word & 0xFFu)) * bmq8_input[input_offset + j];
-            sum += scale * float(sign_extend_i8((word >> 8) & 0xFFu)) * bmq8_input[input_offset + j + 1];
-            sum += scale * float(sign_extend_i8((word >> 16) & 0xFFu)) * bmq8_input[input_offset + j + 2];
-            sum += scale * float(sign_extend_i8((word >> 24) & 0xFFu)) * bmq8_input[input_offset + j + 3];
         }
-    }
 
-    bmq8_shared[gi] = sum;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (gi < s) bmq8_shared[gi] += bmq8_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+
+        // Accumulate: each thread computes a 4x4 sub-tile of the output
+        for (uint k = 0; k < 32; k++) {
+            float a0 = q8_A[k * 65 + tm * 4];
+            float a1 = q8_A[k * 65 + tm * 4 + 1];
+            float a2 = q8_A[k * 65 + tm * 4 + 2];
+            float a3 = q8_A[k * 65 + tm * 4 + 3];
+            float b0 = q8_B[k * 65 + tn * 4];
+            float b1 = q8_B[k * 65 + tn * 4 + 1];
+            float b2 = q8_B[k * 65 + tn * 4 + 2];
+            float b3 = q8_B[k * 65 + tn * 4 + 3];
+            acc[0]  += a0 * b0; acc[1]  += a0 * b1; acc[2]  += a0 * b2; acc[3]  += a0 * b3;
+            acc[4]  += a1 * b0; acc[5]  += a1 * b1; acc[6]  += a1 * b2; acc[7]  += a1 * b3;
+            acc[8]  += a2 * b0; acc[9]  += a2 * b1; acc[10] += a2 * b2; acc[11] += a2 * b3;
+            acc[12] += a3 * b0; acc[13] += a3 * b1; acc[14] += a3 * b2; acc[15] += a3 * b3;
+        }
+
         GroupMemoryBarrierWithGroupSync();
     }
-    if (gi == 0) {
-        bmq8_output[pos * bmq8_pc.out_dim + row] = bmq8_shared[0];
+
+    // Write results
+    for (uint r = 0; r < 4; r++) {
+        uint gm = pos_base + tm * 4 + r;
+        if (gm < bmq8_pc.seq_len) {
+            for (uint c = 0; c < 4; c++) {
+                uint gn = tile_n * 64 + tn * 4 + c;
+                if (gn < bmq8_pc.out_dim) {
+                    bmq8_output[gm * bmq8_pc.out_dim + gn] = acc[r * 4 + c];
+                }
+            }
+        }
     }
 }
 

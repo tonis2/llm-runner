@@ -329,7 +329,8 @@ fn void quant_q8_0_block(float* input, char* block) {
     ichar* qs = (ichar*)(block + 2);
     for (uint i = 0; i < 32; i++) {
         float val = input[i];
-        int q = (int)(val / d);
+        float scaled = val / d;
+        int q = scaled >= 0 ? (int)(scaled + 0.5) : (int)(scaled - 0.5);
         // Clamp to int8 range
         if (q > 127) q = 127;
         if (q < -127) q = -127;

@@ -332,7 +332,6 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
         .setCode((uint*)&llm_spv[0])
         .build(ctx.device)!!;
 
-    io::printfn("  Creating zimage kernels...");
     llm::ComputeKernel k_patchify = llm::create_kernel(ctx, zi_shader, 2, PatchifyPC.sizeof, "patchify")!!;
     llm::ComputeKernel k_unpatchify = llm::create_kernel(ctx, zi_shader, 2, UnpatchifyPC.sizeof, "unpatchify")!!;
     llm::ComputeKernel k_adaln = llm::create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!;
@@ -346,7 +345,6 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
     llm::ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
     llm::ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
     llm::ComputeKernel k_clip = llm::create_kernel(ctx, zi_shader, 1, ClipParams.sizeof, "clip_values")!!;
-    io::printfn("  Creating mrope kernel...");
     char[] mrope_spv = &MROPE_SPV;
     vk::ShaderModule mrope_shader = vk::shaderModuleCreateInfo()
         .setCodeSize(mrope_spv.len)
@@ -354,7 +352,6 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
         .build(ctx.device)!!;
     llm::ComputeKernel k_mrope = llm::create_kernel(ctx, mrope_shader, 3, MRoPEPC.sizeof, "mrope")!!;
     mrope_shader.free(ctx.device);
-    io::printfn("  mrope kernel created.");
     DiTKernels kernels = {
         .patchify         = k_patchify,
         .unpatchify       = k_unpatchify,
@@ -392,7 +389,6 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
 // --- Activation Allocation ---
 
 fn DiTActivations? allocate_dit_activations(llm::DeviceContext* ctx, uint max_seq_len) {
-    io::printfn("Allocating DiT activation buffers (max_seq=%d)...", max_seq_len);
 
     ulong max_dim_total = (ulong)max_seq_len * DIT_DIM;
     ulong max_ffn_total = (ulong)max_seq_len * DIT_FFN_DIM;
@@ -937,6 +933,7 @@ fn void dispatch_batch_matmul(
         tiled_2d = true;
     } else if (weight.dtype == llm::GGML_Q8_0) {
         kernel = &dk.batch_matmul_q8;
+        tiled_2d = true;
     } else if (weight.dtype == llm::GGML_Q4_0) {
         kernel = &dk.batch_matmul_q4_0;
     } else {
