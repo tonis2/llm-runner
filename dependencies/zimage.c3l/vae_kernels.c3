@@ -5,6 +5,21 @@ import llm;
 import llm::pipelines;
 import std::io;
 
+// --- VAE-only push constant structs ---
+
+struct SpatialAttentionPC {
+    uint head_dim;
+    uint n_heads;
+    uint seq_len;
+    float scale;
+}
+
+struct TransposeChannelSpatialPC {
+    uint channels;
+    uint spatial;
+    uint direction;
+}
+
 // --- VAE-only Kernel Set ---
 // Lightweight subset of diffusion kernels needed for TAESD and Flux VAE decoding.
 
@@ -15,7 +30,7 @@ struct VaeKernels {
     llm::ComputeKernel scale_shift_clamp;
     llm::ComputeKernel relu;
     llm::ComputeKernel tanh_clamp;
-    llm::SharedKernels shared;  // silu, residual_add
+    llm::SharedKernels shared;  // silu, residual_add, matmul, softmax
 }
 
 fn VaeKernels? create_vae_kernels(llm::DeviceContext* ctx) {

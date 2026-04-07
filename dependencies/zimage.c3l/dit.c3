@@ -277,6 +277,7 @@ struct DiTKernels {
     llm::ComputeKernel flash_attention;
     llm::ComputeKernel batch_rmsnorm;
     llm::ComputeKernel transpose_heads;
+    llm::ComputeKernel transpose_channel_spatial;
     llm::ComputeKernel batch_head_norm;
     llm::ComputeKernel scale_modulate;
     llm::ComputeKernel gated_residual;
@@ -370,6 +371,7 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx) {
         .mrope            = k_mrope,
         .batch_rmsnorm    = llm::create_kernel(ctx, zi_shader, 3, BatchRMSNormPC.sizeof, "batch_rmsnorm")!!,
         .transpose_heads  = llm::create_kernel(ctx, zi_shader, 2, TransposeHeadsPC.sizeof, "transpose_heads")!!,
+        .transpose_channel_spatial = llm::create_kernel(ctx, zi_shader, 3, TransposeChannelSpatialPC.sizeof, "transpose_channel_spatial")!!,
         .batch_head_norm  = llm::create_kernel(ctx, zi_shader, 2, BatchHeadNormPC.sizeof, "batch_head_norm")!!,
         .batch_matmul     = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul")!!,
         .batch_matmul_simple = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_simple")!!,
@@ -488,30 +490,31 @@ fn void? precompute_mrope_tables(
                 pos_col = 0;
             }
         } else {
-            // FULL mode: [text_real, text_pad, image_real, image_pad]
-            // C3 ordering: caption tokens first, then image tokens
-            // Matches Diffusers position IDs:
-            //   Text: axis0 = 1..padded_text (1-indexed, padding gets sequential positions)
+            // FULL mode: [image_real, image_pad, text_real, text_pad]
+            // Matches Diffusers ordering: image tokens first, then text tokens
+            // Position IDs:
             //   Image: axis0 = padded_text + 1 (constant), axis1/2 = row/col
-            if (t < text_len) {
-                // Real text token, 1-indexed (Diffusers: pos_start=(1,0,0))
-                pos_text = t + 1;
-                pos_row = 0;
-                pos_col = 0;
-            } else if (t < padded_text) {
-                // Text padding: sequential positions (Diffusers gives padding real positions)
-                pos_text = t + 1;
-                pos_row = 0;
-                pos_col = 0;
-            } else if (t < padded_text + n_patches) {
-                // Real image token: text-axis = padded_text + 1
-                uint img_idx = t - padded_text;
+            //   Text: axis0 = 1..padded_text (1-indexed, padding gets sequential positions)
+            if (t < n_patches) {
+                // Real image token
                 pos_text = padded_text + 1;
-                pos_row = img_idx / patches_w;
-                pos_col = img_idx % patches_w;
-            } else {
+                pos_row = t / patches_w;
+                pos_col = t % patches_w;
+            } else if (t < padded_patches) {
                 // Image padding
                 pos_text = 0;
+                pos_row = 0;
+                pos_col = 0;
+            } else if (t < padded_patches + text_len) {
+                // Real text token, 1-indexed
+                uint text_idx = t - padded_patches;
+                pos_text = text_idx + 1;
+                pos_row = 0;
+                pos_col = 0;
+            } else {
+                // Text padding: sequential positions
+                uint text_idx = t - padded_patches;
+                pos_text = text_idx + 1;
                 pos_row = 0;
                 pos_col = 0;
             }
@@ -624,10 +627,12 @@ fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile
 
     DiTLayerWeights lw;
 
+    bool force_f32 = false;
+
     // Fused QKV: prefix.L.attention.qkv.weight
     String qkv_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.qkv.weight");
     if (try info = gf.find_tensor(qkv_name)) {
-        if (info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32) {
+        if (force_f32 || info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32) {
             lw.wqkv = llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
         } else {
             lw.wqkv = llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
@@ -636,10 +641,17 @@ fn DiTLayerWeights load_dit_layer_weights(llm::DeviceContext* ctx, llm::GGUFFile
 
     lw.q_norm = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.q_norm.weight"));
     lw.k_norm = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.k_norm.weight"));
-    lw.wo = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight"));
-    lw.ffn_gate = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w1.weight"));
-    lw.ffn_up = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w3.weight"));
-    lw.ffn_down = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w2.weight"));
+    if (force_f32) {
+        lw.wo = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight"));
+        lw.ffn_gate = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w1.weight"));
+        lw.ffn_up = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w3.weight"));
+        lw.ffn_down = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w2.weight"));
+    } else {
+        lw.wo = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention.out.weight"));
+        lw.ffn_gate = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w1.weight"));
+        lw.ffn_up = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w3.weight"));
+        lw.ffn_down = load_dit_tensor(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "feed_forward.w2.weight"));
+    }
 
     lw.attn_norm1 = load_dit_tensor_f32(ctx, gf, dit_layer_tensor_name(&buf, prefix, layer, "attention_norm1.weight"));
 
@@ -897,7 +909,7 @@ fn void? dit_apply_head_norm(
         .n_heads = n_heads,
         .head_dim = head_dim,
         .seq_len = seq_len,
-        .eps = 1e-6f,
+        .eps = 1e-5f,
     };
 llm::dispatch_kernel(cmd, &dk.batch_head_norm,
         { qk.gpu_buffer.buffer, norm_weight.gpu_buffer.buffer },
@@ -997,7 +1009,7 @@ llm::compute_barrier(cmd);
     }
 
     // Pre-attention RMSNorm: all tokens get same norm1
-    BatchRMSNormPC rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+    BatchRMSNormPC rms_pc = { .dim = dim, .eps = 1e-5f, .n_rows = seq_len, .row_offset = 0 };
 llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
         { hidden.gpu_buffer.buffer, lw.attn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { hidden.size_bytes, lw.attn_norm1.size_bytes, a.buf_a.size_bytes },
@@ -1020,6 +1032,8 @@ llm::compute_barrier(cmd);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
     dispatch_batch_matmul(cmd, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
 llm::compute_barrier(cmd);
+
+
 
     // === Phase C: Head norm + Forward Transpose + Flash Attention ===
     dit_apply_head_norm(model, cmd, &a.q, &lw.q_norm, seq_len, DIT_HEADS, DIT_HEAD_DIM)!!;
@@ -1101,7 +1115,7 @@ llm::compute_barrier(cmd);
 
     // Post-attention norm: norm2(attn_output)
     if (lw.attn_norm2.size_bytes > 0) {
-        BatchRMSNormPC post_attn_rms = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+        BatchRMSNormPC post_attn_rms = { .dim = dim, .eps = 1e-5f, .n_rows = seq_len, .row_offset = 0 };
 llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             { a.buf_a.gpu_buffer.buffer, lw.attn_norm2.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
             { a.buf_a.size_bytes, lw.attn_norm2.size_bytes, a.buf_b.size_bytes },
@@ -1145,7 +1159,7 @@ llm::compute_barrier(cmd);
     }
 
     // Pre-FFN RMSNorm: all tokens get same ffn_norm1
-    BatchRMSNormPC ffn_rms_pc = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+    BatchRMSNormPC ffn_rms_pc = { .dim = dim, .eps = 1e-5f, .n_rows = seq_len, .row_offset = 0 };
 llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
         { hidden.gpu_buffer.buffer, lw.ffn_norm1.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
         { hidden.size_bytes, lw.ffn_norm1.size_bytes, a.buf_a.size_bytes },
@@ -1190,7 +1204,7 @@ llm::compute_barrier(cmd);
 
     // === Phase G: Post-FFN norm + Gated residual ===
     if (lw.ffn_norm2.size_bytes > 0) {
-        BatchRMSNormPC post_ffn_rms = { .dim = dim, .eps = 1e-6f, .n_rows = seq_len, .row_offset = 0 };
+        BatchRMSNormPC post_ffn_rms = { .dim = dim, .eps = 1e-5f, .n_rows = seq_len, .row_offset = 0 };
 llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             { a.ffn_down_out.gpu_buffer.buffer, lw.ffn_norm2.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer },
             { a.ffn_down_out.size_bytes, lw.ffn_norm2.size_bytes, a.buf_a.size_bytes },
@@ -1356,27 +1370,15 @@ llm::submit_and_wait(ctx)!!;
     phase_start = clock::now();
 llm::begin_compute(cmd)!!;
 
-    // 5. Concat [padded_text, padded_image] -> [padded_text + padded_patches, dim]
-    // Official Lumina2 ordering: text tokens first, then image tokens
+    // 5. Concat [padded_image, padded_text] -> [padded_patches + padded_text, dim]
+    // Diffusers ordering: image tokens first, then text tokens
     // hidden currently has image tokens [padded_patches, dim] at offset 0 (from noise_refiner)
-    // Need to rearrange to [text, image] order
+    // Just append text tokens after image
 
-    // Step 1: Save image tokens from hidden to buf_a (temporary)
-    vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0,
-                         .size = (ulong)padded_patches * dim * 4 }});
-llm::compute_barrier(cmd);
-
-    // Step 2: Copy text embeddings to the BEGINNING of hidden
+    // Copy text embeddings AFTER image tokens in hidden
     vk::cmdCopyBuffer(cmd, text_embeddings.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)padded_patches * dim * 4,
                          .size = (ulong)padded_text * dim * 4 }});
-llm::compute_barrier(cmd);
-
-    // Step 3: Copy image tokens AFTER text in hidden
-    vk::cmdCopyBuffer(cmd, a.buf_a.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)padded_text * dim * 4,
-                         .size = (ulong)padded_patches * dim * 4 }});
 llm::compute_barrier(cmd);
 
     uint total_seq = padded_patches + padded_text;
@@ -1387,6 +1389,7 @@ llm::compute_barrier(cmd);
     Clock batch_start = clock::now();
 
     uint actual_layers = self.weights.actual_num_layers;
+
     if (w.streaming) {
         // Streaming mode: upload each layer, run, free
         for (uint l = 0; l < actual_layers; l++) {
@@ -1404,18 +1407,21 @@ llm::compute_barrier(cmd);
             llm::begin_compute(cmd)!!;
         }
     } else {
+    
         for (uint l = 0; l < actual_layers; l++) {
             dit_transformer_layer(self, cmd, &w.layers[l], &a.hidden, total_seq, true,
                 &self.rope_cos_main, &self.rope_sin_main)!!;
 
             // Flush GPU every 5 layers to prevent command buffer overflow / GPU timeout
-            if ((l + 1) % 5 == 0 || l == actual_layers - 1) {
+            if (l == 0 || (l + 1) % 5 == 0 || l == actual_layers - 1) {
 llm::submit_and_wait(ctx)!!;
                 if ((l + 1) % 10 == 0 || l == actual_layers - 1) {
                     batch_times[batch_idx] = batch_start.to_now().to_sec();
                     batch_idx++;
                     batch_start = clock::now();
                 }
+
+
 llm::begin_compute(cmd)!!;
             }
         }
@@ -1451,16 +1457,15 @@ llm::dispatch_kernel(cmd, &dk.linear_proj,
         &final_adaln_pc, dim);
 llm::compute_barrier(cmd);
 
-    // Copy only real image portion to buf_a (image tokens start after padded_text)
-    // Official Lumina2: begin = cap_size, end = begin + n_patches
+    // Copy only real image portion to buf_a (image tokens are first in [image, text] order)
     vk::cmdCopyBuffer(cmd, a.hidden.gpu_buffer.buffer, a.buf_a.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = (ulong)padded_text * dim * 4, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n_patches * dim * 4 }});
 llm::compute_barrier(cmd);
 
     // Apply LayerNorm (no affine) to image portion — Lumina2 FinalLayer uses elementwise_affine=False
     if (w.final_norm.size_bytes > 0) {
         // Learnable RMSNorm (if weight tensor exists in GGUF)
-        BatchRMSNormPC final_rms = { .dim = dim, .eps = 1e-6f, .n_rows = n_patches, .row_offset = 0 };
+        BatchRMSNormPC final_rms = { .dim = dim, .eps = 1e-5f, .n_rows = n_patches, .row_offset = 0 };
 llm::dispatch_kernel(cmd, &dk.batch_rmsnorm,
             { a.buf_a.gpu_buffer.buffer, w.final_norm.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
             { a.buf_a.size_bytes, w.final_norm.size_bytes, a.buf_b.size_bytes },
@@ -1471,7 +1476,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
     } else {
         // No-affine LayerNorm (Lumina2 default: no learnable weight)
-        BatchLayerNormPC final_ln = { .dim = dim, .eps = 1e-6f, .n_rows = n_patches };
+        BatchLayerNormPC final_ln = { .dim = dim, .eps = 1e-5f, .n_rows = n_patches };
 llm::dispatch_kernel(cmd, &dk.batch_layernorm,
             { a.buf_a.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer },
             { a.buf_a.size_bytes, a.buf_b.size_bytes },
@@ -1654,6 +1659,7 @@ fn void DiTModel.free(&self) {
     self.kernels.mrope.free(self.ctx.device);
     self.kernels.batch_rmsnorm.free(self.ctx.device);
     self.kernels.transpose_heads.free(self.ctx.device);
+    self.kernels.transpose_channel_spatial.free(self.ctx.device);
     self.kernels.batch_head_norm.free(self.ctx.device);
     self.kernels.batch_matmul.free(self.ctx.device);
     self.kernels.batch_matmul_simple.free(self.ctx.device);

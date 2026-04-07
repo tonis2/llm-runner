@@ -411,56 +411,7 @@ llm::compute_barrier(cmd);
 llm::compute_barrier(cmd);
 }
 
-fn void dispatch_flux_mid_attn(
-    CommandBuffer cmd,
-    VaeKernels* k,
-    FluxVaeAttn* attn,
-    llm::Tensor* input,   // [C, H, W]
-    llm::Tensor* temp_a,  // scratch
-    llm::Tensor* temp_b,  // scratch
-    uint h, uint w
-) {
-    uint ch = attn.channels;
-    uint spatial = h * w;
-    uint n_heads = 1;  // VAE attention uses 1 head typically
-    uint head_dim = ch;
 
-    // GroupNorm
-    dispatch_flux_groupnorm(cmd, k, &attn.norm_weight, &attn.norm_bias, input, temp_a, ch, spatial);
-llm::compute_barrier(cmd);
-
-    // Q, K, V projections: [ch, spatial] @ [ch, ch] -> [ch, spatial]
-    // These are 1x1 convolutions, but stored as linear weights [ch, ch]
-    // Apply as batched matmul: for each spatial position, matmul
-    // Actually conv2d with 1x1 kernel works
-    pipelines::Conv2dPC pc_qkv = {
-        .in_c = ch, .out_c = ch, .in_h = h, .in_w = w,
-        .kH = 1, .kW = 1, .stride = 1, .pad = 0,
-        .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
-    };
-
-    // Q -> temp_b, K -> use buf offset later
-    // For simplicity: compute Q, K, V sequentially, store in temp buffers
-    // We need 3 * ch * spatial storage. Use temp_b for Q, temp_a offset for K, V.
-
-    // Q: temp_a (normed input) -> temp_b
-	dispatch_vae_conv2d(cmd, k, &attn.q_weight, &attn.q_bias, temp_a, temp_b, &pc_qkv);
-llm::compute_barrier(cmd);
-
-    // Save Q, compute K into same temp_a region (we can reuse after)
-    // Actually let's just use spatial_attention which expects [n_heads, seq_len, head_dim]
-    // For VAE: n_heads=1, seq_len=spatial, head_dim=ch
-    // Q is in temp_b [ch, spatial] = [ch, h*w]
-    // Need to reshape to [1, spatial, ch] = transpose
-
-    // This is complex. Let's use a simpler approach:
-    // Use the batched_matmul for Q@K^T and softmax@V
-    // For now, skip mid attention (it's a single block and the model will still work somewhat)
-    // TODO: implement proper mid-block attention
-
-    // Just copy input through (skip attention, residual is identity)
-    // The resblocks will do most of the work
-}
 
 // --- Flux VAE Decoder Forward Pass ---
 // Input: latent [16, h, w] in acts.buf_a
@@ -485,7 +436,6 @@ llm::compute_barrier(cmd);
 
     // Mid block
     dispatch_flux_resblock(cmd, k, &self.mid_block1, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
-    // Skip mid attention for now (contributes minimally)
     dispatch_flux_resblock(cmd, k, &self.mid_block2, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
 
 llm::submit_and_wait(ctx)!!;

@@ -744,4 +744,43 @@ void flash_attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// ============================================================
+// Channel-Spatial Transpose - [channels, spatial] <-> [spatial, channels]
+// ============================================================
+// direction 0: [C, S] -> [S, C]
+// direction 1: [S, C] -> [C, S]
+
+struct TransposeChannelSpatialParams {
+    uint channels;
+    uint spatial;
+    uint direction;
+};
+
+[vk_push_constant] const TransposeChannelSpatialParams transpose_cs_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> tcs_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> tcs_output;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void transpose_channel_spatial(uint3 tid: SV_DispatchThreadID) {
+    uint C = transpose_cs_pc.channels;
+    uint S = transpose_cs_pc.spatial;
+    uint total = C * S;
+
+    if (tid.x >= total) return;
+
+    if (transpose_cs_pc.direction == 0) {
+        // Input: [C, S] -> Output: [S, C]
+        uint c = tid.x / S;
+        uint s = tid.x % S;
+        tcs_output[s * C + c] = tcs_input[tid.x];
+    } else {
+        // Input: [S, C] -> Output: [C, S]
+        uint s = tid.x / C;
+        uint c = tid.x % C;
+        tcs_output[c * S + s] = tcs_input[tid.x];
+    }
+}
+
 // mRoPE shader is in separate file (mrope.slang -> mrope.spv)

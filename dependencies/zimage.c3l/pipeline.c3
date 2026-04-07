@@ -121,7 +121,39 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
     Clock encode_start = clock::now();
 
-    llm::Tensor cond_embeddings = text_model.encode_text(cond_tokens)!!;
+    llm::Tensor cond_embeddings;
+
+    // // Check for pre-computed text embeddings file
+    // if (self.text_embeddings_file.len > 0) {
+    //     io::printfn("  Loading pre-computed text embeddings from: %s", self.text_embeddings_file);
+    //     File ef = io::file::open(self.text_embeddings_file, "rb")!!;
+    //     uint[2] header;
+    //     ef.read((char[])((char*)&header[0])[:8])!!;
+    //     uint file_tokens = header[0];
+    //     uint file_dim = header[1];
+    //     io::printfn("  Pre-computed: %d tokens, dim=%d", file_tokens, file_dim);
+    //     // Override text_len with file tokens
+    //     cond_text_len = file_tokens;
+    //     usz data_size = (usz)file_tokens * file_dim * 4;
+    //     float* emb_data = (float*)mem::calloc(data_size);
+    //     ef.read((char[])(((char*)emb_data)[:data_size]))!!;
+    //     ef.close()!!;
+    //     cond_embeddings = llm::create_f32_tensor(ctx, { (ulong)cond_text_len * text_config.dim, 0, 0, 0 }, 1)!!;
+    //     // Upload to GPU
+    //     vk::Memory upload_stg = vk::new_buffer(allocator: &ctx.allocator,
+    //         usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+    //         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    //         data: emb_data, data_size: data_size)!!;
+    //     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer ucmd) {
+    //         vk::cmdCopyBuffer(ucmd, upload_stg.buffer, cond_embeddings.gpu_buffer.buffer, 1,
+    //             (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = data_size }});
+    //     }!!;
+    //     upload_stg.free();
+    //     mem::free(emb_data);
+    //     io::printfn("  Loaded pre-computed embeddings [%d, %d]", cond_text_len, text_config.dim);
+    // } else {
+    //     cond_embeddings = text_model.encode_text(cond_tokens)!!;
+    // }
     io::printfn("  Cond encoded: [%d, %d]", cond_text_len, text_config.dim);
 
     llm::Tensor uncond_embeddings;
