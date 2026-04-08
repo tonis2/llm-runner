@@ -1288,10 +1288,11 @@ llm::dispatch_kernel(cmd, &dk.batch_matmul_simple,
 llm::compute_barrier(cmd);
 
     // Then add bias using broadcast_add_dim
+    BroadcastAddDimPC x_bias_pc = { .n_total = n_patches * dim, .dim = dim };
 llm::dispatch_kernel(cmd, &dk.broadcast_add_dim,
-        { a.hidden.gpu_buffer.buffer, w.x_emb_bias.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
-        { a.hidden.size_bytes, w.x_emb_bias.size_bytes, a.hidden.size_bytes },
-        null, n_patches * dim);
+        { a.hidden.gpu_buffer.buffer, w.x_emb_bias.gpu_buffer.buffer },
+        { a.hidden.size_bytes, w.x_emb_bias.size_bytes },
+        &x_bias_pc, llm::ceil_div(n_patches * dim, 256));
 llm::compute_barrier(cmd);
 
     // 2b. Pad image tokens with x_pad_token (append n_img_pad copies)

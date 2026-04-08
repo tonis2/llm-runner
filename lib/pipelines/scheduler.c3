@@ -140,11 +140,10 @@ fn FlowMatchingState init_flow_matching(uint num_steps, uint image_seq_len = 0) 
     // Formula: shifted_sigma = shift * sigma / (1 + (shift - 1) * sigma)
     float shift = 3.0f;
 
-    // Generate linearly spaced sigmas from 1.0 to 0.0, then apply shift (Diffusers convention).
-    // Diffusers: linspace(sigma_max=1.0, sigma_min=0.0, num_steps) then shift, then append terminal 0.
-    // Note: the last sigma will be 0.0, so the last Euler step has dt=0 (no-op).
+    // Generate linearly spaced sigmas from 1.0 to 1/num_steps, then apply shift, then append terminal 0.
+    // Diffusers: linspace(1.0, 1/num_steps, num_steps) → shift each → append 0.0
     for (uint i = 0; i < num_steps; i++) {
-        float t = (num_steps > 1) ? 1.0f - (float)i / (float)(num_steps - 1) : 1.0f;
+        float t = 1.0f - (float)i * (1.0f - 1.0f / (float)num_steps) / (float)(num_steps > 1 ? num_steps - 1 : 1);
         sigmas[i] = time_snr_shift(shift, t);
     }
     sigmas[num_steps] = 0.0f;
