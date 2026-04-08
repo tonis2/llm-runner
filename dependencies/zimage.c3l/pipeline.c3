@@ -537,7 +537,9 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             }!!;
         } else {
             // No CFG: single forward pass
+            dit.profile_step = (step == 0);
             dit.forward(&cond_projected, t)!!;
+            dit.profile_step = false;
         }
 
         // Euler step
