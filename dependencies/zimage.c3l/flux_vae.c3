@@ -87,6 +87,11 @@ struct FluxVaeActivations {
     llm::Tensor buf_a;  // Primary buffer
     llm::Tensor buf_b;  // Secondary buffer
     llm::Tensor buf_c;  // Temp for residual
+    llm::Tensor attn_q;      // [lat_spatial * 512] Q for mid-block attention
+    llm::Tensor attn_k;      // [lat_spatial * 512] K for mid-block attention
+    llm::Tensor attn_v;      // [lat_spatial * 512] V for mid-block attention
+    llm::Tensor attn_out;    // [lat_spatial * 512] attention output
+    llm::Tensor attn_temp;   // [lat_spatial * 512] residual save
 }
 
 // --- Loading Helpers ---
@@ -269,10 +274,20 @@ fn FluxVaeActivations? allocate_flux_vae_activations(llm::DeviceContext* ctx, ui
     ulong max_elems = (ulong)256 * max_size * max_size;
     ulong[4] shape = { max_elems, 0, 0, 0 };
 
+    // Attention buffers: 512 channels at latent resolution (max_size/8)
+    ulong lat_size = (ulong)max_size / 8;
+    ulong attn_elems = 512 * lat_size * lat_size;
+    ulong[4] attn_shape = { attn_elems, 0, 0, 0 };
+
     return {
         .buf_a = llm::create_f32_tensor(ctx, shape, 1)!!,
         .buf_b = llm::create_f32_tensor(ctx, shape, 1)!!,
         .buf_c = llm::create_f32_tensor(ctx, shape, 1)!!,
+        .attn_q = llm::create_f32_tensor(ctx, attn_shape, 1)!!,
+        .attn_k = llm::create_f32_tensor(ctx, attn_shape, 1)!!,
+        .attn_v = llm::create_f32_tensor(ctx, attn_shape, 1)!!,
+        .attn_out = llm::create_f32_tensor(ctx, attn_shape, 1)!!,
+        .attn_temp = llm::create_f32_tensor(ctx, attn_shape, 1)!!,
     };
 }
 
@@ -412,6 +427,116 @@ llm::compute_barrier(cmd);
 }
 
 
+fn void dispatch_flux_attn(
+    CommandBuffer cmd,
+    VaeKernels* k,
+    FluxVaeAttn* attn,
+    FluxVaeActivations* acts,
+    uint h, uint w
+) {
+    uint channels = attn.channels;
+    uint spatial = h * w;
+    uint n_heads = 1;
+    uint head_dim = channels / n_heads;
+    float scale = 1.0f / math::sqrt((float)head_dim);
+
+    // Step 1: Save residual BEFORE GroupNorm (original input)
+    vk::cmdCopyBuffer(cmd, acts.buf_a.gpu_buffer.buffer, acts.attn_temp.gpu_buffer.buffer, 1,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)channels * spatial * 4 }});
+llm::compute_barrier(cmd);
+
+    // Step 2: GroupNorm on input [C, S] layout
+    dispatch_flux_groupnorm(cmd, k, &attn.norm_weight, &attn.norm_bias,
+        &acts.buf_a, &acts.buf_b, channels, spatial);
+llm::compute_barrier(cmd);
+
+    // Step 3: Transpose [C, S] -> [S, C]
+    TransposeChannelSpatialPC tcs_fwd = {
+        .channels = channels,
+        .spatial = spatial,
+        .direction = 0,
+    };
+    llm::dispatch_kernel(cmd, &k.transpose_channel_spatial,
+        { acts.buf_b.gpu_buffer.buffer, acts.buf_c.gpu_buffer.buffer },
+        { acts.buf_b.size_bytes, acts.buf_c.size_bytes },
+        &tcs_fwd, llm::ceil_div(channels * spatial, 256));
+llm::compute_barrier(cmd);
+
+    // Step 4: Q projection: [S, C] -> [S, C]
+    VaeLinearProjPC q_pc = { .out_dim = channels, .in_dim = channels, .seq_len = spatial };
+    llm::dispatch_kernel(cmd, &k.linear_proj,
+        { attn.q_weight.gpu_buffer.buffer, attn.q_bias.gpu_buffer.buffer,
+          acts.buf_c.gpu_buffer.buffer, acts.attn_q.gpu_buffer.buffer },
+        { attn.q_weight.size_bytes, attn.q_bias.size_bytes,
+          acts.buf_c.size_bytes, acts.attn_q.size_bytes },
+        &q_pc, spatial * channels);
+llm::compute_barrier(cmd);
+
+    // Step 5: K projection
+    llm::dispatch_kernel(cmd, &k.linear_proj,
+        { attn.k_weight.gpu_buffer.buffer, attn.k_bias.gpu_buffer.buffer,
+          acts.buf_c.gpu_buffer.buffer, acts.attn_k.gpu_buffer.buffer },
+        { attn.k_weight.size_bytes, attn.k_bias.size_bytes,
+          acts.buf_c.size_bytes, acts.attn_k.size_bytes },
+        &q_pc, spatial * channels);
+llm::compute_barrier(cmd);
+
+    // Step 6: V projection
+    llm::dispatch_kernel(cmd, &k.linear_proj,
+        { attn.v_weight.gpu_buffer.buffer, attn.v_bias.gpu_buffer.buffer,
+          acts.buf_c.gpu_buffer.buffer, acts.attn_v.gpu_buffer.buffer },
+        { attn.v_weight.size_bytes, attn.v_bias.size_bytes,
+          acts.buf_c.size_bytes, acts.attn_v.size_bytes },
+        &q_pc, spatial * channels);
+llm::compute_barrier(cmd);
+
+    // Step 7: Self-attention (Q/K/V in [S, C] layout, output in [S, C])
+    VaeAttentionPC va_pc = {
+        .head_dim = head_dim,
+        .n_heads = n_heads,
+        .seq_len = spatial,
+        .scale = scale,
+        .channels = channels,
+    };
+    llm::dispatch_kernel(cmd, &k.vae_attention,
+        { acts.attn_q.gpu_buffer.buffer, acts.attn_k.gpu_buffer.buffer,
+          acts.attn_v.gpu_buffer.buffer, acts.attn_out.gpu_buffer.buffer },
+        { acts.attn_q.size_bytes, acts.attn_k.size_bytes,
+          acts.attn_v.size_bytes, acts.attn_out.size_bytes },
+        &va_pc, n_heads * spatial);
+llm::compute_barrier(cmd);
+
+    // Step 8: proj_out projection: [S, C] -> [S, C]
+    llm::dispatch_kernel(cmd, &k.linear_proj,
+        { attn.proj_out_weight.gpu_buffer.buffer, attn.proj_out_bias.gpu_buffer.buffer,
+          acts.attn_out.gpu_buffer.buffer, acts.buf_c.gpu_buffer.buffer },
+        { attn.proj_out_weight.size_bytes, attn.proj_out_bias.size_bytes,
+          acts.attn_out.size_bytes, acts.buf_c.size_bytes },
+        &q_pc, spatial * channels);
+llm::compute_barrier(cmd);
+
+    // Step 9: Transpose [S, C] -> [C, S]
+    TransposeChannelSpatialPC tcs_rev = {
+        .channels = channels,
+        .spatial = spatial,
+        .direction = 1,
+    };
+    llm::dispatch_kernel(cmd, &k.transpose_channel_spatial,
+        { acts.buf_c.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer },
+        { acts.buf_c.size_bytes, acts.buf_a.size_bytes },
+        &tcs_rev, llm::ceil_div(channels * spatial, 256));
+llm::compute_barrier(cmd);
+
+    // Step 10: Residual add: buf_a += attn_temp (original input, both [C,S])
+    llm::ResidualPC res_pc = { .n = channels * spatial };
+    llm::dispatch_kernel(cmd, &k.shared.residual_add,
+        { acts.buf_a.gpu_buffer.buffer, acts.attn_temp.gpu_buffer.buffer },
+        { acts.buf_a.size_bytes, acts.attn_temp.size_bytes },
+        &res_pc, llm::ceil_div(channels * spatial, 256));
+llm::compute_barrier(cmd);
+}
+
+
 
 // --- Flux VAE Decoder Forward Pass ---
 // Input: latent [16, h, w] in acts.buf_a
@@ -436,6 +561,7 @@ llm::compute_barrier(cmd);
 
     // Mid block
     dispatch_flux_resblock(cmd, k, &self.mid_block1, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+    dispatch_flux_attn(cmd, k, &self.mid_attn, acts, h, w);
     dispatch_flux_resblock(cmd, k, &self.mid_block2, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
 
 llm::submit_and_wait(ctx)!!;
@@ -513,8 +639,8 @@ llm::compute_barrier(cmd);
     dispatch_flux_conv(cmd, k, &self.conv_out, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
 llm::compute_barrier(cmd);
 
-    // Scale+shift to [0,1]: output = output * 0.5 + 0.5
-    pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
+    // Clamp to [0,1]: output = clamp(input, 0, 1)
+    pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 1.0f, .shift = 0.0f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
@@ -586,4 +712,9 @@ fn void FluxVaeActivations.free(&self) {
     self.buf_a.free();
     self.buf_b.free();
     self.buf_c.free();
+    self.attn_q.free();
+    self.attn_k.free();
+    self.attn_v.free();
+    self.attn_out.free();
+    self.attn_temp.free();
 }

@@ -1630,3 +1630,193 @@ void elemwise_mul(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= elemwise_pc.n) return;
     elemwise_a[tid.x] *= elemwise_b[tid.x];
 }
+
+// ============================================================
+// Linear Projection with Bias - output = input @ weight^T + bias
+// ============================================================
+// Input: [seq_len, in_dim], Weight: [out_dim, in_dim], Bias: [out_dim]
+// Output: [seq_len, out_dim]
+// One workgroup per (seq_pos, out_idx) pair
+
+struct LinearProjParams {
+    uint out_dim;
+    uint in_dim;
+    uint seq_len;
+};
+
+[vk_push_constant] const LinearProjParams linear_proj_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> lp_weight;   // [out_dim, in_dim]
+[vk_binding(1, 0)] RWStructuredBuffer<float> lp_bias;     // [out_dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> lp_input;    // [seq_len, in_dim]
+[vk_binding(3, 0)] RWStructuredBuffer<float> lp_output;   // [seq_len, out_dim]
+
+groupshared float lp_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void linear_proj(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint flat_idx = gid.x;
+    uint seq_pos = flat_idx / linear_proj_pc.out_dim;
+    uint out_idx = flat_idx % linear_proj_pc.out_dim;
+
+    if (seq_pos >= linear_proj_pc.seq_len || out_idx >= linear_proj_pc.out_dim) return;
+
+    float partial = 0.0;
+    for (uint k = gi; k < linear_proj_pc.in_dim; k += 256) {
+        partial += lp_input[seq_pos * linear_proj_pc.in_dim + k] *
+                   lp_weight[out_idx * linear_proj_pc.in_dim + k];
+    }
+
+    lp_shared[gi] = partial;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            lp_shared[gi] += lp_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        lp_output[seq_pos * linear_proj_pc.out_dim + out_idx] = lp_shared[0] + lp_bias[out_idx];
+    }
+}
+
+// ============================================================
+// Channel-Spatial Transpose - [channels, spatial] <-> [spatial, channels]
+// ============================================================
+// direction 0: [C, S] -> [S, C]
+// direction 1: [S, C] -> [C, S]
+
+struct TransposeChannelSpatialParams {
+    uint channels;
+    uint spatial;
+    uint direction;
+};
+
+[vk_push_constant] const TransposeChannelSpatialParams transpose_cs_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> tcs_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> tcs_output;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void transpose_channel_spatial(uint3 tid: SV_DispatchThreadID) {
+    uint C = transpose_cs_pc.channels;
+    uint S = transpose_cs_pc.spatial;
+    uint total = C * S;
+
+    if (tid.x >= total) return;
+
+    if (transpose_cs_pc.direction == 0) {
+        uint c = tid.x / S;
+        uint s = tid.x % S;
+        tcs_output[s * C + c] = tcs_input[tid.x];
+    } else {
+        uint s = tid.x / C;
+        uint c = tid.x % C;
+        tcs_output[c * S + s] = tcs_input[tid.x];
+    }
+}
+
+// ============================================================
+// VAE Self-Attention (flash-style, [S, C] layout)
+// ============================================================
+// Q, K, V in [S, C] = [seq_len, n_heads * head_dim] layout
+// Output in [S, C] layout (fused head merge on write)
+// Scores in groupshared memory — no global scores buffer needed
+// Supports seq_len up to 4096 (512x512 image, latent 64x64)
+// One workgroup per (head, query_position) pair
+
+struct VaeAttentionParams {
+    uint head_dim;
+    uint n_heads;
+    uint seq_len;
+    float scale;
+    uint channels;
+};
+
+[vk_push_constant] const VaeAttentionParams vae_attn_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> va_Q;       // [S, C]
+[vk_binding(1, 0)] RWStructuredBuffer<float> va_K;       // [S, C]
+[vk_binding(2, 0)] RWStructuredBuffer<float> va_V;       // [S, C]
+[vk_binding(3, 0)] RWStructuredBuffer<float> va_output;  // [S, C]
+
+groupshared float va_scores[4096];
+groupshared float va_reduce[256];
+groupshared float va_q[512];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void vae_attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint head = gid.x / vae_attn_pc.seq_len;
+    uint q_pos = gid.x % vae_attn_pc.seq_len;
+    uint D = vae_attn_pc.head_dim;
+    uint S = vae_attn_pc.seq_len;
+    uint C = vae_attn_pc.channels;
+
+    if (head >= vae_attn_pc.n_heads) return;
+
+    uint head_d_start = head * D;
+
+    // Pre-load Q vector for this query position into shared memory
+    for (uint d = gi; d < D; d += 256) {
+        va_q[d] = va_Q[q_pos * C + head_d_start + d];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 1: Q * K^T -> scores in shared memory
+    for (uint kv_pos = gi; kv_pos < S; kv_pos += 256) {
+        float dot_val = 0.0;
+        for (uint d = 0; d < D; d++) {
+            dot_val += va_q[d] * va_K[kv_pos * C + head_d_start + d];
+        }
+        va_scores[kv_pos] = dot_val * vae_attn_pc.scale;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 2: Softmax in shared memory
+    float max_val = -1.0e30;
+    for (uint i = gi; i < S; i += 256) {
+        max_val = max(max_val, va_scores[i]);
+    }
+    va_reduce[gi] = max_val;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) va_reduce[gi] = max(va_reduce[gi], va_reduce[gi + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float global_max = va_reduce[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    float sum = 0.0;
+    for (uint i = gi; i < S; i += 256) {
+        float val = exp(va_scores[i] - global_max);
+        va_scores[i] = val;
+        sum += val;
+    }
+    va_reduce[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) va_reduce[gi] += va_reduce[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float global_sum = va_reduce[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint i = gi; i < S; i += 256) {
+        va_scores[i] /= global_sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase 3: Weighted V sum -> output in [S, C] layout (fused head merge)
+    for (uint d = gi; d < D; d += 256) {
+        float acc = 0.0;
+        for (uint pos = 0; pos < S; pos++) {
+            acc += va_scores[pos] * va_V[pos * C + head_d_start + d];
+        }
+        va_output[q_pos * C + head_d_start + d] = acc;
+    }
+}
