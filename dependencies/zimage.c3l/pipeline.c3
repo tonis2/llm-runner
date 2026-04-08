@@ -568,6 +568,30 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
     flow.free();
 
+    // Copy latent to CPU before freeing DiT (needed for VAE decode)
+    float[] latent_cpu = mem::new_array(float, latent_elems);
+    {
+        vk::Memory lat_readback = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null, data_size: (usz)latent_elems * 4,
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer rb_cmd) {
+            vk::cmdCopyBuffer(rb_cmd, dit.acts.latent.gpu_buffer.buffer, lat_readback.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
+        }!!;
+        mem::copy(latent_cpu.ptr, (float*)lat_readback.data(), (usz)latent_elems * 4);
+        lat_readback.free();
+    }
+
+    // Free DiT model + weights before VAE to reclaim VRAM
+    dit_gf.free();
+    dit_mm.destroy();
+    dit.free();
+    mem::free(dit);
+    dit = null;
+
     // ---- Phase 5: VAE decode and return image ----
     io::printfn("\n[5/5] VAE decoding...");
 
@@ -579,11 +603,18 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         io::printfn("  Using VAE: %s", use_taesd ? "TAESD" : "Flux VAE");
 
         if (use_taesd) {
+            vk::Memory lat_staging = vk::new_buffer(
+                allocator: &ctx.allocator,
+                usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                data: latent_cpu.ptr, data_size: (usz)latent_elems * 4,
+            )!!;
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
-                vk::cmdCopyBuffer(copy_cmd, dit.acts.latent.gpu_buffer.buffer,
+                vk::cmdCopyBuffer(copy_cmd, lat_staging.buffer,
                     taesd_acts.buf_a.gpu_buffer.buffer, 1,
                     (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
+            lat_staging.free();
 
             taesd_decoder.forward(&taesd_acts, lat_h, lat_w)!!;
             decode_output = &taesd_acts.buf_a;
@@ -592,33 +623,27 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             const float SCALE_FACTOR = 0.3611f;
             const float SHIFT_FACTOR = 0.1159f;
 
-            vk::Memory lat_readback = vk::new_buffer(
-                allocator: &ctx.allocator,
-                usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                data: null, data_size: (usz)latent_elems * 4,
-            )!!;
-            ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer rb_cmd) {
-                vk::cmdCopyBuffer(rb_cmd, dit.acts.latent.gpu_buffer.buffer, lat_readback.buffer, 1,
-                    (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
-            }!!;
-
-            float* lat_cpu = (float*)lat_readback.data();
-
             for (uint i = 0; i < latent_elems; i++) {
-                lat_cpu[i] = lat_cpu[i] / SCALE_FACTOR + SHIFT_FACTOR;
+                latent_cpu[i] = latent_cpu[i] / SCALE_FACTOR + SHIFT_FACTOR;
             }
 
+            vk::Memory lat_staging = vk::new_buffer(
+                allocator: &ctx.allocator,
+                usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                data: latent_cpu.ptr, data_size: (usz)latent_elems * 4,
+            )!!;
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
-                vk::cmdCopyBuffer(copy_cmd, lat_readback.buffer,
+                vk::cmdCopyBuffer(copy_cmd, lat_staging.buffer,
                     vae_acts.buf_a.gpu_buffer.buffer, 1,
                     (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
             }!!;
-            lat_readback.free();
+            lat_staging.free();
 
             vae_decoder.forward(&vae_acts, lat_h, lat_w)!!;
             decode_output = &vae_acts.buf_a;
         }
+        mem::free(latent_cpu);
 
         // Download image from GPU
         usz total_px = (usz)img_size * img_size * 3;
@@ -656,19 +681,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         io::printfn("  Warning: No VAE loaded, returning raw latent (first channel)");
 
         float[] latent_img = mem::new_array(float, (usz)lat_h * lat_w);
-        vk::Memory lat_readback = vk::new_buffer(
-            allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: (usz)latent_elems * 4,
-        )!!;
 
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer rb_cmd) {
-            vk::cmdCopyBuffer(rb_cmd, dit.acts.latent.gpu_buffer.buffer, lat_readback.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 }});
-        }!!;
-
-        float* lat_ptr = (float*)lat_readback.data();
+        float* lat_ptr = latent_cpu.ptr;
         float lmin = lat_ptr[0];
         float lmax = lat_ptr[0];
         for (uint i = 0; i < lat_h * lat_w; i++) {
@@ -683,7 +697,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
             latent_img[i] = (lat_ptr[i] - lmin) / lrange;
         }
 
-        lat_readback.free();
+        mem::free(latent_cpu);
 
         result = llm::pipelines::float_tensor_to_image(latent_img, lat_w, lat_h, 1)!!;
         mem::free(latent_img);
@@ -693,10 +707,6 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     cond_projected.free();
     if (use_cfg) uncond_projected.free();
     vae_kernels.free(ctx.device);
-    dit_gf.free();
-    dit_mm.destroy();
-    dit.free();
-    mem::free(dit);
 
     double total_sec = total_start.to_now().to_sec();
     io::printfn("\n=== Generation Complete ===");

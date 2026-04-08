@@ -1856,15 +1856,15 @@ fn void? DiTModel.forward(&self, llm::Tensor* text_embeddings, float timestep)
 				profile: do_profile
 			)!!;
 
-			// Flush GPU once at the end — all layers in one command buffer
-			if (l == actual_layers - 1)
+			// Flush GPU every layer to avoid driver timeout (TDR) at high resolutions
+			llm::submit_and_wait(ctx)!!;
+			if ((l + 1) % 10 == 0 || l == actual_layers - 1)
 			{
-				llm::submit_and_wait(ctx)!!;
 				batch_times[batch_idx] = batch_start.to_now().to_sec();
 				batch_idx++;
 				batch_start = clock::now();
-				llm::begin_compute(cmd)!!;
 			}
+			llm::begin_compute(cmd)!!;
 		}
 	}
 	double dit_sec = phase_start.to_now().to_sec();

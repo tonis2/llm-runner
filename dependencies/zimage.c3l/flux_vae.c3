@@ -570,6 +570,8 @@ llm::begin_compute(cmd)!!;
     // up.3: 3 resblocks at 512 + upsample (h -> 2h)
     for (uint i = 0; i < 3; i++) {
         dispatch_flux_resblock(cmd, k, &self.up3_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        llm::submit_and_wait(ctx)!!;
+        llm::begin_compute(cmd)!!;
     }
     // Upsample 2x
     pipelines::UpsamplePC up_pc = { .channels = 512, .in_h = h, .in_w = w };
@@ -588,6 +590,8 @@ llm::begin_compute(cmd)!!;
     // up.2: 3 resblocks at 512 + upsample
     for (uint i = 0; i < 3; i++) {
         dispatch_flux_resblock(cmd, k, &self.up2_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        llm::submit_and_wait(ctx)!!;
+        llm::begin_compute(cmd)!!;
     }
     up_pc = { .channels = 512, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
@@ -605,6 +609,8 @@ llm::begin_compute(cmd)!!;
     // up.1: 3 resblocks 512->256 + upsample
     for (uint i = 0; i < 3; i++) {
         dispatch_flux_resblock(cmd, k, &self.up1_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        llm::submit_and_wait(ctx)!!;
+        llm::begin_compute(cmd)!!;
     }
     up_pc = { .channels = 256, .in_h = h, .in_w = w };
 llm::dispatch_kernel(cmd, &k.upsample_nearest,
@@ -622,6 +628,8 @@ llm::begin_compute(cmd)!!;
     // up.0: 3 resblocks 256->128 (no upsample)
     for (uint i = 0; i < 3; i++) {
         dispatch_flux_resblock(cmd, k, &self.up0_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        llm::submit_and_wait(ctx)!!;
+        llm::begin_compute(cmd)!!;
     }
 
     // Final: GroupNorm -> SiLU -> conv_out
