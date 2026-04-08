@@ -15,10 +15,10 @@
     "shaders": {
 			"type": "prepare",
 			"exec": [
-				"slangc ./lib/shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./lib/shaders/diffusion.spv",
-				"slangc ./dependencies/llm_text.c3l/shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./dependencies/llm_text.c3l/shaders/llm.spv",
-				"slangc ./dependencies/zimage.c3l/shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./dependencies/zimage.c3l/shaders/zimage.spv",
-				"slangc ./dependencies/zimage.c3l/shaders/mrope.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -o ./dependencies/zimage.c3l/shaders/mrope.spv"
+				"slangc ./lib/shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./lib/shaders/diffusion.spv",
+				"slangc ./dependencies/llm_text.c3l/shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/llm_text.c3l/shaders/llm.spv",
+				"slangc ./dependencies/zimage.c3l/shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/zimage.spv",
+				"slangc ./dependencies/zimage.c3l/shaders/mrope.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/mrope.spv"
 			]
 		},
     "zimage": {
@@ -27,5 +27,5 @@
 		}
   },
   "cpu": "generic",
-  "opt": "O0"
+  "opt": "O2"
 }
