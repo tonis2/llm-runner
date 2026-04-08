@@ -44,14 +44,17 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     io::printfn("  Prompt: \"%s\"", inputs.prompt);
     io::printfn("  Mode: %s", is_img2img ? "img2img" : "txt2img");
     io::printfn("  Steps: %d, Seed: %d, Size: %d, CFG: %.1f",
-        inputs.num_steps, inputs.seed, inputs.image_size, cfg_scale);
+        inputs.num_steps, inputs.seed, (inputs.image_size + 8) / 16 * 16, cfg_scale);
     if (is_img2img) {
         io::printfn("  Strength: %.2f", inputs.strength);
     }
 
     Clock total_start = clock::now();
 
-    uint img_size = inputs.image_size;
+    uint img_size = (inputs.image_size + 8) / 16 * 16; // Round to nearest multiple of 16 (8x VAE downscale * 2x patch size)
+    if (img_size != inputs.image_size) {
+        io::printfn("  Note: size %d rounded to %d (must be multiple of 16)", inputs.image_size, img_size);
+    }
     uint lat_h = img_size / 8;
     uint lat_w = img_size / 8;
     uint n_patches = (lat_h / DIT_PATCH_SIZE) * (lat_w / DIT_PATCH_SIZE);
@@ -193,7 +196,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     uint max_padded_text = cond_padded_text;
     if (use_cfg && uncond_padded_text > max_padded_text) max_padded_text = uncond_padded_text;
     uint max_seq = padded_patches + max_padded_text;
-    DiTActivations dit_acts = allocate_dit_activations(ctx, max_seq)!!;
+    DiTActivations dit_acts = allocate_dit_activations(ctx, max_seq, n_patches, latent_elems)!!;
 
     DiTModel* dit = mem::alloc(DiTModel);
     dit.weights = dit_weights;

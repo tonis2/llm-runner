@@ -455,17 +455,17 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 
 // --- Activation Allocation ---
 
-fn DiTActivations? allocate_dit_activations(llm::DeviceContext* ctx, uint max_seq_len)
+fn DiTActivations? allocate_dit_activations(llm::DeviceContext* ctx, uint max_seq_len, uint n_patches, uint latent_elems)
 {
 	ulong max_dim_total = (ulong)max_seq_len * DIT_DIM;
 	ulong max_ffn_total = (ulong)max_seq_len * DIT_FFN_DIM;
-	ulong latent_total = (ulong)DIT_LATENT_CHANNELS * 64 * 64; // max 512x512 image
+	ulong latent_total = (ulong)latent_elems;
 
 	return {
 		.buf_a = llm::create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
 		.buf_b = llm::create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
 		.buf_c = llm::create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
-		.patches = llm::create_f32_tensor(ctx, { (ulong)1024 * DIT_PATCH_DIM, 0, 0, 0 }, 1)!!,
+		.patches = llm::create_f32_tensor(ctx, { (ulong)n_patches * DIT_PATCH_DIM, 0, 0, 0 }, 1)!!,
 		.hidden = llm::create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
 		.norm_out = llm::create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
 		.q = llm::create_f32_tensor(ctx, { max_dim_total, 0, 0, 0 }, 1)!!,
@@ -479,7 +479,7 @@ fn DiTActivations? allocate_dit_activations(llm::DeviceContext* ctx, uint max_se
 		.adaln_params = llm::create_f32_tensor(ctx, { (ulong)4 * DIT_DIM, 0, 0, 0 }, 1)!!,
 		.adaln_scale = llm::create_f32_tensor(ctx, { DIT_DIM, 0, 0, 0 }, 1)!!,
 		.adaln_shift = llm::create_f32_tensor(ctx, { DIT_DIM, 0, 0, 0 }, 1)!!,
-		.velocity = llm::create_f32_tensor(ctx, { (ulong)1024 * DIT_PATCH_DIM, 0, 0, 0 }, 1)!!,
+		.velocity = llm::create_f32_tensor(ctx, { (ulong)n_patches * DIT_PATCH_DIM, 0, 0, 0 }, 1)!!,
 		.latent = llm::create_f32_tensor(ctx, { latent_total, 0, 0, 0 }, 1)!!,
 		};
 }
