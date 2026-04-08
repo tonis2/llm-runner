@@ -18,7 +18,8 @@
 				"slangc ./lib/shaders/diffusion.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./lib/shaders/diffusion.spv",
 				"slangc ./dependencies/llm_text.c3l/shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/llm_text.c3l/shaders/llm.spv",
 				"slangc ./dependencies/zimage.c3l/shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/zimage.spv",
-				"slangc ./dependencies/zimage.c3l/shaders/mrope.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/mrope.spv"
+				"slangc ./dependencies/zimage.c3l/shaders/mrope.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/mrope.spv",
+			"slangc ./dependencies/zimage.c3l/shaders/flash_attn.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/flash_attn.spv"
 			]
 		},
     "zimage": {

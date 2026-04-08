@@ -11,6 +11,7 @@ import std::time::clock;
 // Embedded Z-Image SPIR-V shaders
 const char[*] ZIMAGE_SPV = $embed("./shaders/zimage.spv");
 const char[*] MROPE_SPV  = $embed("./shaders/mrope.spv");
+const char[*] FLASH_ATTN_SPV = $embed("./shaders/flash_attn.spv");
 
 // Profiling macro: submit GPU work and print elapsed time since last checkpoint
 macro @prof_checkpoint(CommandBuffer cmd, llm::DeviceContext* ctx, Clock* prof_start, bool profile, String $label)
@@ -390,13 +391,18 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		"broadcast_add_dim"
 	)!!;
 	llm::ComputeKernel k_scalebuf = llm::create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!;
+	char[] fa_spv = &FLASH_ATTN_SPV;
+	vk::ShaderModule fa_shader = vk::shaderModuleCreateInfo().setCodeSize(
+		fa_spv.len
+	).setCode((uint*)&fa_spv[0]).build(ctx.device)!!;
 	llm::ComputeKernel k_flashattn = llm::create_kernel(
 		ctx,
-		zi_shader,
+		fa_shader,
 		4,
 		FlashAttentionPC.sizeof,
-		"flash_attention"
+		"flash_attention_v2"
 	)!!;
+	fa_shader.free(ctx.device);
 	llm::ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
 	llm::ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
 	llm::ComputeKernel k_clip = llm::create_kernel(ctx, zi_shader, 1, ClipParams.sizeof, "clip_values")!!;
@@ -1364,16 +1370,18 @@ fn void? dit_transformer_layer(
 		llm::compute_barrier(cmd);
 	}
 
-	// Flash attention: Q=buf_c, K=norm_out, V=buf_b → output to k (free after transpose)
+	// Flash attention v2: tiled FA2-style with online softmax
+	// 2D dispatch: gid.x = Q-block index, gid.y = head index
 	float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
 	FlashAttentionPC fa_pc = { .head_dim = DIT_HEAD_DIM, .n_heads = DIT_HEADS, .seq_len = seq_len, .scale = scale, };
+	uint fa_q_blocks = llm::ceil_div(seq_len, 8);  // FA2_BR = 8
 	llm::dispatch_kernel(
 		cmd,
 		&dk.flash_attention,
 		{ a.buf_c.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, a.buf_b.gpu_buffer.buffer, a.k.gpu_buffer.buffer },
 		{ a.buf_c.size_bytes, a.norm_out.size_bytes, a.buf_b.size_bytes, a.k.size_bytes },
 		&fa_pc,
-		DIT_HEADS * seq_len
+		fa_q_blocks, DIT_HEADS
 	);
 llm::compute_barrier(cmd);
     @prof_checkpoint(cmd, ctx, &prof_start, profile, "C:attn_all");

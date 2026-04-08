@@ -1,0 +1,1 @@
+You can check project.json how building/running a C3 project works, you can then run c3c run zimge -- --config zimage.json to auto compile and run a project
