@@ -647,8 +647,8 @@ llm::compute_barrier(cmd);
     dispatch_flux_conv(cmd, k, &self.conv_out, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
 llm::compute_barrier(cmd);
 
-    // Clamp to [0,1]: output = clamp(input, 0, 1)
-    pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 1.0f, .shift = 0.0f };
+    // Denormalize from [-1,1] to [0,1]: output = clamp(input * 0.5 + 0.5, 0, 1)
+    pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
 llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
         { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
         { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
