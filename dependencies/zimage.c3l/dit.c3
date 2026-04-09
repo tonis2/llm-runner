@@ -39,6 +39,7 @@ const uint DIT_LATENT_CHANNELS    = 16;
 const uint DIT_PATCH_DIM          = 64; // 16 * 2 * 2
 const uint DIT_T_EMB_DIM          = 256; // Timestep embedding dimension
 const uint DIT_T_MLP_DIM          = 1024; // t_embedder MLP intermediate dim
+const uint DIT_MAX_LORA_RANK      = 256;  // Largest LoRA rank we'll size scratch for
 
 // mRoPE config (from Z-Image-Turbo config.json)
 const float DIT_ROPE_THETA      = 256.0;
@@ -176,6 +177,14 @@ struct BatchMatMulPC
 	uint row_offset;
 }
 
+struct BatchMatMulAddScaledPC
+{
+	uint out_dim;
+	uint in_dim;
+	uint seq_len;
+	float scale;
+}
+
 
 // --- DiT Layer Weights ---
 
@@ -295,6 +304,7 @@ struct DiTActivations
 	llm::Tensor adaln_shift; // [dim]
 	llm::Tensor velocity; // [n_patches, patch_dim]
 	llm::Tensor latent; // [channels, h, w]
+	llm::Tensor lora_scratch; // [max_seq * DIT_MAX_LORA_RANK] F32 — LoRA hop 1 output
 }
 
 // --- DiT Kernels ---
@@ -327,6 +337,7 @@ struct DiTKernels
 	llm::ComputeKernel batch_matmul_q4k;
 	llm::ComputeKernel batch_matmul_q5k;
 	llm::ComputeKernel batch_matmul_q6k;
+	llm::ComputeKernel batch_matmul_add_scaled; // F32 LoRA hop 2: output += scale * (B @ scratch)
 	llm::SharedKernels shared;
 }
 
@@ -352,6 +363,7 @@ struct DiTModel
 	llm::Tensor rope_cos_context; // [text_len, head_dim/2] for context refiner
 	llm::Tensor rope_sin_context; // [text_len, head_dim/2]
 	bool profile_step; // Enable per-phase profiling for layer 0
+	llm::DiTLoraAdapter lora; // Optional LoRA adapter (lora.loaded == false when unused)
 }
 
 // --- Kernel Creation ---
@@ -444,6 +456,7 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		.batch_matmul_q4k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4k")!!,
 		.batch_matmul_q5k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q5k")!!,
 		.batch_matmul_q6k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q6k")!!,
+		.batch_matmul_add_scaled = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulAddScaledPC.sizeof, "batch_matmul_add_scaled")!!,
 		.shared = llm::create_shared_kernels(ctx, llm_shader)!!,
 		};
 
@@ -480,6 +493,7 @@ fn DiTActivations? allocate_dit_activations(llm::DeviceContext* ctx, uint max_se
 		.adaln_shift = llm::create_f32_tensor(ctx, { DIT_DIM, 0, 0, 0 }, 1)!!,
 		.velocity = llm::create_f32_tensor(ctx, { (ulong)n_patches * DIT_PATCH_DIM, 0, 0, 0 }, 1)!!,
 		.latent = llm::create_f32_tensor(ctx, { latent_total, 0, 0, 0 }, 1)!!,
+		.lora_scratch = llm::create_f32_tensor(ctx, { (ulong)max_seq_len * DIT_MAX_LORA_RANK, 0, 0, 0 }, 1)!!,
 		};
 }
 
@@ -1086,6 +1100,12 @@ fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, bool
 
 // Dispatch a batch matmul: weight[out_dim, in_dim] × input[seq_len, in_dim] → output[seq_len, out_dim]
 // row_offset: skip rows in weight (for fused QKV split)
+//
+// If `lora` is non-null and `lora.present`, also append two extra dispatches
+// implementing the LoRA correction:
+//   scratch = A @ input              (hop 1, F32 batch_matmul_simple)
+//   output += scale * B @ scratch    (hop 2, batch_matmul_add_scaled)
+// `lora_scratch` must be a writable F32 tensor large enough for [seq_len * lora.rank].
 fn void dispatch_batch_matmul(
 	llm::RenderGraph* g,
 	DiTKernels* dk,
@@ -1095,7 +1115,9 @@ fn void dispatch_batch_matmul(
 	uint out_dim,
 	uint in_dim,
 	uint seq_len,
-	uint row_offset
+	uint row_offset,
+	llm::LoraTensor* lora = null,
+	llm::Tensor* lora_scratch = null
 )
 {
 	BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
@@ -1131,17 +1153,60 @@ fn void dispatch_batch_matmul(
 		// 2D dispatch: (seq_len, out_dim) workgroups
 		g.dispatch(&dk.batch_matmul_simple, { weight, input, output },
 			&pc, seq_len, out_dim);
+		dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len);
 		return;
 	}
 	// 2D tiled GEMM: ceil(seq_len/64) * ceil(out_dim/64) workgroups
 	// Legacy (Q8_0, Q4_0): seq_len * out_dim workgroups
 	uint groups = tiled_2d ? ((seq_len + 63) / 64) * ((out_dim + 63) / 64) : seq_len * out_dim;
 	g.dispatch(kernel, { weight, input, output }, &pc, groups);
+	dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len);
+}
+
+// Append the two-hop LoRA correction onto a base batch_matmul output. No-op
+// when `lora` is null or `lora.present` is false. The base call must have
+// already written into `output`; we only add to it.
+fn void dispatch_lora_correction(
+	llm::RenderGraph* g,
+	DiTKernels* dk,
+	llm::LoraTensor* lora,
+	llm::Tensor* lora_scratch,
+	llm::Tensor* input,
+	llm::Tensor* output,
+	uint in_dim,
+	uint out_dim,
+	uint seq_len
+)
+{
+	if (lora == null || !lora.present) return;
+	if (lora.rank > DIT_MAX_LORA_RANK) return; // scratch buffer too small
+	// Hop 1: scratch[seq, rank] = A[rank, in_dim] @ input[seq, in_dim]
+	BatchMatMulPC a_pc = {
+		.out_dim = lora.rank,
+		.in_dim = in_dim,
+		.seq_len = seq_len,
+		.row_offset = 0,
+	};
+	g.dispatch(&dk.batch_matmul_simple, { &lora.a, input, lora_scratch },
+		&a_pc, seq_len, lora.rank);
+
+	// Hop 2: output[seq, o] += scale * B[out_dim, rank] @ scratch[seq, rank]
+	BatchMatMulAddScaledPC b_pc = {
+		.out_dim = out_dim,
+		.in_dim = lora.rank,
+		.seq_len = seq_len,
+		.scale = lora.scale,
+	};
+	g.dispatch(&dk.batch_matmul_add_scaled, { &lora.b, lora_scratch, output },
+		&b_pc, seq_len, out_dim);
 }
 
 // Run a single DiT transformer layer (Lumina2 architecture)
 // Lumina2 adaLN: 4 params = [scale_msa, gate_msa, scale_mlp, gate_mlp]
 // Pre-norm + scale modulation (no shift), post-norm + tanh-gated residual
+//
+// `lora` is optional; when non-null its per-module LoraTensor pairs are applied
+// at the 7 adapted dispatch sites (Q/K/V/O + ffn_gate/up/down).
 fn void? dit_transformer_layer(
 	DiTModel* model,
 	llm::RenderGraph* g,
@@ -1151,7 +1216,8 @@ fn void? dit_transformer_layer(
 	bool has_adaln,
 	llm::Tensor* rope_cos, // [seq_len, head_dim/2] precomputed cos table
 	llm::Tensor* rope_sin, // [seq_len, head_dim/2] precomputed sin table
-	bool profile = false
+	bool profile = false,
+	llm::DiTLoraLayer* lora = null
 )
 {
 	llm::SharedKernels* sk = &model.kernels.shared;
@@ -1206,9 +1272,12 @@ fn void? dit_transformer_layer(
 
 	// === Phase B: QKV batch matmul (3 dispatches) ===
 	// wqkv is [3*dim, dim] fused — split via row_offset: Q=0, K=dim, V=2*dim
-	dispatch_batch_matmul(g, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0);
-	dispatch_batch_matmul(g, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim);
-	dispatch_batch_matmul(g, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim);
+	dispatch_batch_matmul(g, dk, &lw.wqkv, &a.buf_a, &a.q, dim, dim, seq_len, 0,
+		lora != null ? &lora.wq : null, &a.lora_scratch);
+	dispatch_batch_matmul(g, dk, &lw.wqkv, &a.buf_a, &a.k, dim, dim, seq_len, dim,
+		lora != null ? &lora.wk : null, &a.lora_scratch);
+	dispatch_batch_matmul(g, dk, &lw.wqkv, &a.buf_a, &a.v, dim, dim, seq_len, 2 * dim,
+		lora != null ? &lora.wv : null, &a.lora_scratch);
     @prof_checkpoint(g, &prof_start, profile, "B:QKV_matmul");
 
     // === Phase C: Head norm + Forward Transpose + Flash Attention ===
@@ -1253,7 +1322,8 @@ fn void? dit_transformer_layer(
 
     // === Phase D: Output projection + Post-attention norm + Gated residual ===
     // Output projection: k (attn output) -> buf_a
-    dispatch_batch_matmul(g, dk, &lw.wo, &a.k, &a.buf_a, dim, dim, seq_len, 0);
+    dispatch_batch_matmul(g, dk, &lw.wo, &a.k, &a.buf_a, dim, dim, seq_len, 0,
+		lora != null ? &lora.wo : null, &a.lora_scratch);
 
 	// Post-attention norm: norm2(attn_output)
 	if (lw.attn_norm2.size_bytes > 0)
@@ -1322,8 +1392,10 @@ fn void? dit_transformer_layer(
 
 	// === Phase F: SwiGLU FFN batch matmul ===
 	// Gate and Up projections (both read buf_a, write to different outputs)
-	dispatch_batch_matmul(g, dk, &lw.ffn_gate, &a.buf_a, &a.ffn_gate_out, DIT_FFN_DIM, dim, seq_len, 0);
-	dispatch_batch_matmul(g, dk, &lw.ffn_up, &a.buf_a, &a.ffn_up_out, DIT_FFN_DIM, dim, seq_len, 0);
+	dispatch_batch_matmul(g, dk, &lw.ffn_gate, &a.buf_a, &a.ffn_gate_out, DIT_FFN_DIM, dim, seq_len, 0,
+		lora != null ? &lora.ffn_gate : null, &a.lora_scratch);
+	dispatch_batch_matmul(g, dk, &lw.ffn_up, &a.buf_a, &a.ffn_up_out, DIT_FFN_DIM, dim, seq_len, 0,
+		lora != null ? &lora.ffn_up : null, &a.lora_scratch);
 
 	// SiLU on gate
 	llm::SiluPC silu_pc = { .n = seq_len * DIT_FFN_DIM };
@@ -1335,7 +1407,8 @@ fn void? dit_transformer_layer(
 		&emul_pc, llm::ceil_div(seq_len * DIT_FFN_DIM, 256));
 
 	// Down projection: [seq_len, ffn_dim] -> [seq_len, dim]
-	dispatch_batch_matmul(g, dk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM, seq_len, 0);
+	dispatch_batch_matmul(g, dk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM, seq_len, 0,
+		lora != null ? &lora.ffn_down : null, &a.lora_scratch);
 
 	// === Phase G: Post-FFN norm + Gated residual ===
 	if (lw.ffn_norm2.size_bytes > 0)
@@ -1524,12 +1597,14 @@ fn void? DiTModel.forward(&self, llm::Tensor* text_embeddings, float timestep)
 
 	uint actual_layers = self.weights.actual_num_layers;
 
+	llm::DiTLoraLayer* lora_for = null;
 	if (w.streaming)
 	{
 		// Streaming mode: upload each layer, run, free
 		for (uint l = 0; l < actual_layers; l++)
 		{
 			DiTLayerWeights lw = upload_dit_layer(ctx, &(*w.cpu_layers)[l]);
+			lora_for = self.lora.loaded && l < self.lora.n_layers ? &self.lora.layers[l] : null;
 			dit_transformer_layer(
 				self,
 				&g,
@@ -1538,7 +1613,8 @@ fn void? DiTModel.forward(&self, llm::Tensor* text_embeddings, float timestep)
 				total_seq,
 				true,
 				&self.rope_cos_main,
-				&self.rope_sin_main
+				&self.rope_sin_main,
+				lora: lora_for
 			)!!;
 			g.checkpoint()!!;
 			lw.free();
@@ -1556,6 +1632,7 @@ fn void? DiTModel.forward(&self, llm::Tensor* text_embeddings, float timestep)
 		for (uint l = 0; l < actual_layers; l++)
 		{
 			bool do_profile = (l == 0 && self.profile_step);
+			lora_for = self.lora.loaded && l < self.lora.n_layers ? &self.lora.layers[l] : null;
 			dit_transformer_layer(
 				self,
 				&g,
@@ -1565,7 +1642,8 @@ fn void? DiTModel.forward(&self, llm::Tensor* text_embeddings, float timestep)
 				true,
 				&self.rope_cos_main,
 				&self.rope_sin_main,
-				profile: do_profile
+				profile: do_profile,
+				lora: lora_for
 			)!!;
 
 			// Flush GPU every layer to avoid driver timeout (TDR) at high resolutions
@@ -1686,6 +1764,9 @@ fn void DiTLayerWeights.free(&self)
 
 fn void DiTModel.free(&self)
 {
+	// Free LoRA adapter (no-op if not loaded)
+	self.lora.free();
+
 	// Free layer weights (CPU or GPU depending on streaming mode)
 	uint num_layers = self.weights.actual_num_layers;
 	uint num_refiner = self.weights.actual_num_refiner_layers;
@@ -1775,6 +1856,7 @@ fn void DiTModel.free(&self)
 	self.acts.adaln_shift.free();
 	self.acts.velocity.free();
 	self.acts.latent.free();
+	self.acts.lora_scratch.free();
 
 	// Free kernels
 	self.kernels.patchify.free(self.ctx.device);
@@ -1803,5 +1885,6 @@ fn void DiTModel.free(&self)
 	self.kernels.batch_matmul_q4k.free(self.ctx.device);
 	self.kernels.batch_matmul_q5k.free(self.ctx.device);
 	self.kernels.batch_matmul_q6k.free(self.ctx.device);
+	self.kernels.batch_matmul_add_scaled.free(self.ctx.device);
 	self.kernels.shared.free(self.ctx.device);
 }

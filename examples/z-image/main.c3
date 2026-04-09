@@ -27,6 +27,8 @@ fn int main(String[] args) {
         .offload = config.offload,
         .text_embeddings_file = config.text_embeddings_file,
         .latent_file = config.latent_file,
+        .lora_path = config.lora_path,
+        .lora_strength = config.lora_strength,
     };
 
     // Create and load pipeline

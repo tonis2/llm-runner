@@ -32,6 +32,8 @@ struct PipelineOptions {
     bool offload;     // Stream DiT layers from CPU RAM to save VRAM
     String text_embeddings_file;  // Pre-computed text embeddings (bypasses text model)
     String latent_file;           // Pre-computed initial latent (bypasses RNG)
+    String lora_path;             // Optional LoRA safetensors file (empty = no LoRA)
+    float lora_strength;          // LoRA strength multiplier (default 1.0)
 }
 
 // --- Unified Generation Inputs ---

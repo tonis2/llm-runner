@@ -21,6 +21,8 @@ struct AppConfig {
     String text_model_path;
     String text_embeddings_file;  // Pre-computed text embeddings (bypasses text model)
     String latent_file;           // Pre-computed initial latent (bypasses RNG)
+    String lora_path;             // Optional LoRA safetensors file
+    float lora_strength;          // LoRA strength multiplier
     uint image_size;
     uint num_steps;
     float cfg_scale;
@@ -40,6 +42,8 @@ fn AppConfig? parse_args(String[] args) {
         .text_model_path = "",
         .text_embeddings_file = "",
         .latent_file = "",
+        .lora_path = "",
+        .lora_strength = 1.0f,
         .image_size = 512,
         .num_steps = 4,
         .cfg_scale = 7.0,
@@ -156,6 +160,15 @@ fn bool load_config(String config_path, AppConfig* config) {
     if (try v = cfg.get_uint("seed")) config.seed = v;
     if (try v = cfg.get_uint("size")) config.image_size = v;
     if (try v = cfg.get_bool("offload")) config.offload = v;
+
+    // LoRA: accept either { "lora": "path.safetensors" } (strength defaults to 1.0)
+    // or { "lora": { "path": "...", "strength": 0.8 } }
+    if (try lv = cfg.get_string("lora")) {
+        config.lora_path = lv;
+    } else if (try lobj = cfg.get("lora")) {
+        if (try p = lobj.get_string("path")) config.lora_path = p;
+        if (try s = lobj.get_float("strength")) config.lora_strength = (float)s;
+    }
 
     io::printfn("Config loaded from: %s", config_path);
     return true;

@@ -22,6 +22,8 @@ struct ZImageState (llm::pipelines::Pipeline) {
     bool offload;
     String text_embeddings_file;
     String latent_file;
+    String lora_path;
+    float lora_strength;
 }
 
 fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String model_path, llm::pipelines::PipelineOptions* opts) @dynamic {
@@ -33,6 +35,8 @@ fn void? ZImageState.load(ZImageState* self, llm::DeviceContext* ctx, String mod
     self.offload = opts.offload;
     self.text_embeddings_file = opts.text_embeddings_file;
     self.latent_file = opts.latent_file;
+    self.lora_path = opts.lora_path;
+    self.lora_strength = opts.lora_strength;
 }
 
 fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx, llm::pipelines::GenerationInputs* inputs) @dynamic {
@@ -199,6 +203,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     DiTActivations dit_acts = allocate_dit_activations(ctx, max_seq, n_patches, latent_elems)!!;
 
     DiTModel* dit = mem::alloc(DiTModel);
+    *dit = (DiTModel){};
     dit.weights = dit_weights;
     dit.acts = dit_acts;
     dit.kernels = dit_kernels;
@@ -209,6 +214,17 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     dit.padded_text = cond_padded_text;
     dit.latent_h = lat_h;
     dit.latent_w = lat_w;
+
+    // Optional LoRA: load now so it's resident before the first forward pass.
+    if (self.lora_path.len > 0) {
+        if (try adapter = llm::load_dit_lora_safetensors(
+            ctx, self.lora_path, self.lora_strength, dit.weights.actual_num_layers))
+        {
+            dit.lora = adapter;
+        } else {
+            io::printfn("  LoRA load failed for %s — continuing without LoRA", self.lora_path);
+        }
+    }
 
     // Precompute mRoPE tables
     uint patches_w = lat_w / DIT_PATCH_SIZE;

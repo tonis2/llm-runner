@@ -21,8 +21,17 @@ struct SafetensorsTensorInfo {
     ulong data_end;
 }
 
+// Captured key/value pair from the optional __metadata__ object in the
+// safetensors header. Diffusers/Kohya/PEFT LoRA files stash things like
+// "lora_alpha", "ss_network_alpha", etc. here as stringified scalars.
+struct SafetensorsMetaKV {
+    String key;
+    String value;
+}
+
 struct SafetensorsFile {
     SafetensorsTensorInfo[] tensors;
+    SafetensorsMetaKV[] metadata; // Empty if header has no __metadata__ section
     char* data_base;     // pointer to start of raw tensor data
     mmap::FileMmap mmap_handle;
     usz n_tensors;
@@ -63,6 +72,30 @@ fn SafetensorsFile? safetensors_open(String path) {
     foreach (key : keys) {
         if (key == "__metadata__") continue;
         tensor_count++;
+    }
+
+    // Parse optional __metadata__ object — Diffusers/Kohya store LoRA alpha here.
+    SafetensorsMetaKV[] metadata = {};
+    if (try meta_obj = root.get("__metadata__")) {
+        if (meta_obj.is_map()) {
+            String[] meta_keys = meta_obj.map.keys(mem);
+            defer mem::free(meta_keys);
+            metadata = mem::new_array(SafetensorsMetaKV, meta_keys.len);
+            usz mi = 0;
+            foreach (mk : meta_keys) {
+                if (try mv = meta_obj.get_string(mk)) {
+                    metadata[mi] = {
+                        .key = mk.copy(mem),
+                        .value = mv.copy(mem),
+                    };
+                    mi++;
+                }
+            }
+            // Trim if some entries weren't strings.
+            if (mi < meta_keys.len) {
+                metadata = metadata[0:mi];
+            }
+        }
     }
 
     SafetensorsTensorInfo[] tensors = mem::new_array(SafetensorsTensorInfo, tensor_count);
@@ -107,6 +140,7 @@ fn SafetensorsFile? safetensors_open(String path) {
 
     return {
         .tensors = tensors,
+        .metadata = metadata,
         .data_base = data_base,
         .mmap_handle = mm,
         .n_tensors = n_tensors,
@@ -118,6 +152,15 @@ fn SafetensorsTensorInfo*? SafetensorsFile.find_tensor(&self, String name) {
         if (self.tensors[i].name == name) {
             return &self.tensors[i];
         }
+    }
+    return FILE_NOT_FOUND~;
+}
+
+// Look up a string value from the file's __metadata__ section.
+// Returns FILE_NOT_FOUND if the key isn't present.
+fn String? SafetensorsFile.get_metadata(&self, String key) {
+    for (usz i = 0; i < self.metadata.len; i++) {
+        if (self.metadata[i].key == key) return self.metadata[i].value;
     }
     return FILE_NOT_FOUND~;
 }
@@ -275,4 +318,5 @@ fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, S
 
 fn void SafetensorsFile.close(&self) {
     mem::free(self.tensors);
+    if (self.metadata.len > 0) mem::free(self.metadata);
 }

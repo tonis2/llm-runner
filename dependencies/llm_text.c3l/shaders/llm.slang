@@ -1179,6 +1179,59 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// --- F32 batch matmul with scaled additive accumulate (LoRA hop 2) ---
+// Computes: output[seq, o] += scale * sum_k weight[o, k] * input[seq, k]
+// Used for the second hop of LoRA application: y += (alpha/r) * B @ scratch
+// Same shape contract as batch_matmul_simple, plus a float scale.
+
+struct BatchMatMulAddScaledParams {
+    uint  out_dim;
+    uint  in_dim;
+    uint  seq_len;
+    float scale;
+};
+
+[vk_push_constant] const BatchMatMulAddScaledParams bm_addscaled_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> bm_addscaled_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bm_addscaled_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bm_addscaled_output;
+
+groupshared float bm_addscaled_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_matmul_add_scaled(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    // 2D dispatch: gid.x = pos, gid.y = out_idx
+    uint pos = gid.x;
+    uint out_idx = gid.y;
+
+    if (pos >= bm_addscaled_pc.seq_len) return;
+
+    uint in_base = pos * bm_addscaled_pc.in_dim;
+
+    float partial = 0.0;
+    for (uint k = gi; k < bm_addscaled_pc.in_dim; k += 256) {
+        partial += bm_addscaled_weight[out_idx * bm_addscaled_pc.in_dim + k]
+                 * bm_addscaled_input[in_base + k];
+    }
+
+    bm_addscaled_shared[gi] = partial;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            bm_addscaled_shared[gi] += bm_addscaled_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        uint out_offset = pos * bm_addscaled_pc.out_dim + out_idx;
+        bm_addscaled_output[out_offset] += bm_addscaled_pc.scale * bm_addscaled_shared[0];
+    }
+}
+
 // --- Q8_0 batch matmul (tiled 2D GEMM) ---
 // Tile sizes: BM=64, BN=64, BK=32 (BK matches Q8_0 block size exactly)
 // Dequantizes Q8_0 weights into shared memory as F32 before accumulation
