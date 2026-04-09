@@ -183,6 +183,13 @@ struct BatchMatMulAddScaledPC
 	uint in_dim;
 	uint seq_len;
 	float scale;
+	uint row_offset; // added to output column index — lets LoRA write into a sub-range of a wider buffer
+}
+
+struct FFNSwigluSplitPC
+{
+	uint n_elements; // seq_len * ffn_dim
+	uint _pad;
 }
 
 
@@ -294,8 +301,8 @@ struct DiTActivations
 	llm::Tensor q; // [n_heads, seq_len, head_dim]
 	llm::Tensor k; // [n_heads, seq_len, head_dim]
 	llm::Tensor v; // [n_heads, seq_len, head_dim]
-	llm::Tensor ffn_gate_out; // [seq_len, ffn_dim]
-	llm::Tensor ffn_up_out; // [seq_len, ffn_dim]
+	llm::Tensor ffn_gate_out; // [seq_len, ffn_dim] — gate matmul output, then SwiGLU output
+	llm::Tensor ffn_up_out; // [seq_len, ffn_dim] — up matmul output
 	llm::Tensor ffn_down_out; // [seq_len, dim]
 	llm::Tensor t_emb; // [t_emb_dim]
 	llm::Tensor t_emb_mlp; // [DIT_T_MLP_DIM] intermediate / [DIT_T_EMB_DIM] final
@@ -338,6 +345,8 @@ struct DiTKernels
 	llm::ComputeKernel batch_matmul_q5k;
 	llm::ComputeKernel batch_matmul_q6k;
 	llm::ComputeKernel batch_matmul_add_scaled; // F32 LoRA hop 2: output += scale * (B @ scratch)
+	llm::ComputeKernel ffn_swiglu_split; // Phase 1: out[i] = silu(in[i]) * in[ffn_dim + i]
+	llm::ComputeKernel batch_matmul_swiglu_q8; // Phase 2: fused gate+up Q8_0 matmul + SwiGLU
 	llm::SharedKernels shared;
 }
 
@@ -457,6 +466,8 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		.batch_matmul_q5k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q5k")!!,
 		.batch_matmul_q6k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q6k")!!,
 		.batch_matmul_add_scaled = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulAddScaledPC.sizeof, "batch_matmul_add_scaled")!!,
+		.ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC.sizeof, "ffn_swiglu_split")!!,
+		.batch_matmul_swiglu_q8 = llm::create_kernel(ctx, llm_shader, 4, BatchMatMulPC.sizeof, "batch_matmul_swiglu_q8")!!,
 		.shared = llm::create_shared_kernels(ctx, llm_shader)!!,
 		};
 
@@ -743,6 +754,7 @@ fn llm::Tensor load_dit_tensor_f32(llm::DeviceContext* ctx, llm::GGUFFile* gf, S
 	llm::GGUFTensorInfo* info = gf.find_tensor(name)!!;
 	return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
 }
+
 
 fn DiTLayerWeights load_dit_layer_weights(
 	llm::DeviceContext* ctx,
@@ -1166,6 +1178,14 @@ fn void dispatch_batch_matmul(
 // Append the two-hop LoRA correction onto a base batch_matmul output. No-op
 // when `lora` is null or `lora.present` is false. The base call must have
 // already written into `output`; we only add to it.
+//
+// `out_dim` is the row stride of `output` (i.e. the number of columns per
+// sequence position in the destination buffer). `b_rows` is the number of
+// rows actually written by the LoRA B matrix — usually equal to `out_dim`
+// for a normal linear, but smaller when writing into a sub-range of a wider
+// fused buffer (e.g. ffn_gate / ffn_up writing into halves of ffn_gate_up_out).
+// `row_offset` shifts the column index of every output write, so the LoRA
+// correction lands at `output[pos * out_dim + row_offset + b_row]`.
 fn void dispatch_lora_correction(
 	llm::RenderGraph* g,
 	DiTKernels* dk,
@@ -1175,11 +1195,14 @@ fn void dispatch_lora_correction(
 	llm::Tensor* output,
 	uint in_dim,
 	uint out_dim,
-	uint seq_len
+	uint seq_len,
+	uint b_rows = 0,
+	uint row_offset = 0
 )
 {
 	if (lora == null || !lora.present) return;
 	if (lora.rank > DIT_MAX_LORA_RANK) return; // scratch buffer too small
+	if (b_rows == 0) b_rows = out_dim;
 	// Hop 1: scratch[seq, rank] = A[rank, in_dim] @ input[seq, in_dim]
 	BatchMatMulPC a_pc = {
 		.out_dim = lora.rank,
@@ -1190,15 +1213,19 @@ fn void dispatch_lora_correction(
 	g.dispatch(&dk.batch_matmul_simple, { &lora.a, input, lora_scratch },
 		&a_pc, seq_len, lora.rank);
 
-	// Hop 2: output[seq, o] += scale * B[out_dim, rank] @ scratch[seq, rank]
+	// Hop 2: output[seq, row_offset + r] += scale * B[r, rank] @ scratch[seq, rank]
+	// for r in [0, b_rows). The shader uses `out_dim` for the row stride and
+	// `row_offset` to shift the column index, so b_rows controls the dispatch
+	// shape and weight indexing while out_dim controls the destination stride.
 	BatchMatMulAddScaledPC b_pc = {
 		.out_dim = out_dim,
 		.in_dim = lora.rank,
 		.seq_len = seq_len,
 		.scale = lora.scale,
+		.row_offset = row_offset,
 	};
 	g.dispatch(&dk.batch_matmul_add_scaled, { &lora.b, lora_scratch, output },
-		&b_pc, seq_len, out_dim);
+		&b_pc, seq_len, b_rows);
 }
 
 // Run a single DiT transformer layer (Lumina2 architecture)
@@ -1391,20 +1418,42 @@ fn void? dit_transformer_layer(
 	}
 
 	// === Phase F: SwiGLU FFN batch matmul ===
-	// Gate and Up projections (both read buf_a, write to different outputs)
-	dispatch_batch_matmul(g, dk, &lw.ffn_gate, &a.buf_a, &a.ffn_gate_out, DIT_FFN_DIM, dim, seq_len, 0,
-		lora != null ? &lora.ffn_gate : null, &a.lora_scratch);
-	dispatch_batch_matmul(g, dk, &lw.ffn_up, &a.buf_a, &a.ffn_up_out, DIT_FFN_DIM, dim, seq_len, 0,
-		lora != null ? &lora.ffn_up : null, &a.lora_scratch);
+	// Phase 2 fast path: when both gate and up are Q8_0 and there's no LoRA
+	// adapting them, run the fused mega-kernel that shares the input A-tile
+	// between gate and up accumulators in shared memory and writes only the
+	// post-SwiGLU result. This is one dispatch instead of three (gate matmul
+	// + up matmul + activation) and avoids materialising ffn_up_out.
+	bool use_swiglu_megakernel =
+		lw.ffn_gate.dtype == llm::GGML_Q8_0
+		&& lw.ffn_up.dtype == llm::GGML_Q8_0
+		&& (lora == null || (!lora.ffn_gate.present && !lora.ffn_up.present));
+	if (use_swiglu_megakernel)
+	{
+		BatchMatMulPC sw_pc = {
+			.out_dim = DIT_FFN_DIM,
+			.in_dim = dim,
+			.seq_len = seq_len,
+			.row_offset = 0,
+		};
+		// BM=64, BN=32 → ceil(seq/64) * ceil(out/32) workgroups
+		// Mega-kernel uses BM=64 BN=32 → ceil(seq/64) * ceil(out/32) workgroups
+		uint groups = ((seq_len + 63) / 64) * ((DIT_FFN_DIM + 31) / 32);
+		g.dispatch(&dk.batch_matmul_swiglu_q8,
+			{ &lw.ffn_gate, &lw.ffn_up, &a.buf_a, &a.ffn_gate_out },
+			&sw_pc, groups);
+	}
+	else
+	{
+		// Phase 1 fallback: two separate matmuls + fused SwiGLU split.
+		dispatch_batch_matmul(g, dk, &lw.ffn_gate, &a.buf_a, &a.ffn_gate_out, DIT_FFN_DIM, dim, seq_len, 0,
+			lora != null ? &lora.ffn_gate : null, &a.lora_scratch);
+		dispatch_batch_matmul(g, dk, &lw.ffn_up, &a.buf_a, &a.ffn_up_out, DIT_FFN_DIM, dim, seq_len, 0,
+			lora != null ? &lora.ffn_up : null, &a.lora_scratch);
 
-	// SiLU on gate
-	llm::SiluPC silu_pc = { .n = seq_len * DIT_FFN_DIM };
-	g.dispatch(&sk.silu, { &a.ffn_gate_out }, &silu_pc, llm::ceil_div(seq_len * DIT_FFN_DIM, 256));
-
-	// gate * up
-	llm::ElemwisePC emul_pc = { .n = seq_len * DIT_FFN_DIM };
-	g.dispatch(&sk.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out },
-		&emul_pc, llm::ceil_div(seq_len * DIT_FFN_DIM, 256));
+		FFNSwigluSplitPC swiglu_pc = { .n_elements = seq_len * DIT_FFN_DIM };
+		g.dispatch(&dk.ffn_swiglu_split, { &a.ffn_gate_out, &a.ffn_up_out },
+			&swiglu_pc, llm::ceil_div(seq_len * DIT_FFN_DIM, 256));
+	}
 
 	// Down projection: [seq_len, ffn_dim] -> [seq_len, dim]
 	dispatch_batch_matmul(g, dk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, dim, DIT_FFN_DIM, seq_len, 0,
@@ -1886,5 +1935,7 @@ fn void DiTModel.free(&self)
 	self.kernels.batch_matmul_q5k.free(self.ctx.device);
 	self.kernels.batch_matmul_q6k.free(self.ctx.device);
 	self.kernels.batch_matmul_add_scaled.free(self.ctx.device);
+	self.kernels.ffn_swiglu_split.free(self.ctx.device);
+	self.kernels.batch_matmul_swiglu_q8.free(self.ctx.device);
 	self.kernels.shared.free(self.ctx.device);
 }

@@ -1185,10 +1185,11 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 // Same shape contract as batch_matmul_simple, plus a float scale.
 
 struct BatchMatMulAddScaledParams {
-    uint  out_dim;
+    uint  out_dim;     // row stride of `output` (columns per sequence position)
     uint  in_dim;
     uint  seq_len;
     float scale;
+    uint  row_offset;  // added to the column index of every output write
 };
 
 [vk_push_constant] const BatchMatMulAddScaledParams bm_addscaled_pc;
@@ -1227,9 +1228,38 @@ void batch_matmul_add_scaled(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 
     if (gi == 0) {
-        uint out_offset = pos * bm_addscaled_pc.out_dim + out_idx;
+        uint out_offset = pos * bm_addscaled_pc.out_dim
+                        + bm_addscaled_pc.row_offset + out_idx;
         bm_addscaled_output[out_offset] += bm_addscaled_pc.scale * bm_addscaled_shared[0];
     }
+}
+
+// --- Fused SwiGLU: Phase 1 FFN activation ---
+// In-place on the gate buffer: gate[i] = silu(gate[i]) * up[i]
+// Replaces the previous SiLU + elementwise_mul pair (2 dispatches → 1).
+// Uses the same in-place pattern as the standalone SiLU shader so the
+// compiler knows the read-modify-write of gate goes through one buffer.
+
+struct FFNSwigluSplitParams {
+    uint n_elements; // seq_len * ffn_dim — total elements
+    uint _pad;
+};
+
+[vk_push_constant] const FFNSwigluSplitParams ffn_swiglu_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> ffn_swiglu_gate; // in-place: read g, write silu(g)*u
+[vk_binding(1, 0)] RWStructuredBuffer<float> ffn_swiglu_up;   // read-only
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void ffn_swiglu_split(uint3 tid: SV_DispatchThreadID) {
+    uint idx = tid.x;
+    if (idx >= ffn_swiglu_pc.n_elements) return;
+    float g = ffn_swiglu_gate[idx];
+    float u = ffn_swiglu_up[idx];
+    // SiLU(g) = g * sigmoid(g) = g / (1 + exp(-g))
+    float silu = g / (1.0 + exp(-g));
+    ffn_swiglu_gate[idx] = silu * u;
 }
 
 // --- Q8_0 batch matmul (tiled 2D GEMM) ---
@@ -1341,6 +1371,150 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
                 uint gn = tile_n * 64 + tn * 4 + c;
                 if (gn < bmq8_pc.out_dim) {
                     bmq8_output[gm * bmq8_pc.out_dim + gn] = acc[r * 4 + c];
+                }
+            }
+        }
+    }
+}
+
+// --- Phase 2: Q8_0 SwiGLU mega-kernel ---
+// Computes BOTH gate and up matmuls plus the SwiGLU activation in a single
+// dispatch, reusing the A-tile across both accumulators in shared memory.
+//
+//   gate_acc[s,o] = sum_k W_gate[o,k] * input[s,k]
+//   up_acc[s,o]   = sum_k W_up[o,k]   * input[s,k]
+//   output[s,o]   = silu(gate_acc[s,o]) * up_acc[s,o]
+//
+// Shape contract: weight_gate, weight_up are both Q8_0 [out_dim, in_dim].
+//   out_dim is FFN_DIM (10240 for Z-Image). Output is [seq, FFN_DIM].
+//
+// Tile sizes: BM=64 BN=32 BK=32 (Q8_0 block size). Smaller in N than the
+// baseline batch_matmul_q8 (which is BN=64) so per-thread accumulator stays at
+// 16 floats total (8 gate + 8 up) — same register pressure as baseline. The
+// trade-off: 2x more workgroups in the N direction.
+// Per-thread layout: TM=4 TN=2 → 4 rows × 2 cols = 8 outputs per accumulator
+// bank. Threads/wg: (BM/TM)*(BN/TN) = 16*16 = 256.
+
+[vk_push_constant] const BatchMatMulParams bmq8sw_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint>  bmq8sw_weight_gate;
+[vk_binding(1, 0)] RWStructuredBuffer<uint>  bmq8sw_weight_up;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bmq8sw_input;
+[vk_binding(3, 0)] RWStructuredBuffer<float> bmq8sw_output;
+
+groupshared float q8sw_A[32 * 65];  // A tile [BK=32][BM=64+1]
+groupshared float q8sw_Bg[32 * 33]; // gate B tile [BK=32][BN=32+1]
+groupshared float q8sw_Bu[32 * 33]; // up   B tile [BK=32][BN=32+1]
+
+// Dequantize one Q8_0 element from a packed weight buffer.
+float dequant_q8_at(RWStructuredBuffer<uint> w, uint bb, uint k_local) {
+    uint scale_uint_idx = bb / 4;
+    uint scale_byte_off = bb % 4;
+    uint scale_word = w[scale_uint_idx];
+    uint scale_bits;
+    if (scale_byte_off == 0) {
+        scale_bits = scale_word & 0xFFFFu;
+    } else if (scale_byte_off == 2) {
+        scale_bits = (scale_word >> 16) & 0xFFFFu;
+    } else {
+        uint next_word = w[scale_uint_idx + 1];
+        scale_bits = ((scale_word >> (scale_byte_off * 8)) | (next_word << (32 - scale_byte_off * 8))) & 0xFFFFu;
+    }
+    float scale = unpack_f16(scale_bits);
+    int q = sign_extend_i8(read_byte(w, bb + 2 + k_local));
+    return scale * float(q);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_matmul_swiglu_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint tiles_n = (bmq8sw_pc.out_dim + 31) / 32;
+    uint tile_m = gid.x / tiles_n;
+    uint tile_n = gid.x % tiles_n;
+    uint pos_base = tile_m * 64;
+    uint row_base = tile_n * 32;
+
+    // 16x16 thread layout within the tile
+    uint tm = gi / 16; // 0..15 (M index)
+    uint tn = gi % 16; // 0..15 (N index)
+
+    float acc_g[8]; // 4 rows * 2 cols
+    float acc_u[8];
+    for (uint i = 0; i < 8; i++) {
+        acc_g[i] = 0.0;
+        acc_u[i] = 0.0;
+    }
+
+    uint blocks_per_row = bmq8sw_pc.in_dim / 32;
+    uint k_tiles = bmq8sw_pc.in_dim / 32;
+
+    for (uint t = 0; t < k_tiles; t++) {
+        uint k_base = t * 32;
+
+        // Load A tile [64*32 = 2048 elements, 8 per thread]
+        for (uint i = 0; i < 8; i++) {
+            uint flat = gi + i * 256;
+            uint m_local = flat >> 5;
+            uint k_local = flat & 31u;
+            uint gm = pos_base + m_local;
+            q8sw_A[k_local * 65 + m_local] = (gm < bmq8sw_pc.seq_len) ?
+                bmq8sw_input[gm * bmq8sw_pc.in_dim + k_base + k_local] : 0.0;
+        }
+
+        // Load BOTH B tiles [32*32 = 1024 elements each, 4 per thread per tile]
+        for (uint i = 0; i < 4; i++) {
+            uint flat = gi + i * 256;
+            uint n_local = flat >> 5;
+            uint k_local = flat & 31u;
+            uint gn = row_base + n_local;
+            if (gn < bmq8sw_pc.out_dim) {
+                uint bb = gn * blocks_per_row * 34 + t * 34;
+                q8sw_Bg[k_local * 33 + n_local] = dequant_q8_at(bmq8sw_weight_gate, bb, k_local);
+                q8sw_Bu[k_local * 33 + n_local] = dequant_q8_at(bmq8sw_weight_up,   bb, k_local);
+            } else {
+                q8sw_Bg[k_local * 33 + n_local] = 0.0;
+                q8sw_Bu[k_local * 33 + n_local] = 0.0;
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // Accumulate: each thread computes a 4x2 sub-tile of BOTH gate and up.
+        for (uint k = 0; k < 32; k++) {
+            float a0 = q8sw_A[k * 65 + tm * 4];
+            float a1 = q8sw_A[k * 65 + tm * 4 + 1];
+            float a2 = q8sw_A[k * 65 + tm * 4 + 2];
+            float a3 = q8sw_A[k * 65 + tm * 4 + 3];
+
+            float bg0 = q8sw_Bg[k * 33 + tn * 2];
+            float bg1 = q8sw_Bg[k * 33 + tn * 2 + 1];
+            acc_g[0] += a0 * bg0; acc_g[1] += a0 * bg1;
+            acc_g[2] += a1 * bg0; acc_g[3] += a1 * bg1;
+            acc_g[4] += a2 * bg0; acc_g[5] += a2 * bg1;
+            acc_g[6] += a3 * bg0; acc_g[7] += a3 * bg1;
+
+            float bu0 = q8sw_Bu[k * 33 + tn * 2];
+            float bu1 = q8sw_Bu[k * 33 + tn * 2 + 1];
+            acc_u[0] += a0 * bu0; acc_u[1] += a0 * bu1;
+            acc_u[2] += a1 * bu0; acc_u[3] += a1 * bu1;
+            acc_u[4] += a2 * bu0; acc_u[5] += a2 * bu1;
+            acc_u[6] += a3 * bu0; acc_u[7] += a3 * bu1;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Epilogue: silu(gate) * up, written to [seq, FFN_DIM] output.
+    for (uint r = 0; r < 4; r++) {
+        uint gm = pos_base + tm * 4 + r;
+        if (gm < bmq8sw_pc.seq_len) {
+            for (uint c = 0; c < 2; c++) {
+                uint gn = tile_n * 32 + tn * 2 + c;
+                if (gn < bmq8sw_pc.out_dim) {
+                    float g = acc_g[r * 2 + c];
+                    float u = acc_u[r * 2 + c];
+                    float silu = g / (1.0 + exp(-g));
+                    bmq8sw_output[gm * bmq8sw_pc.out_dim + gn] = silu * u;
                 }
             }
         }
