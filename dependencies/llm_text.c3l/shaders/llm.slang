@@ -1521,6 +1521,115 @@ void batch_matmul_swiglu_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// --- Phase 3: Q8_0 cooperative matrix matmul ---
+// Replaces the inner K-loop of batch_matmul_q8 with subgroup-scope cooperative
+// matrix mma instructions, which map to the GPU's tensor / matrix-cores
+// (RDNA3 WMMA on AMD, Tensor Cores on NVIDIA Ampere+).
+//
+// Each workgroup is one subgroup (64 threads on RDNA3 wave64 — the AMD
+// default for compute shaders) and computes one 16x16 output sub-tile. The
+// simplest possible shape — designed for correctness first, optimization later.
+//
+// Per K-iteration (BK=16):
+//   1. All 64 threads cast a 16-element row of input from F32 to FP16 in shared mem.
+//   2. All 64 threads dequantize one 16-element slice of Q8_0 weight to FP16 in shared mem.
+//   3. coopMatLoad from groupshared into MatA / MatB fragments.
+//   4. coopMatMulAdd into the FP32 accumulator.
+//
+// Two K=16 slices fit in one Q8_0 block (block size = 32). Block-relative
+// position is `block_idx = kc/2`, `half_offset = (kc%2)*16`.
+
+[vk_push_constant] const BatchMatMulParams bmq8cm_pc;
+[vk_binding(0, 0)] RWStructuredBuffer<uint>  bmq8cm_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bmq8cm_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bmq8cm_output;
+
+groupshared float16_t q8cm_A[16 * 16];
+groupshared float16_t q8cm_B[16 * 16];
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void batch_matmul_q8_coopmat(uint3 gid: SV_GroupID, uint3 ltid: SV_GroupThreadID) {
+    uint tiles_n = (bmq8cm_pc.out_dim + 15) / 16;
+    uint tile_m = gid.x / tiles_n;
+    uint tile_n = gid.x % tiles_n;
+    uint pos_base = tile_m * 16;
+    uint row_base = bmq8cm_pc.row_offset + tile_n * 16;
+    uint tid = ltid.x;
+
+    var acc = linalg.CoopMat<float, MemoryScope.Subgroup, 16, 16, linalg.CoopMatMatrixUse.MatrixAccumulator>(0.0);
+
+    uint blocks_per_row = bmq8cm_pc.in_dim / 32;
+    uint k_chunks = bmq8cm_pc.in_dim / 16;
+
+    for (uint kc = 0; kc < k_chunks; kc++) {
+        uint k_base = kc * 16;
+        uint block_idx = kc >> 1;          // which Q8_0 block (32 elements)
+        uint half_offset = (kc & 1u) * 16; // 0 or 16 within the block
+
+        // Load A tile [16 rows × 16 cols], 256 elements / 64 threads = 4 per thread.
+        for (uint i = 0; i < 4; i++) {
+            uint flat = tid + i * 64;
+            uint m_local = flat >> 4;
+            uint k_local = flat & 15u;
+            uint gm = pos_base + m_local;
+            float v = (gm < bmq8cm_pc.seq_len)
+                ? bmq8cm_input[gm * bmq8cm_pc.in_dim + k_base + k_local]
+                : 0.0;
+            q8cm_A[m_local * 16 + k_local] = float16_t(v);
+        }
+
+        // Load B tile [16 K × 16 N], 256 elements / 64 threads = 4 per thread.
+        // B is K-major: q8cm_B[k * 16 + n] is the value at K-row k, N-col n.
+        for (uint i = 0; i < 4; i++) {
+            uint flat = tid + i * 64;
+            uint n_local = flat >> 4;
+            uint k_local = flat & 15u;
+            uint gn = row_base + n_local;
+            float v = 0.0;
+            if (gn < bmq8cm_pc.row_offset + bmq8cm_pc.out_dim) {
+                uint bb = gn * blocks_per_row * 34 + block_idx * 34;
+
+                // Decode F16 scale at byte offset bb (2 bytes)
+                uint scale_uint_idx = bb / 4;
+                uint scale_byte_off = bb % 4;
+                uint scale_word = bmq8cm_weight[scale_uint_idx];
+                uint scale_bits;
+                if (scale_byte_off == 0) {
+                    scale_bits = scale_word & 0xFFFFu;
+                } else if (scale_byte_off == 2) {
+                    scale_bits = (scale_word >> 16) & 0xFFFFu;
+                } else {
+                    uint next_word = bmq8cm_weight[scale_uint_idx + 1];
+                    scale_bits = ((scale_word >> (scale_byte_off * 8)) | (next_word << (32 - scale_byte_off * 8))) & 0xFFFFu;
+                }
+                float scale = unpack_f16(scale_bits);
+
+                // int8 quant value at offset bb + 2 + (half_offset + k_local)
+                int q = sign_extend_i8(read_byte(bmq8cm_weight, bb + 2 + half_offset + k_local));
+                v = scale * float(q);
+            }
+            q8cm_B[k_local * 16 + n_local] = float16_t(v);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // Cooperative matrix mma. NOTE: this currently produces wrong results
+        // on Mesa RADV / RDNA3 because the `groupshared float16_t` writes
+        // above appear not to be visible to coopMatLoad. The dispatch in
+        // dispatch_batch_matmul is gated off (`coopmat_enabled = false`)
+        // until that's resolved.
+        var matA = linalg.coopMatLoad<half, MemoryScope.Subgroup, 16, 16, linalg.CoopMatMatrixUse.MatrixA, linalg.CoopMatMatrixLayout.RowMajor>(q8cm_A, 0, 16);
+        var matB = linalg.coopMatLoad<half, MemoryScope.Subgroup, 16, 16, linalg.CoopMatMatrixUse.MatrixB, linalg.CoopMatMatrixLayout.RowMajor>(q8cm_B, 0, 16);
+        acc = linalg.coopMatMulAdd<float, false>(matA, matB, acc);
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    uint out_base = pos_base * bmq8cm_pc.out_dim + tile_n * 16;
+    acc.Store<linalg.CoopMatMatrixLayout.RowMajor>(bmq8cm_output, out_base, bmq8cm_pc.out_dim);
+}
+
 // --- Q4_0 batch matmul ---
 
 [vk_push_constant] const BatchMatMulParams bmq40_pc;

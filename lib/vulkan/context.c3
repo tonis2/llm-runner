@@ -17,12 +17,17 @@ struct DeviceContext {
     DeviceQueue compute_queue;
     vk::MemoryAllocator allocator;
     Fence compute_fence;
+    bool coopmat_supported; // VK_KHR_cooperative_matrix + fp16x16x16x16->fp32 mode available
 }
 
 fn DeviceContext? createContext() {
     ZStringList extensions;
     ZStringList device_extensions;
     device_extensions.push_all({"VK_KHR_push_descriptor"});
+    // Phase 3: cooperative matrix tensor-core path. Both extensions are
+    // optional — checked at runtime, falls back to the tiled GEMM path if
+    // missing or if the right matrix configuration isn't supported.
+    ZString[2] coopmat_exts = {"VK_KHR_cooperative_matrix", "VK_KHR_shader_float16_int8"};
 
     Instance instance;
     PhysicalDevice physical_device;
@@ -88,9 +93,78 @@ fn DeviceContext? createContext() {
 
     devices.free();
 
+    // Query the driver ID so we can blacklist drivers with broken cooperative
+    // matrix support. Mesa RADV and Mesa ANV both produce wrong results from
+    // OpCooperativeMatrixStoreKHR — see freedesktop Mesa issue #10847 (open as
+    // of 2025), and the ncnn project applies the same blacklist (Tencent/ncnn
+    // PR #5739). The Phase 3 path is gated on this check, so the program runs
+    // the existing tiled GEMM on broken drivers and the coopmat shader
+    // entirely on NVIDIA / fixed Mesa.
+    PhysicalDeviceDriverProperties driverProps = {
+        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+        .pNext = null,
+    };
+    PhysicalDeviceProperties2 props2 = {
+        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &driverProps,
+    };
+    vk::getPhysicalDeviceProperties2(physical_device, &props2);
+    bool driver_blacklisted_for_coopmat =
+        driverProps.driverID == vk::DRIVER_ID_MESA_RADV
+        || driverProps.driverID == vk::DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+
+    // Probe for cooperative matrix support: device must advertise the extension
+    // AND expose a 16x16x16 fp16xfp16->fp32 subgroup-scope configuration.
+    bool coopmat_supported = false;
+    if (driver_blacklisted_for_coopmat) {
+        io::printfn("  cooperative matrix: blacklisted on this driver (Mesa #10847 — wrong results)");
+    } else {
+        ZStringList probe;
+        probe.push_all({"VK_KHR_cooperative_matrix"});
+        bool ext_ok = false;
+        if (try b = physical_device.checkExtensionSupport(probe)) ext_ok = b;
+        probe.free();
+        if (ext_ok) {
+            uint cnt = 0;
+            vk::getPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &cnt, null)!!;
+            if (cnt > 0 && cnt <= 64) {
+                CooperativeMatrixPropertiesKHR[64] props;
+                for (uint i = 0; i < cnt; i++) {
+                    props[i].sType = vk::STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                }
+                vk::getPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &cnt, &props[0])!!;
+                for (uint i = 0; i < cnt; i++) {
+                    if (props[i].mSize == 16 && props[i].nSize == 16 && props[i].kSize == 16
+                        && props[i].aType == vk::COMPONENT_TYPE_FLOAT16_KHR
+                        && props[i].bType == vk::COMPONENT_TYPE_FLOAT16_KHR
+                        && props[i].cType == vk::COMPONENT_TYPE_FLOAT32_KHR
+                        && props[i].resultType == vk::COMPONENT_TYPE_FLOAT32_KHR
+                        && props[i].scope == vk::SCOPE_SUBGROUP_KHR) {
+                        coopmat_supported = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (coopmat_supported) {
+            io::printfn("  cooperative matrix: 16x16x16 fp16->fp32 supported");
+            device_extensions.push_all({coopmat_exts[0], coopmat_exts[1]});
+        } else {
+            io::printfn("  cooperative matrix: not supported (using tiled GEMM fallback)");
+        }
+    }
+
+    // Feature chain (built bottom-up). Coop matrix tail node is conditional.
+    PhysicalDeviceCooperativeMatrixFeaturesKHR coopmatFeatures = {
+        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .pNext = null,
+        .cooperativeMatrix = vk::TRUE,
+        .cooperativeMatrixRobustBufferAccess = 0,
+    };
+
     PhysicalDeviceVulkan13Features vulkan13Features = {
         .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = null,
+        .pNext = coopmat_supported ? (void*)&coopmatFeatures : null,
         .synchronization2 = vk::TRUE,
         .maintenance4 = vk::TRUE,
     };
@@ -111,6 +185,14 @@ fn DeviceContext? createContext() {
     };
 
     vk::getPhysicalDeviceFeatures2(physical_device, &device_features);
+
+    // Force-enable the bits we need for the coopmat path even if the GPU
+    // would have left them disabled.
+    if (coopmat_supported) {
+        vulkan11Features.storageBuffer16BitAccess = vk::TRUE;
+        vulkan12Features.shaderFloat16 = vk::TRUE;
+        coopmatFeatures.cooperativeMatrix = vk::TRUE;
+    }
 
     DeviceQueueCreateInfo computeInfo = vk::deviceQueueCreateInfo()
         .setQueueFamilyIndex(compute_queue.index)
@@ -153,6 +235,7 @@ fn DeviceContext? createContext() {
         .compute_queue = compute_queue,
         .allocator = allocator,
         .compute_fence = compute_fence,
+        .coopmat_supported = coopmat_supported,
     };
 }
 

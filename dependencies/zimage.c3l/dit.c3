@@ -347,7 +347,9 @@ struct DiTKernels
 	llm::ComputeKernel batch_matmul_add_scaled; // F32 LoRA hop 2: output += scale * (B @ scratch)
 	llm::ComputeKernel ffn_swiglu_split; // Phase 1: out[i] = silu(in[i]) * in[ffn_dim + i]
 	llm::ComputeKernel batch_matmul_swiglu_q8; // Phase 2: fused gate+up Q8_0 matmul + SwiGLU
+	llm::ComputeKernel batch_matmul_q8_coopmat; // Phase 3: Q8_0 matmul via cooperative matrix
 	llm::SharedKernels shared;
+	bool coopmat_supported; // mirror of DeviceContext.coopmat_supported for fast access in dispatch_*
 }
 
 // --- DiT Model ---
@@ -468,7 +470,9 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		.batch_matmul_add_scaled = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulAddScaledPC.sizeof, "batch_matmul_add_scaled")!!,
 		.ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC.sizeof, "ffn_swiglu_split")!!,
 		.batch_matmul_swiglu_q8 = llm::create_kernel(ctx, llm_shader, 4, BatchMatMulPC.sizeof, "batch_matmul_swiglu_q8")!!,
+		.batch_matmul_q8_coopmat = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q8_coopmat")!!,
 		.shared = llm::create_shared_kernels(ctx, llm_shader)!!,
+		.coopmat_supported = ctx.coopmat_supported,
 		};
 
 	zi_shader.free(ctx.device);
@@ -1133,6 +1137,24 @@ fn void dispatch_batch_matmul(
 )
 {
 	BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
+
+	// Phase 3 fast path: Q8_0 via cooperative matrix.
+	// On Mesa RADV with the default ACO compiler, fp16 cooperative matrix
+	// produces wrong results (Mesa bug freedesktop #13014, fixed by env
+	// var RADV_DEBUG=llvm). Run with `RADV_DEBUG=llvm c3c run zimage ...`
+	// to enable the LLVM backend path.
+	if (dk.coopmat_supported
+		&& weight.dtype == llm::GGML_Q8_0
+		&& (lora == null || !lora.present)
+		&& (out_dim % 16) == 0
+		&& (in_dim % 16) == 0
+		&& (seq_len % 16) == 0)
+	{
+		uint groups = (seq_len / 16) * (out_dim / 16);
+		g.dispatch(&dk.batch_matmul_q8_coopmat, { weight, input, output }, &pc, groups);
+		return;
+	}
+
 	llm::ComputeKernel* kernel;
 	bool tiled_2d = false;
 	if (weight.dtype == llm::GGML_Q4_K)
@@ -1937,5 +1959,6 @@ fn void DiTModel.free(&self)
 	self.kernels.batch_matmul_add_scaled.free(self.ctx.device);
 	self.kernels.ffn_swiglu_split.free(self.ctx.device);
 	self.kernels.batch_matmul_swiglu_q8.free(self.ctx.device);
+	self.kernels.batch_matmul_q8_coopmat.free(self.ctx.device);
 	self.kernels.shared.free(self.ctx.device);
 }
