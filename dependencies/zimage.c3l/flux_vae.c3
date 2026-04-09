@@ -291,10 +291,10 @@ fn FluxVaeActivations? allocate_flux_vae_activations(llm::DeviceContext* ctx, ui
     };
 }
 
-// --- Forward Pass Helpers ---
+// --- Forward Pass Block Functions (RenderGraph-based) ---
 
-fn void dispatch_flux_conv(
-    CommandBuffer cmd,
+fn void flux_conv_block(
+    llm::RenderGraph* g,
     VaeKernels* k,
     FluxVaeConv* conv,
     llm::Tensor* input,
@@ -318,11 +318,29 @@ fn void dispatch_flux_conv(
         .out_w = out_w,
         .has_bias = 1,
     };
-	dispatch_vae_conv2d(cmd, k, &conv.weight, &conv.bias, input, output, &pc);
+    uint spatial_groups = llm::ceil_div(out_h * out_w, 256);
+    g.dispatch(&k.conv2d,
+        { &conv.weight, &conv.bias, input, output },
+        &pc, spatial_groups, conv.out_c);
 }
 
-fn void dispatch_flux_groupnorm(
-    CommandBuffer cmd,
+fn void flux_conv2d_block(
+    llm::RenderGraph* g,
+    VaeKernels* k,
+    llm::Tensor* weight,
+    llm::Tensor* bias,
+    llm::Tensor* input,
+    llm::Tensor* output,
+    pipelines::Conv2dPC* pc,
+) {
+    uint spatial_groups = llm::ceil_div(pc.out_h * pc.out_w, 256);
+    g.dispatch(&k.conv2d,
+        { weight, bias, input, output },
+        pc, spatial_groups, pc.out_c);
+}
+
+fn void flux_groupnorm_block(
+    llm::RenderGraph* g,
     VaeKernels* k,
     llm::Tensor* weight,
     llm::Tensor* bias,
@@ -337,14 +355,13 @@ fn void dispatch_flux_groupnorm(
         .num_groups = 32,
         .eps = 1e-6f,
     };
-llm::dispatch_kernel(cmd, &k.group_norm,
-        { input.gpu_buffer.buffer, weight.gpu_buffer.buffer, bias.gpu_buffer.buffer, output.gpu_buffer.buffer },
-        { input.size_bytes, weight.size_bytes, bias.size_bytes, output.size_bytes },
+    g.dispatch(&k.group_norm,
+        { input, weight, bias, output },
         &pc, 32);
 }
 
-fn void dispatch_flux_resblock(
-    CommandBuffer cmd,
+fn void flux_resblock_block(
+    llm::RenderGraph* g,
     VaeKernels* k,
     FluxVaeResBlock* rb,
     llm::Tensor* input,     // buf_a - also receives output
@@ -357,44 +374,33 @@ fn void dispatch_flux_resblock(
     uint spatial = h * w;
 
     // GroupNorm1 -> SiLU -> Conv1
-    dispatch_flux_groupnorm(cmd, k, &rb.norm1_weight, &rb.norm1_bias, input, temp, in_c, spatial);
-llm::compute_barrier(cmd);
+    flux_groupnorm_block(g, k, &rb.norm1_weight, &rb.norm1_bias, input, temp, in_c, spatial);
 
     llm::SiluPC silu_pc = { .n = in_c * spatial };
-llm::dispatch_kernel(cmd, &k.shared.silu,
-        { temp.gpu_buffer.buffer },
-        { temp.size_bytes },
-        &silu_pc, llm::ceil_div(in_c * spatial, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.shared.silu, { temp }, &silu_pc, llm::ceil_div(in_c * spatial, 256));
 
     pipelines::Conv2dPC pc1 = {
         .in_c = in_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	dispatch_vae_conv2d(cmd, k, &rb.conv1_weight, &rb.conv1_bias, temp, skip_temp, &pc1);
-llm::compute_barrier(cmd);
+    flux_conv2d_block(g, k, &rb.conv1_weight, &rb.conv1_bias, temp, skip_temp, &pc1);
 
     // GroupNorm2 -> SiLU -> Conv2
-    dispatch_flux_groupnorm(cmd, k, &rb.norm2_weight, &rb.norm2_bias, skip_temp, temp, out_c, spatial);
-llm::compute_barrier(cmd);
+    flux_groupnorm_block(g, k, &rb.norm2_weight, &rb.norm2_bias, skip_temp, temp, out_c, spatial);
 
     llm::SiluPC silu_pc2 = { .n = out_c * spatial };
-llm::dispatch_kernel(cmd, &k.shared.silu,
-        { temp.gpu_buffer.buffer },
-        { temp.size_bytes },
-        &silu_pc2, llm::ceil_div(out_c * spatial, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.shared.silu, { temp }, &silu_pc2, llm::ceil_div(out_c * spatial, 256));
 
     pipelines::Conv2dPC pc2 = {
         .in_c = out_c, .out_c = out_c, .in_h = h, .in_w = w,
         .kH = 3, .kW = 3, .stride = 1, .pad = 1,
         .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
     };
-	dispatch_vae_conv2d(cmd, k, &rb.conv2_weight, &rb.conv2_bias, temp, skip_temp, &pc2);
-llm::compute_barrier(cmd);
+    flux_conv2d_block(g, k, &rb.conv2_weight, &rb.conv2_bias, temp, skip_temp, &pc2);
 
     // Skip connection
+    llm::ResidualPC res_pc = { .n = out_c * spatial };
     if (rb.has_nin_shortcut && rb.nin_shortcut_weight.size_bytes > 0) {
         // 1x1 conv for channel change
         pipelines::Conv2dPC pc_nin = {
@@ -402,33 +408,21 @@ llm::compute_barrier(cmd);
             .kH = 1, .kW = 1, .stride = 1, .pad = 0,
             .groups = 1, .out_h = h, .out_w = w, .has_bias = 1,
         };
-	dispatch_vae_conv2d(cmd, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
-llm::compute_barrier(cmd);
+        flux_conv2d_block(g, k, &rb.nin_shortcut_weight, &rb.nin_shortcut_bias, input, temp, &pc_nin);
         // Residual: skip_temp += temp
-        llm::ResidualPC res_pc = { .n = out_c * spatial };
-llm::dispatch_kernel(cmd, &k.shared.residual_add,
-            { skip_temp.gpu_buffer.buffer, temp.gpu_buffer.buffer },
-            { skip_temp.size_bytes, temp.size_bytes },
-            &res_pc, llm::ceil_div(out_c * spatial, 256));
+        g.dispatch(&k.shared.residual_add, { skip_temp, temp }, &res_pc, llm::ceil_div(out_c * spatial, 256));
     } else {
         // Identity skip: skip_temp += input
-        llm::ResidualPC res_pc = { .n = out_c * spatial };
-llm::dispatch_kernel(cmd, &k.shared.residual_add,
-            { skip_temp.gpu_buffer.buffer, input.gpu_buffer.buffer },
-            { skip_temp.size_bytes, input.size_bytes },
-            &res_pc, llm::ceil_div(out_c * spatial, 256));
+        g.dispatch(&k.shared.residual_add, { skip_temp, input }, &res_pc, llm::ceil_div(out_c * spatial, 256));
     }
-llm::compute_barrier(cmd);
 
-    // Copy result to input buffer
-    vk::cmdCopyBuffer(cmd, skip_temp.gpu_buffer.buffer, input.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)out_c * spatial * 4 }});
-llm::compute_barrier(cmd);
+    // Copy result back to input buffer
+    g.copy(skip_temp, input, (ulong)out_c * spatial * 4);
 }
 
 
-fn void dispatch_flux_attn(
-    CommandBuffer cmd,
+fn void flux_attn_block(
+    llm::RenderGraph* g,
     VaeKernels* k,
     FluxVaeAttn* attn,
     FluxVaeActivations* acts,
@@ -441,14 +435,11 @@ fn void dispatch_flux_attn(
     float scale = 1.0f / math::sqrt((float)head_dim);
 
     // Step 1: Save residual BEFORE GroupNorm (original input)
-    vk::cmdCopyBuffer(cmd, acts.buf_a.gpu_buffer.buffer, acts.attn_temp.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)channels * spatial * 4 }});
-llm::compute_barrier(cmd);
+    g.copy(&acts.buf_a, &acts.attn_temp, (ulong)channels * spatial * 4);
 
     // Step 2: GroupNorm on input [C, S] layout
-    dispatch_flux_groupnorm(cmd, k, &attn.norm_weight, &attn.norm_bias,
+    flux_groupnorm_block(g, k, &attn.norm_weight, &attn.norm_bias,
         &acts.buf_a, &acts.buf_b, channels, spatial);
-llm::compute_barrier(cmd);
 
     // Step 3: Transpose [C, S] -> [S, C]
     TransposeChannelSpatialPC tcs_fwd = {
@@ -456,39 +447,21 @@ llm::compute_barrier(cmd);
         .spatial = spatial,
         .direction = 0,
     };
-    llm::dispatch_kernel(cmd, &k.transpose_channel_spatial,
-        { acts.buf_b.gpu_buffer.buffer, acts.buf_c.gpu_buffer.buffer },
-        { acts.buf_b.size_bytes, acts.buf_c.size_bytes },
+    g.dispatch(&k.transpose_channel_spatial,
+        { &acts.buf_b, &acts.buf_c },
         &tcs_fwd, llm::ceil_div(channels * spatial, 256));
-llm::compute_barrier(cmd);
 
-    // Step 4: Q projection: [S, C] -> [S, C]
+    // Step 4-6: Q/K/V projections: [S, C] -> [S, C]
     VaeLinearProjPC q_pc = { .out_dim = channels, .in_dim = channels, .seq_len = spatial };
-    llm::dispatch_kernel(cmd, &k.linear_proj,
-        { attn.q_weight.gpu_buffer.buffer, attn.q_bias.gpu_buffer.buffer,
-          acts.buf_c.gpu_buffer.buffer, acts.attn_q.gpu_buffer.buffer },
-        { attn.q_weight.size_bytes, attn.q_bias.size_bytes,
-          acts.buf_c.size_bytes, acts.attn_q.size_bytes },
+    g.dispatch(&k.linear_proj,
+        { &attn.q_weight, &attn.q_bias, &acts.buf_c, &acts.attn_q },
         &q_pc, spatial * channels);
-llm::compute_barrier(cmd);
-
-    // Step 5: K projection
-    llm::dispatch_kernel(cmd, &k.linear_proj,
-        { attn.k_weight.gpu_buffer.buffer, attn.k_bias.gpu_buffer.buffer,
-          acts.buf_c.gpu_buffer.buffer, acts.attn_k.gpu_buffer.buffer },
-        { attn.k_weight.size_bytes, attn.k_bias.size_bytes,
-          acts.buf_c.size_bytes, acts.attn_k.size_bytes },
+    g.dispatch(&k.linear_proj,
+        { &attn.k_weight, &attn.k_bias, &acts.buf_c, &acts.attn_k },
         &q_pc, spatial * channels);
-llm::compute_barrier(cmd);
-
-    // Step 6: V projection
-    llm::dispatch_kernel(cmd, &k.linear_proj,
-        { attn.v_weight.gpu_buffer.buffer, attn.v_bias.gpu_buffer.buffer,
-          acts.buf_c.gpu_buffer.buffer, acts.attn_v.gpu_buffer.buffer },
-        { attn.v_weight.size_bytes, attn.v_bias.size_bytes,
-          acts.buf_c.size_bytes, acts.attn_v.size_bytes },
+    g.dispatch(&k.linear_proj,
+        { &attn.v_weight, &attn.v_bias, &acts.buf_c, &acts.attn_v },
         &q_pc, spatial * channels);
-llm::compute_barrier(cmd);
 
     // Step 7: Self-attention (Q/K/V in [S, C] layout, output in [S, C])
     VaeAttentionPC va_pc = {
@@ -498,22 +471,14 @@ llm::compute_barrier(cmd);
         .scale = scale,
         .channels = channels,
     };
-    llm::dispatch_kernel(cmd, &k.vae_attention,
-        { acts.attn_q.gpu_buffer.buffer, acts.attn_k.gpu_buffer.buffer,
-          acts.attn_v.gpu_buffer.buffer, acts.attn_out.gpu_buffer.buffer },
-        { acts.attn_q.size_bytes, acts.attn_k.size_bytes,
-          acts.attn_v.size_bytes, acts.attn_out.size_bytes },
+    g.dispatch(&k.vae_attention,
+        { &acts.attn_q, &acts.attn_k, &acts.attn_v, &acts.attn_out },
         &va_pc, n_heads * spatial);
-llm::compute_barrier(cmd);
 
     // Step 8: proj_out projection: [S, C] -> [S, C]
-    llm::dispatch_kernel(cmd, &k.linear_proj,
-        { attn.proj_out_weight.gpu_buffer.buffer, attn.proj_out_bias.gpu_buffer.buffer,
-          acts.attn_out.gpu_buffer.buffer, acts.buf_c.gpu_buffer.buffer },
-        { attn.proj_out_weight.size_bytes, attn.proj_out_bias.size_bytes,
-          acts.attn_out.size_bytes, acts.buf_c.size_bytes },
+    g.dispatch(&k.linear_proj,
+        { &attn.proj_out_weight, &attn.proj_out_bias, &acts.attn_out, &acts.buf_c },
         &q_pc, spatial * channels);
-llm::compute_barrier(cmd);
 
     // Step 9: Transpose [S, C] -> [C, S]
     TransposeChannelSpatialPC tcs_rev = {
@@ -521,19 +486,15 @@ llm::compute_barrier(cmd);
         .spatial = spatial,
         .direction = 1,
     };
-    llm::dispatch_kernel(cmd, &k.transpose_channel_spatial,
-        { acts.buf_c.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer },
-        { acts.buf_c.size_bytes, acts.buf_a.size_bytes },
+    g.dispatch(&k.transpose_channel_spatial,
+        { &acts.buf_c, &acts.buf_a },
         &tcs_rev, llm::ceil_div(channels * spatial, 256));
-llm::compute_barrier(cmd);
 
     // Step 10: Residual add: buf_a += attn_temp (original input, both [C,S])
     llm::ResidualPC res_pc = { .n = channels * spatial };
-    llm::dispatch_kernel(cmd, &k.shared.residual_add,
-        { acts.buf_a.gpu_buffer.buffer, acts.attn_temp.gpu_buffer.buffer },
-        { acts.buf_a.size_bytes, acts.attn_temp.size_bytes },
+    g.dispatch(&k.shared.residual_add,
+        { &acts.buf_a, &acts.attn_temp },
         &res_pc, llm::ceil_div(channels * spatial, 256));
-llm::compute_barrier(cmd);
 }
 
 
@@ -543,124 +504,89 @@ llm::compute_barrier(cmd);
 // Output: image [3, 8h, 8w] in acts.buf_a
 
 fn void? FluxVaeDecoder.forward(&self, FluxVaeActivations* acts, uint lat_h, uint lat_w) {
-    llm::DeviceContext* ctx = self.ctx;
-    CommandBuffer cmd = ctx.command_buffer;
     VaeKernels* k = self.kernels;
 
     uint h = lat_h;
     uint w = lat_w;
 
-llm::begin_compute(cmd)!!;
+    llm::RenderGraph g;
+    g.init(self.ctx)!!;
 
     // conv_in: [16, h, w] -> [512, h, w]
-    dispatch_flux_conv(cmd, k, &self.conv_in, &acts.buf_a, &acts.buf_b, h, w, 1, 1);
-llm::compute_barrier(cmd);
-    vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)512 * h * w * 4 }});
-llm::compute_barrier(cmd);
+    flux_conv_block(&g, k, &self.conv_in, &acts.buf_a, &acts.buf_b, h, w, 1, 1);
+    g.copy(&acts.buf_b, &acts.buf_a, (ulong)512 * h * w * 4);
 
     // Mid block
-    dispatch_flux_resblock(cmd, k, &self.mid_block1, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
-    dispatch_flux_attn(cmd, k, &self.mid_attn, acts, h, w);
-    dispatch_flux_resblock(cmd, k, &self.mid_block2, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+    flux_resblock_block(&g, k, &self.mid_block1, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+    flux_attn_block(&g, k, &self.mid_attn, acts, h, w);
+    flux_resblock_block(&g, k, &self.mid_block2, &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
 
-llm::submit_and_wait(ctx)!!;
-llm::begin_compute(cmd)!!;
+    g.checkpoint()!!;
 
     // up.3: 3 resblocks at 512 + upsample (h -> 2h)
     for (uint i = 0; i < 3; i++) {
-        dispatch_flux_resblock(cmd, k, &self.up3_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
-        llm::submit_and_wait(ctx)!!;
-        llm::begin_compute(cmd)!!;
+        flux_resblock_block(&g, k, &self.up3_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        g.checkpoint()!!;
     }
     // Upsample 2x
     pipelines::UpsamplePC up_pc = { .channels = 512, .in_h = h, .in_w = w };
-llm::dispatch_kernel(cmd, &k.upsample_nearest,
-        { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
-        { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, llm::ceil_div(512 * h * w * 4, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.upsample_nearest, { &acts.buf_a, &acts.buf_b }, &up_pc,
+        llm::ceil_div(512 * h * w * 4, 256));
     h *= 2; w *= 2;
-    dispatch_flux_conv(cmd, k, &self.up3_upsample, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-llm::compute_barrier(cmd);
+    flux_conv_block(&g, k, &self.up3_upsample, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
 
-llm::submit_and_wait(ctx)!!;
-llm::begin_compute(cmd)!!;
+    g.checkpoint()!!;
 
     // up.2: 3 resblocks at 512 + upsample
     for (uint i = 0; i < 3; i++) {
-        dispatch_flux_resblock(cmd, k, &self.up2_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
-        llm::submit_and_wait(ctx)!!;
-        llm::begin_compute(cmd)!!;
+        flux_resblock_block(&g, k, &self.up2_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        g.checkpoint()!!;
     }
     up_pc = { .channels = 512, .in_h = h, .in_w = w };
-llm::dispatch_kernel(cmd, &k.upsample_nearest,
-        { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
-        { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, llm::ceil_div(512 * h * w * 4, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.upsample_nearest, { &acts.buf_a, &acts.buf_b }, &up_pc,
+        llm::ceil_div(512 * h * w * 4, 256));
     h *= 2; w *= 2;
-    dispatch_flux_conv(cmd, k, &self.up2_upsample, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-llm::compute_barrier(cmd);
+    flux_conv_block(&g, k, &self.up2_upsample, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
 
-llm::submit_and_wait(ctx)!!;
-llm::begin_compute(cmd)!!;
+    g.checkpoint()!!;
 
     // up.1: 3 resblocks 512->256 + upsample
     for (uint i = 0; i < 3; i++) {
-        dispatch_flux_resblock(cmd, k, &self.up1_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
-        llm::submit_and_wait(ctx)!!;
-        llm::begin_compute(cmd)!!;
+        flux_resblock_block(&g, k, &self.up1_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        g.checkpoint()!!;
     }
     up_pc = { .channels = 256, .in_h = h, .in_w = w };
-llm::dispatch_kernel(cmd, &k.upsample_nearest,
-        { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
-        { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &up_pc, llm::ceil_div(256 * h * w * 4, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.upsample_nearest, { &acts.buf_a, &acts.buf_b }, &up_pc,
+        llm::ceil_div(256 * h * w * 4, 256));
     h *= 2; w *= 2;
-    dispatch_flux_conv(cmd, k, &self.up1_upsample, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-llm::compute_barrier(cmd);
+    flux_conv_block(&g, k, &self.up1_upsample, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
 
-llm::submit_and_wait(ctx)!!;
-llm::begin_compute(cmd)!!;
+    g.checkpoint()!!;
 
     // up.0: 3 resblocks 256->128 (no upsample)
     for (uint i = 0; i < 3; i++) {
-        dispatch_flux_resblock(cmd, k, &self.up0_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
-        llm::submit_and_wait(ctx)!!;
-        llm::begin_compute(cmd)!!;
+        flux_resblock_block(&g, k, &self.up0_blocks[i], &acts.buf_a, &acts.buf_b, &acts.buf_c, h, w);
+        g.checkpoint()!!;
     }
 
     // Final: GroupNorm -> SiLU -> conv_out
-    dispatch_flux_groupnorm(cmd, k, &self.norm_out_weight, &self.norm_out_bias,
+    flux_groupnorm_block(&g, k, &self.norm_out_weight, &self.norm_out_bias,
         &acts.buf_a, &acts.buf_b, 128, h * w);
-llm::compute_barrier(cmd);
 
     llm::SiluPC silu_pc = { .n = 128 * h * w };
-llm::dispatch_kernel(cmd, &k.shared.silu,
-        { acts.buf_b.gpu_buffer.buffer },
-        { acts.buf_b.size_bytes },
-        &silu_pc, llm::ceil_div(128 * h * w, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.shared.silu, { &acts.buf_b }, &silu_pc, llm::ceil_div(128 * h * w, 256));
 
-    dispatch_flux_conv(cmd, k, &self.conv_out, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
-llm::compute_barrier(cmd);
+    flux_conv_block(&g, k, &self.conv_out, &acts.buf_b, &acts.buf_a, h, w, 1, 1);
 
     // Denormalize from [-1,1] to [0,1]: output = clamp(input * 0.5 + 0.5, 0, 1)
     pipelines::ScaleShiftPC ss_pc = { .n = 3 * h * w, .scale = 0.5f, .shift = 0.5f };
-llm::dispatch_kernel(cmd, &k.scale_shift_clamp,
-        { acts.buf_a.gpu_buffer.buffer, acts.buf_b.gpu_buffer.buffer },
-        { acts.buf_a.size_bytes, acts.buf_b.size_bytes },
-        &ss_pc, llm::ceil_div(3 * h * w, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.scale_shift_clamp, { &acts.buf_a, &acts.buf_b }, &ss_pc,
+        llm::ceil_div(3 * h * w, 256));
 
     // Copy result back to buf_a
-    vk::cmdCopyBuffer(cmd, acts.buf_b.gpu_buffer.buffer, acts.buf_a.gpu_buffer.buffer, 1,
-        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)3 * h * w * 4 }});
-llm::compute_barrier(cmd);
+    g.copy(&acts.buf_b, &acts.buf_a, (ulong)3 * h * w * 4);
 
-llm::submit_and_wait(ctx)!!;
+    g.flush()!!;
     // Image [3, h, w] is in buf_a
 }
 

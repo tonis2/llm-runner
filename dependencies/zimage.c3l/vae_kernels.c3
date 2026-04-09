@@ -86,22 +86,3 @@ fn void VaeKernels.free(&self, vk::Device device) {
     self.transpose_channel_spatial.free(device);
     self.shared.free(device);
 }
-
-// --- VAE dispatch_conv2d ---
-// VAE weights are always F32, so no Q8 variant needed.
-
-fn void dispatch_vae_conv2d(
-    vk::CommandBuffer cmd,
-    VaeKernels* k,
-    llm::Tensor* weight,
-    llm::Tensor* bias,
-    llm::Tensor* input,
-    llm::Tensor* output,
-    pipelines::Conv2dPC* pc
-) {
-    uint spatial_groups = llm::ceil_div(pc.out_h * pc.out_w, 256);
-    llm::dispatch_kernel(cmd, &k.conv2d,
-        { weight.gpu_buffer.buffer, bias.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
-        { weight.size_bytes, bias.size_bytes, input.size_bytes, output.size_bytes },
-        pc, spatial_groups, pc.out_c);
-}

@@ -69,7 +69,7 @@ fn uint ceil_div(uint a, uint b) {
 }
 
 fn void dispatch_matmul(
-    CommandBuffer cmd,
+    RenderGraph* g,
     SharedKernels* k,
     Tensor* weight,
     Tensor* input,
@@ -92,8 +92,5 @@ fn void dispatch_matmul(
     } else {
         kernel = &k.matmul;
     }
-    dispatch_kernel(cmd, kernel,
-        { weight.gpu_buffer.buffer, input.gpu_buffer.buffer, output.gpu_buffer.buffer },
-        { weight.size_bytes, input.size_bytes, output.size_bytes },
-        &pc, out_dim);
+    g.dispatch(kernel, { weight, input, output }, &pc, out_dim);
 }

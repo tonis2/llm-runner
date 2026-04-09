@@ -247,68 +247,61 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     // Project text through cap_embedder + context_refiner
     llm::Tensor cond_projected = llm::create_f32_tensor(ctx, { (ulong)cond_padded_text * DIT_DIM, 0, 0, 0 }, 1)!!;
     llm::Tensor norm_scratch = llm::create_f32_tensor(ctx, { (ulong)text_config.dim, 0, 0, 0 }, 1)!!;
-    vk::CommandBuffer cmd = ctx.command_buffer;
 
-    llm::begin_compute(cmd)!!;
+    llm::RenderGraph g;
+    g.init(ctx)!!;
     for (uint pos = 0; pos < cond_text_len; pos++) {
         usz in_off = (usz)pos * text_config.dim * 4;
-        vk::cmdCopyBuffer(cmd, cond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
+        if (g.needs_barrier) llm::compute_barrier(g.cmd);
+        vk::cmdCopyBuffer(g.cmd, cond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
             (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
-        llm::compute_barrier(cmd);
+        g.needs_barrier = true;
         RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
-        llm::dispatch_kernel(cmd, &dit.kernels.shared.rmsnorm,
-            { norm_scratch.gpu_buffer.buffer, dit.weights.cap_emb_norm.gpu_buffer.buffer,
-              norm_scratch.gpu_buffer.buffer },
-            { norm_scratch.size_bytes, dit.weights.cap_emb_norm.size_bytes,
-              norm_scratch.size_bytes },
+        g.dispatch(&dit.kernels.shared.rmsnorm,
+            { &norm_scratch, &dit.weights.cap_emb_norm, &norm_scratch },
             &rms_pc, 1);
-        llm::compute_barrier(cmd);
-        vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, cond_embeddings.gpu_buffer.buffer, 1,
+        if (g.needs_barrier) llm::compute_barrier(g.cmd);
+        vk::cmdCopyBuffer(g.cmd, norm_scratch.gpu_buffer.buffer, cond_embeddings.gpu_buffer.buffer, 1,
             (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
-        llm::compute_barrier(cmd);
+        g.needs_barrier = true;
     }
     LinearProjPC cap_pc = { .out_dim = DIT_DIM, .in_dim = text_config.dim, .seq_len = cond_text_len };
-    llm::dispatch_kernel(cmd, &dit.kernels.linear_proj,
-        { dit.weights.cap_emb_weight.gpu_buffer.buffer, dit.weights.cap_emb_bias.gpu_buffer.buffer,
-          cond_embeddings.gpu_buffer.buffer, cond_projected.gpu_buffer.buffer },
-        { dit.weights.cap_emb_weight.size_bytes, dit.weights.cap_emb_bias.size_bytes,
-          cond_embeddings.size_bytes, cond_projected.size_bytes },
+    g.dispatch(&dit.kernels.linear_proj,
+        { &dit.weights.cap_emb_weight, &dit.weights.cap_emb_bias, &cond_embeddings, &cond_projected },
         &cap_pc, cond_text_len * DIT_DIM);
-    llm::compute_barrier(cmd);
     if (cond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
+        if (g.needs_barrier) llm::compute_barrier(g.cmd);
         for (uint p = 0; p < cond_n_text_pad; p++) {
-            vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
+            vk::cmdCopyBuffer(g.cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
                 cond_projected.gpu_buffer.buffer, 1,
                 (vk::BufferCopy[]){{ .srcOffset = 0,
                     .dstOffset = (ulong)(cond_text_len + p) * DIT_DIM * 4,
                     .size = (ulong)DIT_DIM * 4 }});
         }
-        llm::compute_barrier(cmd);
+        g.needs_barrier = true;
     }
-    llm::submit_and_wait(ctx)!!;
+    g.checkpoint()!!;
     cond_embeddings.free();
 
     // Context refiner: 2 plain transformer layers (no adaLN) on text embeddings
     dit.rope_cos_context = cond_rope_cos_ctx;
     dit.rope_sin_context = cond_rope_sin_ctx;
-    llm::begin_compute(cmd)!!;
     if (dit.weights.streaming) {
         for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
             DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
-            dit_transformer_layer(dit, cmd, &lw, &cond_projected, cond_padded_text, false,
+            dit_transformer_layer(dit, &g, &lw, &cond_projected, cond_padded_text, false,
                 &dit.rope_cos_context, &dit.rope_sin_context)!!;
-            llm::submit_and_wait(ctx)!!;
+            g.checkpoint()!!;
             lw.free();
-            llm::begin_compute(cmd)!!;
         }
     } else {
         for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-            dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+            dit_transformer_layer(dit, &g, &dit.weights.context_refiner[l],
                 &cond_projected, cond_padded_text, false,
                 &dit.rope_cos_context, &dit.rope_sin_context)!!;
         }
     }
-    llm::submit_and_wait(ctx)!!;
+    g.flush()!!;
     io::printfn("  Context refiner complete (padded=%d).", cond_padded_text);
 
     // Process unconditioned text for CFG
@@ -316,68 +309,60 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     if (use_cfg) {
         uncond_projected = llm::create_f32_tensor(ctx, { (ulong)uncond_padded_text * DIT_DIM, 0, 0, 0 }, 1)!!;
 
-        llm::begin_compute(cmd)!!;
+        g.init(ctx)!!;
         for (uint pos = 0; pos < uncond_text_len; pos++) {
             usz in_off = (usz)pos * text_config.dim * 4;
-            vk::cmdCopyBuffer(cmd, uncond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, uncond_embeddings.gpu_buffer.buffer, norm_scratch.gpu_buffer.buffer, 1,
                 (vk::BufferCopy[]){{ .srcOffset = in_off, .dstOffset = 0, .size = (ulong)text_config.dim * 4 }});
-            llm::compute_barrier(cmd);
+            g.needs_barrier = true;
             RMSNormPC rms_pc = { .dim = text_config.dim, .eps = 1e-6f };
-            llm::dispatch_kernel(cmd, &dit.kernels.shared.rmsnorm,
-                { norm_scratch.gpu_buffer.buffer, dit.weights.cap_emb_norm.gpu_buffer.buffer,
-                  norm_scratch.gpu_buffer.buffer },
-                { norm_scratch.size_bytes, dit.weights.cap_emb_norm.size_bytes,
-                  norm_scratch.size_bytes },
+            g.dispatch(&dit.kernels.shared.rmsnorm,
+                { &norm_scratch, &dit.weights.cap_emb_norm, &norm_scratch },
                 &rms_pc, 1);
-            llm::compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, norm_scratch.gpu_buffer.buffer, uncond_embeddings.gpu_buffer.buffer, 1,
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, norm_scratch.gpu_buffer.buffer, uncond_embeddings.gpu_buffer.buffer, 1,
                 (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = in_off, .size = (ulong)text_config.dim * 4 }});
-            llm::compute_barrier(cmd);
+            g.needs_barrier = true;
         }
         LinearProjPC uncond_cap_pc = { .out_dim = DIT_DIM, .in_dim = text_config.dim, .seq_len = uncond_text_len };
-        llm::dispatch_kernel(cmd, &dit.kernels.linear_proj,
-            { dit.weights.cap_emb_weight.gpu_buffer.buffer, dit.weights.cap_emb_bias.gpu_buffer.buffer,
-              uncond_embeddings.gpu_buffer.buffer, uncond_projected.gpu_buffer.buffer },
-            { dit.weights.cap_emb_weight.size_bytes, dit.weights.cap_emb_bias.size_bytes,
-              uncond_embeddings.size_bytes, uncond_projected.size_bytes },
+        g.dispatch(&dit.kernels.linear_proj,
+            { &dit.weights.cap_emb_weight, &dit.weights.cap_emb_bias, &uncond_embeddings, &uncond_projected },
             &uncond_cap_pc, uncond_text_len * DIT_DIM);
-        llm::compute_barrier(cmd);
         if (uncond_n_text_pad > 0 && dit.weights.cap_pad_token.size_bytes > 0) {
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
             for (uint p = 0; p < uncond_n_text_pad; p++) {
-                vk::cmdCopyBuffer(cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
+                vk::cmdCopyBuffer(g.cmd, dit.weights.cap_pad_token.gpu_buffer.buffer,
                     uncond_projected.gpu_buffer.buffer, 1,
                     (vk::BufferCopy[]){{ .srcOffset = 0,
                         .dstOffset = (ulong)(uncond_text_len + p) * DIT_DIM * 4,
                         .size = (ulong)DIT_DIM * 4 }});
             }
-            llm::compute_barrier(cmd);
+            g.needs_barrier = true;
         }
-        llm::submit_and_wait(ctx)!!;
+        g.checkpoint()!!;
         uncond_embeddings.free();
 
         // Context refiner on uncond text
         dit.rope_cos_context = uncond_rope_cos_ctx;
         dit.rope_sin_context = uncond_rope_sin_ctx;
-        llm::begin_compute(cmd)!!;
         if (dit.weights.streaming) {
             for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
                 DiTLayerWeights lw = upload_dit_layer(ctx, &(*dit.weights.cpu_context_refiner)[l]);
-                dit_transformer_layer(dit, cmd, &lw,
+                dit_transformer_layer(dit, &g, &lw,
                     &uncond_projected, uncond_padded_text, false,
                     &dit.rope_cos_context, &dit.rope_sin_context)!!;
-                llm::submit_and_wait(ctx)!!;
+                g.checkpoint()!!;
                 lw.free();
-                llm::begin_compute(cmd)!!;
             }
-            llm::submit_and_wait(ctx)!!;
         } else {
             for (uint l = 0; l < DIT_NUM_REFINER_LAYERS; l++) {
-                dit_transformer_layer(dit, cmd, &dit.weights.context_refiner[l],
+                dit_transformer_layer(dit, &g, &dit.weights.context_refiner[l],
                     &uncond_projected, uncond_padded_text, false,
                     &dit.rope_cos_context, &dit.rope_sin_context)!!;
             }
-            llm::submit_and_wait(ctx)!!;
         }
+        g.flush()!!;
         io::printfn("  Uncond context refiner complete (padded=%d).", uncond_padded_text);
     }
     norm_scratch.free();
@@ -546,13 +531,13 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         }
 
         // Euler step
-        llm::begin_compute(cmd)!!;
+        llm::RenderGraph euler_g;
+        euler_g.init(ctx)!!;
         FlowEulerPC euler_pc = { .n = latent_elems, .dt = dt };
-        llm::dispatch_kernel(cmd, &dit.kernels.flow_euler_step,
-            { dit.acts.latent.gpu_buffer.buffer, dit.acts.velocity.gpu_buffer.buffer },
-            { dit.acts.latent.size_bytes, dit.acts.velocity.size_bytes },
+        euler_g.dispatch(&dit.kernels.flow_euler_step,
+            { &dit.acts.latent, &dit.acts.velocity },
             &euler_pc, llm::ceil_div(latent_elems, 256));
-        llm::submit_and_wait(ctx)!!;
+        euler_g.flush()!!;
 
     }
 

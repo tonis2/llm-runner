@@ -381,8 +381,8 @@ fn LlmModel? load_llm_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::Mod
 }
 
 // Process a single transformer layer. Reads/writes acts.hidden.
-// Must be called within a begin_compute/submit_and_wait block.
-fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint layer, uint position) {
+// Appends ops to the provided RenderGraph; the caller owns the submission frame.
+fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, uint layer, uint position) {
     llm::ModelConfig* c = &self.config;
     LlmActivations* a = &self.acts;
     KVCache* kv = &self.kv;
@@ -392,88 +392,79 @@ fn void? LlmModel.forward_layer(&self, CommandBuffer cmd, LayerWeights* lw, uint
     // Norm(hidden, attn_norm) -> norm_out
     if (c.norm_type == RMSNORM) {
         llm::RMSNormPC rms_pc = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.rmsnorm,
-            { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, lw.attn_norm.size_bytes, a.norm_out.size_bytes },
-            &rms_pc, 1);
+        g.dispatch(&sk.rmsnorm, { &a.hidden, &lw.attn_norm, &a.norm_out }, &rms_pc, 1);
     } else {
         llm::LayerNormPC ln_pc = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.layernorm,
-            { a.hidden.gpu_buffer.buffer, lw.attn_norm.gpu_buffer.buffer, lw.attn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, lw.attn_norm.size_bytes, lw.attn_norm_bias.size_bytes, a.norm_out.size_bytes },
+        g.dispatch(&sk.layernorm,
+            { &a.hidden, &lw.attn_norm, &lw.attn_norm_bias, &a.norm_out },
             &ln_pc, 1);
     }
-llm::compute_barrier(cmd);
 
     // Q/K/V projections
     // Q output = n_heads * head_dim (may differ from dim, e.g. Qwen3: dim=2560 but Q=32*128=4096)
     uint q_dim = c.n_heads * c.head_dim;
     uint kv_dim = c.n_kv_heads * c.head_dim;
-llm::dispatch_matmul(cmd, sk, &lw.wq, &a.norm_out, &a.q, q_dim, c.dim);
-llm::dispatch_matmul(cmd, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
-llm::dispatch_matmul(cmd, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
-llm::compute_barrier(cmd);
+    llm::dispatch_matmul(g, sk, &lw.wq, &a.norm_out, &a.q, q_dim, c.dim);
+    llm::dispatch_matmul(g, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
+    llm::dispatch_matmul(g, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
 
     // Q/K norm (per-head RMSNorm, e.g. Qwen3)
     if (lw.wq_norm.size_bytes > 0) {
         for (uint h = 0; h < c.n_heads; h++) {
             usz h_off = (usz)h * c.head_dim * 4;
-            vk::cmdCopyBuffer(cmd, a.q.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
+            // Per-head copy reads from a non-zero offset, so call cmdCopyBuffer directly.
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, a.q.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
-llm::compute_barrier(cmd);
+            g.needs_barrier = true;
             llm::RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.wq_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
-                { (usz)c.head_dim * 4, lw.wq_norm.size_bytes, (usz)c.head_dim * 4 },
+            g.dispatch(&sk.rmsnorm,
+                { &a.norm_out, &lw.wq_norm, &a.ffn_down_out },
                 &qn_pc, 1);
-llm::compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, a.ffn_down_out.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
-llm::compute_barrier(cmd);
+            g.needs_barrier = true;
         }
         for (uint h = 0; h < c.n_kv_heads; h++) {
             usz h_off = (usz)h * c.head_dim * 4;
-            vk::cmdCopyBuffer(cmd, a.k.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, a.k.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
-llm::compute_barrier(cmd);
+            g.needs_barrier = true;
             llm::RMSNormPC kn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.rmsnorm,
-                { a.norm_out.gpu_buffer.buffer, lw.wk_norm.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
-                { (usz)c.head_dim * 4, lw.wk_norm.size_bytes, (usz)c.head_dim * 4 },
+            g.dispatch(&sk.rmsnorm,
+                { &a.norm_out, &lw.wk_norm, &a.ffn_down_out },
                 &kn_pc, 1);
-llm::compute_barrier(cmd);
-            vk::cmdCopyBuffer(cmd, a.ffn_down_out.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, a.ffn_down_out.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
-llm::compute_barrier(cmd);
+            g.needs_barrier = true;
         }
     }
 
-    // RoPE on Q and K
+    // RoPE on Q and K (independent — no inter-dispatch barrier required)
     RoPEPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .position = position, .theta = c.rope_theta };
-llm::dispatch_kernel(cmd, &k.rope,
-        { a.q.gpu_buffer.buffer },
-        { a.q.size_bytes },
-        &rope_q_pc, llm::ceil_div(c.n_heads * (c.head_dim / 2), 128));
+    g.dispatch(&k.rope, { &a.q }, &rope_q_pc,
+        llm::ceil_div(c.n_heads * (c.head_dim / 2), 128));
 
     RoPEPC rope_k_pc = { .dim = c.head_dim, .n_heads = c.n_kv_heads, .position = position, .theta = c.rope_theta };
-llm::dispatch_kernel(cmd, &k.rope,
-        { a.k.gpu_buffer.buffer },
-        { a.k.size_bytes },
-        &rope_k_pc, llm::ceil_div(c.n_kv_heads * (c.head_dim / 2), 128));
-llm::compute_barrier(cmd);
+    g.dispatch(&k.rope, { &a.k }, &rope_k_pc,
+        llm::ceil_div(c.n_kv_heads * (c.head_dim / 2), 128));
 
     // Copy K, V into KV cache at position
+    if (g.needs_barrier) llm::compute_barrier(g.cmd);
     usz kv_head_bytes = (usz)c.head_dim * 4;
     for (uint h = 0; h < c.n_kv_heads; h++) {
         usz src_offset = h * kv_head_bytes;
         usz dst_offset = (usz)h * self.max_seq_len * kv_head_bytes + (usz)position * kv_head_bytes;
 
-        vk::cmdCopyBuffer(cmd, a.k.gpu_buffer.buffer, kv.k_cache[layer].gpu_buffer.buffer, 1,
+        vk::cmdCopyBuffer(g.cmd, a.k.gpu_buffer.buffer, kv.k_cache[layer].gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = kv_head_bytes }});
-        vk::cmdCopyBuffer(cmd, a.v.gpu_buffer.buffer, kv.v_cache[layer].gpu_buffer.buffer, 1,
+        vk::cmdCopyBuffer(g.cmd, a.v.gpu_buffer.buffer, kv.v_cache[layer].gpu_buffer.buffer, 1,
             (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = kv_head_bytes }});
     }
-llm::compute_barrier(cmd);
+    g.needs_barrier = true;
 
     // Attention
     uint seq_len = position + 1;
@@ -485,93 +476,59 @@ llm::compute_barrier(cmd);
         .scale = 1.0f / std::math::sqrt((float)c.head_dim),
         .max_seq_len = self.max_seq_len,
     };
-llm::dispatch_kernel(cmd, &k.attention,
-        { a.q.gpu_buffer.buffer, kv.k_cache[layer].gpu_buffer.buffer, kv.v_cache[layer].gpu_buffer.buffer,
-          a.attn_scores.gpu_buffer.buffer, a.attn_out.gpu_buffer.buffer },
-        { a.q.size_bytes, kv.k_cache[layer].size_bytes, kv.v_cache[layer].size_bytes,
-          a.attn_scores.size_bytes, a.attn_out.size_bytes },
+    g.dispatch(&k.attention,
+        { &a.q, &kv.k_cache[layer], &kv.v_cache[layer], &a.attn_scores, &a.attn_out },
         &attn_pc, c.n_heads);
-llm::compute_barrier(cmd);
 
     // Output projection: attn_out [q_dim] -> norm_out [dim]
-llm::dispatch_matmul(cmd, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, q_dim);
-llm::compute_barrier(cmd);
+    llm::dispatch_matmul(g, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, q_dim);
 
     // Residual add: hidden += attn_output
     llm::ResidualPC res_pc = { .n = c.dim };
-llm::dispatch_kernel(cmd, &sk.residual_add,
-        { a.hidden.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-        { a.hidden.size_bytes, a.norm_out.size_bytes },
-        &res_pc, llm::ceil_div(c.dim, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&sk.residual_add, { &a.hidden, &a.norm_out }, &res_pc, llm::ceil_div(c.dim, 256));
 
     // Norm for FFN
     if (c.norm_type == RMSNORM) {
         llm::RMSNormPC rms_pc2 = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.rmsnorm,
-            { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, lw.ffn_norm.size_bytes, a.norm_out.size_bytes },
-            &rms_pc2, 1);
+        g.dispatch(&sk.rmsnorm, { &a.hidden, &lw.ffn_norm, &a.norm_out }, &rms_pc2, 1);
     } else {
         llm::LayerNormPC ln_pc2 = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.layernorm,
-            { a.hidden.gpu_buffer.buffer, lw.ffn_norm.gpu_buffer.buffer, lw.ffn_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, lw.ffn_norm.size_bytes, lw.ffn_norm_bias.size_bytes, a.norm_out.size_bytes },
+        g.dispatch(&sk.layernorm,
+            { &a.hidden, &lw.ffn_norm, &lw.ffn_norm_bias, &a.norm_out },
             &ln_pc2, 1);
     }
-llm::compute_barrier(cmd);
 
     // FFN
     if (c.ffn_type == SWIGLU) {
-llm::dispatch_matmul(cmd, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
-llm::dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
-llm::compute_barrier(cmd);
+        llm::dispatch_matmul(g, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
+        llm::dispatch_matmul(g, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
 
         llm::SiluPC silu_pc = { .n = c.ffn_dim };
-llm::dispatch_kernel(cmd, &sk.silu,
-            { a.ffn_gate_out.gpu_buffer.buffer },
-            { a.ffn_gate_out.size_bytes },
-            &silu_pc, llm::ceil_div(c.ffn_dim, 256));
-llm::compute_barrier(cmd);
+        g.dispatch(&sk.silu, { &a.ffn_gate_out }, &silu_pc, llm::ceil_div(c.ffn_dim, 256));
 
         llm::ElemwisePC emul_pc = { .n = c.ffn_dim };
-llm::dispatch_kernel(cmd, &sk.elemwise_mul,
-            { a.ffn_gate_out.gpu_buffer.buffer, a.ffn_up_out.gpu_buffer.buffer },
-            { a.ffn_gate_out.size_bytes, a.ffn_up_out.size_bytes },
+        g.dispatch(&sk.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out },
             &emul_pc, llm::ceil_div(c.ffn_dim, 256));
-llm::compute_barrier(cmd);
 
-llm::dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+        llm::dispatch_matmul(g, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
     } else {
-llm::dispatch_matmul(cmd, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
-llm::compute_barrier(cmd);
+        llm::dispatch_matmul(g, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
 
         llm::GeluPC gelu_pc = { .n = c.ffn_dim };
-llm::dispatch_kernel(cmd, &sk.gelu,
-            { a.ffn_up_out.gpu_buffer.buffer },
-            { a.ffn_up_out.size_bytes },
-            &gelu_pc, llm::ceil_div(c.ffn_dim, 256));
-llm::compute_barrier(cmd);
+        g.dispatch(&sk.gelu, { &a.ffn_up_out }, &gelu_pc, llm::ceil_div(c.ffn_dim, 256));
 
-llm::dispatch_matmul(cmd, sk, &lw.ffn_down, &a.ffn_up_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+        llm::dispatch_matmul(g, sk, &lw.ffn_down, &a.ffn_up_out, &a.ffn_down_out, c.dim, c.ffn_dim);
     }
-llm::compute_barrier(cmd);
 
     // Residual add: hidden += ffn_down_out
-llm::dispatch_kernel(cmd, &sk.residual_add,
-        { a.hidden.gpu_buffer.buffer, a.ffn_down_out.gpu_buffer.buffer },
-        { a.hidden.size_bytes, a.ffn_down_out.size_bytes },
-        &res_pc, llm::ceil_div(c.dim, 256));
-llm::compute_barrier(cmd);
+    g.dispatch(&sk.residual_add, { &a.hidden, &a.ffn_down_out }, &res_pc, llm::ceil_div(c.dim, 256));
 }
 
 fn void? LlmModel.forward(&self, uint token, uint position) {
     llm::DeviceContext* ctx = self.ctx;
-    CommandBuffer cmd = ctx.command_buffer;
     llm::ModelConfig* c = &self.config;
     LlmWeights* w = &self.weights;
     LlmActivations* a = &self.acts;
-    KVCache* kv = &self.kv;
     LlmKernels* k = &self.kernels;
     llm::SharedKernels* sk = &k.shared;
 
@@ -588,45 +545,38 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
         }!!;
     }
 
-llm::begin_compute(cmd)!!;
+    llm::RenderGraph g;
+    g.init(ctx)!!;
 
     if (!self.encode_only) {
         EmbeddingPC emb_pc = { .token_id = token, .dim = c.dim };
-llm::dispatch_kernel(cmd, &k.embedding,
-            { w.token_embedding.gpu_buffer.buffer, a.hidden.gpu_buffer.buffer },
-            { w.token_embedding.size_bytes, a.hidden.size_bytes },
-            &emb_pc, llm::ceil_div(c.dim, 256));
-llm::compute_barrier(cmd);
+        g.dispatch(&k.embedding, { &w.token_embedding, &a.hidden }, &emb_pc,
+            llm::ceil_div(c.dim, 256));
     }
 
     // 2. For each transformer layer
     for (uint l = 0; l < c.n_layers; l++) {
-        self.forward_layer(cmd, &w.layers[l], l, position)!!;
+        self.forward_layer(&g, &w.layers[l], l, position)!!;
     }
 
     // 3. Final norm
     if (c.norm_type == RMSNORM) {
         llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.rmsnorm,
-            { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, w.output_norm.size_bytes, a.norm_out.size_bytes },
-            &final_rms, 1);
+        g.dispatch(&sk.rmsnorm, { &a.hidden, &w.output_norm, &a.norm_out }, &final_rms, 1);
     } else {
         llm::LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
-llm::dispatch_kernel(cmd, &sk.layernorm,
-            { a.hidden.gpu_buffer.buffer, w.output_norm.gpu_buffer.buffer, w.output_norm_bias.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer },
-            { a.hidden.size_bytes, w.output_norm.size_bytes, w.output_norm_bias.size_bytes, a.norm_out.size_bytes },
+        g.dispatch(&sk.layernorm,
+            { &a.hidden, &w.output_norm, &w.output_norm_bias, &a.norm_out },
             &final_ln, 1);
     }
-llm::compute_barrier(cmd);
 
     // 4. Output projection -> logits (skip in encode_only mode)
     if (!self.encode_only) {
-llm::dispatch_matmul(cmd, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
+        llm::dispatch_matmul(&g, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
     }
 
     // 5. Submit and wait
-llm::submit_and_wait(ctx)!!;
+    g.flush()!!;
 }
 
 // Encode text: run forward pass for each token, extract post-final-norm hidden states.
@@ -674,7 +624,6 @@ fn llm::Tensor? LlmModel.encode_text(&self, uint[] tokens) {
 fn llm::Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
     llm::ModelConfig* c = &self.config;
     llm::DeviceContext* ctx = self.ctx;
-    CommandBuffer cmd = ctx.command_buffer;
     uint seq_len = (uint)tokens.len;
 
     // Allocate intermediate hidden states: [seq_len, dim]
@@ -702,22 +651,25 @@ fn llm::Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
         LayerWeights lw = load_single_layer(ctx, self.gf, self.names, c, l)!!;
 
         // Process all positions through this layer
-llm::begin_compute(cmd)!!;
+        llm::RenderGraph g;
+        g.init(ctx)!!;
         for (uint pos = 0; pos < seq_len; pos++) {
-            // Copy hidden_states[pos] → acts.hidden
-            vk::cmdCopyBuffer(cmd, hidden_states.gpu_buffer.buffer, self.acts.hidden.gpu_buffer.buffer, 1,
+            // Copy hidden_states[pos] → acts.hidden (offset read, raw cmd)
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, hidden_states.gpu_buffer.buffer, self.acts.hidden.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = (ulong)pos * c.dim * 4, .dstOffset = 0, .size = (ulong)c.dim * 4 }});
-llm::compute_barrier(cmd);
+            g.needs_barrier = true;
 
             // Process layer
-            self.forward_layer(cmd, &lw, l, pos)!!;
+            self.forward_layer(&g, &lw, l, pos)!!;
 
-            // Copy acts.hidden → hidden_states[pos]
-            vk::cmdCopyBuffer(cmd, self.acts.hidden.gpu_buffer.buffer, hidden_states.gpu_buffer.buffer, 1,
+            // Copy acts.hidden → hidden_states[pos] (offset write, raw cmd)
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, self.acts.hidden.gpu_buffer.buffer, hidden_states.gpu_buffer.buffer, 1,
                 (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
-llm::compute_barrier(cmd);
+            g.needs_barrier = true;
         }
-llm::submit_and_wait(ctx)!!;
+        g.flush()!!;
 
         // Free this layer's weights (space reused for next layer)
         free_layer_weights(&lw, c);
