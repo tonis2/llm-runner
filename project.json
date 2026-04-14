@@ -2,7 +2,7 @@
   "langrev": "1",
   "warnings": [ "no-unused" ],
   "dependency-search-paths": [ "dependencies" ],
-  "dependencies": ["vk", "image", "llm_text", "zimage"],
+  "dependencies": ["vk", "image", "llm_text", "zimage", "qwen_edit"],
   "linked-libraries": ["vulkan"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
@@ -19,12 +19,17 @@
 				"slangc ./dependencies/llm_text.c3l/shaders/llm.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/llm_text.c3l/shaders/llm.spv",
 				"slangc ./dependencies/zimage.c3l/shaders/zimage.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/zimage.spv",
 				"slangc ./dependencies/zimage.c3l/shaders/mrope.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/mrope.spv",
-			"slangc ./dependencies/zimage.c3l/shaders/flash_attn.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/flash_attn.spv"
+			"slangc ./dependencies/zimage.c3l/shaders/flash_attn.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/zimage.c3l/shaders/flash_attn.spv",
+				"slangc ./dependencies/qwen_edit.c3l/shaders/vit.slang -fvk-use-entrypoint-name -target spirv -emit-spirv-directly -O2 -o ./dependencies/qwen_edit.c3l/shaders/vit.spv"
 			]
 		},
     "zimage": {
 			"type": "executable",
       "sources": ["examples/z-image/**"]
+		},
+    "vit-test": {
+			"type": "executable",
+      "sources": ["examples/vit-test/**"]
 		}
   },
   "cpu": "generic",

@@ -86,6 +86,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         config_json = (String)&llm_text::QWEN3_CONFIG_JSON;
     } else if (arch_name == "qwen2") {
         config_json = (String)&llm_text::QWEN2_CONFIG_JSON;
+    } else if (arch_name == "qwen2vl") {
+        config_json = (String)&llm_text::QWEN2_VL_CONFIG_JSON;
     } else {
         config_json = (String)&llm_text::QWEN3_CONFIG_JSON;
     }

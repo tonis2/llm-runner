@@ -35,6 +35,9 @@ struct WeightNames {
     String wk;
     String wv;
     String wo;
+    String wq_bias;
+    String wk_bias;
+    String wv_bias;
     String wq_norm;
     String wk_norm;
     String ffn_norm;
@@ -149,6 +152,9 @@ fn WeightNames? load_weight_names(String json_text) {
         .wk = w.get_string("attn_k") ?? "attn_k.weight",
         .wv = w.get_string("attn_v") ?? "attn_v.weight",
         .wo = w.get_string("attn_output") ?? "attn_output.weight",
+        .wq_bias = w.get_string("attn_q_bias") ?? "",
+        .wk_bias = w.get_string("attn_k_bias") ?? "",
+        .wv_bias = w.get_string("attn_v_bias") ?? "",
         .wq_norm = w.get_string("attn_q_norm") ?? "",
         .wk_norm = w.get_string("attn_k_norm") ?? "",
         .ffn_norm = w.get_string("ffn_norm") ?? "ffn_norm.weight",
