@@ -737,10 +737,26 @@ fn String dit_layer_tensor_name(char[128]* buf, String prefix, uint layer, Strin
 	return (String)(*buf)[0..pos - 1];
 }
 
+fn String ggml_type_name(llm::GGMLType type) {
+	switch (type) {
+		case llm::GGML_F32: return "F32";
+		case llm::GGML_F16: return "F16";
+		case llm::GGML_Q4_0: return "Q4_0";
+		case llm::GGML_Q4_1: return "Q4_1";
+		case llm::GGML_Q4_K: return "Q4_K";
+		case llm::GGML_Q5_K: return "Q5_K";
+		case llm::GGML_Q6_K: return "Q6_K";
+		case llm::GGML_Q8_0: return "Q8_0";
+		case llm::GGML_BF16: return "BF16";
+		default: return "UNKNOWN";
+	}
+}
+
 fn llm::Tensor load_dit_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name)
 {
 	if (try info = gf.find_tensor(name))
 	{
+		io::printfn("  [dtype] %s -> %s", name, ggml_type_name(info.type));
 		// F16/BF16 weights get dequantized to F32
 		if (info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32)
 		{
@@ -778,6 +794,7 @@ fn DiTLayerWeights load_dit_layer_weights(
 	String qkv_name = dit_layer_tensor_name(&buf, prefix, layer, "attention.qkv.weight");
 	if (try info = gf.find_tensor(qkv_name))
 	{
+		io::printfn("  [dtype] %s -> %s", qkv_name, ggml_type_name(info.type));
 		if (force_f32 || info.type == llm::GGML_F16 || info.type == llm::GGML_BF16 || info.type == llm::GGML_F32)
 		{
 			lw.wqkv = llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
@@ -1193,6 +1210,9 @@ fn void dispatch_batch_matmul(
 	// 2D tiled GEMM: ceil(seq_len/64) * ceil(out_dim/64) workgroups
 	// Legacy (Q8_0, Q4_0): seq_len * out_dim workgroups
 	uint groups = tiled_2d ? ((seq_len + 63) / 64) * ((out_dim + 63) / 64) : seq_len * out_dim;
+	if (weight.dtype == llm::GGML_Q4_0) {
+		io::printfn("  [Q4_0 dispatch] seq_len=%d out_dim=%d groups=%d", seq_len, out_dim, groups);
+	}
 	g.dispatch(kernel, { weight, input, output }, &pc, groups);
 	dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len);
 }

@@ -41,6 +41,13 @@ fn int main(String[] args) {
 
     // Init Vulkan
     llm::DeviceContext ctx = llm::createContext()!!;
+
+    // Run Q4_0 matmul test
+    test_q4_0_matmul(&ctx)!!;
+    
+    // Inspect MMDiT model dtypes
+    inspect_gguf_dtypes(mmdit_path)!!;
+    
     defer ctx.free();
 
     // === Phase 1: Text Encoding (conditional + unconditional) ===
@@ -48,11 +55,14 @@ fn int main(String[] args) {
     uint n_txt = (uint)text_emb.shape[0];
     uint txt_dim = (uint)text_emb.shape[1];
     io::printfn("\n  Cond text embeddings: [%d, %d]", n_txt, txt_dim);
+    qwen_edit::print_tensor_stats(&ctx, &text_emb, "text_emb")!!;
+    qwen_edit::print_tensor_first_n(&ctx, &text_emb, "text_emb", 10)!!;
 
     // Encode unconditional (negative prompt = single space)
     llm::Tensor uncond_emb = qwen_edit::encode_text_prompt(&ctx, " ", text_path)!!;
     uint n_uncond = (uint)uncond_emb.shape[0];
     io::printfn("  Uncond text embeddings: [%d, %d]", n_uncond, txt_dim);
+    qwen_edit::print_tensor_stats(&ctx, &uncond_emb, "uncond_emb")!!;
 
     // Use max of n_txt and n_uncond for activation allocation
     uint n_txt_max = n_txt > n_uncond ? n_txt : n_uncond;
@@ -100,11 +110,29 @@ fn int main(String[] args) {
         }!!;
         staging.free();
         io::printfn("  Initialized latent with Gaussian noise.");
+        qwen_edit::print_tensor_stats(&ctx, &mmdit.acts.patched_latent, "init_latent")!!;
     }
 
-    // === Phase 3: MMDiT Denoising ===
+    // === Phase 3: Single-step diagnostic ===
+    io::printfn("\n=== Single-step diagnostic ===");
+    mmdit.forward(n_patches, n_txt, 1.0f)!!;
+    qwen_edit::print_tensor_stats(&ctx, &mmdit.acts.velocity, "velocity_step0")!!;
+    qwen_edit::print_tensor_first_n(&ctx, &mmdit.acts.velocity, "velocity_step0", 20)!!;
+    
+    // Also check img_hidden after one layer
+    io::printfn("\n=== Layer 0 diagnostic ===");
+    qwen_edit::MMDiTLayerWeights lw0 = qwen_edit::load_mmdit_layer(&ctx, &mmdit.gf, 0)!!;
+    mmdit.forward_layer(&lw0, n_patches, n_txt)!!;
+    qwen_edit::print_tensor_stats(&ctx, &mmdit.acts.img_hidden, "img_hidden_after_layer0")!!;
+    qwen_edit::free_mmdit_layer(&lw0);
+
+    // === Phase 4: MMDiT Denoising ===
+    io::printfn("\n=== Full denoising ===");
     float cfg_scale = 4.0f;
     mmdit.denoise(n_patches, n_txt, lat_h, lat_w, n_steps, cfg_scale, &uncond_emb, n_uncond)!!;
+    
+    io::printfn("\n  Post-denoise latent stats:");
+    qwen_edit::print_tensor_stats(&ctx, &mmdit.acts.patched_latent, "denoised_latent")!!;
 
     // === Phase 4: VAE Decode ===
     io::printfn("\n=== VAE Decode ===");
@@ -137,6 +165,9 @@ fn int main(String[] args) {
             &unpatch_pc, llm::ceil_div(latent_elems, 256));
         g.flush()!!;
     }
+    
+    io::printfn("  Unpatchified latent stats:");
+    qwen_edit::print_tensor_stats(&ctx, &output_latent, "output_latent")!!;
 
     // Download latent to CPU for denormalization
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
@@ -205,6 +236,26 @@ fn int main(String[] args) {
     float* mapped = (float*)download_staging.data();
     mem::copy(img_data.ptr, mapped, total_px * 4);
     download_staging.free();
+    
+    // Debug: print first few pixel values
+    io::printf("  First 10 pixel values (RGB): [");
+    for (uint i = 0; i < 10 && i < total_px; i++) {
+        if (i > 0) io::printf(", ");
+        io::printf("%.3f", img_data[i]);
+    }
+    io::printfn("]");
+    
+    // Compute image statistics
+    float img_min = img_data[0];
+    float img_max = img_data[0];
+    double img_sum = 0.0;
+    for (usz i = 0; i < total_px; i++) {
+        float v = img_data[i];
+        if (v < img_min) img_min = v;
+        if (v > img_max) img_max = v;
+        img_sum += (double)v;
+    }
+    io::printfn("  Image stats: min=%.3f max=%.3f mean=%.3f", img_min, img_max, (float)(img_sum / (double)total_px));
 
     // Convert to image and save
     image::Image result = pipelines::float_tensor_to_image(img_data, img_w, img_h, 3)!!;

@@ -200,7 +200,13 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
     dec.ctx = ctx;
     dec.kernels = kernels;
 
-    dec.conv_in = load_flux_conv(ctx, sf, "decoder.conv_in.", 16, 512);
+    // Auto-detect input channels from weight shape: [out_c, in_c, kH, kW]
+    uint vae_in_ch = 16;  // default for Flux.1 ae.safetensors
+    if (try info = sf.find_tensor("decoder.conv_in.weight")) {
+        if (info.n_dims >= 2) vae_in_ch = (uint)info.shape[1];
+    }
+    io::printfn("  VAE decoder conv_in: %d input channels", vae_in_ch);
+    dec.conv_in = load_flux_conv(ctx, sf, "decoder.conv_in.", vae_in_ch, 512);
     dec.mid_block1 = load_flux_resblock(ctx, sf, "decoder.mid.block_1.", 512, 512);
     dec.mid_attn = load_flux_attn(ctx, sf, "decoder.mid.attn_1.", 512);
     dec.mid_block2 = load_flux_resblock(ctx, sf, "decoder.mid.block_2.", 512, 512);

@@ -91,6 +91,10 @@ fn DeviceContext? createContext() {
 
     io::printfn("Device selected: %s", (ZString)device_props.deviceName[0..]);
 
+    PhysicalDeviceLimits limits = device_props.limits;
+    io::printfn("  maxComputeWorkGroupCount: (%d, %d, %d)", limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1], limits.maxComputeWorkGroupCount[2]);
+    io::printfn("  maxComputeWorkGroupSize: (%d, %d, %d)", limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]);
+
     devices.free();
 
     // Query the driver ID so we can blacklist drivers with broken cooperative
