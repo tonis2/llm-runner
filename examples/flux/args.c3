@@ -39,6 +39,9 @@ fn flux::FluxConfig? parse_flux_args(String[] args) {
             else if (args[i] == "--size") { config.image_size = args[i + 1].to_uint() ?? 1024; i += 2; }
             else if (args[i] == "--steps") { config.num_steps = args[i + 1].to_uint() ?? 4; i += 2; }
             else if (args[i] == "--seed") { config.seed = args[i + 1].to_uint() ?? 42; i += 2; }
+            else if (args[i] == "--input") { config.input_path = args[i + 1]; i += 2; }
+            else if (args[i] == "--edit-mode") { config.edit_mode = args[i + 1]; i += 2; }
+            else if (args[i] == "--strength") { config.strength = args[i + 1].to_float() ?? 0.6f; i += 2; }
             else if (args[i] == "--config") { i += 2; }
             else { i++; }
         } else {
@@ -83,6 +86,7 @@ fn void load_flux_config(String path, flux::FluxConfig* config) {
     if (try v = cfg.get_uint("seed")) config.seed = v;
     if (try v = cfg.get_uint("size")) config.image_size = v;
     if (try v = cfg.get_bool("offload")) config.offload = v;
+    if (try v = cfg.get_string("edit_mode")) config.edit_mode = v;
 
     io::printfn("Flux config loaded from: %s", path);
 }
@@ -100,5 +104,8 @@ fn void print_usage() {
     io::printfn("  --size         Image size (default: 1024)");
     io::printfn("  --steps        Denoising steps (default: 4)");
     io::printfn("  --seed         Random seed (default: 42)");
+    io::printfn("  --input        Input image (PNG) for img2img / kontext modes");
+    io::printfn("  --edit-mode    Edit mode: img2img | kontext (default: txt2img)");
+    io::printfn("  --strength     img2img strength 0..1 (default: 0.75)");
     io::printfn("  --config       Load from JSON config file");
 }

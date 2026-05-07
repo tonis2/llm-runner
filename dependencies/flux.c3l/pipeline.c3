@@ -28,12 +28,13 @@ struct FluxConfig
 	String text_model_path; // Qwen3-8B GGUF (text encoder)
 	String vae_path; // ae.safetensors (Flux VAE)
 	String prompt;
-	String input_path; // Input image for img2img
+	String input_path; // Input image for img2img / kontext
 	String output_path;
+	String edit_mode;  // "" (txt2img, default) | "img2img" | "kontext"
 	uint image_size;
 	uint num_steps;
 	float cfg_scale;
-	float strength; // img2img strength (0-1)
+	float strength; // img2img strength (0-1): 0=keep input, 1=full re-roll
 	uint seed;
 	bool offload;
 }
@@ -159,22 +160,8 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	text_gf.free();
 	text_mm.destroy();
 
-	// --- Phase 2: Load Flux DiT ---
-	io::printfn("\n--- Phase 2: Loading Flux DiT ---");
-
-	FluxDiTKernels dit_kernels = create_flux_dit_kernels(&ctx)!!;
-	defer dit_kernels.free(ctx.device);
-
-	mmap::FileMmap dit_mm = file::mmap_open(config.model_path, "rb")!!;
-	char[] dit_data       = dit_mm.bytes();
-	llm::GGUFFile dit_gf  = llm::gguf_parse(dit_data)!!;
-	FluxDiTModel dit      = load_flux_dit(&ctx, &dit_gf, &dit_kernels)!!;
-	// dit is freed explicitly after the denoise loop to free ~9 GB of VRAM
-
-	// before the VAE allocates its full-resolution scratch buffers.
-
-
-	// Image dimensions: Flux.2 uses 16x spatial reduction (8x VAE + 2x pixel unshuffle)
+	// Image dimensions: Flux.2 uses 16x spatial reduction (8x VAE + 2x pixel unshuffle).
+	// Computed early because the (optional) img2img encode pass below needs lat_h/lat_w.
 	uint img_h        = (config.image_size + 15) / 16 * 16; // Round to multiple of 16
 	uint img_w        = img_h;
 	uint lat_h        = img_h / 16;                     // 16x reduction (8x VAE * 2x unshuffle)
@@ -190,6 +177,53 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	}
 	io::printfn("  Image: %dx%d → latent: [128, %d, %d] → %d patches", img_h, img_w, lat_h, lat_w, n_img);
 	io::printfn("  Sequence: %d img + %d txt = %d joint", n_img, n_txt, n_joint);
+
+	// --- Optional Phase 1.5: img2img / kontext input encoding ---
+	// Done before loading the DiT so the encoder weights don't fight with DiT VRAM.
+	float[] img2img_ref_latent = (float[]){};
+	if (config.edit_mode == "img2img")
+	{
+		if (config.input_path.len == 0)
+		{
+			io::printfn("ERROR: --edit-mode img2img requires --input <image>");
+			return llm::COMPUTE_ERROR~;
+		}
+		io::printfn("\n--- Phase 1.5: VAE Encoding (mode=img2img) ---");
+		img2img_ref_latent = encode_image_to_dit_latent(&ctx, config.input_path, config.vae_path, img_h, img_w, lat_h, lat_w)!!;
+		ctx.allocator.release_empty_pages();
+	}
+	else if (config.edit_mode == "kontext")
+	{
+		// Kontext-style editing concatenates the encoded reference latent as
+		// extra image-stream tokens to the DiT input, with offset (H, W) position
+		// IDs so the model can distinguish noise tokens from reference tokens.
+		// This requires plumbing a separate n_ref count through ~30 sites in
+		// flux_dit.c3 (mRoPE table, image-stream Q/K/V, joint sequence buffers).
+		// The encoder + preprocessing infrastructure (encode_image_to_dit_latent
+		// above) is ready for this; the DiT-side splice is not yet wired.
+		// Note: Klein 9B is distilled txt2img and is unlikely to produce strong
+		// instruction edits even with the wiring in place — an edit-tuned
+		// checkpoint (Flux 2 Pro / Kontext-tuned) would be needed for that.
+		io::printfn("ERROR: --edit-mode kontext is not yet implemented end-to-end.");
+		io::printfn("       The VAE encoder works (validated cos>=0.995 vs PyTorch ref);");
+		io::printfn("       what's missing is concatenating the reference latent as extra");
+		io::printfn("       DiT image-stream tokens with offset RoPE positions.");
+		io::printfn("       See dependencies/flux.c3l/flux_dit.c3 (n_img/n_joint sites).");
+		return llm::COMPUTE_ERROR~;
+	}
+
+	// --- Phase 2: Load Flux DiT ---
+	io::printfn("\n--- Phase 2: Loading Flux DiT ---");
+
+	FluxDiTKernels dit_kernels = create_flux_dit_kernels(&ctx)!!;
+	defer dit_kernels.free(ctx.device);
+
+	mmap::FileMmap dit_mm = file::mmap_open(config.model_path, "rb")!!;
+	char[] dit_data       = dit_mm.bytes();
+	llm::GGUFFile dit_gf  = llm::gguf_parse(dit_data)!!;
+	FluxDiTModel dit      = load_flux_dit(&ctx, &dit_gf, &dit_kernels)!!;
+	// dit is freed explicitly after the denoise loop to free ~9 GB of VRAM
+	// before the VAE allocates its full-resolution scratch buffers.
 
 	// Set model dimensions
 	dit.n_img = n_img;
@@ -207,34 +241,12 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	// --- Phase 3: Denoising ---
 	io::printfn("\n--- Phase 3: Denoising (%d steps) ---", config.num_steps);
 
-	// Generate random latent [128, lat_h, lat_w]
-	float[] latent_cpu = mem::new_array(float, latent_elems);
-	pipelines::generate_random_latent(latent_cpu, config.seed);
-
-	// Upload latent to GPU
-
-	{
-		vk::Memory lat_staging = vk::new_buffer(
-			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			data: latent_cpu.ptr,
-			data_size: (usz)latent_elems * 4,
-		)!!;
-		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer copy_cmd)
-		{
-			vk::cmdCopyBuffer(
-				copy_cmd,
-				lat_staging.buffer,
-				dit.acts.latent.gpu_buffer.buffer,
-				1,
-				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 } }
-			);
-		}!!;
-		lat_staging.free();
-	}
-
-	// Scheduler: linear sigma schedule with dynamic shift
+	// Scheduler: linear sigma schedule with dynamic shift.
+	// For img2img we rebuild the schedule from a lower starting sigma so the
+	// reference latent actually contributes — Klein's distilled 4-step shift
+	// (~7.6) puts sigma[1] at ~0.96, which would drown out the reference at
+	// any practical `strength`. Treating `strength` as the noise fraction and
+	// rescheduling all `num_steps` Euler steps from there preserves user intent.
 	float[] sigmas = mem::new_array(float, (usz)config.num_steps + 1);
 
 	{
@@ -261,21 +273,80 @@ fn void? run_flux_pipeline(FluxConfig* config)
 		}
 		float flux_shift = math::exp(mu);
 
+		// Pick the schedule's top t. For txt2img/kontext: t_top=1.0 → sigma=1.0
+		// (full noise). For img2img: invert the shift to find the t that yields
+		// sigma == config.strength, so the schedule starts exactly at the
+		// requested noise level.
+		float t_top = 1.0f;
+		if (config.edit_mode == "img2img" && img2img_ref_latent.len > 0)
+		{
+			float s = config.strength;
+			if (s < 0.0f) s = 0.0f;
+			if (s > 1.0f) s = 1.0f;
+			// Inverse of time_snr_shift: t = s / (shift*(1-s) + s)
+			t_top = s / (flux_shift * (1.0f - s) + s);
+		}
+
 		for (uint i = 0; i < config.num_steps; i++)
 		{
-			float t = 1.0f
-				- (float)i * (1.0f - 1.0f / (float)config.num_steps)
-					/ (float)(config.num_steps > 1 ? config.num_steps - 1 : 1);
+			float frac = (float)i * (1.0f - 1.0f / (float)config.num_steps)
+				/ (float)(config.num_steps > 1 ? config.num_steps - 1 : 1);
+			float t = t_top * (1.0f - frac);
 			sigmas[i] = pipelines::time_snr_shift(flux_shift, t);
 		}
 		sigmas[config.num_steps] = 0.0f;
-		io::printfn("  Scheduler: mu=%.3f, shift=%.3f", mu, flux_shift);
+		io::printfn("  Scheduler: mu=%.3f, shift=%.3f, sigma_top=%.4f", mu, flux_shift, sigmas[0]);
 	}
 
 	pipelines::FlowMatchingState scheduler = { .num_steps = config.num_steps, .sigmas = sigmas, };
 	defer scheduler.free();
 
-	// Denoising loop
+	// Generate random latent [128, lat_h, lat_w]
+	float[] latent_cpu = mem::new_array(float, latent_elems);
+	pipelines::generate_random_latent(latent_cpu, config.seed);
+
+	// img2img: blend noise with the encoded reference latent at sigma[0].
+	// Matches diffusers FlowMatchScheduler.scale_noise: latent = sigma*noise + (1-sigma)*ref.
+	// We always run the full denoise loop from step 0 (the schedule itself was
+	// rebuilt above with a lower top sigma instead of skipping steps).
+	if (config.edit_mode == "img2img" && img2img_ref_latent.len > 0)
+	{
+		float sigma_start = sigmas[0];
+		io::printfn("  img2img: strength=%.2f, sigma_start=%.4f, ref_weight=%.4f",
+			config.strength, sigma_start, 1.0f - sigma_start);
+		for (uint i = 0; i < latent_elems; i++)
+		{
+			latent_cpu[i] = sigma_start * latent_cpu[i] + (1.0f - sigma_start) * img2img_ref_latent[i];
+		}
+		mem::free(img2img_ref_latent);
+		img2img_ref_latent = (float[]){};
+	}
+
+	// Upload latent to GPU
+	{
+		vk::Memory lat_staging = vk::new_buffer(
+			allocator: &ctx.allocator,
+			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			data: latent_cpu.ptr,
+			data_size: (usz)latent_elems * 4,
+		)!!;
+		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer copy_cmd)
+		{
+			vk::cmdCopyBuffer(
+				copy_cmd,
+				lat_staging.buffer,
+				dit.acts.latent.gpu_buffer.buffer,
+				1,
+				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = 0, .size = (ulong)latent_elems * 4 } }
+			);
+		}!!;
+		lat_staging.free();
+	}
+
+	// Denoising loop — always runs the full num_steps. img2img controls noise
+	// retention via the rescheduled top sigma (see schedule build above), not
+	// by skipping leading steps.
 	for (uint step = 0; step < config.num_steps; step++)
 	{
 		float sigma = scheduler.get_timestep(step);
@@ -519,6 +590,216 @@ fn void pixel_shuffle_cpu(float[] input, float[] output, uint in_channels, uint 
 			}
 		}
 	}
+}
+
+// --- Pixel unshuffle (space-to-depth) on CPU ---
+// Inverse of pixel_shuffle_cpu. Input [in_ch, H*r, W*r] -> [in_ch * r * r, H, W].
+fn void pixel_unshuffle_cpu(float[] input, float[] output, uint in_channels, uint in_h, uint in_w, uint r)
+{
+	uint out_ch = in_channels * r * r;
+	uint out_h  = in_h / r;
+	uint out_w  = in_w / r;
+
+	for (uint c = 0; c < in_channels; c++)
+	{
+		for (uint ih = 0; ih < in_h; ih++)
+		{
+			for (uint iw = 0; iw < in_w; iw++)
+			{
+				uint sub_h = ih % r;
+				uint sub_w = iw % r;
+				uint dst_c = c * r * r + sub_h * r + sub_w;
+				uint dst_h = ih / r;
+				uint dst_w = iw / r;
+
+				uint src_idx = c * in_h * in_w + ih * in_w + iw;
+				uint dst_idx = dst_c * out_h * out_w + dst_h * out_w + dst_w;
+				output[dst_idx] = input[src_idx];
+			}
+		}
+	}
+}
+
+// --- Encoder CPU post-processing ---
+// Takes the raw encoder output [64, enc_h, enc_w] and produces the DiT-input
+// latent [128, lat_h, lat_w] in noise space. Mirrors the inverse of the decoder
+// pre-processing (BN-inverse + pixel_shuffle + post_quant_conv) at lines 345-413.
+//
+// Steps:
+//   1. quant_conv (1x1, 64 -> 64)
+//   2. Split: take first 32 channels (mean), drop logvar
+//   3. pixel_unshuffle (32 ch -> 128 ch, halves spatial): [32, enc_h, enc_w] -> [128, lat_h, lat_w]
+//   4. BN-forward: x = (x - mean) / sqrt(var + eps)  (in 128-ch space)
+fn void? encoder_postprocess_to_dit_latent(
+	llm::SafetensorsFile* vae_sf,
+	float[] enc_out,         // [64, enc_h, enc_w] from encoder forward
+	float[] dit_latent_out,  // [128, lat_h, lat_w] (caller-allocated, lat_h = enc_h / 2)
+	uint enc_h, uint enc_w,
+	uint lat_h, uint lat_w
+)
+{
+	uint enc_spatial = enc_h * enc_w;
+
+	// Step 1: quant_conv (1x1 [64, 64, 1, 1])
+	float[64 * 64] qc_weight;
+	float[64] qc_bias;
+	if (try info = vae_sf.find_tensor("quant_conv.weight"))
+	{
+		mem::copy(&qc_weight, (float*)(vae_sf.data_base + (usz)info.data_start), 64 * 64 * 4);
+	}
+	else
+	{
+		io::printfn("  ERROR: quant_conv.weight missing from VAE safetensors");
+		return llm::COMPUTE_ERROR~;
+	}
+	if (try info = vae_sf.find_tensor("quant_conv.bias"))
+	{
+		mem::copy(&qc_bias, (float*)(vae_sf.data_base + (usz)info.data_start), 64 * 4);
+	}
+
+	float[] qc_out = mem::new_array(float, (usz)64 * enc_spatial);
+	defer mem::free(qc_out);
+	float[64] tmp;
+	for (uint s = 0; s < enc_spatial; s++)
+	{
+		for (uint c = 0; c < 64; c++) tmp[c] = enc_out[c * enc_spatial + s];
+		for (uint oc = 0; oc < 64; oc++)
+		{
+			float v = qc_bias[oc];
+			for (uint ic = 0; ic < 64; ic++) v += qc_weight[oc * 64 + ic] * tmp[ic];
+			qc_out[oc * enc_spatial + s] = v;
+		}
+	}
+
+	// Step 2: take first 32 channels (mean) — deterministic encode (no logvar sampling)
+	float[] mean_only = mem::new_array(float, (usz)32 * enc_spatial);
+	defer mem::free(mean_only);
+	mem::copy(mean_only.ptr, qc_out.ptr, (usz)32 * enc_spatial * 4);
+
+	// Step 3: pixel_unshuffle 32 ch -> 128 ch (spatial halved): [32, enc_h, enc_w] -> [128, lat_h, lat_w]
+	pixel_unshuffle_cpu(mean_only, dit_latent_out, 32, enc_h, enc_w, 2);
+
+	// Step 4: BN-forward (inverse of decoder's BN-inverse at lines 345-368)
+	float[128] bn_mean;
+	float[128] bn_var;
+	if (try info = vae_sf.find_tensor("bn.running_mean"))
+	{
+		mem::copy(&bn_mean, (float*)(vae_sf.data_base + (usz)info.data_start), 128 * 4);
+	}
+	if (try info = vae_sf.find_tensor("bn.running_var"))
+	{
+		mem::copy(&bn_var, (float*)(vae_sf.data_base + (usz)info.data_start), 128 * 4);
+	}
+	float eps = 1e-5f;
+	uint lat_spatial = lat_h * lat_w;
+	for (uint c = 0; c < 128; c++)
+	{
+		float std = math::sqrt(bn_var[c] + eps);
+		for (uint j = 0; j < lat_spatial; j++)
+		{
+			uint idx = c * lat_spatial + j;
+			dit_latent_out[idx] = (dit_latent_out[idx] - bn_mean[c]) / std;
+		}
+	}
+}
+
+// --- Run the VAE encoder on an input image and return the DiT-input latent [128, lat_h, lat_w] ---
+// Loads encoder, encodes, applies CPU post-processing (quant_conv + split + pixel_unshuffle + BN-forward),
+// then frees the encoder. Caller frees the returned array.
+fn float[]? encode_image_to_dit_latent(
+	llm::DeviceContext* ctx,
+	String input_path,
+	String vae_path,
+	uint img_h, uint img_w,
+	uint lat_h, uint lat_w
+)
+{
+	// 1. Load + preprocess input image
+	io::printfn("  Loading input: %s", input_path);
+	image::Image src_img = llm::load_png(input_path)!!;
+	defer src_img.free();
+	image::Image preprocessed = llm::resize_center_crop(&src_img, img_w, img_h)!!;
+	defer preprocessed.free();
+	float[] input_chw = llm::image_to_float_nchw_signed(&preprocessed)!!;
+	defer mem::free(input_chw);
+	io::printfn("  Preprocessed: %dx%d, range [-1, 1]", img_w, img_h);
+
+	// 2. Open VAE safetensors + create encoder
+	llm::SafetensorsFile enc_sf = llm::safetensors_open(vae_path)!!;
+	defer enc_sf.close();
+
+	zimage::VaeKernels enc_kernels = zimage::create_vae_kernels(ctx)!!;
+	defer enc_kernels.free(ctx.device);
+
+	zimage::FluxVaeEncoder enc = zimage::load_flux_vae_encoder(ctx, &enc_sf, &enc_kernels)!!;
+	defer enc.free();
+
+	zimage::FluxVaeActivations enc_acts = zimage::allocate_flux_vae_activations(ctx, img_h)!!;
+	defer enc_acts.free();
+
+	// 3. Upload preprocessed image [3, H, W] to enc_acts.buf_a
+	{
+		usz img_bytes = (usz)3 * img_h * img_w * 4;
+		vk::Memory in_staging = vk::new_buffer(
+			allocator: &ctx.allocator,
+			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			data: input_chw.ptr,
+			data_size: img_bytes,
+		)!!;
+		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer up_cmd)
+		{
+			vk::cmdCopyBuffer(
+				up_cmd,
+				in_staging.buffer,
+				enc_acts.buf_a.gpu_buffer.buffer,
+				1,
+				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = 0, .size = img_bytes } }
+			);
+		}!!;
+		in_staging.free();
+	}
+
+	// 4. Run encoder forward
+	io::printfn("  Running VAE encoder...");
+	enc.forward(&enc_acts, img_h, img_w)!!;
+
+	// 5. Download encoder output [64, enc_h, enc_w] (enc_h = img_h / 8 = lat_h * 2)
+	uint enc_h = img_h / 8;
+	uint enc_w = img_w / 8;
+	uint enc_elems = 64 * enc_h * enc_w;
+	float[] enc_out_cpu = mem::new_array(float, enc_elems);
+	defer mem::free(enc_out_cpu);
+	{
+		usz enc_bytes = (usz)enc_elems * 4;
+		vk::Memory dl_staging = vk::new_buffer(
+			allocator: &ctx.allocator,
+			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			data: null,
+			data_size: enc_bytes,
+		)!!;
+		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer dl_cmd)
+		{
+			vk::cmdCopyBuffer(
+				dl_cmd,
+				enc_acts.buf_a.gpu_buffer.buffer,
+				dl_staging.buffer,
+				1,
+				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = 0, .size = enc_bytes } }
+			);
+		}!!;
+		mem::copy(enc_out_cpu.ptr, dl_staging.data(), enc_bytes);
+		dl_staging.free();
+	}
+
+	// 6. CPU post-processing: quant_conv -> split mean -> pixel_unshuffle -> BN-forward
+	uint dit_elems = 128 * lat_h * lat_w;
+	float[] dit_latent = mem::new_array(float, dit_elems);
+	encoder_postprocess_to_dit_latent(&enc_sf, enc_out_cpu, dit_latent, enc_h, enc_w, lat_h, lat_w)!!;
+
+	io::printfn("  Encoded latent: [128, %d, %d]", lat_h, lat_w);
+	return dit_latent;
 }
 
 // --- Multi-layer text encoding ---
