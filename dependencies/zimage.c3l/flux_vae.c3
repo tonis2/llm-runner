@@ -143,8 +143,9 @@ fn FluxVaeResBlock load_flux_resblock(llm::DeviceContext* ctx, llm::SafetensorsF
     rb.conv2_bias = load_flux_vae_tensor(ctx, sf, prefix, "conv2.bias");
 
     // Check for shortcut (channel change)
+    char[256] cs_buf;
     char[256] nin_buf;
-    String conv_shortcut_name = flux_vae_name(&nin_buf, prefix, "conv_shortcut.weight");
+    String conv_shortcut_name = flux_vae_name(&cs_buf, prefix, "conv_shortcut.weight");
     String nin_name = flux_vae_name(&nin_buf, prefix, "nin_shortcut.weight");
     if (try info = sf.find_tensor(conv_shortcut_name)) {
         rb.nin_shortcut_weight = llm::upload_safetensor_conv_f32(ctx, sf, conv_shortcut_name)!!;
