@@ -219,15 +219,25 @@ fn void? run_flux_pipeline(FluxConfig* config) {
     // Scheduler: linear sigma schedule with dynamic shift
     float[] sigmas = mem::new_array(float, (usz)config.num_steps + 1);
     {
-        // Compute dynamic shift based on image sequence length (same as Flux.1)
-        float base_shift = 0.5f;
-        float max_shift = 1.15f;
-        float base_seq = 256.0f;
-        float max_seq = 4096.0f;
-        float m = (max_shift - base_shift) / (max_seq - base_seq);
-        float b = base_shift - m * base_seq;
-        float mu = (float)n_img * m + b;
-        float flux_shift = math::exp(mu);  // time_snr_shift expects exp(mu), not mu
+        // Use compute_empirical_mu from diffusers Flux2KleinPipeline
+        // https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux2/pipeline_flux2_klein.py
+        float a1 = 8.73809524e-05f;
+        float b1 = 1.89833333f;
+        float a2 = 0.00016927f;
+        float b2 = 0.45666666f;
+        float image_seq_len = (float)n_img;
+        float num_steps_f = (float)config.num_steps;
+        float mu;
+        if (image_seq_len > 4300.0f) {
+            mu = a2 * image_seq_len + b2;
+        } else {
+            float m_200 = a2 * image_seq_len + b2;
+            float m_10 = a1 * image_seq_len + b1;
+            float a = (m_200 - m_10) / 190.0f;
+            float b = m_200 - 200.0f * a;
+            mu = a * num_steps_f + b;
+        }
+        float flux_shift = math::exp(mu);
 
         for (uint i = 0; i < config.num_steps; i++) {
             float t = 1.0f - (float)i * (1.0f - 1.0f / (float)config.num_steps)
@@ -443,16 +453,12 @@ fn void? run_flux_pipeline(FluxConfig* config) {
             }
             io::printfn("  Latent before BN: min=%.4f max=%.4f mean=%.4f", lat_min, lat_max, lat_sum / (float)latent_elems);
 
-            if (!skip_bn) {
-                for (uint c = 0; c < 128; c++) {
-                    float std = math::sqrt(bn_var[c] + eps);
-                    for (uint j = 0; j < lat_h * lat_w; j++) {
-                        uint idx = c * lat_h * lat_w + j;
-                        latent_cpu[idx] = latent_cpu[idx] * std + bn_mean[c];
-                    }
+            for (uint c = 0; c < 128; c++) {
+                float std = math::sqrt(bn_var[c] + eps);
+                for (uint j = 0; j < lat_h * lat_w; j++) {
+                    uint idx = c * lat_h * lat_w + j;
+                    latent_cpu[idx] = latent_cpu[idx] * std + bn_mean[c];
                 }
-            } else {
-                io::printfn("  *** SKIPPING BN inverse (debug) ***");
             }
 
             // Print latent stats after BN
@@ -720,17 +726,12 @@ fn llm::Tensor? encode_text_multilayer(
             extract_layers[i], layer_data[i][0], layer_data[i][1], rms_first, rms_last);
     }
 
-    // Note: official Flux2KleinPipeline does NOT normalize hidden states
-    // Raw Qwen3 hidden states are passed directly to txt_in projection
-
-    // Concatenate per-token: [layer0_token0, layer1_token0, layer2_token0, layer0_token1, ...]
+    // Concatenate raw hidden states (no normalization — official pipeline passes raw)
     for (uint t = 0; t < seq_len; t++) {
         for (uint i = 0; i < 3; i++) {
-            mem::copy(
-                &concat_cpu[t * out_dim + i * dim],
-                &layer_data[i][t * dim],
-                (usz)dim * 4
-            );
+            for (uint d = 0; d < dim; d++) {
+                concat_cpu[t * out_dim + i * dim + d] = layer_data[i][t * dim + d];
+            }
         }
     }
 

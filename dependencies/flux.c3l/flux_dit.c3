@@ -749,13 +749,13 @@ fn void? flux_dual_stream_block(
     g.dispatch(&dk.adaln_modulate, { &a.buf_a, &a.mod_scale, &a.mod_shift, &a.buf_a },
         &img_mod, llm::ceil_div(n_img * dim, 256));
 
-    // IMG GEGLU FFN: up→[2*mlp], split x/gate, x*GELU(gate), down→[dim]
-    // Reference: x, gate = chunk(2); return out_proj(x * GELU(gate))
-    // x = first half (row_offset=0), gate = second half (row_offset=mlp)
-    flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, n_img, 0);     // x (features)
-    flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_up_out, mlp, dim, n_img, mlp);      // gate
-    llm::GeluPC gelu_pc = { .n = n_img * mlp };
-    g.dispatch(&dk.shared.gelu, { &a.ffn_up_out }, &gelu_pc, llm::ceil_div(n_img * mlp, 256));
+    // IMG SwiGLU FFN: up→[2*mlp], split x1/x2, SiLU(x1)*x2, down→[dim]
+    // Reference (Flux2SwiGLU): x1, x2 = chunk(2, dim=-1); return SiLU(x1) * x2
+    // x1 = first half (offset 0), x2 = second half (offset mlp)
+    flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, n_img, 0);     // x1 (gets SiLU)
+    flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_up_out, mlp, dim, n_img, mlp);      // x2 (multiplier)
+    llm::SiluPC silu_pc = { .n = n_img * mlp };
+    g.dispatch(&dk.shared.silu, { &a.ffn_gate_out }, &silu_pc, llm::ceil_div(n_img * mlp, 256));
     llm::ElemwisePC emul_pc = { .n = n_img * mlp };
     g.dispatch(&dk.shared.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out }, &emul_pc, llm::ceil_div(n_img * mlp, 256));
     flux_matmul(g, dk, &lw.img_mlp_down_w, &a.ffn_gate_out, &a.buf_a, dim, mlp, n_img, 0);
@@ -772,11 +772,11 @@ fn void? flux_dual_stream_block(
     g.dispatch(&dk.adaln_modulate, { &a.buf_b, &a.mod_scale, &a.mod_shift, &a.buf_b },
         &txt_mod, llm::ceil_div(n_txt * dim, 256));
 
-    // TXT GEGLU FFN: x = first half, gate = second half, GELU on gate
+    // TXT SwiGLU FFN: SiLU(first half) * second half
     flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_gate_out, mlp, dim, n_txt, 0);
     flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_up_out, mlp, dim, n_txt, mlp);
-    llm::GeluPC gelu_txt = { .n = n_txt * mlp };
-    g.dispatch(&dk.shared.gelu, { &a.ffn_up_out }, &gelu_txt, llm::ceil_div(n_txt * mlp, 256));
+    llm::SiluPC silu_txt = { .n = n_txt * mlp };
+    g.dispatch(&dk.shared.silu, { &a.ffn_gate_out }, &silu_txt, llm::ceil_div(n_txt * mlp, 256));
     llm::ElemwisePC emul_txt = { .n = n_txt * mlp };
     g.dispatch(&dk.shared.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out }, &emul_txt, llm::ceil_div(n_txt * mlp, 256));
     flux_matmul(g, dk, &lw.txt_mlp_down_w, &a.ffn_gate_out, &a.buf_b, dim, mlp, n_txt, 0);
@@ -846,9 +846,9 @@ fn void? flux_single_stream_block(
     g.dispatch(&dk.flash_attention, { &a.buf_a, &a.buf_b, &a.buf_c, &a.attn_out },
         &fa_pc, fa_q_blocks, FLUX_HEADS);
 
-    // === GEGLU on MLP portion: x * GELU(gate), gate is the second half ===
-    llm::GeluPC gelu_pc = { .n = seq * mlp };
-    g.dispatch(&dk.shared.gelu, { &a.ffn_up_out }, &gelu_pc, llm::ceil_div(seq * mlp, 256));
+    // === SwiGLU on MLP portion: SiLU(x1) * x2 (x1 = first half, x2 = second half) ===
+    llm::SiluPC silu_pc = { .n = seq * mlp };
+    g.dispatch(&dk.shared.silu, { &a.ffn_gate_out }, &silu_pc, llm::ceil_div(seq * mlp, 256));
     llm::ElemwisePC emul_pc = { .n = seq * mlp };
     g.dispatch(&dk.shared.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out }, &emul_pc, llm::ceil_div(seq * mlp, 256));
 
@@ -905,6 +905,9 @@ fn void? FluxDiTModel.forward(
     flux_matmul(&g, dk, &w.txt_in_w, t5_embeddings, &a.txt_hidden, dim, FLUX_TEXT_DIM, n_txt, 0);
 
     // 4. Timestep embedding: sigma * 1000 → sincos[256] → MLP → [dim]
+    // diffusers Klein pipeline passes timestep/1000 = sigma into the transformer,
+    // and Flux2Transformer.forward then multiplies by 1000 again before time_proj
+    // (transformer_flux2.py line ~825), so time_proj sees sigma*1000.
     float timestep_val = sigma * 1000.0f;
     zimage::DiTTimestepPC ts_pc = { .dim = FLUX_T_EMB_DIM, .timestep = timestep_val };
     g.dispatch(&dk.dit_timestep_embed, { &a.t_emb }, &ts_pc, llm::ceil_div(FLUX_T_EMB_DIM, 256));
@@ -915,15 +918,15 @@ fn void? FluxDiTModel.forward(
     g.dispatch(&dk.shared.silu, { &a.t_emb_mlp }, &silu1_pc, llm::ceil_div(dim, 256));
     flux_matmul(&g, dk, &w.time_in_w1, &a.t_emb_mlp, &a.silu_t, dim, dim, 1, 0);
 
-    // 5. Shared modulations: SiLU(t_emb_final) → matmul → mod params
-    g.copy(&a.silu_t, &a.t_emb_mlp, (ulong)dim * 4);
-    llm::SiluPC silu2_pc = { .n = dim };
-    g.dispatch(&dk.shared.silu, { &a.t_emb_mlp }, &silu2_pc, llm::ceil_div(dim, 256));
+    // 5. Shared modulations: SiLU(t_emb) → matmul → mod params
+    // Diffusers Flux2Modulation does: mod = linear(SiLU(temb))
+    llm::SiluPC mod_silu_pc = { .n = dim };
+    g.dispatch(&dk.shared.silu, { &a.silu_t }, &mod_silu_pc, llm::ceil_div(dim, 256));
 
     // dual_mod_img = SiLU(t_emb) @ double_mod_img_w^T → [6*dim]
-    flux_matmul(&g, dk, &w.double_mod_img_w, &a.t_emb_mlp, &a.dual_mod_img, 6 * dim, dim, 1, 0);
-    flux_matmul(&g, dk, &w.double_mod_txt_w, &a.t_emb_mlp, &a.dual_mod_txt, 6 * dim, dim, 1, 0);
-    flux_matmul(&g, dk, &w.single_mod_w, &a.t_emb_mlp, &a.single_mod_buf, 3 * dim, dim, 1, 0);
+    flux_matmul(&g, dk, &w.double_mod_img_w, &a.silu_t, &a.dual_mod_img, 6 * dim, dim, 1, 0);
+    flux_matmul(&g, dk, &w.double_mod_txt_w, &a.silu_t, &a.dual_mod_txt, 6 * dim, dim, 1, 0);
+    flux_matmul(&g, dk, &w.single_mod_w, &a.silu_t, &a.single_mod_buf, 3 * dim, dim, 1, 0);
 
     g.checkpoint()!!;
 
@@ -980,7 +983,7 @@ fn void? FluxDiTModel.forward(
                 (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
         }!!;
         dp = (float*)dbgm.data();
-        io::printfn("    vec (pre-SiLU)[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
+        io::printfn("    vec (time_in MLP output)[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
         // Print weight dtypes  (0=F32, 1=F16, 8=Q8_0, 30=BF16)
         io::printfn("    weight dtypes: time_w0=%d time_w1=%d mod_img=%d img_in=%d",
             w.time_in_w0.dtype, w.time_in_w1.dtype, w.double_mod_img_w.dtype, w.img_in_w.dtype);
@@ -1019,9 +1022,8 @@ fn void? FluxDiTModel.forward(
         gf.needs_barrier = true;
 
         // Final AdaLN: SiLU(t_emb) → matmul → [2*dim] → (shift, scale)
-        // Use buf_b as temp for the [2*dim] output (mod_shift is only [dim] sized)
-        flux_matmul(&gf, dk, &w.final_adaln_w, &a.t_emb_mlp, &a.buf_b, 2 * dim, dim, 1, 0);
-        // buf_b[0:dim] = shift, buf_b[dim:2*dim] = scale
+        // GGUF uses original-DiT ordering (shift first, then scale) for final_layer.adaLN_modulation
+        flux_matmul(&gf, dk, &w.final_adaln_w, &a.silu_t, &a.buf_b, 2 * dim, dim, 1, 0);
         copy_chunk(&gf, &a.buf_b, &a.mod_shift, 0, dim);
         copy_chunk(&gf, &a.buf_b, &a.mod_scale, dim, dim);
 
