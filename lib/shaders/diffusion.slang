@@ -1725,9 +1725,9 @@ void transpose_channel_spatial(uint3 tid: SV_DispatchThreadID) {
 // ============================================================
 // Q, K, V in [S, C] = [seq_len, n_heads * head_dim] layout
 // Output in [S, C] layout (fused head merge on write)
-// Scores in groupshared memory — no global scores buffer needed
-// Supports seq_len up to 4096 (512x512 image, latent 64x64)
-// One workgroup per (head, query_position) pair
+// Tiled online softmax: processes K/V in tiles of TILE_S so that
+// arbitrary seq_len fits in 64 KB shared memory. One workgroup per
+// (head, query_position) pair.
 
 struct VaeAttentionParams {
     uint head_dim;
@@ -1744,9 +1744,17 @@ struct VaeAttentionParams {
 [vk_binding(2, 0)] RWStructuredBuffer<float> va_V;       // [S, C]
 [vk_binding(3, 0)] RWStructuredBuffer<float> va_output;  // [S, C]
 
+// LDS budget (RX 7800 XT = 64 KB):
+//   va_scores[4096]  = 16 KB
+//   va_q[512]        =  2 KB
+//   va_reduce[256]   =  1 KB
+//   va_run[2]        =  8 B
+//   total           ~ 19 KB  ✓
 groupshared float va_scores[4096];
 groupshared float va_reduce[256];
 groupshared float va_q[512];
+groupshared float va_run_max;
+groupshared float va_run_sum;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -1761,62 +1769,103 @@ void vae_attention(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
     uint head_d_start = head * D;
 
+    // Per-thread output accumulator. For Flux 2 mid attn D = 512, so 2 dims/thread.
+    // Sized for D up to 1024 (4 dims/thread).
+    float out_acc[4];
+    out_acc[0] = 0.0; out_acc[1] = 0.0; out_acc[2] = 0.0; out_acc[3] = 0.0;
+
     // Pre-load Q vector for this query position into shared memory
     for (uint d = gi; d < D; d += 256) {
         va_q[d] = va_Q[q_pos * C + head_d_start + d];
     }
+    if (gi == 0) {
+        va_run_max = -1.0e30;
+        va_run_sum = 0.0;
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    // Phase 1: Q * K^T -> scores in shared memory
-    for (uint kv_pos = gi; kv_pos < S; kv_pos += 256) {
-        float dot_val = 0.0;
-        for (uint d = 0; d < D; d++) {
-            dot_val += va_q[d] * va_K[kv_pos * C + head_d_start + d];
+    const uint TILE_S = 4096;
+    uint num_tiles = (S + TILE_S - 1) / TILE_S;
+
+    for (uint t = 0; t < num_tiles; t++) {
+        uint tile_start = t * TILE_S;
+        uint tile_end = min(tile_start + TILE_S, S);
+        uint tile_len = tile_end - tile_start;
+
+        // Phase 1: scores for this tile
+        for (uint i = gi; i < tile_len; i += 256) {
+            uint kv_pos = tile_start + i;
+            float dot_val = 0.0;
+            for (uint d = 0; d < D; d++) {
+                dot_val += va_q[d] * va_K[kv_pos * C + head_d_start + d];
+            }
+            va_scores[i] = dot_val * vae_attn_pc.scale;
         }
-        va_scores[kv_pos] = dot_val * vae_attn_pc.scale;
-    }
-    GroupMemoryBarrierWithGroupSync();
+        GroupMemoryBarrierWithGroupSync();
 
-    // Phase 2: Softmax in shared memory
-    float max_val = -1.0e30;
-    for (uint i = gi; i < S; i += 256) {
-        max_val = max(max_val, va_scores[i]);
-    }
-    va_reduce[gi] = max_val;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (gi < s) va_reduce[gi] = max(va_reduce[gi], va_reduce[gi + s]);
+        // Tile max
+        float local_max = -1.0e30;
+        for (uint i = gi; i < tile_len; i += 256) {
+            local_max = max(local_max, va_scores[i]);
+        }
+        va_reduce[gi] = local_max;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (gi < s) va_reduce[gi] = max(va_reduce[gi], va_reduce[gi + s]);
+            GroupMemoryBarrierWithGroupSync();
+        }
+        float tile_max = va_reduce[0];
+        GroupMemoryBarrierWithGroupSync();
+
+        // Online softmax: combine running stats with this tile.
+        float old_max = va_run_max;
+        float new_max = max(old_max, tile_max);
+        // alpha = exp(old_max - new_max). For first tile (old_max = -1e30), exp underflows to 0.
+        float alpha = exp(old_max - new_max);
+
+        // Convert scores to exp(s - new_max), reduce tile_sum
+        float local_sum = 0.0;
+        for (uint i = gi; i < tile_len; i += 256) {
+            float v = exp(va_scores[i] - new_max);
+            va_scores[i] = v;
+            local_sum += v;
+        }
+        va_reduce[gi] = local_sum;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (gi < s) va_reduce[gi] += va_reduce[gi + s];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        float tile_sum = va_reduce[0];
+        GroupMemoryBarrierWithGroupSync();
+
+        // Rescale per-thread output accumulator and add this tile's weighted V
+        for (uint k = 0; k < 4; k++) {
+            uint d = gi + k * 256;
+            if (d < D) {
+                out_acc[k] *= alpha;
+                float v_acc = 0.0;
+                for (uint i = 0; i < tile_len; i++) {
+                    v_acc += va_scores[i] * va_V[(tile_start + i) * C + head_d_start + d];
+                }
+                out_acc[k] += v_acc;
+            }
+        }
+
+        // Update running stats
+        if (gi == 0) {
+            va_run_max = new_max;
+            va_run_sum = va_run_sum * alpha + tile_sum;
+        }
         GroupMemoryBarrierWithGroupSync();
     }
-    float global_max = va_reduce[0];
-    GroupMemoryBarrierWithGroupSync();
 
-    float sum = 0.0;
-    for (uint i = gi; i < S; i += 256) {
-        float val = exp(va_scores[i] - global_max);
-        va_scores[i] = val;
-        sum += val;
-    }
-    va_reduce[gi] = sum;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (gi < s) va_reduce[gi] += va_reduce[gi + s];
-        GroupMemoryBarrierWithGroupSync();
-    }
-    float global_sum = va_reduce[0];
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint i = gi; i < S; i += 256) {
-        va_scores[i] /= global_sum;
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    // Phase 3: Weighted V sum -> output in [S, C] layout (fused head merge)
-    for (uint d = gi; d < D; d += 256) {
-        float acc = 0.0;
-        for (uint pos = 0; pos < S; pos++) {
-            acc += va_scores[pos] * va_V[pos * C + head_d_start + d];
+    // Final write: out / total_sum
+    float inv_sum = 1.0 / va_run_sum;
+    for (uint k = 0; k < 4; k++) {
+        uint d = gi + k * 256;
+        if (d < D) {
+            va_output[q_pos * C + head_d_start + d] = out_acc[k] * inv_sum;
         }
-        va_output[q_pos * C + head_d_start + d] = acc;
     }
 }
