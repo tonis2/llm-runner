@@ -1,0 +1,9 @@
+{
+  "provides": "qwen_edit",
+  "dependencies": ["llm_text", "vk", "image"],
+  "sources": ["./**"],
+  "targets": {
+    "linux-x64": { "linked-libraries": ["vulkan"] },
+    "windows-x64": { "linked-libraries": ["vulkan-1"] }
+  }
+}

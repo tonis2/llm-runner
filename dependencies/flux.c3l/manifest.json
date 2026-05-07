@@ -1,0 +1,9 @@
+{
+  "provides": "flux",
+  "dependencies": ["llm_text", "zimage", "vk", "image"],
+  "sources": ["./**"],
+  "targets": {
+    "linux-x64": { "linked-libraries": ["vulkan"] },
+    "windows-x64": { "linked-libraries": ["vulkan-1"] }
+  }
+}

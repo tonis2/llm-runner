@@ -1703,6 +1703,102 @@ void batch_matmul_q4_0(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// --- Q4_1 batch matmul ---
+// Q4_1: 20 bytes per block of 32 elements: f16 scale (2B) + f16 min (2B) + 16B nibbles
+// Dequant: value = scale * nibble + min  (nibble in 0..15, no -8 offset)
+
+[vk_push_constant] const BatchMatMulParams bmq41_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> bmq41_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bmq41_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bmq41_output;
+
+groupshared float bmq41_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_matmul_q4_1(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint pos = gid.x / bmq41_pc.out_dim;
+    uint row = gid.x % bmq41_pc.out_dim;
+    if (pos >= bmq41_pc.seq_len) return;
+    uint actual_row = bmq41_pc.row_offset + row;
+
+    uint blocks_per_row = bmq41_pc.in_dim / 32;
+    uint bytes_per_row = blocks_per_row * 20;  // 20 bytes per Q4_1 block
+    uint row_byte_offset = actual_row * bytes_per_row;
+    uint in_base = pos * bmq41_pc.in_dim;
+    float sum = 0.0;
+
+    for (uint block_idx = gi; block_idx < blocks_per_row; block_idx += 256) {
+        uint block_byte = row_byte_offset + block_idx * 20;
+
+        // Read f16 scale at offset 0
+        uint scale_uint_idx = block_byte / 4;
+        uint scale_byte_offset = block_byte % 4;
+        uint scale_word = bmq41_weight[scale_uint_idx];
+        uint scale_bits;
+        if (scale_byte_offset == 0) {
+            scale_bits = scale_word & 0xFFFFu;
+        } else if (scale_byte_offset == 2) {
+            scale_bits = (scale_word >> 16) & 0xFFFFu;
+        } else {
+            uint next_word = bmq41_weight[scale_uint_idx + 1];
+            scale_bits = ((scale_word >> (scale_byte_offset * 8)) | (next_word << (32 - scale_byte_offset * 8))) & 0xFFFFu;
+        }
+        float scale = unpack_f16(scale_bits);
+
+        // Read f16 min at offset 2
+        uint min_byte = block_byte + 2;
+        uint min_uint_idx = min_byte / 4;
+        uint min_byte_offset = min_byte % 4;
+        uint min_word = bmq41_weight[min_uint_idx];
+        uint min_bits;
+        if (min_byte_offset == 0) {
+            min_bits = min_word & 0xFFFFu;
+        } else if (min_byte_offset == 2) {
+            min_bits = (min_word >> 16) & 0xFFFFu;
+        } else {
+            uint next_word = bmq41_weight[min_uint_idx + 1];
+            min_bits = ((min_word >> (min_byte_offset * 8)) | (next_word << (32 - min_byte_offset * 8))) & 0xFFFFu;
+        }
+        float min_val = unpack_f16(min_bits);
+
+        // Quantized nibbles start at offset 4
+        uint qs_byte = block_byte + 4;
+        uint input_offset = in_base + block_idx * 32;
+
+        for (uint j = 0; j < 16; j += 4) {
+            uint byte_pos = qs_byte + j;
+            uint uint_idx = byte_pos / 4;
+            uint byte_off = byte_pos % 4;
+            uint word = bmq41_weight[uint_idx];
+            if (byte_off != 0) {
+                uint next_word = bmq41_weight[uint_idx + 1];
+                word = (word >> (byte_off * 8)) | (next_word << (32 - byte_off * 8));
+            }
+            // Low nibbles: elements 0-15, high nibbles: elements 16-31
+            sum += (scale * float(word & 0xFu) + min_val) * bmq41_input[input_offset + j];
+            sum += (scale * float((word >> 8) & 0xFu) + min_val) * bmq41_input[input_offset + j + 1];
+            sum += (scale * float((word >> 16) & 0xFu) + min_val) * bmq41_input[input_offset + j + 2];
+            sum += (scale * float((word >> 24) & 0xFu) + min_val) * bmq41_input[input_offset + j + 3];
+            sum += (scale * float((word >> 4) & 0xFu) + min_val) * bmq41_input[input_offset + 16 + j];
+            sum += (scale * float((word >> 12) & 0xFu) + min_val) * bmq41_input[input_offset + 16 + j + 1];
+            sum += (scale * float((word >> 20) & 0xFu) + min_val) * bmq41_input[input_offset + 16 + j + 2];
+            sum += (scale * float((word >> 28) & 0xFu) + min_val) * bmq41_input[input_offset + 16 + j + 3];
+        }
+    }
+
+    bmq41_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) bmq41_shared[gi] += bmq41_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) {
+        bmq41_output[pos * bmq41_pc.out_dim + row] = bmq41_shared[0];
+    }
+}
+
 // --- Q4_K batch matmul ---
 
 [vk_push_constant] const BatchMatMulParams bmq4k_pc;

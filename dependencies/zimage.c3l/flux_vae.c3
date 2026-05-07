@@ -142,10 +142,15 @@ fn FluxVaeResBlock load_flux_resblock(llm::DeviceContext* ctx, llm::SafetensorsF
     rb.conv2_weight = load_flux_vae_conv_weight(ctx, sf, prefix, "conv2.weight");
     rb.conv2_bias = load_flux_vae_tensor(ctx, sf, prefix, "conv2.bias");
 
-    // Check for nin_shortcut (channel change)
+    // Check for shortcut (channel change)
     char[256] nin_buf;
+    String conv_shortcut_name = flux_vae_name(&nin_buf, prefix, "conv_shortcut.weight");
     String nin_name = flux_vae_name(&nin_buf, prefix, "nin_shortcut.weight");
-    if (try info = sf.find_tensor(nin_name)) {
+    if (try info = sf.find_tensor(conv_shortcut_name)) {
+        rb.nin_shortcut_weight = llm::upload_safetensor_conv_f32(ctx, sf, conv_shortcut_name)!!;
+        rb.nin_shortcut_bias = load_flux_vae_tensor(ctx, sf, prefix, "conv_shortcut.bias");
+        rb.has_nin_shortcut = true;
+    } else if (try info = sf.find_tensor(nin_name)) {
         rb.nin_shortcut_weight = llm::upload_safetensor_conv_f32(ctx, sf, nin_name)!!;
         rb.nin_shortcut_bias = load_flux_vae_tensor(ctx, sf, prefix, "nin_shortcut.bias");
         rb.has_nin_shortcut = true;
@@ -176,6 +181,26 @@ fn llm::Tensor load_flux_vae_conv_weight(llm::DeviceContext* ctx, llm::Safetenso
 }
 
 fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String prefix, uint channels) {
+    // Try new diffusers format first
+    char[256] buf;
+    String group_norm_w = flux_vae_name(&buf, prefix, "group_norm.weight");
+    if (try info = sf.find_tensor(group_norm_w)) {
+        return {
+            .norm_weight = load_flux_vae_tensor(ctx, sf, prefix, "group_norm.weight"),
+            .norm_bias = load_flux_vae_tensor(ctx, sf, prefix, "group_norm.bias"),
+            .q_weight = load_flux_vae_tensor(ctx, sf, prefix, "to_q.weight"),
+            .q_bias = load_flux_vae_tensor(ctx, sf, prefix, "to_q.bias"),
+            .k_weight = load_flux_vae_tensor(ctx, sf, prefix, "to_k.weight"),
+            .k_bias = load_flux_vae_tensor(ctx, sf, prefix, "to_k.bias"),
+            .v_weight = load_flux_vae_tensor(ctx, sf, prefix, "to_v.weight"),
+            .v_bias = load_flux_vae_tensor(ctx, sf, prefix, "to_v.bias"),
+            .proj_out_weight = load_flux_vae_tensor(ctx, sf, prefix, "to_out.0.weight"),
+            .proj_out_bias = load_flux_vae_tensor(ctx, sf, prefix, "to_out.0.bias"),
+            .channels = channels,
+        };
+    }
+
+    // Fall back to old converted format
     return {
         .norm_weight = load_flux_vae_tensor(ctx, sf, prefix, "norm.weight"),
         .norm_bias = load_flux_vae_tensor(ctx, sf, prefix, "norm.bias"),
@@ -194,60 +219,78 @@ fn FluxVaeAttn load_flux_attn(llm::DeviceContext* ctx, llm::SafetensorsFile* sf,
 // --- Load Flux VAE Decoder ---
 
 fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, VaeKernels* kernels) {
-    String pfx = "decoder.";
-
     FluxVaeDecoder dec;
     dec.ctx = ctx;
     dec.kernels = kernels;
 
-    dec.conv_in = load_flux_conv(ctx, sf, "decoder.conv_in.", 16, 512);
-    dec.mid_block1 = load_flux_resblock(ctx, sf, "decoder.mid.block_1.", 512, 512);
-    dec.mid_attn = load_flux_attn(ctx, sf, "decoder.mid.attn_1.", 512);
-    dec.mid_block2 = load_flux_resblock(ctx, sf, "decoder.mid.block_2.", 512, 512);
+    // Detect format: new diffusers format vs old converted format
+    bool new_fmt = false;
+    if (try info = sf.find_tensor("decoder.mid_block.resnets.0.conv1.weight")) {
+        new_fmt = true;
+        io::printfn("  VAE format: diffusers (new)");
+    } else {
+        io::printfn("  VAE format: converted (old)");
+    }
 
-    // up.3: 3 resblocks at 512 + upsample
+    // Auto-detect input channels from weight shape: [out_c, in_c, kH, kW]
+    uint vae_in_ch = 16;  // default for Flux.1 ae.safetensors
+    if (try info = sf.find_tensor("decoder.conv_in.weight")) {
+        if (info.n_dims >= 2) vae_in_ch = (uint)info.shape[1];
+    }
+    io::printfn("  VAE decoder conv_in: %d input channels", vae_in_ch);
+    dec.conv_in = load_flux_conv(ctx, sf, "decoder.conv_in.", vae_in_ch, 512);
+
+    if (new_fmt) {
+        dec.mid_block1 = load_flux_resblock(ctx, sf, "decoder.mid_block.resnets.0.", 512, 512);
+        dec.mid_attn = load_flux_attn(ctx, sf, "decoder.mid_block.attentions.0.", 512);
+        dec.mid_block2 = load_flux_resblock(ctx, sf, "decoder.mid_block.resnets.1.", 512, 512);
+    } else {
+        dec.mid_block1 = load_flux_resblock(ctx, sf, "decoder.mid.block_1.", 512, 512);
+        dec.mid_attn = load_flux_attn(ctx, sf, "decoder.mid.attn_1.", 512);
+        dec.mid_block2 = load_flux_resblock(ctx, sf, "decoder.mid.block_2.", 512, 512);
+    }
+
+    // up blocks: new format up_blocks.0 is closest to mid (like old up.3),
+    // up_blocks.3 is closest to output (like old up.0)
     for (uint i = 0; i < 3; i++) {
         char[64] rb_prefix;
         usz plen = 0;
-        String base = "decoder.up.3.block.";
+        String base = new_fmt ? "decoder.up_blocks.0.resnets." : "decoder.up.3.block.";
         for (usz j = 0; j < base.len; j++) { rb_prefix[plen] = base[j]; plen++; }
         rb_prefix[plen] = (char)('0' + i); plen++;
         rb_prefix[plen] = '.'; plen++;
         dec.up3_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], 512, 512);
     }
-    dec.up3_upsample = load_flux_conv(ctx, sf, "decoder.up.3.upsample.conv.", 512, 512);
+    dec.up3_upsample = load_flux_conv(ctx, sf, new_fmt ? "decoder.up_blocks.0.upsamplers.0.conv." : "decoder.up.3.upsample.conv.", 512, 512);
 
-    // up.2: 3 resblocks at 512 + upsample
     for (uint i = 0; i < 3; i++) {
         char[64] rb_prefix;
         usz plen = 0;
-        String base = "decoder.up.2.block.";
+        String base = new_fmt ? "decoder.up_blocks.1.resnets." : "decoder.up.2.block.";
         for (usz j = 0; j < base.len; j++) { rb_prefix[plen] = base[j]; plen++; }
         rb_prefix[plen] = (char)('0' + i); plen++;
         rb_prefix[plen] = '.'; plen++;
         uint in_c = (i == 0) ? 512 : 512;
         dec.up2_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], in_c, 512);
     }
-    dec.up2_upsample = load_flux_conv(ctx, sf, "decoder.up.2.upsample.conv.", 512, 512);
+    dec.up2_upsample = load_flux_conv(ctx, sf, new_fmt ? "decoder.up_blocks.1.upsamplers.0.conv." : "decoder.up.2.upsample.conv.", 512, 512);
 
-    // up.1: 3 resblocks 512->256 + upsample
     for (uint i = 0; i < 3; i++) {
         char[64] rb_prefix;
         usz plen = 0;
-        String base = "decoder.up.1.block.";
+        String base = new_fmt ? "decoder.up_blocks.2.resnets." : "decoder.up.1.block.";
         for (usz j = 0; j < base.len; j++) { rb_prefix[plen] = base[j]; plen++; }
         rb_prefix[plen] = (char)('0' + i); plen++;
         rb_prefix[plen] = '.'; plen++;
         uint in_c = (i == 0) ? 512 : 256;
         dec.up1_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], in_c, 256);
     }
-    dec.up1_upsample = load_flux_conv(ctx, sf, "decoder.up.1.upsample.conv.", 256, 256);
+    dec.up1_upsample = load_flux_conv(ctx, sf, new_fmt ? "decoder.up_blocks.2.upsamplers.0.conv." : "decoder.up.1.upsample.conv.", 256, 256);
 
-    // up.0: 3 resblocks 256->128
     for (uint i = 0; i < 3; i++) {
         char[64] rb_prefix;
         usz plen = 0;
-        String base = "decoder.up.0.block.";
+        String base = new_fmt ? "decoder.up_blocks.3.resnets." : "decoder.up.0.block.";
         for (usz j = 0; j < base.len; j++) { rb_prefix[plen] = base[j]; plen++; }
         rb_prefix[plen] = (char)('0' + i); plen++;
         rb_prefix[plen] = '.'; plen++;
@@ -255,9 +298,14 @@ fn FluxVaeDecoder? load_flux_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
         dec.up0_blocks[i] = load_flux_resblock(ctx, sf, (String)rb_prefix[0..plen - 1], in_c, 128);
     }
 
-    // Output
-    dec.norm_out_weight = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.weight");
-    dec.norm_out_bias = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.bias");
+    // Output norm
+    if (new_fmt) {
+        dec.norm_out_weight = load_flux_vae_tensor(ctx, sf, "decoder.", "conv_norm_out.weight");
+        dec.norm_out_bias = load_flux_vae_tensor(ctx, sf, "decoder.", "conv_norm_out.bias");
+    } else {
+        dec.norm_out_weight = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.weight");
+        dec.norm_out_bias = load_flux_vae_tensor(ctx, sf, "decoder.", "norm_out.bias");
+    }
     dec.conv_out = load_flux_conv(ctx, sf, "decoder.conv_out.", 128, 3);
 
     return dec;
