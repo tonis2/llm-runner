@@ -1,0 +1,10 @@
+{
+    "model": "/home/tonis/Documents/AI/models/flux-2-klein-9b-Q8_0.gguf",
+    "text_model": "/home/tonis/Documents/AI/models/Qwen3-8B-Q8_0.gguf",
+    "vae": "/home/tonis/Documents/AI/models/flux_vae_converted.safetensors",
+    "prompt": "a bright blue ocean with white waves under sunny sky",
+    "steps": 4,
+    "seed": 42,
+    "size": 512,
+    "output": "output_flux.png"
+}

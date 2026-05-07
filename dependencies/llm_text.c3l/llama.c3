@@ -15,6 +15,7 @@ const char[*] LLM_SPV = $embed("./shaders/llm.spv");
 const char[*] LLAMA_CONFIG_JSON = $embed("./configs/llama.json");
 const char[*] QWEN2_CONFIG_JSON = $embed("./configs/qwen2.json");
 const char[*] QWEN3_CONFIG_JSON = $embed("./configs/qwen3.json");
+const char[*] QWEN2_VL_CONFIG_JSON = $embed("./configs/qwen2_vl.json");
 
 struct LayerWeights {
     llm::Tensor attn_norm;
@@ -23,6 +24,9 @@ struct LayerWeights {
     llm::Tensor wk;
     llm::Tensor wv;
     llm::Tensor wo;
+    llm::Tensor wq_bias;
+    llm::Tensor wk_bias;
+    llm::Tensor wv_bias;
     llm::Tensor wq_norm;
     llm::Tensor wk_norm;
     llm::Tensor ffn_norm;
@@ -148,6 +152,13 @@ fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm:
                 layers[l].ffn_gate = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.ffn_gate);
             }
 
+            // Load Q/K/V bias weights if configured (e.g. Qwen2.5-VL)
+            if (names.wq_bias.len > 0) {
+                layers[l].wq_bias = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wq_bias);
+                layers[l].wk_bias = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wk_bias);
+                layers[l].wv_bias = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wv_bias);
+            }
+
             // Load Q/K norm weights if configured
             if (names.wq_norm.len > 0) {
                 layers[l].wq_norm = load_layer_tensor(ctx, gf, names.layer_prefix, l, names.wq_norm);
@@ -244,6 +255,11 @@ fn LayerWeights? load_single_layer(llm::DeviceContext* ctx, llm::GGUFFile* gf, l
     if (config.ffn_type == SWIGLU) {
         lw.ffn_gate = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.ffn_gate);
     }
+    if (names.wq_bias.len > 0) {
+        lw.wq_bias = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.wq_bias);
+        lw.wk_bias = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.wk_bias);
+        lw.wv_bias = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.wv_bias);
+    }
     if (names.wq_norm.len > 0) {
         lw.wq_norm = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.wq_norm);
         lw.wk_norm = load_layer_tensor(ctx, gf, names.layer_prefix, layer, names.wk_norm);
@@ -267,6 +283,9 @@ fn void free_layer_weights(LayerWeights* lw, llm::ModelConfig* config) {
     lw.wk.free();
     lw.wv.free();
     lw.wo.free();
+    if (lw.wq_bias.size_bytes > 0) lw.wq_bias.free();
+    if (lw.wk_bias.size_bytes > 0) lw.wk_bias.free();
+    if (lw.wv_bias.size_bytes > 0) lw.wv_bias.free();
     lw.ffn_norm.free();
     if (lw.ffn_norm_bias.size_bytes > 0) lw.ffn_norm_bias.free();
     if (lw.wq_norm.size_bytes > 0) lw.wq_norm.free();
@@ -407,6 +426,16 @@ fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, ui
     llm::dispatch_matmul(g, sk, &lw.wq, &a.norm_out, &a.q, q_dim, c.dim);
     llm::dispatch_matmul(g, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
     llm::dispatch_matmul(g, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
+
+    // Q/K/V bias addition (e.g. Qwen2.5-VL)
+    if (lw.wq_bias.size_bytes > 0) {
+        llm::ResidualPC q_bias_pc = { .n = q_dim };
+        g.dispatch(&sk.residual_add, { &a.q, &lw.wq_bias }, &q_bias_pc, llm::ceil_div(q_dim, 256));
+        llm::ResidualPC k_bias_pc = { .n = kv_dim };
+        g.dispatch(&sk.residual_add, { &a.k, &lw.wk_bias }, &k_bias_pc, llm::ceil_div(kv_dim, 256));
+        llm::ResidualPC v_bias_pc = { .n = kv_dim };
+        g.dispatch(&sk.residual_add, { &a.v, &lw.wv_bias }, &v_bias_pc, llm::ceil_div(kv_dim, 256));
+    }
 
     // Q/K norm (per-head RMSNorm, e.g. Qwen3)
     if (lw.wq_norm.size_bytes > 0) {
@@ -686,6 +715,85 @@ fn llm::Tensor? LlmModel.encode_text_streaming(&self, uint[] tokens) {
     }
 
     // Skip final norm — diffusers uses raw hidden_states[-2] without normalization
+    hidden_states.free();
+
+    text_embeddings.n_dims = 2;
+    text_embeddings.shape = { (ulong)seq_len, (ulong)c.dim, 0, 0 };
+
+    return text_embeddings;
+}
+
+// Streaming encode with visual token injection.
+// Same as encode_text_streaming, but positions where tokens[pos] == image_pad_id
+// get their embeddings from visual_embeddings (GPU tensor [n_visual, dim]) instead
+// of from the token embedding table.
+fn llm::Tensor? LlmModel.encode_text_with_visual(&self, uint[] tokens, llm::Tensor* visual_embeddings, uint image_pad_id) {
+    llm::ModelConfig* c = &self.config;
+    llm::DeviceContext* ctx = self.ctx;
+    uint seq_len = (uint)tokens.len;
+
+    llm::Tensor hidden_states = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+
+    // 1. Embed all tokens — visual positions get ViT embeddings, text positions get vocab embeddings
+    uint visual_idx = 0;
+    for (uint pos = 0; pos < seq_len; pos++) {
+        if (tokens[pos] == image_pad_id && visual_embeddings != null) {
+            // Copy from ViT output (GPU → GPU)
+            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer vis_cmd) {
+                vk::cmdCopyBuffer(vis_cmd, visual_embeddings.gpu_buffer.buffer, hidden_states.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = (ulong)visual_idx * c.dim * 4, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
+            }!!;
+            visual_idx++;
+        } else {
+            // Normal token embedding via CPU dequant
+            float* staging_ptr = (float*)self.embedding_staging.data();
+            llm::dequant_embedding_row(self.weights.embedding_data, &self.weights.embedding_info, tokens[pos], staging_ptr, c.dim);
+
+            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer emb_cmd) {
+                vk::cmdCopyBuffer(emb_cmd, self.embedding_staging.buffer, hidden_states.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
+            }!!;
+        }
+    }
+
+    io::printfn("  Embedded %d tokens (%d visual, %d text)", seq_len, visual_idx, seq_len - visual_idx);
+
+    // 2. Process layers one at a time (identical to encode_text_streaming)
+    uint penultimate_layer = c.n_layers >= 2 ? c.n_layers - 2 : 0;
+    llm::Tensor text_embeddings;
+
+    for (uint l = 0; l < c.n_layers; l++) {
+        LayerWeights lw = load_single_layer(ctx, self.gf, self.names, c, l)!!;
+
+        llm::RenderGraph g;
+        g.init(ctx)!!;
+        for (uint pos = 0; pos < seq_len; pos++) {
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, hidden_states.gpu_buffer.buffer, self.acts.hidden.gpu_buffer.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = (ulong)pos * c.dim * 4, .dstOffset = 0, .size = (ulong)c.dim * 4 }});
+            g.needs_barrier = true;
+
+            self.forward_layer(&g, &lw, l, pos)!!;
+
+            if (g.needs_barrier) llm::compute_barrier(g.cmd);
+            vk::cmdCopyBuffer(g.cmd, self.acts.hidden.gpu_buffer.buffer, hidden_states.gpu_buffer.buffer, 1,
+                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)pos * c.dim * 4, .size = (ulong)c.dim * 4 }});
+            g.needs_barrier = true;
+        }
+        g.flush()!!;
+
+        free_layer_weights(&lw, c);
+
+        if (l == penultimate_layer) {
+            text_embeddings = llm::create_f32_tensor(ctx, { (ulong)seq_len * c.dim, 0, 0, 0 }, 1)!!;
+            ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer snap_cmd) {
+                vk::cmdCopyBuffer(snap_cmd, hidden_states.gpu_buffer.buffer,
+                    text_embeddings.gpu_buffer.buffer, 1,
+                    (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * c.dim * 4 }});
+            }!!;
+        }
+    }
+
     hidden_states.free();
 
     text_embeddings.n_dims = 2;

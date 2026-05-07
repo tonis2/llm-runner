@@ -406,6 +406,20 @@ void gated_residual(uint3 tid: SV_DispatchThreadID) {
 }
 
 // ============================================================
+// Gated Residual Add (Linear) - residual += gate * input
+// ============================================================
+// Like gated_residual but without tanh — for architectures that use linear gating (e.g. Flux)
+// Reuses the same push constants and bindings as gated_residual (scale/clip_thresh ignored)
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void gated_residual_linear(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= gated_res_pc.n_elements) return;
+    uint d = tid.x % gated_res_pc.dim;
+    gres_residual[tid.x] += gres_gate[d] * gres_input[tid.x];
+}
+
+// ============================================================
 // Value Clipping - Clip extreme outliers in-place
 // ============================================================
 
