@@ -171,6 +171,7 @@ struct Tokenizer {
     bool ignore_merges;
     uint bos_id;
     uint eos_id;
+    uint pad_id;
     MergeMap merge_map;
 }
 
@@ -219,6 +220,8 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
     // Read BOS/EOS from GGUF metadata, default to 1/2 (SPM convention)
     uint bos_id = gf.get_u32("tokenizer.ggml.bos_token_id") ?? 1;
     uint eos_id = gf.get_u32("tokenizer.ggml.eos_token_id") ?? 2;
+    // Pad token: GGUF stores it as padding_token_id; falls back to eos_id (Qwen3 uses <|endoftext|>=151643)
+    uint pad_id = gf.get_u32("tokenizer.ggml.padding_token_id") ?? eos_id;
 
     // Load merges for BPE
     MergeMap merge_map;
@@ -260,6 +263,7 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
         .ignore_merges = ignore_merges,
         .bos_id = bos_id,
         .eos_id = eos_id,
+        .pad_id = pad_id,
         .merge_map = merge_map,
     };
 }
