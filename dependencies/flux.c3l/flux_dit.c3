@@ -151,18 +151,9 @@ struct FluxDiTModel {
     uint n_joint;     // n_img + n_txt
     uint latent_h;
     uint latent_w;
-    uint patches_h;
-    uint patches_w;
 }
 
 // --- Tensor Name Helpers ---
-
-fn String flux_dit_name(char[256]* buf, String prefix, String suffix) {
-    usz pos = 0;
-    for (usz i = 0; i < prefix.len; i++) { (*buf)[pos] = prefix[i]; pos++; }
-    for (usz i = 0; i < suffix.len; i++) { (*buf)[pos] = suffix[i]; pos++; }
-    return (String)(*buf)[0..pos - 1];
-}
 
 fn String flux_block_name(char[256]* buf, String prefix, uint layer, String suffix) {
     usz pos = 0;
@@ -219,7 +210,6 @@ fn void detect_flux_block_counts(llm::GGUFFile* gf, uint* n_dual, uint* n_single
 
     *n_dual = dual;
     *n_single = single;
-    io::printfn("Detected Flux blocks: %d dual-stream, %d single-stream", dual, single);
 }
 
 // --- Activation Allocation ---
@@ -373,7 +363,6 @@ fn void? precompute_flux_mrope(
 
     mem::free(cos_data);
     mem::free(sin_data);
-    io::printfn("  mRoPE tables: [%d, %d] (theta=%.0f)", seq_len, half_dim, FLUX_ROPE_THETA);
 }
 
 // --- Batch Matmul Dispatch Helper ---
@@ -458,67 +447,6 @@ fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxD
     uint n_dual, n_single;
     detect_flux_block_counts(gf, &n_dual, &n_single);
 
-    // Diagnostic: check key tensor shapes and existence
-    {
-        uint bias_count = 0;
-        bool has_guidance = false;
-        bool has_vector = false;
-        for (usz i = 0; i < gf.n_tensors; i++) {
-            String name = gf.tensors[i].name;
-            if (name.contains("bias")) bias_count++;
-            if (name.contains("guidance")) has_guidance = true;
-            if (name.contains("vector")) has_vector = true;
-        }
-        io::printfn("  Tensor stats: %d total, %d with bias, guidance=%s, vector=%s",
-            (uint)gf.n_tensors, bias_count, has_guidance ? "yes" : "no", has_vector ? "yes" : "no");
-
-        // Check key tensor shapes
-        if (try info = gf.find_tensor("txt_in.weight")) {
-            io::printfn("  txt_in.weight: [%d, %d] type=%d", (uint)info.shape[0], (uint)info.shape[1], (uint)info.type);
-        }
-        if (try info = gf.find_tensor("img_in.weight")) {
-            io::printfn("  img_in.weight: [%d, %d] type=%d", (uint)info.shape[0], (uint)info.shape[1], (uint)info.type);
-        }
-        if (try info = gf.find_tensor("time_in.in_layer.weight")) {
-            io::printfn("  time_in.in_layer.weight: [%d, %d] type=%d", (uint)info.shape[0], (uint)info.shape[1], (uint)info.type);
-        }
-        // Check for biases in time_in
-        if (try info = gf.find_tensor("time_in.in_layer.bias")) {
-            io::printfn("  time_in.in_layer.bias: [%d] EXISTS", (uint)info.shape[0]);
-        }
-        if (try info = gf.find_tensor("time_in.out_layer.bias")) {
-            io::printfn("  time_in.out_layer.bias: [%d] EXISTS", (uint)info.shape[0]);
-        }
-        // Check guidance_in
-        if (try info = gf.find_tensor("guidance_in.in_layer.weight")) {
-            io::printfn("  guidance_in.in_layer.weight: [%d, %d] EXISTS", (uint)info.shape[0], (uint)info.shape[1]);
-        }
-        // Check vector_in
-        if (try info = gf.find_tensor("vector_in.in_layer.weight")) {
-            io::printfn("  vector_in.in_layer.weight: [%d, %d] EXISTS", (uint)info.shape[0], (uint)info.shape[1]);
-        }
-        // Check modulation biases
-        if (try info = gf.find_tensor("double_stream_modulation_img.lin.bias")) {
-            io::printfn("  double_stream_modulation_img.lin.bias: [%d] EXISTS", (uint)info.shape[0]);
-        }
-        // Check final layer biases
-        if (try info = gf.find_tensor("final_layer.linear.bias")) {
-            io::printfn("  final_layer.linear.bias: [%d] EXISTS", (uint)info.shape[0]);
-        }
-        if (try info = gf.find_tensor("final_layer.adaLN_modulation.1.bias")) {
-            io::printfn("  final_layer.adaLN_modulation.1.bias: [%d] EXISTS", (uint)info.shape[0]);
-        }
-        // Print a few bias tensor names for reference
-        uint printed = 0;
-        for (usz i = 0; i < gf.n_tensors && printed < 5; i++) {
-            String name = gf.tensors[i].name;
-            if (name.contains("bias")) {
-                io::printfn("    bias tensor: %s [%d]", name, (uint)gf.tensors[i].shape[0]);
-                printed++;
-            }
-        }
-    }
-
     char[256] buf;
 
     // Load global weights
@@ -534,8 +462,6 @@ fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxD
 
     global.final_linear_w = load_dit_tensor(ctx, gf, "final_layer.linear.weight");
     global.final_adaln_w = load_dit_tensor(ctx, gf, "final_layer.adaLN_modulation.1.weight");
-
-    io::printfn("  Global weights loaded");
 
     // Load dual-stream blocks
     FluxDualBlockWeights[] dual_blocks = mem::new_array(FluxDualBlockWeights, n_dual);
@@ -559,10 +485,6 @@ fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxD
             .txt_mlp_up_w = load_dit_tensor(ctx, gf, flux_block_name(&buf, blk_prefix, l, "txt_mlp.0.weight")),
             .txt_mlp_down_w = load_dit_tensor(ctx, gf, flux_block_name(&buf, blk_prefix, l, "txt_mlp.2.weight")),
         };
-
-        if ((l + 1) % 5 == 0 || l == n_dual - 1) {
-            io::printfn("  Dual block %d / %d loaded", l + 1, n_dual);
-        }
     }
 
     // Load single-stream blocks
@@ -576,10 +498,6 @@ fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxD
             .q_norm = load_dit_tensor(ctx, gf, flux_block_name(&buf, blk_prefix, l, "norm.query_norm.scale")),
             .k_norm = load_dit_tensor(ctx, gf, flux_block_name(&buf, blk_prefix, l, "norm.key_norm.scale")),
         };
-
-        if ((l + 1) % 10 == 0 || l == n_single - 1) {
-            io::printfn("  Single block %d / %d loaded", l + 1, n_single);
-        }
     }
 
     io::printfn("  Flux DiT loaded: %d dual + %d single blocks, dim=%d", n_dual, n_single, FLUX_DIM);
@@ -873,9 +791,8 @@ fn void? flux_single_stream_block(
 
 fn void? FluxDiTModel.forward(
     &self,
-    llm::Tensor* t5_embeddings, // [n_txt, 4096] T5 output
-    uint t5_seq_len,
-    float sigma                 // timestep (0=clean, 1=noise)
+    llm::Tensor* text_embeddings, // [n_txt, FLUX_TEXT_DIM]
+    float sigma                   // timestep (0=clean, 1=noise)
 ) {
     llm::DeviceContext* ctx = self.ctx;
     zimage::DiTKernels* dk = &self.dk.dit;
@@ -902,7 +819,7 @@ fn void? FluxDiTModel.forward(
     flux_matmul(&g, dk, &w.img_in_w, &a.patches, &a.img_hidden, dim, FLUX_PATCH_DIM, n_img, 0);
 
     // 3. txt_in: [n_txt, 12288] → [n_txt, dim]
-    flux_matmul(&g, dk, &w.txt_in_w, t5_embeddings, &a.txt_hidden, dim, FLUX_TEXT_DIM, n_txt, 0);
+    flux_matmul(&g, dk, &w.txt_in_w, text_embeddings, &a.txt_hidden, dim, FLUX_TEXT_DIM, n_txt, 0);
 
     // 4. Timestep embedding: sigma * 1000 → sincos[256] → MLP → [dim]
     // diffusers Klein pipeline passes timestep/1000 = sigma into the transformer,
@@ -930,72 +847,7 @@ fn void? FluxDiTModel.forward(
 
     g.checkpoint()!!;
 
-    // Debug: print img_hidden and txt_hidden after embedding
-    g.checkpoint()!!;
-    {
-        float[4] dbg;
-        vk::Memory dbgm = vk::new_buffer(
-            allocator: &ctx.allocator, usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: null, data_size: 16)!!;
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc) {
-            vk::cmdCopyBuffer(dc, a.img_hidden.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
-        }!!;
-        float* dp = (float*)dbgm.data();
-        io::printfn("    img_hidden[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc2) {
-            vk::cmdCopyBuffer(dc2, a.txt_hidden.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
-        }!!;
-        dp = (float*)dbgm.data();
-        io::printfn("    txt_hidden[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc3) {
-            vk::cmdCopyBuffer(dc3, a.dual_mod_img.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
-        }!!;
-        dp = (float*)dbgm.data();
-        io::printfn("    dual_mod_img[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        // Check gate values (at offset 2*dim=8192)
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc4) {
-            vk::cmdCopyBuffer(dc4, a.dual_mod_img.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = (ulong)2 * FLUX_DIM * 4, .dstOffset = 0, .size = 16 }});
-        }!!;
-        dp = (float*)dbgm.data();
-        io::printfn("    dual_gate1_img[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        // Check t_emb_mlp (SiLU(vec))
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc5) {
-            vk::cmdCopyBuffer(dc5, a.t_emb_mlp.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
-        }!!;
-        dp = (float*)dbgm.data();
-        io::printfn("    silu_vec[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        // Check raw t_emb (sinusoidal)
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc6) {
-            vk::cmdCopyBuffer(dc6, a.t_emb.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
-        }!!;
-        dp = (float*)dbgm.data();
-        io::printfn("    t_emb_sincos[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        // Check silu_t (vec before final SiLU) — should be the time_in MLP output
-        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer dc7) {
-            vk::cmdCopyBuffer(dc7, a.silu_t.gpu_buffer.buffer, dbgm.buffer, 1,
-                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = 16 }});
-        }!!;
-        dp = (float*)dbgm.data();
-        io::printfn("    vec (time_in MLP output)[0:4] = %.4f %.4f %.4f %.4f", dp[0], dp[1], dp[2], dp[3]);
-        // Print weight dtypes  (0=F32, 1=F16, 8=Q8_0, 30=BF16)
-        io::printfn("    weight dtypes: time_w0=%d time_w1=%d mod_img=%d img_in=%d",
-            w.time_in_w0.dtype, w.time_in_w1.dtype, w.double_mod_img_w.dtype, w.img_in_w.dtype);
-        io::printfn("    block dtypes: dual_qkv=%d dual_proj=%d single_l1=%d single_l2=%d",
-            self.dual_blocks[0].img_qkv_w.dtype, self.dual_blocks[0].img_proj_w.dtype,
-            self.single_blocks[0].linear1_w.dtype, self.single_blocks[0].linear2_w.dtype);
-        dbgm.free();
-    }
-    g.init(ctx)!!;
-
     // 6. Dual-stream blocks
-    io::printfn("    Running %d dual-stream blocks...", self.n_dual_blocks);
     for (uint l = 0; l < self.n_dual_blocks; l++) {
         flux_dual_stream_block(self, &g, &self.dual_blocks[l])!!;
     }
@@ -1005,7 +857,6 @@ fn void? FluxDiTModel.forward(
     copy_to_offset(&g, &a.img_hidden, &a.hidden, n_txt * dim, n_img * dim);
 
     // 8. Single-stream blocks
-    io::printfn("    Running %d single-stream blocks...", self.n_single_blocks);
     for (uint l = 0; l < self.n_single_blocks; l++) {
         flux_single_stream_block(self, &g, &self.single_blocks[l])!!;
     }
