@@ -146,11 +146,17 @@ struct FluxDiTModel {
     FluxDiTActivations acts;
     llm::DeviceContext* ctx;
 
-    uint n_img;       // actual image patch count
+    uint n_img;       // total image-stream tokens (= n_noise + n_ref)
+    uint n_noise;     // noise latent token count (= latent_h * latent_w)
+    uint n_ref;       // kontext reference image tokens (0 in txt2img/img2img)
     uint n_txt;       // actual text token count
     uint n_joint;     // n_img + n_txt
-    uint latent_h;
-    uint latent_w;
+    uint latent_h;    // noise latent grid height
+    uint latent_w;    // noise latent grid width
+
+    // Kontext reference patches in patchify-output layout: [n_ref, FLUX_PATCH_DIM]
+    // i.e. HWC-per-patch (channel innermost). Empty when n_ref == 0.
+    llm::Tensor ref_patches;
 }
 
 // --- Tensor Name Helpers ---
@@ -265,13 +271,23 @@ fn void? precompute_flux_mrope(
     llm::Tensor* cos_out,
     llm::Tensor* sin_out,
     uint n_txt,
-    uint n_img,
+    uint n_noise,
     uint patches_w,
-    uint patches_h
+    uint patches_h,
+    uint n_ref = 0,
+    uint ref_patches_w = 0,
+    uint ref_patches_h = 0
 ) {
+    // Sequence layout: [text(n_txt) | noise_img(n_noise) | ref_img(n_ref)]
+    uint n_img   = n_noise + n_ref;
     uint seq_len = n_txt + n_img;
     uint half_dim = FLUX_HEAD_DIM / 2; // 64
     usz table_size = (usz)seq_len * half_dim;
+
+    // T-axis offset for reference image tokens. Matches diffusers
+    // `_prepare_image_ids` (pipeline_flux2_klein.py:352): t = scale + scale * i
+    // with scale=10 for the (single) reference image we support.
+    const uint REF_T_OFFSET = 10;
 
     float* cos_data = (float*)mem::calloc(table_size * 4);
     float* sin_data = (float*)mem::calloc(table_size * 4);
@@ -286,12 +302,19 @@ fn void? precompute_flux_mrope(
             pos_h = 0;
             pos_w = 0;
             pos_l = t;
-        } else {
-            // Image token: spatial position on H/W axes
+        } else if (t < n_txt + n_noise) {
+            // Noise image token: spatial position on H/W axes, T=0
             uint img_idx = t - n_txt;
             pos_t = 0;
             pos_h = img_idx / patches_w;
             pos_w = img_idx % patches_w;
+            pos_l = 0;
+        } else {
+            // Reference image token: spatial position on H/W axes, T=REF_T_OFFSET
+            uint ref_idx = t - n_txt - n_noise;
+            pos_t = REF_T_OFFSET;
+            pos_h = ref_idx / ref_patches_w;
+            pos_w = ref_idx % ref_patches_w;
             pos_l = 0;
         }
 
@@ -806,14 +829,24 @@ fn void? FluxDiTModel.forward(
     llm::RenderGraph g;
     g.init(ctx)!!;
 
-    // 1. Patchify latent → [n_patches, 128]
+    // 1. Patchify noise latent → first n_noise rows of [n_img, 128]
     // Flux.2 latent is [128, H/16, W/16] after pixel unshuffle.
     // With PATCH_SIZE=1, patchify just reshapes [128, H, W] → [H*W, 128]
+    // (n_noise = latent_h * latent_w; reference patches, if any, are appended below.)
     zimage::PatchifyPC patch_pc = {
         .channels = FLUX_LATENT_CH, .height = self.latent_h, .width = self.latent_w, .patch_size = FLUX_PATCH_SIZE,
     };
     g.dispatch(&dk.patchify, { &a.latent, &a.patches }, &patch_pc,
-        llm::ceil_div(n_img * FLUX_PATCH_DIM, 256));
+        llm::ceil_div(self.n_noise * FLUX_PATCH_DIM, 256));
+
+    // 1b. Kontext: append reference image patches into patches[n_noise..n_img].
+    // The diffusers Klein pipeline does `cat([latents, image_latents], dim=1)` —
+    // we reproduce the same single-sequence image stream by appending into the
+    // existing `patches` buffer so all downstream code (img_in, attention,
+    // single-stream blocks, final layer) sees one unified image-token sequence.
+    if (self.n_ref > 0) {
+        copy_to_offset(&g, &self.ref_patches, &a.patches, self.n_noise * FLUX_PATCH_DIM, self.n_ref * FLUX_PATCH_DIM);
+    }
 
     // 2. img_in: [n_patches, 128] → [n_patches, dim]
     flux_matmul(&g, dk, &w.img_in_w, &a.patches, &a.img_hidden, dim, FLUX_PATCH_DIM, n_img, 0);
@@ -972,6 +1005,7 @@ fn void FluxDiTModel.free(&self) {
 
     if (self.rope_cos.size_bytes > 0) self.rope_cos.free();
     if (self.rope_sin.size_bytes > 0) self.rope_sin.free();
+    if (self.ref_patches.size_bytes > 0) self.ref_patches.free();
 
     self.acts.free();
 }

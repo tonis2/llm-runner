@@ -13,30 +13,30 @@ import std::io::file::mmap;
 import std::math;
 import std::core::mem;
 
-// Flux 2 Klein Pipeline: txt2img with Flux.2 Klein 9B
-// 
+// Flux 2 Klein 9B pipeline: txt2img, img2img, and Kontext-style image editing.
+//
 // Flow:
 //   1. Encode text with Qwen3-8B → extract 3 hidden states → [seq_len, 12288]
-//   2. Load Flux DiT from GGUF
-//   3. Denoise with flow matching Euler steps
-//   4. Pixel shuffle + VAE decode → output image
-//   5. Save
+//   2. (img2img/kontext) Encode reference image with the Flux VAE encoder
+//   3. Load Flux DiT from GGUF
+//   4. Denoise with flow matching Euler steps. For kontext the encoded ref is
+//      appended to the image-stream token sequence with a T-axis RoPE offset.
+//   5. Pixel shuffle + VAE decode → output image
+//   6. Save
 
 struct FluxConfig
 {
-	String model_path; // Flux DiT GGUF
-	String text_model_path; // Qwen3-8B GGUF (text encoder)
-	String vae_path; // ae.safetensors (Flux VAE)
+	String model_path;       // Flux DiT GGUF
+	String text_model_path;  // Qwen3-8B GGUF (text encoder)
+	String vae_path;         // Flux VAE safetensors
 	String prompt;
-	String input_path; // Input image for img2img / kontext
+	String input_path;       // Input image for img2img / kontext
 	String output_path;
-	String edit_mode;  // "" (txt2img, default) | "img2img" | "kontext"
+	String edit_mode;        // "" (txt2img, default) | "img2img" | "kontext"
 	uint image_size;
 	uint num_steps;
-	float cfg_scale;
-	float strength; // img2img strength (0-1): 0=keep input, 1=full re-roll
+	float strength;          // img2img only: noise fraction (0=keep input, 1=full re-roll)
 	uint seed;
-	bool offload;
 }
 
 fn FluxConfig flux_config_defaults()
@@ -44,9 +44,8 @@ fn FluxConfig flux_config_defaults()
 	return {
 		.output_path = "output.png",
 		.image_size = 1024,
-		.num_steps = 4, // Klein is distilled to 4 steps
-		.cfg_scale = 1.0f, // No CFG for distilled Klein
-		.strength = 0.75f,
+		.num_steps = 4,        // Klein is distilled to 4 steps
+		.strength = 0.6f,
 		.seed = 42,
 	};
 }
@@ -180,7 +179,12 @@ fn void? run_flux_pipeline(FluxConfig* config)
 
 	// --- Optional Phase 1.5: img2img / kontext input encoding ---
 	// Done before loading the DiT so the encoder weights don't fight with DiT VRAM.
+	// img2img produces a CHW noise-space latent that gets blended into the seed noise.
+	// kontext produces an HWC-per-patch packed latent that gets concatenated as extra
+	// image-stream tokens in the DiT.
 	float[] img2img_ref_latent = (float[]){};
+	float[] kontext_ref_packed = (float[]){};
+	uint kontext_n_ref = 0;
 	if (config.edit_mode == "img2img")
 	{
 		if (config.input_path.len == 0)
@@ -194,22 +198,31 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	}
 	else if (config.edit_mode == "kontext")
 	{
-		// Kontext-style editing concatenates the encoded reference latent as
-		// extra image-stream tokens to the DiT input, with offset (H, W) position
-		// IDs so the model can distinguish noise tokens from reference tokens.
-		// This requires plumbing a separate n_ref count through ~30 sites in
-		// flux_dit.c3 (mRoPE table, image-stream Q/K/V, joint sequence buffers).
-		// The encoder + preprocessing infrastructure (encode_image_to_dit_latent
-		// above) is ready for this; the DiT-side splice is not yet wired.
-		// Note: Klein 9B is distilled txt2img and is unlikely to produce strong
-		// instruction edits even with the wiring in place — an edit-tuned
-		// checkpoint (Flux 2 Pro / Kontext-tuned) would be needed for that.
-		io::printfn("ERROR: --edit-mode kontext is not yet implemented end-to-end.");
-		io::printfn("       The VAE encoder works (validated cos>=0.995 vs PyTorch ref);");
-		io::printfn("       what's missing is concatenating the reference latent as extra");
-		io::printfn("       DiT image-stream tokens with offset RoPE positions.");
-		io::printfn("       See dependencies/flux.c3l/flux_dit.c3 (n_img/n_joint sites).");
-		return llm::COMPUTE_ERROR~;
+		if (config.input_path.len == 0)
+		{
+			io::printfn("ERROR: --edit-mode kontext requires --input <image>");
+			return llm::COMPUTE_ERROR~;
+		}
+		io::printfn("\n--- Phase 1.5: VAE Encoding (mode=kontext) ---");
+		// Same encoder pipeline as img2img — diffusers' `_encode_vae_image`
+		// (pipeline_flux2_klein.py:460-471) is shared between both modes.
+		float[] ref_chw = encode_image_to_dit_latent(&ctx, config.input_path, config.vae_path, img_h, img_w, lat_h, lat_w)!!;
+		defer mem::free(ref_chw);
+
+		// Pack [128, lat_h, lat_w] (CHW) into [n_ref, 128] (HWC-per-patch) so it
+		// matches the patchify output layout. The DiT will copy this buffer
+		// directly into `patches[n_noise..]` each forward pass.
+		kontext_n_ref = lat_h * lat_w;
+		kontext_ref_packed = mem::new_array(float, (usz)kontext_n_ref * FLUX_LATENT_CH);
+		for (uint sp = 0; sp < kontext_n_ref; sp++)
+		{
+			for (uint c = 0; c < FLUX_LATENT_CH; c++)
+			{
+				kontext_ref_packed[sp * FLUX_LATENT_CH + c] = ref_chw[c * kontext_n_ref + sp];
+			}
+		}
+		ctx.allocator.release_empty_pages();
+		io::printfn("  Reference packed: %d tokens x %d ch (T-offset 10)", kontext_n_ref, FLUX_LATENT_CH);
 	}
 
 	// --- Phase 2: Load Flux DiT ---
@@ -225,18 +238,50 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	// dit is freed explicitly after the denoise loop to free ~9 GB of VRAM
 	// before the VAE allocates its full-resolution scratch buffers.
 
-	// Set model dimensions
-	dit.n_img = n_img;
-	dit.n_txt = n_txt;
-	dit.n_joint = n_joint;
+	// Set model dimensions. For kontext we extend the image-stream length to
+	// include the reference tokens; everything downstream (matmul/attention)
+	// is sized off n_img and absorbs the longer sequence transparently.
+	uint n_noise     = n_img;
+	uint n_img_total = n_noise + kontext_n_ref;
+
+	dit.n_img    = n_img_total;
+	dit.n_noise  = n_noise;
+	dit.n_ref    = kontext_n_ref;
+	dit.n_txt    = n_txt;
+	dit.n_joint  = n_img_total + n_txt;
 	dit.latent_h = lat_h;
 	dit.latent_w = lat_w;
 
-	// Allocate activations
-	dit.acts = allocate_flux_activations(&ctx, n_img, n_txt, latent_elems)!!;
+	dit.acts = allocate_flux_activations(&ctx, n_img_total, n_txt, latent_elems)!!;
 
-	// Precompute mRoPE tables
-	precompute_flux_mrope(&ctx, &dit.rope_cos, &dit.rope_sin, n_txt, n_img, lat_w, lat_h)!!;
+	// Upload kontext reference patches (if any) into a GPU tensor that
+	// dit.forward copies into patches[n_noise..] on every step.
+	if (kontext_n_ref > 0)
+	{
+		usz ref_bytes = (usz)kontext_n_ref * FLUX_LATENT_CH * 4;
+		vk::Memory ref_buf = vk::new_buffer(
+			allocator: &ctx.allocator,
+			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			data: kontext_ref_packed.ptr,
+			data_size: ref_bytes,
+		)!!;
+		dit.ref_patches = {
+			.gpu_buffer = ref_buf,
+			.dtype = llm::GGML_F32,
+			.n_dims = 1,
+			.shape = { (ulong)kontext_n_ref * FLUX_LATENT_CH, 0, 0, 0 },
+			.size_bytes = ref_bytes,
+		};
+		mem::free(kontext_ref_packed);
+	}
+
+	// Precompute mRoPE tables (4-axis: T, H, W, L). Ref tokens get T=10 offset.
+	// Ref grid dims equal lat_h/lat_w because the reference is preprocessed to
+	// match the noise resolution.
+	precompute_flux_mrope(&ctx, &dit.rope_cos, &dit.rope_sin,
+		n_txt, n_noise, lat_w, lat_h,
+		kontext_n_ref, lat_w, lat_h)!!;
 
 	// --- Phase 3: Denoising ---
 	io::printfn("\n--- Phase 3: Denoising (%d steps) ---", config.num_steps);
@@ -319,7 +364,6 @@ fn void? run_flux_pipeline(FluxConfig* config)
 			latent_cpu[i] = sigma_start * latent_cpu[i] + (1.0f - sigma_start) * img2img_ref_latent[i];
 		}
 		mem::free(img2img_ref_latent);
-		img2img_ref_latent = (float[]){};
 	}
 
 	// Upload latent to GPU

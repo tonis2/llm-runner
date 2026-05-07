@@ -81,11 +81,9 @@ fn void load_flux_config(String path, flux::FluxConfig* config) {
     if (try v = cfg.get_string("input")) config.input_path = v;
     if (try v = cfg.get_string("output")) config.output_path = v;
     if (try v = cfg.get_uint("steps")) config.num_steps = v;
-    if (try v = cfg.get_float("cfg_scale")) config.cfg_scale = (float)v;
     if (try v = cfg.get_float("strength")) config.strength = (float)v;
     if (try v = cfg.get_uint("seed")) config.seed = v;
     if (try v = cfg.get_uint("size")) config.image_size = v;
-    if (try v = cfg.get_bool("offload")) config.offload = v;
     if (try v = cfg.get_string("edit_mode")) config.edit_mode = v;
 
     io::printfn("Flux config loaded from: %s", path);
