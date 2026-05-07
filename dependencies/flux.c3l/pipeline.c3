@@ -108,7 +108,9 @@ fn void? run_flux_pipeline(FluxConfig* config)
 		cond_buf[cond_len] = config.prompt[i];
 		cond_len++;
 	}
-	String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+	// Qwen3 chat template with enable_thinking=False appends an empty <think></think> block.
+	// Must match diffusers' tokenizer.apply_chat_template(..., enable_thinking=False) exactly.
+	String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 	for (usz i = 0; i < cond_suffix.len; i++)
 	{
 		cond_buf[cond_len] = cond_suffix[i];
@@ -126,11 +128,16 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	const uint FLUX2_TEXT_LEN = 512;
 	uint text_len             = FLUX2_TEXT_LEN;
 	if (raw_len > FLUX2_TEXT_LEN) raw_len = FLUX2_TEXT_LEN; // Truncate (diffusers truncation=True)
+	// Diffusers' Qwen2TokenizerFast pads with "<|endoftext|>". The Qwen3-8B GGUF
+	// declares padding_token_id=151654 (<|vision_pad|>), which is wrong for this
+	// pipeline, so resolve the diffusers-correct token by name.
+	uint flux_pad_id = tok.find_special_token("<|endoftext|>");
+	if (flux_pad_id == 0) flux_pad_id = tok.pad_id; // Fallback if vocab lookup fails
 	uint[] cond_tokens = mem::new_array(uint, FLUX2_TEXT_LEN);
 	for (uint i = 0; i < raw_len; i++) cond_tokens[i] = raw_tokens[i];
-	for (uint i = raw_len; i < FLUX2_TEXT_LEN; i++) cond_tokens[i] = tok.pad_id;
+	for (uint i = raw_len; i < FLUX2_TEXT_LEN; i++) cond_tokens[i] = flux_pad_id;
 	mem::free(raw_tokens);
-	io::printfn("  Tokenized: %d real tokens, padded to %d (pad_id=%d)", raw_len, text_len, tok.pad_id);
+	io::printfn("  Tokenized: %d real tokens, padded to %d (pad_id=%d)", raw_len, text_len, flux_pad_id);
 
 	// Load LLM for text encoding
 	llm_text::LlmModel text_model = llm_text::load_llm_model(

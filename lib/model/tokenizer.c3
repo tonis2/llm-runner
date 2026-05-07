@@ -4,9 +4,10 @@ import std::io;
 import std::core::mem;
 import std::ascii;
 
-const uint TOKEN_NORMAL  = 1;
-const uint TOKEN_CONTROL = 3;
-const uint TOKEN_BYTE    = 6;
+const uint TOKEN_NORMAL       = 1;
+const uint TOKEN_CONTROL      = 3;
+const uint TOKEN_USER_DEFINED = 4;
+const uint TOKEN_BYTE         = 6;
 
 // --- Vocab hash map (string -> id + score) ---
 
@@ -220,8 +221,21 @@ fn Tokenizer? load_tokenizer(GGUFFile* gf) {
     // Read BOS/EOS from GGUF metadata, default to 1/2 (SPM convention)
     uint bos_id = gf.get_u32("tokenizer.ggml.bos_token_id") ?? 1;
     uint eos_id = gf.get_u32("tokenizer.ggml.eos_token_id") ?? 2;
-    // Pad token: GGUF stores it as padding_token_id; falls back to eos_id (Qwen3 uses <|endoftext|>=151643)
-    uint pad_id = gf.get_u32("tokenizer.ggml.padding_token_id") ?? eos_id;
+    // Pad token: many GGUFs (incl. Qwen3-8B) omit padding_token_id metadata.
+    // Fall back to a vocab scan for "<|endoftext|>" (Qwen pad token = 151643), then eos_id.
+    uint pad_id;
+    if (try p = gf.get_u32("tokenizer.ggml.padding_token_id"))
+    {
+        pad_id = p;
+    }
+    else
+    {
+        pad_id = eos_id;
+        for (usz i = 0; i < vocab.len; i++)
+        {
+            if (vocab[i] == "<|endoftext|>") { pad_id = (uint)i; break; }
+        }
+    }
 
     // Load merges for BPE
     MergeMap merge_map;
@@ -823,59 +837,57 @@ fn uint Tokenizer.find_special_token(&self, String text) {
 
 // Encode text containing special token patterns (e.g. <|im_start|>, <|im_end|>).
 // Splits input around special tokens, BPE-encodes regular segments, inserts special token IDs.
+// Match the longest special token (CONTROL or USER_DEFINED) at `pos`.
+// Returns true and writes id+length on hit; returns false otherwise.
+fn bool Tokenizer.match_special_at(&self, String text, usz pos, uint* out_id, usz* out_len) {
+    usz remaining = text.len - pos;
+    if (remaining == 0 || text[pos] != '<') return false;
+    usz best_len = 0;
+    uint best_id = 0;
+    for (usz i = 0; i < self.vocab_size; i++) {
+        uint t = self.token_types[i];
+        if (t != TOKEN_CONTROL && t != TOKEN_USER_DEFINED) continue;
+        String s = self.vocab[i];
+        if (s.len == 0 || s.len > remaining) continue;
+        if (s[0] != '<') continue; // All Qwen specials start with '<'
+        bool eq = true;
+        for (usz k = 0; k < s.len; k++) {
+            if (text[pos + k] != s[k]) { eq = false; break; }
+        }
+        if (eq && s.len > best_len) { best_len = s.len; best_id = (uint)i; }
+    }
+    if (best_len == 0) return false;
+    *out_id = best_id;
+    *out_len = best_len;
+    return true;
+}
+
 fn uint[]? Tokenizer.encode_with_specials(&self, String text) {
     if (text.len == 0) return mem::new_array(uint, 0);
 
-    // Find special token IDs (cached per call — fast enough for one-time use)
-    uint im_start_id = self.find_special_token("<|im_start|>");
-    uint im_end_id = self.find_special_token("<|im_end|>");
-
-    // Max possible output tokens
     uint[] result = mem::new_array(uint, text.len + 32);
     usz n = 0;
     usz pos = 0;
 
     while (pos < text.len) {
-        usz remaining = text.len - pos;
-
-        // Check for <|im_start|> (12 chars)
-        if (remaining >= 12 && im_start_id != 0) {
-            String candidate = (String)text[pos..pos + 11];
-            if (candidate == "<|im_start|>") {
-                result[n] = im_start_id;
-                n++;
-                pos += 12;
-                continue;
-            }
+        uint sp_id;
+        usz sp_len;
+        if (self.match_special_at(text, pos, &sp_id, &sp_len)) {
+            result[n] = sp_id;
+            n++;
+            pos += sp_len;
+            continue;
         }
 
-        // Check for <|im_end|> (10 chars)
-        if (remaining >= 10 && im_end_id != 0) {
-            String candidate = (String)text[pos..pos + 9];
-            if (candidate == "<|im_end|>") {
-                result[n] = im_end_id;
-                n++;
-                pos += 10;
-                continue;
-            }
-        }
-
-        // Find end of regular text segment (next special token or end)
+        // Find end of regular text segment: scan to next special-token start.
         usz seg_end = pos + 1;
         while (seg_end < text.len) {
-            usz rem = text.len - seg_end;
-            if (rem >= 12 && im_start_id != 0) {
-                String c2 = (String)text[seg_end..seg_end + 11];
-                if (c2 == "<|im_start|>") break;
-            }
-            if (rem >= 10 && im_end_id != 0) {
-                String c2 = (String)text[seg_end..seg_end + 9];
-                if (c2 == "<|im_end|>") break;
-            }
+            uint dummy_id;
+            usz dummy_len;
+            if (self.match_special_at(text, seg_end, &dummy_id, &dummy_len)) break;
             seg_end++;
         }
 
-        // Tokenize the regular segment
         String segment = (String)text[pos..seg_end - 1];
         uint[] seg_tokens = self.encode(segment)!;
         for (usz i = 0; i < seg_tokens.len; i++) {
@@ -886,7 +898,6 @@ fn uint[]? Tokenizer.encode_with_specials(&self, String text) {
         pos = seg_end;
     }
 
-    // Trim to actual size
     uint[] trimmed = mem::new_array(uint, n);
     for (usz i = 0; i < n; i++) trimmed[i] = result[i];
     mem::free(result);
