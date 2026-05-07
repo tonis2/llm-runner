@@ -125,7 +125,8 @@ fn void? run_flux_pipeline(FluxConfig* config) {
     char[] dit_data = dit_mm.bytes();
     llm::GGUFFile dit_gf = llm::gguf_parse(dit_data)!!;
     FluxDiTModel dit = load_flux_dit(&ctx, &dit_gf, &dit_kernels)!!;
-    defer dit.free();
+    // dit is freed explicitly after the denoise loop to free ~9 GB of VRAM
+    // before the VAE allocates its full-resolution scratch buffers.
 
     // Image dimensions: Flux.2 uses 16x spatial reduction (8x VAE + 2x pixel unshuffle)
     uint img_h = (config.image_size + 15) / 16 * 16; // Round to multiple of 16
@@ -255,6 +256,14 @@ fn void? run_flux_pipeline(FluxConfig* config) {
         mem::copy(latent_cpu.ptr, mapped, (usz)latent_elems * 4);
         dl_staging.free();
     }
+
+    // Free DiT weights and activations now — the VAE needs the VRAM headroom.
+    // release_empty_pages actually returns device memory to the driver; without
+    // it, Memory.free only marks regions free within retained Vulkan pages.
+    dit.free();
+    dit_gf.free();
+    dit_mm.destroy();
+    ctx.allocator.release_empty_pages();
 
     // Flux.2 VAE decode:
     // 1. Apply BatchNorm (inv_normalize) in 128-ch space using bn.running_mean/var
