@@ -1,7 +1,7 @@
 module flux;
 
 // Flux server state + per-request generation entry point.
-//
+// 
 // The CLI (run_flux_pipeline) now goes through this same path with keep_dit=false.
 // An HTTP server can hold a FluxServerState across many flux_generate calls,
 // optionally with keep_dit=true to keep DiT weights resident on the GPU.
@@ -27,39 +27,34 @@ import std::core::mem;
 // + RoPE tables churn per request.
 struct FluxServerState
 {
-	llm::DeviceContext  ctx;
-	FluxDiTKernels      dit_kernels;
-	mmap::FileMmap      dit_mm;       // DiT GGUF mmap (kept open so per-request load is just a VRAM upload)
-	llm::GGUFFile       dit_gf;       // parsed once
-	String              text_model_path;
-	String              vae_path;
-	bool                keep_dit;
-	bool                dit_loaded;   // true if `dit` holds weights
-	FluxDiTModel        dit;          // valid only if dit_loaded
+	llm::DeviceContext ctx;
+	FluxDiTKernels dit_kernels;
+	mmap::FileMmap dit_mm; // DiT GGUF mmap (kept open so per-request load is just a VRAM upload)
+	llm::GGUFFile dit_gf; // parsed once
+	String text_model_path;
+	String vae_path;
+	bool keep_dit;
+	bool dit_loaded; // true if `dit` holds weights
+	FluxDiTModel dit; // valid only if dit_loaded
 }
 
 // Request-scoped inputs. Mirrors the relevant subset of FluxConfig, plus an
 // optional in-memory image (server passes pre-decoded init_images here).
 struct FluxGenerateRequest
 {
-	String        prompt;
-	String        edit_mode;     // "" | "img2img" | "kontext"
-	String        input_path;    // used iff input_image == null
-	image::Image* input_image;   // optional, takes precedence over input_path
-	uint          image_width;
-	uint          image_height;
-	uint          image_size;    // fallback when width/height are 0
-	uint          num_steps;
-	float         strength;
-	uint          seed;
+	String prompt;
+	String edit_mode; // "" | "img2img" | "kontext"
+	String input_path; // used iff input_image == null
+	image::Image* input_image; // optional, takes precedence over input_path
+	uint image_width;
+	uint image_height;
+	uint image_size; // fallback when width/height are 0
+	uint num_steps;
+	float strength;
+	uint seed;
 }
 
-fn FluxServerState? init_flux_server(
-	String dit_path,
-	String text_model_path,
-	String vae_path,
-	bool keep_dit
-)
+fn FluxServerState? init_flux_server(String dit_path, String text_model_path, String vae_path, bool keep_dit)
 {
 	io::printfn("\n=== Initialising Flux server state ===");
 	io::printfn("  DiT: %s", dit_path);
@@ -67,10 +62,10 @@ fn FluxServerState? init_flux_server(
 	io::printfn("  VAE: %s", vae_path);
 	io::printfn("  keep_dit: %s", keep_dit ? "true" : "false");
 
-	llm::DeviceContext ctx = llm::createContext()!!;
+	llm::DeviceContext ctx     = llm::createContext()!!;
 	FluxDiTKernels dit_kernels = create_flux_dit_kernels(&ctx)!!;
-	mmap::FileMmap dit_mm = file::mmap_open(dit_path, "rb")!!;
-	llm::GGUFFile dit_gf = llm::gguf_parse(dit_mm.bytes())!!;
+	mmap::FileMmap dit_mm      = file::mmap_open(dit_path, "rb")!!;
+	llm::GGUFFile dit_gf       = llm::gguf_parse(dit_mm.bytes())!!;
 
 	FluxServerState state = {
 		.ctx = ctx,
@@ -110,13 +105,18 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 {
 	llm::DeviceContext* ctx = &state.ctx;
 
-	uint req_w = req.image_width  > 0 ? req.image_width  : req.image_size;
+	uint req_w = req.image_width > 0 ? req.image_width : req.image_size;
 	uint req_h = req.image_height > 0 ? req.image_height : req.image_size;
 	io::printfn("\n=== Flux generate ===");
 	io::printfn("  Prompt: %s", req.prompt);
-	io::printfn("  Size: %dx%d, Steps: %d, Seed: %d, Mode: %s",
-		req_w, req_h, req.num_steps, req.seed,
-		req.edit_mode.len > 0 ? req.edit_mode : "txt2img");
+	io::printfn(
+		"  Size: %dx%d, Steps: %d, Seed: %d, Mode: %s",
+		req_w,
+		req_h,
+		req.num_steps,
+		req.seed,
+		req.edit_mode.len > 0 ? req.edit_mode : "txt2img"
+	);
 
 	// --- Phase 1: Text encoding with Qwen3 ---
 	io::printfn("\n--- Phase 1: Qwen3 Text Encoding ---");
@@ -218,9 +218,9 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	io::printfn("  Sequence: %d img + %d txt = %d joint", n_img, n_txt, n_joint);
 
 	// --- Optional Phase 1.5: img2img / kontext input encoding ---
-	float[] img2img_ref_latent = (float[]){};
-	float[] kontext_ref_packed = (float[]){};
-	uint kontext_n_ref = 0;
+	float[] img2img_ref_latent = (float[]) { };
+	float[] kontext_ref_packed = (float[]) { };
+	uint kontext_n_ref         = 0;
 	if (req.edit_mode == "img2img")
 	{
 		if (req.input_image == null && req.input_path.len == 0)
@@ -232,11 +232,27 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		io::printfn("\n--- Phase 1.5: VAE Encoding (mode=img2img) ---");
 		if (req.input_image != null)
 		{
-			img2img_ref_latent = encode_image_object_to_dit_latent(ctx, req.input_image, state.vae_path, img_h, img_w, lat_h, lat_w)!!;
+			img2img_ref_latent = encode_image_object_to_dit_latent(
+				ctx,
+				req.input_image,
+				state.vae_path,
+				img_h,
+				img_w,
+				lat_h,
+				lat_w
+			)!!;
 		}
 		else
 		{
-			img2img_ref_latent = encode_image_to_dit_latent(ctx, req.input_path, state.vae_path, img_h, img_w, lat_h, lat_w)!!;
+			img2img_ref_latent = encode_image_to_dit_latent(
+				ctx,
+				req.input_path,
+				state.vae_path,
+				img_h,
+				img_w,
+				lat_h,
+				lat_w
+			)!!;
 		}
 		ctx.allocator.release_empty_pages();
 	}
@@ -252,7 +268,15 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		float[] ref_chw;
 		if (req.input_image != null)
 		{
-			ref_chw = encode_image_object_to_dit_latent(ctx, req.input_image, state.vae_path, img_h, img_w, lat_h, lat_w)!!;
+			ref_chw = encode_image_object_to_dit_latent(
+				ctx,
+				req.input_image,
+				state.vae_path,
+				img_h,
+				img_w,
+				lat_h,
+				lat_w
+			)!!;
 		}
 		else
 		{
@@ -292,11 +316,11 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	uint n_noise     = n_img;
 	uint n_img_total = n_noise + kontext_n_ref;
 
-	dit.n_img    = n_img_total;
-	dit.n_noise  = n_noise;
-	dit.n_ref    = kontext_n_ref;
-	dit.n_txt    = n_txt;
-	dit.n_joint  = n_img_total + n_txt;
+	dit.n_img = n_img_total;
+	dit.n_noise = n_noise;
+	dit.n_ref = kontext_n_ref;
+	dit.n_txt = n_txt;
+	dit.n_joint = n_img_total + n_txt;
 	dit.latent_h = lat_h;
 	dit.latent_w = lat_w;
 
@@ -307,7 +331,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		usz ref_bytes = (usz)kontext_n_ref * FLUX_LATENT_CH * 4;
 		vk::Memory ref_buf = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
+			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT
+				| vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
 			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: kontext_ref_packed.ptr,
 			data_size: ref_bytes,
@@ -322,14 +347,24 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		mem::free(kontext_ref_packed);
 	}
 
-	precompute_flux_mrope(ctx, &dit.rope_cos, &dit.rope_sin,
-		n_txt, n_noise, lat_w, lat_h,
-		kontext_n_ref, lat_w, lat_h)!!;
+	precompute_flux_mrope(
+		ctx,
+		&dit.rope_cos,
+		&dit.rope_sin,
+		n_txt,
+		n_noise,
+		lat_w,
+		lat_h,
+		kontext_n_ref,
+		lat_w,
+		lat_h
+	)!!;
 
 	// --- Phase 3: Denoising ---
 	io::printfn("\n--- Phase 3: Denoising (%d steps) ---", req.num_steps);
 
 	float[] sigmas = mem::new_array(float, (usz)req.num_steps + 1);
+
 	{
 		float a1            = 8.73809524e-05f;
 		float b1            = 1.89833333f;
@@ -381,14 +416,19 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	if (req.edit_mode == "img2img" && img2img_ref_latent.len > 0)
 	{
 		float sigma_start = sigmas[0];
-		io::printfn("  img2img: strength=%.2f, sigma_start=%.4f, ref_weight=%.4f",
-			req.strength, sigma_start, 1.0f - sigma_start);
+		io::printfn(
+			"  img2img: strength=%.2f, sigma_start=%.4f, ref_weight=%.4f",
+			req.strength,
+			sigma_start,
+			1.0f - sigma_start
+		);
 		for (uint i = 0; i < latent_elems; i++)
 		{
 			latent_cpu[i] = sigma_start * latent_cpu[i] + (1.0f - sigma_start) * img2img_ref_latent[i];
 		}
 		mem::free(img2img_ref_latent);
 	}
+
 
 	{
 		vk::Memory lat_staging = vk::new_buffer(
@@ -434,6 +474,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	// --- Phase 4: VAE decode ---
 	io::printfn("\n--- Phase 4: VAE Decoding ---");
 
+
 	{
 		vk::Memory dl_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
@@ -461,10 +502,22 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	// memory budget that lets a 16 GB card survive 1024². With keep_dit we
 	// drop only the activations + RoPE + ref_patches; weights stay.
 	dit.acts.free();
-	dit.acts = {};
-	if (dit.rope_cos.size_bytes > 0) { dit.rope_cos.free(); dit.rope_cos = {}; }
-	if (dit.rope_sin.size_bytes > 0) { dit.rope_sin.free(); dit.rope_sin = {}; }
-	if (dit.ref_patches.size_bytes > 0) { dit.ref_patches.free(); dit.ref_patches = {}; }
+	dit.acts = { };
+	if (dit.rope_cos.size_bytes > 0)
+	{
+		dit.rope_cos.free();
+		dit.rope_cos = { };
+	}
+	if (dit.rope_sin.size_bytes > 0)
+	{
+		dit.rope_sin.free();
+		dit.rope_sin = { };
+	}
+	if (dit.ref_patches.size_bytes > 0)
+	{
+		dit.ref_patches.free();
+		dit.ref_patches = { };
+	}
 	if (owns_dit)
 	{
 		// owns_dit means we loaded weights this request — free them entirely.
@@ -476,6 +529,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 
 	llm::SafetensorsFile vae_sf = llm::safetensors_open(state.vae_path)!!;
 	defer vae_sf.close();
+
 
 	{
 		float[128] bn_mean;
@@ -506,6 +560,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	float[] vae_latent = mem::new_array(float, vae_elems);
 	pixel_shuffle_cpu(latent_cpu, vae_latent, FLUX_LATENT_CH, lat_h, lat_w, 2);
 	mem::free(latent_cpu);
+
 
 	{
 		float[32 * 32] pqc_weight;
@@ -546,9 +601,10 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	zimage::FluxVaeDecoder vae_dec = zimage::load_flux_vae_decoder(ctx, &vae_sf, &vae_kernels)!!;
 	defer vae_dec.free();
 
-	uint vae_alloc_size = img_h > img_w ? img_h : img_w;
+	uint vae_alloc_size                 = img_h > img_w ? img_h : img_w;
 	zimage::FluxVaeActivations vae_acts = zimage::allocate_flux_vae_activations(ctx, vae_alloc_size)!!;
 	defer vae_acts.free();
+
 
 	{
 		vk::Memory lat_staging = vk::new_buffer(
@@ -579,6 +635,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 
 	usz total_px     = (usz)img_h * img_w * 3;
 	float[] img_data = mem::new_array(float, total_px);
+
 
 	{
 		vk::Memory dl_staging = vk::new_buffer(
