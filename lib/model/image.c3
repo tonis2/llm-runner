@@ -32,6 +32,31 @@ fn image::Image? load_image(String filename) {
     return img;
 }
 
+// --- Load image from in-memory bytes (PNG or JPEG) ---
+// Detects format from the magic bytes. Used by the HTTP server to decode
+// base64 init_images without writing to disk.
+fn image::Image? load_image_from_bytes(char[] data) {
+    if (data.len < 4) return COMPUTE_ERROR~;
+    image::Image img;
+    bool is_png  = data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
+    bool is_jpeg = data[0] == 0xFF && data[1] == 0xD8;
+    if (is_png) {
+        img = png::load_bytes(data)!!;
+    } else if (is_jpeg) {
+        img = jpeg::load_bytes(data)!!;
+    } else {
+        io::printfn("Error: input bytes are neither PNG nor JPEG");
+        return COMPUTE_ERROR~;
+    }
+
+    if (img.format != PixelFormat.RGB && img.format != PixelFormat.RGBA && img.format != PixelFormat.GRAYSCALE) {
+        io::printfn("Error: Only RGB, RGBA, and Grayscale images supported, got %s", img.format);
+        img.free();
+        return COMPUTE_ERROR~;
+    }
+    return img;
+}
+
 // --- Bilinear resize + center crop to target_w x target_h ---
 // Resizes the short side to fit `target` (preserving aspect ratio), then
 // center-crops to exactly target_w x target_h. Output is a new image::Image
