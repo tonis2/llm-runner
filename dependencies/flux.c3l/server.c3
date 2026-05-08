@@ -18,6 +18,7 @@ import std::io::file;
 import std::io::file::mmap;
 import std::math;
 import std::core::mem;
+import std::time::clock;
 
 // Persistent state held across requests. What lives here is the pre-loaded
 // stuff the server pays for once at startup. The text encoder and VAE still
@@ -471,13 +472,16 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		lat_staging.free();
 	}
 
+	double total_step_ms = 0.0;
+	double total_fwd_ms  = 0.0;
 	for (uint step = 0; step < req.num_steps; step++)
 	{
 		float sigma = scheduler.get_timestep(step);
 		float dt    = scheduler.get_dt(step);
-		io::printfn("  Step %d/%d: sigma=%.4f, dt=%.4f", step + 1, req.num_steps, sigma, dt);
 
+		Clock step_start = clock::now();
 		dit.forward(&text_embeddings, sigma)!!;
+		double fwd_ms = step_start.to_now().to_sec() * 1000.0;
 
 		llm::RenderGraph euler_g;
 		euler_g.init(ctx)!!;
@@ -489,7 +493,17 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			llm::ceil_div(latent_elems, 256)
 		);
 		euler_g.flush()!!;
+
+		double step_ms = step_start.to_now().to_sec() * 1000.0;
+		total_step_ms += step_ms;
+		total_fwd_ms  += fwd_ms;
+		io::printfn("  Step %d/%d: sigma=%.4f, dt=%.4f  forward=%.1fms  total=%.1fms",
+			step + 1, req.num_steps, sigma, dt, fwd_ms, step_ms);
 	}
+	io::printfn("  --- Step timing: avg fwd=%.1fms, avg total=%.1fms over %d steps ---",
+		total_fwd_ms / (double)req.num_steps,
+		total_step_ms / (double)req.num_steps,
+		req.num_steps);
 
 	// --- Phase 4: VAE decode ---
 	io::printfn("\n--- Phase 4: VAE Decoding ---");

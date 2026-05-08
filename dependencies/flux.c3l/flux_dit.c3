@@ -7,6 +7,7 @@ import zimage;
 import std::io;
 import std::math;
 import std::core::mem;
+import std::time::clock;
 
 // Flux 2 Klein Hybrid DiT Transformer
 // dim=4096, heads=32, head_dim=128, mlp_dim=12288
@@ -1007,6 +1008,7 @@ fn void? FluxDiTModel.forward(
     flux_matmul(&g, dk, &w.single_mod_w, &a.silu_t, &a.single_mod_buf, 3 * dim, dim, 1, 0);
 
     g.checkpoint()!!;
+    Clock t_setup_done = clock::now();
 
     // 6. Dual-stream blocks
     bool use_lora = self.lora.loaded;
@@ -1014,6 +1016,9 @@ fn void? FluxDiTModel.forward(
         llm::FluxDualLoraLayer* dl = use_lora && l < self.lora.n_dual ? &self.lora.dual_layers[l] : null;
         flux_dual_stream_block(self, &g, &self.dual_blocks[l], dl)!!;
     }
+    g.checkpoint()!!;
+    double dual_ms = t_setup_done.to_now().to_sec() * 1000.0;
+    Clock t_dual_done = clock::now();
 
     // 7. Concatenate streams: hidden = [txt_hidden; img_hidden]
     g.copy(&a.txt_hidden, &a.hidden, (ulong)n_txt * dim * 4);
@@ -1024,6 +1029,9 @@ fn void? FluxDiTModel.forward(
         llm::FluxSingleLoraLayer* sl = use_lora && l < self.lora.n_single ? &self.lora.single_layers[l] : null;
         flux_single_stream_block(self, &g, &self.single_blocks[l], sl)!!;
     }
+    g.checkpoint()!!;
+    double single_ms = t_dual_done.to_now().to_sec() * 1000.0;
+    Clock t_single_done = clock::now();
 
     // 9. Final layer: extract img portion, AdaLN, project to patch_dim
     {
@@ -1067,6 +1075,9 @@ fn void? FluxDiTModel.forward(
 
         gf.flush()!!;
     }
+    double final_ms = t_single_done.to_now().to_sec() * 1000.0;
+    io::printfn("    [forward] dual=%.1fms (%d blocks) single=%.1fms (%d blocks) final=%.1fms",
+        dual_ms, self.n_dual_blocks, single_ms, self.n_single_blocks, final_ms);
 }
 
 // --- Free ---

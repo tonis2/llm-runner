@@ -33,7 +33,7 @@
 		},
     "flux": {
 			"type": "executable",
-      "sources": ["examples/flux/**"]
+      "sources": ["examples/flux/**", "server/**"]
 		}
   },
   "cpu": "generic",
