@@ -33,7 +33,9 @@ struct FluxConfig
 	String input_path;       // Input image for img2img / kontext
 	String output_path;
 	String edit_mode;        // "" (txt2img, default) | "img2img" | "kontext"
-	uint image_size;
+	uint image_size;         // Square shortcut. If image_width/height are 0, both are derived from this.
+	uint image_width;        // Output width  (0 = use image_size)
+	uint image_height;       // Output height (0 = use image_size)
 	uint num_steps;
 	float strength;          // img2img only: noise fraction (0=keep input, 1=full re-roll)
 	uint seed;
@@ -44,6 +46,8 @@ fn FluxConfig flux_config_defaults()
 	return {
 		.output_path = "output.png",
 		.image_size = 1024,
+		.image_width = 0,
+		.image_height = 0,
 		.num_steps = 4,        // Klein is distilled to 4 steps
 		.strength = 0.6f,
 		.seed = 42,
@@ -59,7 +63,9 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	io::printfn("  Text model: %s", config.text_model_path);
 	io::printfn("  VAE: %s", config.vae_path);
 	io::printfn("  Prompt: %s", config.prompt);
-	io::printfn("  Size: %d, Steps: %d, Seed: %d", config.image_size, config.num_steps, config.seed);
+	uint req_w = config.image_width  > 0 ? config.image_width  : config.image_size;
+	uint req_h = config.image_height > 0 ? config.image_height : config.image_size;
+	io::printfn("  Size: %dx%d, Steps: %d, Seed: %d", req_w, req_h, config.num_steps, config.seed);
 
 	// Setup Vulkan
 	llm::DeviceContext ctx = llm::createContext()!!;
@@ -161,8 +167,8 @@ fn void? run_flux_pipeline(FluxConfig* config)
 
 	// Image dimensions: Flux.2 uses 16x spatial reduction (8x VAE + 2x pixel unshuffle).
 	// Computed early because the (optional) img2img encode pass below needs lat_h/lat_w.
-	uint img_h        = (config.image_size + 15) / 16 * 16; // Round to multiple of 16
-	uint img_w        = img_h;
+	uint img_h        = (req_h + 15) / 16 * 16;         // Round to multiple of 16
+	uint img_w        = (req_w + 15) / 16 * 16;
 	uint lat_h        = img_h / 16;                     // 16x reduction (8x VAE * 2x unshuffle)
 	uint lat_w        = img_w / 16;
 	uint n_img        = lat_h * lat_w;                  // PATCH_SIZE=1, so n_patches = spatial elements
@@ -170,9 +176,9 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	uint n_joint      = n_img + n_txt;
 	uint latent_elems = FLUX_LATENT_CH * lat_h * lat_w; // 128 * lat_h * lat_w
 
-	if (img_h != config.image_size)
+	if (img_h != req_h || img_w != req_w)
 	{
-		io::printfn("  Note: size %d rounded to %d (must be multiple of 16)", config.image_size, img_h);
+		io::printfn("  Note: size %dx%d rounded to %dx%d (must be multiple of 16)", req_w, req_h, img_w, img_h);
 	}
 	io::printfn("  Image: %dx%d → latent: [128, %d, %d] → %d patches", img_h, img_w, lat_h, lat_w, n_img);
 	io::printfn("  Sequence: %d img + %d txt = %d joint", n_img, n_txt, n_joint);
@@ -535,7 +541,8 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	zimage::FluxVaeDecoder vae_dec = zimage::load_flux_vae_decoder(&ctx, &vae_sf, &vae_kernels)!!;
 	defer vae_dec.free();
 
-	zimage::FluxVaeActivations vae_acts = zimage::allocate_flux_vae_activations(&ctx, img_h)!!;
+	uint vae_alloc_size = img_h > img_w ? img_h : img_w;
+	zimage::FluxVaeActivations vae_acts = zimage::allocate_flux_vae_activations(&ctx, vae_alloc_size)!!;
 	defer vae_acts.free();
 
 	// Upload pixel-shuffled latent to VAE input
@@ -778,7 +785,8 @@ fn float[]? encode_image_to_dit_latent(
 	zimage::FluxVaeEncoder enc = zimage::load_flux_vae_encoder(ctx, &enc_sf, &enc_kernels)!!;
 	defer enc.free();
 
-	zimage::FluxVaeActivations enc_acts = zimage::allocate_flux_vae_activations(ctx, img_h)!!;
+	uint enc_alloc_size = img_h > img_w ? img_h : img_w;
+	zimage::FluxVaeActivations enc_acts = zimage::allocate_flux_vae_activations(ctx, enc_alloc_size)!!;
 	defer enc_acts.free();
 
 	// 3. Upload preprocessed image [3, H, W] to enc_acts.buf_a

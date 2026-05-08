@@ -37,6 +37,8 @@ fn flux::FluxConfig? parse_flux_args(String[] args) {
             else if (args[i] == "--prompt") { config.prompt = args[i + 1]; i += 2; }
             else if (args[i] == "--output") { config.output_path = args[i + 1]; i += 2; }
             else if (args[i] == "--size") { config.image_size = args[i + 1].to_uint() ?? 1024; i += 2; }
+            else if (args[i] == "--width") { config.image_width = args[i + 1].to_uint() ?? 0; i += 2; }
+            else if (args[i] == "--height") { config.image_height = args[i + 1].to_uint() ?? 0; i += 2; }
             else if (args[i] == "--steps") { config.num_steps = args[i + 1].to_uint() ?? 4; i += 2; }
             else if (args[i] == "--seed") { config.seed = args[i + 1].to_uint() ?? 42; i += 2; }
             else if (args[i] == "--input") { config.input_path = args[i + 1]; i += 2; }
@@ -84,6 +86,8 @@ fn void load_flux_config(String path, flux::FluxConfig* config) {
     if (try v = cfg.get_float("strength")) config.strength = (float)v;
     if (try v = cfg.get_uint("seed")) config.seed = v;
     if (try v = cfg.get_uint("size")) config.image_size = v;
+    if (try v = cfg.get_uint("width")) config.image_width = v;
+    if (try v = cfg.get_uint("height")) config.image_height = v;
     if (try v = cfg.get_string("edit_mode")) config.edit_mode = v;
 
     io::printfn("Flux config loaded from: %s", path);
@@ -99,7 +103,9 @@ fn void print_usage() {
     io::printfn("  --vae          Flux VAE safetensors");
     io::printfn("  --prompt       Text prompt");
     io::printfn("  --output       Output path (default: output.png)");
-    io::printfn("  --size         Image size (default: 1024)");
+    io::printfn("  --size         Square image size (default: 1024)");
+    io::printfn("  --width        Image width  (overrides --size for width)");
+    io::printfn("  --height       Image height (overrides --size for height)");
     io::printfn("  --steps        Denoising steps (default: 4)");
     io::printfn("  --seed         Random seed (default: 42)");
     io::printfn("  --input        Input image (PNG or JPG) for img2img / kontext modes");
