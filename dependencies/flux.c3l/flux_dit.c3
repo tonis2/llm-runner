@@ -44,6 +44,11 @@ const uint FLUX_ROPE_AXES_L   = 32;  // sequential (text)
 // Timestep embedding dims
 const uint FLUX_T_EMB_DIM  = 256;
 
+// Largest LoRA rank for which the per-pass scratch buffer is sized. LoRAs
+// above this rank are silently no-op'd by dispatch_lora_correction in
+// zimage::dit, since the [seq, rank] hop-1 result wouldn't fit.
+const uint FLUX_MAX_LORA_RANK = 256;
+
 // --- Weight Structures ---
 
 struct FluxDualBlockWeights {
@@ -127,6 +132,7 @@ struct FluxDiTActivations {
     llm::Tensor mod_shift;      // [dim] temp
     llm::Tensor mod_scale;      // [dim] temp
     llm::Tensor mod_gate;       // [dim] temp
+    llm::Tensor lora_scratch;   // [max_seq * FLUX_MAX_LORA_RANK] LoRA hop-1 result; size 0 when no LoRA loaded
 }
 
 // --- Model ---
@@ -157,6 +163,11 @@ struct FluxDiTModel {
     // Kontext reference patches in patchify-output layout: [n_ref, FLUX_PATCH_DIM]
     // i.e. HWC-per-patch (channel innermost). Empty when n_ref == 0.
     llm::Tensor ref_patches;
+
+    // Optional LoRA adapter. lora.loaded == false when no LoRA is in use; in
+    // that case all the per-block helpers below short-circuit on the null
+    // FluxDualLoraLayer* / FluxSingleLoraLayer* pointers passed by forward().
+    llm::FluxLoraAdapter lora;
 }
 
 // --- Tensor Name Helpers ---
@@ -221,7 +232,7 @@ fn void detect_flux_block_counts(llm::GGUFFile* gf, uint* n_dual, uint* n_single
 // --- Activation Allocation ---
 
 fn FluxDiTActivations? allocate_flux_activations(
-    llm::DeviceContext* ctx, uint n_img, uint n_txt, uint latent_elems
+    llm::DeviceContext* ctx, uint n_img, uint n_txt, uint latent_elems, bool with_lora_scratch = false
 ) {
     uint n_joint = n_img + n_txt;
     uint max_seq = n_joint;  // single-stream uses full sequence
@@ -230,6 +241,12 @@ fn FluxDiTActivations? allocate_flux_activations(
     ulong sd = (ulong)max_seq * dim;
     ulong sm = (ulong)max_seq * mlp;
     ulong sc = (ulong)max_seq * (ulong)(dim + mlp);
+
+    llm::Tensor lora_scratch;
+    if (with_lora_scratch) {
+        lora_scratch = llm::create_f32_tensor(ctx,
+            { (ulong)max_seq * FLUX_MAX_LORA_RANK, 0, 0, 0 }, 1)!!;
+    }
 
     return {
         .img_hidden = llm::create_f32_tensor(ctx, { (ulong)n_img * dim, 0, 0, 0 }, 1)!!,
@@ -257,6 +274,7 @@ fn FluxDiTActivations? allocate_flux_activations(
         .mod_shift = llm::create_f32_tensor(ctx, { dim, 0, 0, 0 }, 1)!!,
         .mod_scale = llm::create_f32_tensor(ctx, { dim, 0, 0, 0 }, 1)!!,
         .mod_gate = llm::create_f32_tensor(ctx, { dim, 0, 0, 0 }, 1)!!,
+        .lora_scratch = lora_scratch,
     };
 }
 
@@ -399,9 +417,66 @@ fn void flux_matmul(
     uint out_dim,
     uint in_dim,
     uint seq_len,
-    uint row_offset
+    uint row_offset,
+    llm::LoraTensor* lora = null,
+    llm::Tensor* lora_scratch = null,
+    uint lora_b_rows = 0,
+    uint lora_row_offset = 0,
+    uint lora_weight_row_offset = 0
 ) {
-    zimage::dispatch_batch_matmul(g, dk, weight, input, output, out_dim, in_dim, seq_len, row_offset);
+    zimage::dispatch_batch_matmul(g, dk, weight, input, output, out_dim, in_dim, seq_len, row_offset,
+        lora, lora_scratch, lora_b_rows, lora_row_offset, lora_weight_row_offset);
+}
+
+// Pick whichever LoraTensor is present at the call site. Returns null if both
+// are absent (or the structs themselves are null), making the call a plain
+// base matmul.
+fn llm::LoraTensor* flux_pick_lora(llm::LoraTensor* primary, llm::LoraTensor* fallback) {
+    if (primary != null && primary.present) return primary;
+    if (fallback != null && fallback.present) return fallback;
+    return null;
+}
+
+// One slot of a fused-QKV-style call. The base matmul reads weight rows
+// [slot*per_slot_dim, (slot+1)*per_slot_dim) and writes output[0:per_slot_dim).
+//
+//   slot_offset       — per_slot_dim * slot (also passed to base as row_offset).
+//   per_slot_dim      — width of one slot in the fused weight (typically `dim`).
+//   fused_lora        — fused LoRA on the full [N*per_slot_dim, in_dim] weight (B
+//                       row offset selects the slot). Optional.
+//   slot_lora         — unfused LoRA on this single slot's [per_slot_dim, in_dim]
+//                       weight. Optional. Wins if both are present.
+fn void flux_matmul_fused_slot(
+    llm::RenderGraph* g,
+    zimage::DiTKernels* dk,
+    llm::Tensor* fused_weight,
+    llm::Tensor* input,
+    llm::Tensor* output,
+    uint per_slot_dim,
+    uint in_dim,
+    uint seq_len,
+    uint slot_offset,
+    llm::LoraTensor* fused_lora,
+    llm::LoraTensor* slot_lora,
+    llm::Tensor* lora_scratch
+) {
+    if (slot_lora != null && slot_lora.present) {
+        // Unfused per-slot LoRA: B is [per_slot_dim, rank], full output write.
+        flux_matmul(g, dk, fused_weight, input, output,
+            per_slot_dim, in_dim, seq_len, slot_offset,
+            slot_lora, lora_scratch);
+    } else if (fused_lora != null && fused_lora.present) {
+        // Fused LoRA: B is [N*per_slot_dim, rank]; read only this slot's rows.
+        flux_matmul(g, dk, fused_weight, input, output,
+            per_slot_dim, in_dim, seq_len, slot_offset,
+            fused_lora, lora_scratch,
+            per_slot_dim,        // lora_b_rows
+            0,                   // lora_row_offset (output is per-slot dest)
+            slot_offset);        // lora_weight_row_offset (read same B rows as base)
+    } else {
+        flux_matmul(g, dk, fused_weight, input, output,
+            per_slot_dim, in_dim, seq_len, slot_offset);
+    }
 }
 
 // --- Copy a chunk from a larger buffer to a separate buffer ---
@@ -541,7 +616,8 @@ fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxD
 fn void? flux_dual_stream_block(
     FluxDiTModel* model,
     llm::RenderGraph* g,
-    FluxDualBlockWeights* lw
+    FluxDualBlockWeights* lw,
+    llm::FluxDualLoraLayer* ll = null
 ) {
     zimage::DiTKernels* dk = &model.dk.dit;
     FluxDiTActivations* a = &model.acts;
@@ -550,6 +626,7 @@ fn void? flux_dual_stream_block(
     uint n_img = model.n_img;
     uint n_txt = model.n_txt;
     uint n_joint = model.n_joint;
+    llm::Tensor* ls = ll != null ? &a.lora_scratch : null;
 
     // === Pre-attention: LayerNorm + AdaLN modulation ===
 
@@ -573,17 +650,25 @@ fn void? flux_dual_stream_block(
 
     // === QKV projections ===
     // IMG Q/K/V → first n_img rows of q/k/v (txt first in joint layout, so img at offset n_txt)
-    flux_matmul(g, dk, &lw.img_qkv_w, &a.buf_a, &a.buf_c, dim, dim, n_img, 0);       // Q
+    llm::LoraTensor* img_qkv_l = ll != null ? &ll.img_qkv : null;
+    llm::LoraTensor* img_q_l   = ll != null ? &ll.img_q   : null;
+    llm::LoraTensor* img_k_l   = ll != null ? &ll.img_k   : null;
+    llm::LoraTensor* img_v_l   = ll != null ? &ll.img_v   : null;
+    flux_matmul_fused_slot(g, dk, &lw.img_qkv_w, &a.buf_a, &a.buf_c, dim, dim, n_img, 0,         img_qkv_l, img_q_l, ls);
     copy_to_offset(g, &a.buf_c, &a.q, n_txt * dim, n_img * dim);
-    flux_matmul(g, dk, &lw.img_qkv_w, &a.buf_a, &a.buf_c, dim, dim, n_img, dim);     // K
+    flux_matmul_fused_slot(g, dk, &lw.img_qkv_w, &a.buf_a, &a.buf_c, dim, dim, n_img, dim,       img_qkv_l, img_k_l, ls);
     copy_to_offset(g, &a.buf_c, &a.k, n_txt * dim, n_img * dim);
-    flux_matmul(g, dk, &lw.img_qkv_w, &a.buf_a, &a.buf_c, dim, dim, n_img, 2 * dim); // V
+    flux_matmul_fused_slot(g, dk, &lw.img_qkv_w, &a.buf_a, &a.buf_c, dim, dim, n_img, 2 * dim,   img_qkv_l, img_v_l, ls);
     copy_to_offset(g, &a.buf_c, &a.v, n_txt * dim, n_img * dim);
 
     // TXT Q/K/V → first n_txt rows of q/k/v (txt at offset 0)
-    flux_matmul(g, dk, &lw.txt_qkv_w, &a.buf_b, &a.q, dim, dim, n_txt, 0);       // Q
-    flux_matmul(g, dk, &lw.txt_qkv_w, &a.buf_b, &a.k, dim, dim, n_txt, dim);     // K
-    flux_matmul(g, dk, &lw.txt_qkv_w, &a.buf_b, &a.v, dim, dim, n_txt, 2 * dim); // V
+    llm::LoraTensor* txt_qkv_l = ll != null ? &ll.txt_qkv : null;
+    llm::LoraTensor* txt_q_l   = ll != null ? &ll.txt_q   : null;
+    llm::LoraTensor* txt_k_l   = ll != null ? &ll.txt_k   : null;
+    llm::LoraTensor* txt_v_l   = ll != null ? &ll.txt_v   : null;
+    flux_matmul_fused_slot(g, dk, &lw.txt_qkv_w, &a.buf_b, &a.q, dim, dim, n_txt, 0,             txt_qkv_l, txt_q_l, ls);
+    flux_matmul_fused_slot(g, dk, &lw.txt_qkv_w, &a.buf_b, &a.k, dim, dim, n_txt, dim,           txt_qkv_l, txt_k_l, ls);
+    flux_matmul_fused_slot(g, dk, &lw.txt_qkv_w, &a.buf_b, &a.v, dim, dim, n_txt, 2 * dim,       txt_qkv_l, txt_v_l, ls);
 
     // === Per-head Q/K RMSNorm (applied to full joint Q/K) ===
     // IMG norms applied to img portion, TXT norms to txt portion
@@ -657,14 +742,16 @@ fn void? flux_dual_stream_block(
 
     // === Split attention output and project ===
     // TXT portion: attn_out[0:n_txt*dim] → txt_proj → buf_b
-    flux_matmul(g, dk, &lw.txt_proj_w, &a.attn_out, &a.buf_b, dim, dim, n_txt, 0);
+    flux_matmul(g, dk, &lw.txt_proj_w, &a.attn_out, &a.buf_b, dim, dim, n_txt, 0,
+        ll != null ? &ll.txt_proj : null, ls);
 
     // IMG portion: attn_out[n_txt*dim:] → buf_c, then img_proj → buf_a
     if (g.needs_barrier) llm::compute_barrier(g.cmd);
     vk::cmdCopyBuffer(g.cmd, a.attn_out.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer, 1,
         (vk::BufferCopy[]){{ .srcOffset = (ulong)n_txt * dim * 4, .dstOffset = 0, .size = (ulong)n_img * dim * 4 }});
     g.needs_barrier = true;
-    flux_matmul(g, dk, &lw.img_proj_w, &a.buf_c, &a.buf_a, dim, dim, n_img, 0);
+    flux_matmul(g, dk, &lw.img_proj_w, &a.buf_c, &a.buf_a, dim, dim, n_img, 0,
+        ll != null ? &ll.img_proj : null, ls);
 
     // === Gated residual (post-attention) ===
     // img_hidden += gate1_img * buf_a
@@ -693,13 +780,26 @@ fn void? flux_dual_stream_block(
     // IMG SwiGLU FFN: up→[2*mlp], split x1/x2, SiLU(x1)*x2, down→[dim]
     // Reference (Flux2SwiGLU): x1, x2 = chunk(2, dim=-1); return SiLU(x1) * x2
     // x1 = first half (offset 0), x2 = second half (offset mlp)
-    flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, n_img, 0);     // x1 (gets SiLU)
-    flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_up_out, mlp, dim, n_img, mlp);      // x2 (multiplier)
+    // For the LoRA on the fused [2*mlp, dim] up: each call writes only its
+    // slot's `mlp` rows of the same [2*mlp] B, so weight_row_offset matches
+    // the base call's row_offset.
+    llm::LoraTensor* img_mlp_up_l   = ll != null ? &ll.img_mlp_up   : null;
+    llm::LoraTensor* img_mlp_down_l = ll != null ? &ll.img_mlp_down : null;
+    if (img_mlp_up_l != null && img_mlp_up_l.present) {
+        flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, n_img, 0,
+            img_mlp_up_l, ls, mlp, 0, 0);
+        flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_up_out, mlp, dim, n_img, mlp,
+            img_mlp_up_l, ls, mlp, 0, mlp);
+    } else {
+        flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, n_img, 0);
+        flux_matmul(g, dk, &lw.img_mlp_up_w, &a.buf_a, &a.ffn_up_out, mlp, dim, n_img, mlp);
+    }
     llm::SiluPC silu_pc = { .n = n_img * mlp };
     g.dispatch(&dk.shared.silu, { &a.ffn_gate_out }, &silu_pc, llm::ceil_div(n_img * mlp, 256));
     llm::ElemwisePC emul_pc = { .n = n_img * mlp };
     g.dispatch(&dk.shared.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out }, &emul_pc, llm::ceil_div(n_img * mlp, 256));
-    flux_matmul(g, dk, &lw.img_mlp_down_w, &a.ffn_gate_out, &a.buf_a, dim, mlp, n_img, 0);
+    flux_matmul(g, dk, &lw.img_mlp_down_w, &a.ffn_gate_out, &a.buf_a, dim, mlp, n_img, 0,
+        img_mlp_down_l, ls);
 
     // IMG gated residual: img_hidden += gate2_img * buf_a
     copy_chunk(g, &a.dual_mod_img, &a.mod_gate, 5 * dim, dim);  // gate2
@@ -714,13 +814,23 @@ fn void? flux_dual_stream_block(
         &txt_mod, llm::ceil_div(n_txt * dim, 256));
 
     // TXT SwiGLU FFN: SiLU(first half) * second half
-    flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_gate_out, mlp, dim, n_txt, 0);
-    flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_up_out, mlp, dim, n_txt, mlp);
+    llm::LoraTensor* txt_mlp_up_l   = ll != null ? &ll.txt_mlp_up   : null;
+    llm::LoraTensor* txt_mlp_down_l = ll != null ? &ll.txt_mlp_down : null;
+    if (txt_mlp_up_l != null && txt_mlp_up_l.present) {
+        flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_gate_out, mlp, dim, n_txt, 0,
+            txt_mlp_up_l, ls, mlp, 0, 0);
+        flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_up_out, mlp, dim, n_txt, mlp,
+            txt_mlp_up_l, ls, mlp, 0, mlp);
+    } else {
+        flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_gate_out, mlp, dim, n_txt, 0);
+        flux_matmul(g, dk, &lw.txt_mlp_up_w, &a.buf_b, &a.ffn_up_out, mlp, dim, n_txt, mlp);
+    }
     llm::SiluPC silu_txt = { .n = n_txt * mlp };
     g.dispatch(&dk.shared.silu, { &a.ffn_gate_out }, &silu_txt, llm::ceil_div(n_txt * mlp, 256));
     llm::ElemwisePC emul_txt = { .n = n_txt * mlp };
     g.dispatch(&dk.shared.elemwise_mul, { &a.ffn_gate_out, &a.ffn_up_out }, &emul_txt, llm::ceil_div(n_txt * mlp, 256));
-    flux_matmul(g, dk, &lw.txt_mlp_down_w, &a.ffn_gate_out, &a.buf_b, dim, mlp, n_txt, 0);
+    flux_matmul(g, dk, &lw.txt_mlp_down_w, &a.ffn_gate_out, &a.buf_b, dim, mlp, n_txt, 0,
+        txt_mlp_down_l, ls);
 
     copy_chunk(g, &a.dual_mod_txt, &a.mod_gate, 5 * dim, dim);
     g.dispatch(&model.dk.gated_residual_linear, { &a.txt_hidden, &a.mod_gate, &a.buf_b },
@@ -734,13 +844,15 @@ fn void? flux_dual_stream_block(
 fn void? flux_single_stream_block(
     FluxDiTModel* model,
     llm::RenderGraph* g,
-    FluxSingleBlockWeights* lw
+    FluxSingleBlockWeights* lw,
+    llm::FluxSingleLoraLayer* ll = null
 ) {
     zimage::DiTKernels* dk = &model.dk.dit;
     FluxDiTActivations* a = &model.acts;
     uint dim = FLUX_DIM;
     uint mlp = FLUX_MLP_DIM;
     uint seq = model.n_joint;
+    llm::Tensor* ls = ll != null ? &a.lora_scratch : null;
 
     // === Pre-norm: LayerNorm + AdaLN modulation ===
     copy_chunk(g, &a.single_mod_buf, &a.mod_shift, 0, dim);       // shift
@@ -753,11 +865,26 @@ fn void? flux_single_stream_block(
 
     // === Fused linear1: [seq, dim] → split into Q/K/V + gate/up ===
     // linear1_w: [3*dim + 2*mlp, dim]
-    flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.q, dim, dim, seq, 0);                          // Q
-    flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.k, dim, dim, seq, dim);                        // K
-    flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.v, dim, dim, seq, 2 * dim);                    // V
-    flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, seq, 3 * dim);         // gate
-    flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.ffn_up_out, mlp, dim, seq, 3 * dim + mlp);     // up
+    // For each Q/K/V slot, prefer the unfused per-slot LoRA from a Diffusers
+    // file; fall back to the fused linear1 LoRA from a native Flux file.
+    llm::LoraTensor* lin1_l = ll != null ? &ll.linear1 : null;
+    llm::LoraTensor* sq_l   = ll != null ? &ll.q       : null;
+    llm::LoraTensor* sk_l   = ll != null ? &ll.k       : null;
+    llm::LoraTensor* sv_l   = ll != null ? &ll.v       : null;
+    flux_matmul_fused_slot(g, dk, &lw.linear1_w, &a.buf_a, &a.q, dim, dim, seq, 0,         lin1_l, sq_l, ls);
+    flux_matmul_fused_slot(g, dk, &lw.linear1_w, &a.buf_a, &a.k, dim, dim, seq, dim,       lin1_l, sk_l, ls);
+    flux_matmul_fused_slot(g, dk, &lw.linear1_w, &a.buf_a, &a.v, dim, dim, seq, 2 * dim,   lin1_l, sv_l, ls);
+    // Gate/up halves of linear1 only get the fused LoRA correction (no
+    // Diffusers single-block FFN entry maps onto Klein's SwiGLU halves).
+    if (lin1_l != null && lin1_l.present) {
+        flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, seq, 3 * dim,
+            lin1_l, ls, mlp, 0, 3 * dim);
+        flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.ffn_up_out, mlp, dim, seq, 3 * dim + mlp,
+            lin1_l, ls, mlp, 0, 3 * dim + mlp);
+    } else {
+        flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.ffn_gate_out, mlp, dim, seq, 3 * dim);
+        flux_matmul(g, dk, &lw.linear1_w, &a.buf_a, &a.ffn_up_out, mlp, dim, seq, 3 * dim + mlp);
+    }
 
     // === Per-head Q/K norm ===
     zimage::BatchHeadNormPC hn_pc = { .n_heads = FLUX_HEADS, .head_dim = FLUX_HEAD_DIM, .seq_len = seq, .eps = 1e-6f };
@@ -799,7 +926,8 @@ fn void? flux_single_stream_block(
     g.needs_barrier = true;
 
     // === linear2: [seq, dim+mlp] → [seq, dim] ===
-    flux_matmul(g, dk, &lw.linear2_w, &a.concat_buf, &a.buf_a, dim, dim + mlp, seq, 0);
+    flux_matmul(g, dk, &lw.linear2_w, &a.concat_buf, &a.buf_a, dim, dim + mlp, seq, 0,
+        ll != null ? &ll.linear2 : null, ls);
 
     // === Gated residual: hidden += gate * output ===
     copy_chunk(g, &a.single_mod_buf, &a.mod_gate, 2 * dim, dim);  // gate
@@ -881,8 +1009,10 @@ fn void? FluxDiTModel.forward(
     g.checkpoint()!!;
 
     // 6. Dual-stream blocks
+    bool use_lora = self.lora.loaded;
     for (uint l = 0; l < self.n_dual_blocks; l++) {
-        flux_dual_stream_block(self, &g, &self.dual_blocks[l])!!;
+        llm::FluxDualLoraLayer* dl = use_lora && l < self.lora.n_dual ? &self.lora.dual_layers[l] : null;
+        flux_dual_stream_block(self, &g, &self.dual_blocks[l], dl)!!;
     }
 
     // 7. Concatenate streams: hidden = [txt_hidden; img_hidden]
@@ -891,7 +1021,8 @@ fn void? FluxDiTModel.forward(
 
     // 8. Single-stream blocks
     for (uint l = 0; l < self.n_single_blocks; l++) {
-        flux_single_stream_block(self, &g, &self.single_blocks[l])!!;
+        llm::FluxSingleLoraLayer* sl = use_lora && l < self.lora.n_single ? &self.lora.single_layers[l] : null;
+        flux_single_stream_block(self, &g, &self.single_blocks[l], sl)!!;
     }
 
     // 9. Final layer: extract img portion, AdaLN, project to patch_dim
@@ -985,6 +1116,7 @@ fn void FluxDiTActivations.free(&self) {
     self.mod_shift.free();
     self.mod_scale.free();
     self.mod_gate.free();
+    if (self.lora_scratch.size_bytes > 0) self.lora_scratch.free();
 }
 
 fn void FluxDiTModel.free(&self) {
@@ -1006,6 +1138,7 @@ fn void FluxDiTModel.free(&self) {
     if (self.rope_cos.size_bytes > 0) self.rope_cos.free();
     if (self.rope_sin.size_bytes > 0) self.rope_sin.free();
     if (self.ref_patches.size_bytes > 0) self.ref_patches.free();
+    self.lora.free();
 
     self.acts.free();
 }

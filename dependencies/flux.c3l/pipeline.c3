@@ -39,6 +39,8 @@ struct FluxConfig
 	uint num_steps;
 	float strength;          // img2img only: noise fraction (0=keep input, 1=full re-roll)
 	uint seed;
+	String lora_path;        // Optional LoRA safetensors (empty = no LoRA)
+	float lora_strength;     // LoRA strength multiplier
 }
 
 fn FluxConfig flux_config_defaults()
@@ -51,6 +53,8 @@ fn FluxConfig flux_config_defaults()
 		.num_steps = 4,        // Klein is distilled to 4 steps
 		.strength = 0.6f,
 		.seed = 42,
+		.lora_path = "",
+		.lora_strength = 1.0f,
 	};
 }
 
@@ -80,6 +84,8 @@ fn void? run_flux_pipeline(FluxConfig* config)
 		.num_steps     = config.num_steps,
 		.strength      = config.strength,
 		.seed          = config.seed,
+		.lora_path     = config.lora_path,
+		.lora_strength = config.lora_strength,
 	};
 
 	image::Image result = flux_generate(&state, &req)!!;

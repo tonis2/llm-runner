@@ -60,6 +60,8 @@ fn flux::FluxConfig? parse_flux_args(String[] args, ServerOptions* server_opts) 
             else if (args[i] == "--input") { config.input_path = args[i + 1]; i += 2; }
             else if (args[i] == "--edit-mode") { config.edit_mode = args[i + 1]; i += 2; }
             else if (args[i] == "--strength") { config.strength = args[i + 1].to_float() ?? 0.6f; i += 2; }
+            else if (args[i] == "--lora") { config.lora_path = args[i + 1]; i += 2; }
+            else if (args[i] == "--lora-strength") { config.lora_strength = args[i + 1].to_float() ?? 1.0f; i += 2; }
             else if (args[i] == "--bind") { server_opts.bind_addr = args[i + 1]; i += 2; }
             else if (args[i] == "--port") { server_opts.port = (int)(args[i + 1].to_uint() ?? 7860); i += 2; }
             else if (args[i] == "--config") { i += 2; }
@@ -108,6 +110,15 @@ fn void load_flux_config(String path, flux::FluxConfig* config) {
     if (try v = cfg.get_uint("height")) config.image_height = v;
     if (try v = cfg.get_string("edit_mode")) config.edit_mode = v;
 
+    // LoRA: accept either { "lora": "path.safetensors" } (strength defaults to 1.0)
+    // or { "lora": { "path": "...", "strength": 0.8 } }
+    if (try lv = cfg.get_string("lora")) {
+        config.lora_path = lv;
+    } else if (try lobj = cfg.get("lora")) {
+        if (try p = lobj.get_string("path")) config.lora_path = p;
+        if (try s = lobj.get_float("strength")) config.lora_strength = (float)s;
+    }
+
     io::printfn("Flux config loaded from: %s", path);
 }
 
@@ -129,6 +140,8 @@ fn void print_usage() {
     io::printfn("  --input        Input image (PNG or JPG) for img2img / kontext modes");
     io::printfn("  --edit-mode    Edit mode: img2img | kontext (default: txt2img)");
     io::printfn("  --strength     img2img strength 0..1 (default: 0.75)");
+    io::printfn("  --lora         Optional LoRA safetensors file");
+    io::printfn("  --lora-strength LoRA strength multiplier (default: 1.0)");
     io::printfn("  --config       Load from JSON config file");
     io::printfn("");
     io::printfn("Server mode:");

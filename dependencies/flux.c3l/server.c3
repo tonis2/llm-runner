@@ -52,6 +52,8 @@ struct FluxGenerateRequest
 	uint num_steps;
 	float strength;
 	uint seed;
+	String lora_path;        // empty = no LoRA
+	float lora_strength;     // 1.0 if not specified
 }
 
 fn FluxServerState? init_flux_server(String dit_path, String text_model_path, String vae_path, bool keep_dit)
@@ -324,7 +326,25 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	dit.latent_h = lat_h;
 	dit.latent_w = lat_w;
 
-	dit.acts = allocate_flux_activations(ctx, n_img_total, n_txt, latent_elems)!!;
+	bool use_lora = req.lora_path.len > 0;
+	dit.acts = allocate_flux_activations(ctx, n_img_total, n_txt, latent_elems, use_lora)!!;
+
+	// Load LoRA after DiT weights so the file's tensors land into VRAM next to
+	// the DiT block weights. We always free per request — this keeps keep_dit
+	// servers able to swap the LoRA between requests.
+	if (use_lora)
+	{
+		float strength = req.lora_strength > 0.0f ? req.lora_strength : 1.0f;
+		if (try adapter = llm::load_flux_lora_safetensors(
+			ctx, req.lora_path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+		{
+			dit.lora = adapter;
+		}
+		else
+		{
+			io::printfn("  Flux LoRA load failed for %s — continuing without LoRA", req.lora_path);
+		}
+	}
 
 	if (kontext_n_ref > 0)
 	{
@@ -517,6 +537,11 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	{
 		dit.ref_patches.free();
 		dit.ref_patches = { };
+	}
+	if (dit.lora.loaded)
+	{
+		dit.lora.free();
+		dit.lora = { };
 	}
 	if (owns_dit)
 	{

@@ -1185,11 +1185,12 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 // Same shape contract as batch_matmul_simple, plus a float scale.
 
 struct BatchMatMulAddScaledParams {
-    uint  out_dim;     // row stride of `output` (columns per sequence position)
+    uint  out_dim;            // row stride of `output` (columns per sequence position)
     uint  in_dim;
     uint  seq_len;
     float scale;
-    uint  row_offset;  // added to the column index of every output write
+    uint  row_offset;         // added to the column index of every output write
+    uint  weight_row_offset;  // added to the row index when reading B — lets a single LoRA's B sub-range write to a fused-QKV slot
 };
 
 [vk_push_constant] const BatchMatMulAddScaledParams bm_addscaled_pc;
@@ -1210,10 +1211,11 @@ void batch_matmul_add_scaled(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     if (pos >= bm_addscaled_pc.seq_len) return;
 
     uint in_base = pos * bm_addscaled_pc.in_dim;
+    uint actual_b_row = bm_addscaled_pc.weight_row_offset + out_idx;
 
     float partial = 0.0;
     for (uint k = gi; k < bm_addscaled_pc.in_dim; k += 256) {
-        partial += bm_addscaled_weight[out_idx * bm_addscaled_pc.in_dim + k]
+        partial += bm_addscaled_weight[actual_b_row * bm_addscaled_pc.in_dim + k]
                  * bm_addscaled_input[in_base + k];
     }
 

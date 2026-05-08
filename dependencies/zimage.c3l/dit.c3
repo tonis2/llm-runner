@@ -183,7 +183,8 @@ struct BatchMatMulAddScaledPC
 	uint in_dim;
 	uint seq_len;
 	float scale;
-	uint row_offset; // added to output column index — lets LoRA write into a sub-range of a wider buffer
+	uint row_offset;        // added to output column index — lets LoRA write into a sub-range of a wider buffer
+	uint weight_row_offset; // added to B row index — lets a fused LoRA B [N*dim, rank] read a single slot's slice
 }
 
 struct FFNSwigluSplitPC
@@ -1139,6 +1140,16 @@ fn DiTWeights? load_dit_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, bool
 //   scratch = A @ input              (hop 1, F32 batch_matmul_simple)
 //   output += scale * B @ scratch    (hop 2, batch_matmul_add_scaled)
 // `lora_scratch` must be a writable F32 tensor large enough for [seq_len * lora.rank].
+//
+// LoRA placement params (default 0 = same as the base call's whole output):
+//   - lora_b_rows: number of B rows to apply (0 = out_dim).
+//   - lora_row_offset: shift the column index of the LoRA's output writes
+//     (used when the base call writes a sub-range of a wider buffer that
+//     the LoRA also targets).
+//   - lora_weight_row_offset: shift the row index when reading B (used when
+//     a fused-QKV LoRA's B = [N*dim, rank] is being applied per-slot — set
+//     this to the same value as the base `row_offset` so the LoRA reads the
+//     matching slot of B).
 fn void dispatch_batch_matmul(
 	llm::RenderGraph* g,
 	DiTKernels* dk,
@@ -1150,7 +1161,10 @@ fn void dispatch_batch_matmul(
 	uint seq_len,
 	uint row_offset,
 	llm::LoraTensor* lora = null,
-	llm::Tensor* lora_scratch = null
+	llm::Tensor* lora_scratch = null,
+	uint lora_b_rows = 0,
+	uint lora_row_offset = 0,
+	uint lora_weight_row_offset = 0
 )
 {
 	BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = seq_len, .row_offset = row_offset };
@@ -1204,7 +1218,8 @@ fn void dispatch_batch_matmul(
 		// 2D dispatch: (seq_len, out_dim) workgroups
 		g.dispatch(&dk.batch_matmul_simple, { weight, input, output },
 			&pc, seq_len, out_dim);
-		dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len);
+		dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len,
+			lora_b_rows, lora_row_offset, lora_weight_row_offset);
 		return;
 	}
 	// 2D tiled GEMM: ceil(seq_len/64) * ceil(out_dim/64) workgroups
@@ -1214,7 +1229,8 @@ fn void dispatch_batch_matmul(
 		io::printfn("  [Q4_0 dispatch] seq_len=%d out_dim=%d groups=%d", seq_len, out_dim, groups);
 	}
 	g.dispatch(kernel, { weight, input, output }, &pc, groups);
-	dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len);
+	dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len,
+		lora_b_rows, lora_row_offset, lora_weight_row_offset);
 }
 
 // Append the two-hop LoRA correction onto a base batch_matmul output. No-op
@@ -1228,6 +1244,11 @@ fn void dispatch_batch_matmul(
 // fused buffer (e.g. ffn_gate / ffn_up writing into halves of ffn_gate_up_out).
 // `row_offset` shifts the column index of every output write, so the LoRA
 // correction lands at `output[pos * out_dim + row_offset + b_row]`.
+// `weight_row_offset` shifts the B row index — used when a single fused LoRA
+// (B = [N*dim, rank]) is being applied to a single slot's per-call output
+// (e.g. Flux fused img_attn.qkv where one base call writes the K slot at
+// weight rows [dim, 2*dim) — the LoRA correction needs to read the same B
+// rows even though the per-call output is only [dim] wide).
 fn void dispatch_lora_correction(
 	llm::RenderGraph* g,
 	DiTKernels* dk,
@@ -1239,7 +1260,8 @@ fn void dispatch_lora_correction(
 	uint out_dim,
 	uint seq_len,
 	uint b_rows = 0,
-	uint row_offset = 0
+	uint row_offset = 0,
+	uint weight_row_offset = 0
 )
 {
 	if (lora == null || !lora.present) return;
@@ -1255,16 +1277,15 @@ fn void dispatch_lora_correction(
 	g.dispatch(&dk.batch_matmul_simple, { &lora.a, input, lora_scratch },
 		&a_pc, seq_len, lora.rank);
 
-	// Hop 2: output[seq, row_offset + r] += scale * B[r, rank] @ scratch[seq, rank]
-	// for r in [0, b_rows). The shader uses `out_dim` for the row stride and
-	// `row_offset` to shift the column index, so b_rows controls the dispatch
-	// shape and weight indexing while out_dim controls the destination stride.
+	// Hop 2: output[seq, row_offset + r] += scale * B[weight_row_offset + r, rank] @ scratch[seq, rank]
+	// for r in [0, b_rows).
 	BatchMatMulAddScaledPC b_pc = {
 		.out_dim = out_dim,
 		.in_dim = lora.rank,
 		.seq_len = seq_len,
 		.scale = lora.scale,
 		.row_offset = row_offset,
+		.weight_row_offset = weight_row_offset,
 	};
 	g.dispatch(&dk.batch_matmul_add_scaled, { &lora.b, lora_scratch, output },
 		&b_pc, seq_len, b_rows);

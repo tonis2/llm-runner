@@ -408,3 +408,394 @@ fn DiTLoraAdapter? load_dit_lora_safetensors(
         .loaded = true,
     };
 }
+
+// ============================================================================
+// Flux 2 Klein DiT LoRA support.
+//
+// Klein has two block topologies that the Z-Image DiTLoraLayer can't model:
+//   - dual-stream blocks: image and text streams each have their own fused
+//     QKV [3*dim, dim], output proj [dim, dim], SwiGLU FFN up [2*mlp, dim]
+//     and down [dim, mlp].
+//   - single-stream blocks: one fused linear1 [3*dim + 2*mlp, dim] (Q/K/V +
+//     SwiGLU gate/up) and one fused linear2 [dim, dim+mlp].
+//
+// LoRA files in the wild use either "native fused" naming (one LoRA pair per
+// fused weight, matching the GGUF tensor names) or Diffusers naming
+// (separate to_q / to_k / to_v that target sub-ranges of the fused output
+// buffers). The runtime applies separate LoraTensors at different row offsets
+// of the same destination, so both layouts compose with the existing
+// dispatch_lora_correction call.
+// ============================================================================
+
+struct FluxDualLoraLayer {
+    LoraTensor img_qkv;       // [3*dim, dim] fused
+    LoraTensor img_q;         // sub-range [0, dim)
+    LoraTensor img_k;         // sub-range [dim, 2*dim)
+    LoraTensor img_v;         // sub-range [2*dim, 3*dim)
+    LoraTensor img_proj;
+    LoraTensor img_mlp_up;    // [2*mlp, dim]
+    LoraTensor img_mlp_down;  // [dim, mlp]
+    LoraTensor txt_qkv;
+    LoraTensor txt_q;
+    LoraTensor txt_k;
+    LoraTensor txt_v;
+    LoraTensor txt_proj;
+    LoraTensor txt_mlp_up;
+    LoraTensor txt_mlp_down;
+}
+
+fn void FluxDualLoraLayer.free(&self) {
+    self.img_qkv.free(); self.img_q.free(); self.img_k.free(); self.img_v.free();
+    self.img_proj.free(); self.img_mlp_up.free(); self.img_mlp_down.free();
+    self.txt_qkv.free(); self.txt_q.free(); self.txt_k.free(); self.txt_v.free();
+    self.txt_proj.free(); self.txt_mlp_up.free(); self.txt_mlp_down.free();
+}
+
+struct FluxSingleLoraLayer {
+    LoraTensor linear1;       // [3*dim + 2*mlp, dim] fused
+    LoraTensor q;             // sub-range [0, dim)
+    LoraTensor k;             // sub-range [dim, 2*dim)
+    LoraTensor v;             // sub-range [2*dim, 3*dim)
+    LoraTensor linear2;       // [dim, dim+mlp]
+}
+
+fn void FluxSingleLoraLayer.free(&self) {
+    self.linear1.free(); self.q.free(); self.k.free(); self.v.free();
+    self.linear2.free();
+}
+
+struct FluxLoraAdapter {
+    String path;
+    float  strength;
+    float  alpha;
+    FluxDualLoraLayer*   dual_layers;
+    FluxSingleLoraLayer* single_layers;
+    uint   n_dual;
+    uint   n_single;
+    uint   covered_sites;
+    bool   loaded;
+}
+
+fn void FluxLoraAdapter.free(&self) {
+    if (!self.loaded) return;
+    for (uint l = 0; l < self.n_dual; l++)   self.dual_layers[l].free();
+    for (uint l = 0; l < self.n_single; l++) self.single_layers[l].free();
+    if (self.n_dual > 0)   mem::free(self.dual_layers);
+    if (self.n_single > 0) mem::free(self.single_layers);
+    self.loaded = false;
+}
+
+// Per-scheme module-name suffixes for every Flux LoRA site we know how to
+// apply. An empty String means the scheme doesn't expose that site (e.g.
+// Diffusers names Q/K/V separately and has no fused QKV name; native-fused
+// names QKV as one and has no separate Q/K/V).
+struct FluxLoraScheme {
+    String dual_prefix;
+    String single_prefix;
+    String layer_suffix;
+    // Dual block sites
+    String img_qkv;
+    String img_q;
+    String img_k;
+    String img_v;
+    String img_proj;
+    String img_mlp_up;
+    String img_mlp_down;
+    String txt_qkv;
+    String txt_q;
+    String txt_k;
+    String txt_v;
+    String txt_proj;
+    String txt_mlp_up;
+    String txt_mlp_down;
+    // Single block sites
+    String single_linear1;
+    String single_q;
+    String single_k;
+    String single_v;
+    String single_linear2;
+}
+
+const FluxLoraScheme[*] FLUX_LORA_SCHEMES = {
+    // 1. Native fused — Kohya/ComfyUI/HF flux GGUF-aligned naming.
+    {
+        .dual_prefix    = "double_blocks.",
+        .single_prefix  = "single_blocks.",
+        .layer_suffix   = ".",
+        .img_qkv        = "img_attn.qkv",
+        .img_proj       = "img_attn.proj",
+        .img_mlp_up     = "img_mlp.0",
+        .img_mlp_down   = "img_mlp.2",
+        .txt_qkv        = "txt_attn.qkv",
+        .txt_proj       = "txt_attn.proj",
+        .txt_mlp_up     = "txt_mlp.0",
+        .txt_mlp_down   = "txt_mlp.2",
+        .single_linear1 = "linear1",
+        .single_linear2 = "linear2",
+    },
+    // 2. ComfyUI checkpoint export with "diffusion_model." container prefix.
+    {
+        .dual_prefix    = "diffusion_model.double_blocks.",
+        .single_prefix  = "diffusion_model.single_blocks.",
+        .layer_suffix   = ".",
+        .img_qkv        = "img_attn.qkv",
+        .img_proj       = "img_attn.proj",
+        .img_mlp_up     = "img_mlp.0",
+        .img_mlp_down   = "img_mlp.2",
+        .txt_qkv        = "txt_attn.qkv",
+        .txt_proj       = "txt_attn.proj",
+        .txt_mlp_up     = "txt_mlp.0",
+        .txt_mlp_down   = "txt_mlp.2",
+        .single_linear1 = "linear1",
+        .single_linear2 = "linear2",
+    },
+    // 3. Diffusers FluxTransformer2DModel naming. Q/K/V are unfused and land
+    //    at row sub-ranges of the fused QKV output. MLP sites are deliberately
+    //    omitted: Flux1's GELU FFN (single up + single down) doesn't map onto
+    //    Klein's SwiGLU FFN (gate/up halves of [2*mlp, dim] + single down), so
+    //    a `ff.net.0.proj` LoRA has no correct destination here.
+    {
+        .dual_prefix    = "transformer.transformer_blocks.",
+        .single_prefix  = "transformer.single_transformer_blocks.",
+        .layer_suffix   = ".",
+        .img_q          = "attn.to_q",
+        .img_k          = "attn.to_k",
+        .img_v          = "attn.to_v",
+        .img_proj       = "attn.to_out.0",
+        .txt_q          = "attn.add_q_proj",
+        .txt_k          = "attn.add_k_proj",
+        .txt_v          = "attn.add_v_proj",
+        .txt_proj       = "attn.to_add_out",
+        .single_q       = "attn.to_q",
+        .single_k       = "attn.to_k",
+        .single_v       = "attn.to_v",
+        .single_linear2 = "proj_out",
+    },
+};
+
+// Build "{prefix}{layer}{suffix}{module}" using the same buffer scheme as
+// build_module_path but with arbitrary prefix/suffix strings.
+fn String flux_build_module_path(char[256]* buf, String layer_prefix, uint layer, String layer_suffix, String module_suffix) {
+    usz pos = 0;
+    pos = append_str(buf, pos, layer_prefix);
+    pos = append_uint(buf, pos, layer);
+    pos = append_str(buf, pos, layer_suffix);
+    pos = append_str(buf, pos, module_suffix);
+    return (String)(*buf)[0:pos];
+}
+
+// Try to load one Flux LoRA site at (layer_prefix, layer, layer_suffix, module).
+// Returns a present LoraTensor on success, or zero-init (present=false) on miss.
+fn LoraTensor try_load_flux_site(
+    DeviceContext* ctx,
+    SafetensorsFile* sf,
+    String layer_prefix,
+    uint layer,
+    String layer_suffix,
+    String module_suffix,
+    float global_alpha,
+    float strength,
+) {
+    LoraTensor result;
+    if (module_suffix.len == 0) return result;
+
+    char[256] mod_buf;
+    String full_module = flux_build_module_path(&mod_buf, layer_prefix, layer, layer_suffix, module_suffix);
+
+    char[256] a_buf;
+    char[256] b_buf;
+    String a_name;
+    String b_name;
+    if (!find_lora_pair_names(sf, full_module, &a_buf, &b_buf, &a_name, &b_name)) {
+        return result;
+    }
+
+    Tensor a_tensor;
+    Tensor b_tensor;
+    if (try t = upload_safetensor_f32(ctx, sf, a_name)) {
+        a_tensor = t;
+    } else {
+        return result;
+    }
+    if (try t = upload_safetensor_f32(ctx, sf, b_name)) {
+        b_tensor = t;
+    } else {
+        a_tensor.free();
+        return result;
+    }
+
+    uint rank = (uint)a_tensor.shape[1];
+    if (rank == 0) {
+        a_tensor.free();
+        b_tensor.free();
+        return result;
+    }
+
+    float effective_alpha = try_load_per_tensor_alpha(sf, full_module);
+    if (effective_alpha < 0.0f) effective_alpha = global_alpha;
+    if (effective_alpha <= 0.0f) effective_alpha = (float)rank;
+
+    result.a = a_tensor;
+    result.b = b_tensor;
+    result.rank = rank;
+    result.scale = strength * effective_alpha / (float)rank;
+    result.present = true;
+    return result;
+}
+
+// Pick the first Flux scheme that yields any matches at layer 0 of either the
+// dual or single stream. Returns null if no scheme matches.
+fn FluxLoraScheme* detect_flux_lora_scheme(SafetensorsFile* sf) {
+    for (uint i = 0; i < FLUX_LORA_SCHEMES.len; i++) {
+        FluxLoraScheme* s = &FLUX_LORA_SCHEMES[i];
+        String[*] dual_modules = {
+            s.img_qkv, s.img_q, s.img_proj, s.img_mlp_up, s.txt_qkv, s.txt_q
+        };
+        String[*] single_modules = {
+            s.single_linear1, s.single_q, s.single_linear2
+        };
+        for (uint m = 0; m < dual_modules.len; m++) {
+            if (dual_modules[m].len == 0) continue;
+            char[256] mod_buf;
+            String full = flux_build_module_path(&mod_buf, s.dual_prefix, 0, s.layer_suffix, dual_modules[m]);
+            char[256] a_buf;
+            usz pa = append_str(&a_buf, 0, full);
+            pa = append_str(&a_buf, pa, ".lora_A.weight");
+            String a_name = (String)a_buf[0:pa];
+            if (try _info = sf.find_tensor(a_name)) return s;
+            pa = append_str(&a_buf, 0, full);
+            pa = append_str(&a_buf, pa, ".lora_down.weight");
+            a_name = (String)a_buf[0:pa];
+            if (try _info = sf.find_tensor(a_name)) return s;
+        }
+        for (uint m = 0; m < single_modules.len; m++) {
+            if (single_modules[m].len == 0) continue;
+            char[256] mod_buf;
+            String full = flux_build_module_path(&mod_buf, s.single_prefix, 0, s.layer_suffix, single_modules[m]);
+            char[256] a_buf;
+            usz pa = append_str(&a_buf, 0, full);
+            pa = append_str(&a_buf, pa, ".lora_A.weight");
+            String a_name = (String)a_buf[0:pa];
+            if (try _info = sf.find_tensor(a_name)) return s;
+            pa = append_str(&a_buf, 0, full);
+            pa = append_str(&a_buf, pa, ".lora_down.weight");
+            a_name = (String)a_buf[0:pa];
+            if (try _info = sf.find_tensor(a_name)) return s;
+        }
+    }
+    return null;
+}
+
+// Load a Flux LoRA safetensors file into a FluxLoraAdapter sized for the model's
+// dual / single block counts. Layers absent from the LoRA file leave their
+// LoraTensor.present flags false (a no-op at compute time).
+fn FluxLoraAdapter? load_flux_lora_safetensors(
+    DeviceContext* ctx,
+    String path,
+    float strength,
+    uint n_dual,
+    uint n_single,
+) {
+    io::printfn("  Loading Flux LoRA: %s", path);
+    SafetensorsFile sf = safetensors_open(path)!;
+    defer sf.close();
+
+    float alpha = 0.0f;
+    if (try v = sf.get_metadata("lora_alpha")) {
+        alpha = (float)(v.to_double() ?? 0.0);
+    } else if (try v = sf.get_metadata("ss_network_alpha")) {
+        alpha = (float)(v.to_double() ?? 0.0);
+    } else if (try v = sf.get_metadata("alpha")) {
+        alpha = (float)(v.to_double() ?? 0.0);
+    }
+    if (alpha == 0.0f) {
+        io::printfn("  Flux LoRA: no alpha in __metadata__, will default to rank per pair");
+    }
+
+    FluxLoraScheme* scheme = detect_flux_lora_scheme(&sf);
+    if (scheme == null) {
+        io::printfn("  Flux LoRA: no recognised tensor naming scheme. Header keys (first 8):");
+        usz max = sf.n_tensors < 8 ? sf.n_tensors : 8;
+        for (usz i = 0; i < max; i++) {
+            io::printfn("    %s", sf.tensors[i].name);
+        }
+        return COMPUTE_ERROR~;
+    }
+    io::printfn("  Flux LoRA scheme: dual=\"%s\", single=\"%s\"", scheme.dual_prefix, scheme.single_prefix);
+
+    FluxDualLoraLayer[]   dual   = n_dual   > 0 ? mem::new_array(FluxDualLoraLayer, n_dual)     : (FluxDualLoraLayer[]){};
+    FluxSingleLoraLayer[] single = n_single > 0 ? mem::new_array(FluxSingleLoraLayer, n_single) : (FluxSingleLoraLayer[]){};
+
+    uint covered = 0;
+
+    for (uint l = 0; l < n_dual; l++) {
+        FluxDualLoraLayer* dl = &dual[l];
+        dl.img_qkv      = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_qkv,      alpha, strength);
+        dl.img_q        = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_q,        alpha, strength);
+        dl.img_k        = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_k,        alpha, strength);
+        dl.img_v        = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_v,        alpha, strength);
+        dl.img_proj     = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_proj,     alpha, strength);
+        dl.img_mlp_up   = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_mlp_up,   alpha, strength);
+        dl.img_mlp_down = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_mlp_down, alpha, strength);
+        dl.txt_qkv      = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_qkv,      alpha, strength);
+        dl.txt_q        = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_q,        alpha, strength);
+        dl.txt_k        = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_k,        alpha, strength);
+        dl.txt_v        = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_v,        alpha, strength);
+        dl.txt_proj     = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_proj,     alpha, strength);
+        dl.txt_mlp_up   = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_mlp_up,   alpha, strength);
+        dl.txt_mlp_down = try_load_flux_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_mlp_down, alpha, strength);
+
+        if (dl.img_qkv.present)      covered++;
+        if (dl.img_q.present)        covered++;
+        if (dl.img_k.present)        covered++;
+        if (dl.img_v.present)        covered++;
+        if (dl.img_proj.present)     covered++;
+        if (dl.img_mlp_up.present)   covered++;
+        if (dl.img_mlp_down.present) covered++;
+        if (dl.txt_qkv.present)      covered++;
+        if (dl.txt_q.present)        covered++;
+        if (dl.txt_k.present)        covered++;
+        if (dl.txt_v.present)        covered++;
+        if (dl.txt_proj.present)     covered++;
+        if (dl.txt_mlp_up.present)   covered++;
+        if (dl.txt_mlp_down.present) covered++;
+    }
+
+    for (uint l = 0; l < n_single; l++) {
+        FluxSingleLoraLayer* sl = &single[l];
+        sl.linear1 = try_load_flux_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_linear1, alpha, strength);
+        sl.q       = try_load_flux_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_q,       alpha, strength);
+        sl.k       = try_load_flux_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_k,       alpha, strength);
+        sl.v       = try_load_flux_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_v,       alpha, strength);
+        sl.linear2 = try_load_flux_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_linear2, alpha, strength);
+
+        if (sl.linear1.present) covered++;
+        if (sl.q.present)       covered++;
+        if (sl.k.present)       covered++;
+        if (sl.v.present)       covered++;
+        if (sl.linear2.present) covered++;
+    }
+
+    io::printfn("  Flux LoRA loaded: alpha=%.2f strength=%.2f, covered %d sites",
+        alpha, strength, covered);
+
+    if (covered == 0) {
+        io::printfn("  Flux LoRA: 0 sites covered — first 10 file keys for diagnosis:");
+        usz max = sf.n_tensors < 10 ? sf.n_tensors : 10;
+        for (usz i = 0; i < max; i++) {
+            io::printfn("    %s", sf.tensors[i].name);
+        }
+    }
+
+    return {
+        .path = path,
+        .strength = strength,
+        .alpha = alpha,
+        .dual_layers = n_dual > 0 ? &dual[0] : null,
+        .single_layers = n_single > 0 ? &single[0] : null,
+        .n_dual = n_dual,
+        .n_single = n_single,
+        .covered_sites = covered,
+        .loaded = true,
+    };
+}

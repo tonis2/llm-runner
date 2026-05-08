@@ -97,11 +97,15 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
         .num_steps     = 4,
         .strength      = 0.6f,
         .seed          = 42,
+        .lora_path     = "",
+        .lora_strength = 1.0f,
     };
     if (try v = body.get_uint("steps"))  greq.num_steps    = (uint)v;
     if (try v = body.get_uint("seed"))   greq.seed         = (uint)v;
     if (try v = body.get_uint("width"))  greq.image_width  = (uint)v;
     if (try v = body.get_uint("height")) greq.image_height = (uint)v;
+    if (try v = body.get_string("lora")) greq.lora_path    = v;
+    if (try v = body.get_float("lora_strength")) greq.lora_strength = (float)v;
 
     image::Image input_img;
     bool have_input = false;
