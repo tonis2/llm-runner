@@ -5,18 +5,25 @@ import std::io::file;
 import std::core::mem;
 import image;
 import image::png;
+import image::jpeg;
 import vk;
 
 
 
-// --- Load PNG as float tensor ---
-// Returns image::Image (caller must call .free())
-// Pixel data is in interleaved format, convert to NCHW float as needed
-fn image::Image? load_png(String filename) {
-    image::Image img = png::load_file(filename)!!;
+// --- Load image (PNG or JPEG) ---
+// Returns image::Image (caller must call .free()). Format is picked from the
+// file extension (case-insensitive).
+fn image::Image? load_image(String filename) {
+    String lower = filename.to_lower_tcopy();
+    image::Image img;
+    if (lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+        img = jpeg::load_file(filename)!!;
+    } else {
+        img = png::load_file(filename)!!;
+    }
 
     if (img.format != PixelFormat.RGB && img.format != PixelFormat.RGBA && img.format != PixelFormat.GRAYSCALE) {
-        io::printfn("Error: Only RGB, RGBA, and Grayscale PNG images supported, got %s", img.format);
+        io::printfn("Error: Only RGB, RGBA, and Grayscale images supported, got %s", img.format);
         img.free();
         return COMPUTE_ERROR~;
     }

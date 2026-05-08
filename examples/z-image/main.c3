@@ -47,7 +47,7 @@ fn int main(String[] args) {
     // Optional: img2img mode
     image::Image input_img;
     if (config.input_path.len > 0) {
-        input_img = llm::load_png(config.input_path)!!;
+        input_img = llm::load_image(config.input_path)!!;
         inputs.input_image = &input_img;
         inputs.strength = 0.75;
     }

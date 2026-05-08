@@ -760,7 +760,7 @@ fn float[]? encode_image_to_dit_latent(
 {
 	// 1. Load + preprocess input image
 	io::printfn("  Loading input: %s", input_path);
-	image::Image src_img = llm::load_png(input_path)!!;
+	image::Image src_img = llm::load_image(input_path)!!;
 	defer src_img.free();
 	image::Image preprocessed = llm::resize_center_crop(&src_img, img_w, img_h)!!;
 	defer preprocessed.free();

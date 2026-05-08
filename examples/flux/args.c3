@@ -102,7 +102,7 @@ fn void print_usage() {
     io::printfn("  --size         Image size (default: 1024)");
     io::printfn("  --steps        Denoising steps (default: 4)");
     io::printfn("  --seed         Random seed (default: 42)");
-    io::printfn("  --input        Input image (PNG) for img2img / kontext modes");
+    io::printfn("  --input        Input image (PNG or JPG) for img2img / kontext modes");
     io::printfn("  --edit-mode    Edit mode: img2img | kontext (default: txt2img)");
     io::printfn("  --strength     img2img strength 0..1 (default: 0.75)");
     io::printfn("  --config       Load from JSON config file");
