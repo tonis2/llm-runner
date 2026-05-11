@@ -61,7 +61,7 @@ fn flux::FluxConfig? parse_flux_args(String[] args, ServerOptions* server_opts) 
             else if (args[i] == "--edit-mode") { config.edit_mode = args[i + 1]; i += 2; }
             else if (args[i] == "--strength") { config.strength = args[i + 1].to_float() ?? 0.6f; i += 2; }
             else if (args[i] == "--lora") { config.lora_path = args[i + 1]; i += 2; }
-            else if (args[i] == "--lora-strength") { config.lora_strength = args[i + 1].to_float() ?? 1.0f; i += 2; }
+            else if (args[i] == "--lora-strength") { config.lora_strength = args[i + 1].to_float() ?? 1.5f; i += 2; }
             else if (args[i] == "--bind") { server_opts.bind_addr = args[i + 1]; i += 2; }
             else if (args[i] == "--port") { server_opts.port = (int)(args[i + 1].to_uint() ?? 7860); i += 2; }
             else if (args[i] == "--config") { i += 2; }

@@ -9,41 +9,46 @@ import std::math;
 import std::core::mem;
 import std::time::clock;
 
-// Flux 2 Klein Hybrid DiT Transformer
-// dim=4096, heads=32, head_dim=128, mlp_dim=12288
-// 8 dual-stream blocks + 24 single-stream blocks (Klein distilled)
-// Shared modulations (same for all dual blocks, same for all single blocks)
-// No biases, no CLIP pooled conditioning
+// Flux 2 Hybrid DiT Transformer
+// Klein-9B defaults: dim=4096, heads=32, head_dim=128, mlp_dim=12288
+//                    8 dual-stream blocks + 24 single-stream blocks
+// FLUX.2-dev would override these via configure_flux_from_gguf() before load.
+// Shared modulations (same for all dual blocks, same for all single blocks).
+// No biases, no CLIP pooled conditioning.
 //
 // Flux.2 VAE latent: 32 channels at 8x spatial reduction
 // Patchify = pixel unshuffle(2): [32, H/8, W/8] → [128, H/16, W/16]
 // So patch_dim=128, effectively patch_size=1 over 128-ch latent
+//
+// These are module-level mutable globals — not `const` — so the same code can
+// drive Klein-9B and FLUX.2-dev. Populated from GGUF tensor shapes (and
+// optional `flux.*` metadata keys) by configure_flux_from_gguf().
 
-const uint FLUX_DIM        = 4096;
-const uint FLUX_HEADS      = 32;   // dim / head_dim
-const uint FLUX_HEAD_DIM   = 128;
-const uint FLUX_MLP_DIM    = 12288;  // dim * 3
-const uint FLUX_PATCH_SIZE = 1;      // patches are 1x1 over 128-channel latent
-const uint FLUX_LATENT_CH  = 128;    // after pixel unshuffle: 32 VAE ch * 4
-const uint FLUX_PATCH_DIM  = 128;    // LATENT_CH * PATCH_SIZE^2 = 128
-const uint FLUX_VAE_CH     = 32;     // actual VAE latent channels before unshuffle
-const float FLUX_ROPE_THETA = 2000.0f;  // Flux.2 uses theta=2000 (NOT 10000 like Flux.1)
+uint flux_dim        = 4096;
+uint flux_heads      = 32;   // dim / head_dim
+uint flux_head_dim   = 128;
+uint flux_mlp_dim    = 12288;  // dim * 3
+uint flux_patch_size = 1;      // patches are 1x1 over 128-channel latent
+uint flux_latent_ch  = 128;    // after pixel unshuffle: 32 VAE ch * 4
+uint flux_patch_dim  = 128;    // LATENT_CH * PATCH_SIZE^2 = 128
+uint flux_vae_ch     = 32;     // actual VAE latent channels before unshuffle
+float flux_rope_theta = 2000.0f;  // Flux.2 uses theta=2000 (NOT 10000 like Flux.1)
 
 // Text encoder: Qwen3-8B, 3 hidden states concatenated → 12288 dim
-const uint FLUX_TEXT_DIM   = 12288;  // 3 * 4096 (Qwen3-8B hidden states)
+uint flux_text_dim   = 12288;  // 3 * 4096 (Qwen3-8B hidden states)
 
 // mRoPE axes for Flux.2 Klein: 4 axes [T, H, W, L] — each 32 dims, sum to head_dim=128
 // T = always 0 (unused temporal axis)
 // H = spatial height (image rows, 0 for text)
 // W = spatial width (image cols, 0 for text)
 // L = sequential position (text token index, 0 for image)
-const uint FLUX_ROPE_AXES_T   = 32;  // temporal (always 0)
-const uint FLUX_ROPE_AXES_H   = 32;  // height
-const uint FLUX_ROPE_AXES_W   = 32;  // width
-const uint FLUX_ROPE_AXES_L   = 32;  // sequential (text)
+uint flux_rope_axes_t   = 32;  // temporal (always 0)
+uint flux_rope_axes_h   = 32;  // height
+uint flux_rope_axes_w   = 32;  // width
+uint flux_rope_axes_l   = 32;  // sequential (text)
 
 // Timestep embedding dims
-const uint FLUX_T_EMB_DIM  = 256;
+uint flux_t_emb_dim  = 256;
 
 // Largest LoRA rank for which the per-pass scratch buffer is sized. LoRAs
 // above this rank are silently no-op'd by dispatch_lora_correction in
@@ -161,7 +166,7 @@ struct FluxDiTModel {
     uint latent_h;    // noise latent grid height
     uint latent_w;    // noise latent grid width
 
-    // Kontext reference patches in patchify-output layout: [n_ref, FLUX_PATCH_DIM]
+    // Kontext reference patches in patchify-output layout: [n_ref, flux_patch_dim]
     // i.e. HWC-per-patch (channel innermost). Empty when n_ref == 0.
     llm::Tensor ref_patches;
 
@@ -190,6 +195,92 @@ fn llm::Tensor load_dit_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, Strin
         return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
     }
     return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
+}
+
+// --- Configure architecture from GGUF ---
+//
+// Klein-9B and FLUX.2-dev share the same DiT graph but differ in dim/heads/
+// mlp/block counts. We don't get reliable `flux.*` metadata in either GGUF
+// (Klein's has none), so the source of truth is the tensor shapes themselves.
+// This populates the module-level FLUX_* globals before any allocations or
+// loads happen. Optional `flux.rope.*` metadata, if present, overrides the
+// rope_theta and axis split — for everything else the shapes are authoritative.
+//
+// Returns false if the GGUF is missing tensors we need to size the model
+// (e.g. partial / corrupt file). Callers should bail in that case.
+fn bool configure_flux_from_gguf(llm::GGUFFile* gf) {
+    // img_in.weight has GGUF shape [patch_dim, dim] (llama.cpp transposes the
+    // PyTorch [out, in] layout to [in, out] on disk).
+    if (try img_in = gf.find_tensor("img_in.weight")) {
+        if (img_in.n_dims < 2) return false;
+        flux_patch_dim = (uint)img_in.shape[0];
+        flux_dim       = (uint)img_in.shape[1];
+    } else {
+        return false;
+    }
+
+    // VAE is pixel-unshuffled with factor 2 into 4× channel count. Patches are
+    // 1×1 over the unshuffled latent so patch_dim == latent_ch.
+    flux_latent_ch  = flux_patch_dim;
+    flux_patch_size = 1;
+    flux_vae_ch     = flux_latent_ch / 4;
+
+    // txt_in.weight: GGUF shape [txt_dim, dim]
+    if (try txt_in = gf.find_tensor("txt_in.weight")) {
+        if (txt_in.n_dims < 2) return false;
+        flux_text_dim = (uint)txt_in.shape[0];
+    } else {
+        return false;
+    }
+
+    // time_in.in_layer.weight: GGUF shape [t_emb_dim, dim]
+    if (try t_in = gf.find_tensor("time_in.in_layer.weight")) {
+        if (t_in.n_dims < 2) return false;
+        flux_t_emb_dim = (uint)t_in.shape[0];
+    } else {
+        return false;
+    }
+
+    // head_dim from the per-head Q-norm scale on block 0 (1D [head_dim]).
+    if (try qn = gf.find_tensor("double_blocks.0.img_attn.norm.query_norm.scale")) {
+        if (qn.n_dims < 1) return false;
+        flux_head_dim = (uint)qn.shape[0];
+    } else {
+        return false;
+    }
+    if (flux_head_dim == 0 || flux_dim % flux_head_dim != 0) return false;
+    flux_heads = flux_dim / flux_head_dim;
+
+    // mlp_dim from img_mlp.0 (GEGLU up-projection). GGUF shape [dim, 2*mlp_dim].
+    if (try mlp = gf.find_tensor("double_blocks.0.img_mlp.0.weight")) {
+        if (mlp.n_dims < 2) return false;
+        flux_mlp_dim = (uint)mlp.shape[1] / 2;
+    } else {
+        return false;
+    }
+
+    // Optional metadata overrides. Klein has none of these so the defaults stand;
+    // a future FLUX.2-dev GGUF can ship them if its rope shape differs.
+    if (try theta = gf.get_f32("flux.rope.freq_base")) {
+        flux_rope_theta = theta;
+    }
+    if (try axes = gf.read_u32_array("flux.rope.dimension_sections")) {
+        if (axes.len == 4) {
+            flux_rope_axes_t = axes[0];
+            flux_rope_axes_h = axes[1];
+            flux_rope_axes_w = axes[2];
+            flux_rope_axes_l = axes[3];
+        }
+    } else {
+        // Default: split head_dim into 4 equal axes [T, H, W, L].
+        uint quarter = flux_head_dim / 4;
+        flux_rope_axes_t = quarter;
+        flux_rope_axes_h = quarter;
+        flux_rope_axes_w = quarter;
+        flux_rope_axes_l = flux_head_dim - 3 * quarter;
+    }
+
+    return true;
 }
 
 // --- Detect Block Counts ---
@@ -237,8 +328,8 @@ fn FluxDiTActivations? allocate_flux_activations(
 ) {
     uint n_joint = n_img + n_txt;
     uint max_seq = n_joint;  // single-stream uses full sequence
-    uint dim = FLUX_DIM;
-    uint mlp = FLUX_MLP_DIM;
+    uint dim = flux_dim;
+    uint mlp = flux_mlp_dim;
     ulong sd = (ulong)max_seq * dim;
     ulong sm = (ulong)max_seq * mlp;
     ulong sc = (ulong)max_seq * (ulong)(dim + mlp);
@@ -263,10 +354,10 @@ fn FluxDiTActivations? allocate_flux_activations(
         .ffn_gate_out = llm::create_f32_tensor(ctx, { sm, 0, 0, 0 }, 1)!!,
         .ffn_up_out = llm::create_f32_tensor(ctx, { sm, 0, 0, 0 }, 1)!!,
         .concat_buf = llm::create_f32_tensor(ctx, { sc, 0, 0, 0 }, 1)!!,
-        .patches = llm::create_f32_tensor(ctx, { (ulong)n_img * FLUX_PATCH_DIM, 0, 0, 0 }, 1)!!,
-        .velocity = llm::create_f32_tensor(ctx, { (ulong)n_img * FLUX_PATCH_DIM, 0, 0, 0 }, 1)!!,
+        .patches = llm::create_f32_tensor(ctx, { (ulong)n_img * flux_patch_dim, 0, 0, 0 }, 1)!!,
+        .velocity = llm::create_f32_tensor(ctx, { (ulong)n_img * flux_patch_dim, 0, 0, 0 }, 1)!!,
         .latent = llm::create_f32_tensor(ctx, { (ulong)latent_elems, 0, 0, 0 }, 1)!!,
-        .t_emb = llm::create_f32_tensor(ctx, { FLUX_T_EMB_DIM, 0, 0, 0 }, 1)!!,
+        .t_emb = llm::create_f32_tensor(ctx, { flux_t_emb_dim, 0, 0, 0 }, 1)!!,
         .t_emb_mlp = llm::create_f32_tensor(ctx, { dim, 0, 0, 0 }, 1)!!,
         .silu_t = llm::create_f32_tensor(ctx, { dim, 0, 0, 0 }, 1)!!,
         .dual_mod_img = llm::create_f32_tensor(ctx, { (ulong)6 * dim, 0, 0, 0 }, 1)!!,
@@ -300,7 +391,7 @@ fn void? precompute_flux_mrope(
     // Sequence layout: [text(n_txt) | noise_img(n_noise) | ref_img(n_ref)]
     uint n_img   = n_noise + n_ref;
     uint seq_len = n_txt + n_img;
-    uint half_dim = FLUX_HEAD_DIM / 2; // 64
+    uint half_dim = flux_head_dim / 2; // 64
     usz table_size = (usz)seq_len * half_dim;
 
     // T-axis offset for reference image tokens. Matches diffusers
@@ -339,36 +430,36 @@ fn void? precompute_flux_mrope(
 
         uint pair = 0;
         // Axis 0: T (32 dims → 16 pairs) — temporal, always 0
-        uint half_ax_t = FLUX_ROPE_AXES_T / 2;
+        uint half_ax_t = flux_rope_axes_t / 2;
         for (uint k = 0; k < half_ax_t; k++) {
-            float freq = 1.0f / math::pow(FLUX_ROPE_THETA, (float)(2 * k) / (float)FLUX_ROPE_AXES_T);
+            float freq = 1.0f / math::pow(flux_rope_theta, (float)(2 * k) / (float)flux_rope_axes_t);
             float angle = (float)pos_t * freq;
             cos_data[t * half_dim + pair] = math::cos(angle);
             sin_data[t * half_dim + pair] = math::sin(angle);
             pair++;
         }
         // Axis 1: H (32 dims → 16 pairs) — height
-        uint half_ax_h = FLUX_ROPE_AXES_H / 2;
+        uint half_ax_h = flux_rope_axes_h / 2;
         for (uint k = 0; k < half_ax_h; k++) {
-            float freq = 1.0f / math::pow(FLUX_ROPE_THETA, (float)(2 * k) / (float)FLUX_ROPE_AXES_H);
+            float freq = 1.0f / math::pow(flux_rope_theta, (float)(2 * k) / (float)flux_rope_axes_h);
             float angle = (float)pos_h * freq;
             cos_data[t * half_dim + pair] = math::cos(angle);
             sin_data[t * half_dim + pair] = math::sin(angle);
             pair++;
         }
         // Axis 2: W (32 dims → 16 pairs) — width
-        uint half_ax_w = FLUX_ROPE_AXES_W / 2;
+        uint half_ax_w = flux_rope_axes_w / 2;
         for (uint k = 0; k < half_ax_w; k++) {
-            float freq = 1.0f / math::pow(FLUX_ROPE_THETA, (float)(2 * k) / (float)FLUX_ROPE_AXES_W);
+            float freq = 1.0f / math::pow(flux_rope_theta, (float)(2 * k) / (float)flux_rope_axes_w);
             float angle = (float)pos_w * freq;
             cos_data[t * half_dim + pair] = math::cos(angle);
             sin_data[t * half_dim + pair] = math::sin(angle);
             pair++;
         }
         // Axis 3: L (32 dims → 16 pairs) — sequential (text position)
-        uint half_ax_l = FLUX_ROPE_AXES_L / 2;
+        uint half_ax_l = flux_rope_axes_l / 2;
         for (uint k = 0; k < half_ax_l; k++) {
-            float freq = 1.0f / math::pow(FLUX_ROPE_THETA, (float)(2 * k) / (float)FLUX_ROPE_AXES_L);
+            float freq = 1.0f / math::pow(flux_rope_theta, (float)(2 * k) / (float)flux_rope_axes_l);
             float angle = (float)pos_l * freq;
             cos_data[t * half_dim + pair] = math::cos(angle);
             sin_data[t * half_dim + pair] = math::sin(angle);
@@ -543,6 +634,14 @@ fn void concat_rows_copy(
 fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxDiTKernels* dk) {
     io::printfn("\nLoading Flux DiT model...");
 
+    if (!configure_flux_from_gguf(gf)) {
+        io::printfn("  ERROR: GGUF is missing tensors needed to infer Flux DiT architecture");
+        return llm::FILE_NOT_FOUND~;
+    }
+    io::printfn("  Config: dim=%d heads=%d head_dim=%d mlp=%d txt=%d patch_dim=%d theta=%.0f rope_axes=[%d,%d,%d,%d]",
+        flux_dim, flux_heads, flux_head_dim, flux_mlp_dim, flux_text_dim, flux_patch_dim,
+        flux_rope_theta, flux_rope_axes_t, flux_rope_axes_h, flux_rope_axes_w, flux_rope_axes_l);
+
     uint n_dual, n_single;
     detect_flux_block_counts(gf, &n_dual, &n_single);
 
@@ -599,7 +698,7 @@ fn FluxDiTModel? load_flux_dit(llm::DeviceContext* ctx, llm::GGUFFile* gf, FluxD
         };
     }
 
-    io::printfn("  Flux DiT loaded: %d dual + %d single blocks, dim=%d", n_dual, n_single, FLUX_DIM);
+    io::printfn("  Flux DiT loaded: %d dual + %d single blocks, dim=%d", n_dual, n_single, flux_dim);
 
     return {
         .global = global,
@@ -622,8 +721,8 @@ fn void? flux_dual_stream_block(
 ) {
     zimage::DiTKernels* dk = &model.dk.dit;
     FluxDiTActivations* a = &model.acts;
-    uint dim = FLUX_DIM;
-    uint mlp = FLUX_MLP_DIM;
+    uint dim = flux_dim;
+    uint mlp = flux_mlp_dim;
     uint n_img = model.n_img;
     uint n_txt = model.n_txt;
     uint n_joint = model.n_joint;
@@ -681,14 +780,14 @@ fn void? flux_dual_stream_block(
     // We'll use the img norm weights on the img portion and txt norm weights on txt portion
 
     // Apply head norm to txt portion (offset 0)
-    zimage::BatchHeadNormPC txt_hn = { .n_heads = FLUX_HEADS, .head_dim = FLUX_HEAD_DIM, .seq_len = n_txt, .eps = 1e-6f };
-    g.dispatch(&dk.batch_head_norm, { &a.q, &lw.txt_q_norm }, &txt_hn, n_txt * FLUX_HEADS);
-    g.dispatch(&dk.batch_head_norm, { &a.k, &lw.txt_k_norm }, &txt_hn, n_txt * FLUX_HEADS);
+    zimage::BatchHeadNormPC txt_hn = { .n_heads = flux_heads, .head_dim = flux_head_dim, .seq_len = n_txt, .eps = 1e-6f };
+    g.dispatch(&dk.batch_head_norm, { &a.q, &lw.txt_q_norm }, &txt_hn, n_txt * flux_heads);
+    g.dispatch(&dk.batch_head_norm, { &a.k, &lw.txt_k_norm }, &txt_hn, n_txt * flux_heads);
 
     // Apply head norm to img portion (need to offset the buffer)
     // batch_head_norm reads input[gid * head_dim ... (gid+1) * head_dim - 1]
     // gid ranges from 0 to seq_len * n_heads - 1
-    // For the img portion starting at offset n_txt*dim, we need gid offset = n_txt * FLUX_HEADS
+    // For the img portion starting at offset n_txt*dim, we need gid offset = n_txt * flux_heads
     // Unfortunately batch_head_norm doesn't support offset. We need to use buf_c as temp.
 
     // Copy img Q/K portions to buf_c, apply norm, copy back
@@ -696,8 +795,8 @@ fn void? flux_dual_stream_block(
     vk::cmdCopyBuffer(g.cmd, a.q.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer, 1,
         (vk::BufferCopy[]){{ .srcOffset = (ulong)n_txt * dim * 4, .dstOffset = 0, .size = (ulong)n_img * dim * 4 }});
     g.needs_barrier = true;
-    zimage::BatchHeadNormPC img_hn = { .n_heads = FLUX_HEADS, .head_dim = FLUX_HEAD_DIM, .seq_len = n_img, .eps = 1e-6f };
-    g.dispatch(&dk.batch_head_norm, { &a.buf_c, &lw.img_q_norm }, &img_hn, n_img * FLUX_HEADS);
+    zimage::BatchHeadNormPC img_hn = { .n_heads = flux_heads, .head_dim = flux_head_dim, .seq_len = n_img, .eps = 1e-6f };
+    g.dispatch(&dk.batch_head_norm, { &a.buf_c, &lw.img_q_norm }, &img_hn, n_img * flux_heads);
     // Copy back
     if (g.needs_barrier) llm::compute_barrier(g.cmd);
     vk::cmdCopyBuffer(g.cmd, a.buf_c.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
@@ -709,7 +808,7 @@ fn void? flux_dual_stream_block(
     vk::cmdCopyBuffer(g.cmd, a.k.gpu_buffer.buffer, a.buf_c.gpu_buffer.buffer, 1,
         (vk::BufferCopy[]){{ .srcOffset = (ulong)n_txt * dim * 4, .dstOffset = 0, .size = (ulong)n_img * dim * 4 }});
     g.needs_barrier = true;
-    g.dispatch(&dk.batch_head_norm, { &a.buf_c, &lw.img_k_norm }, &img_hn, n_img * FLUX_HEADS);
+    g.dispatch(&dk.batch_head_norm, { &a.buf_c, &lw.img_k_norm }, &img_hn, n_img * flux_heads);
     if (g.needs_barrier) llm::compute_barrier(g.cmd);
     vk::cmdCopyBuffer(g.cmd, a.buf_c.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
         (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = (ulong)n_txt * dim * 4, .size = (ulong)n_img * dim * 4 }});
@@ -719,7 +818,7 @@ fn void? flux_dual_stream_block(
     uint total_elems = n_joint * dim;
     uint transpose_groups = llm::ceil_div(total_elems, 256);
     zimage::TransposeHeadsPC th_fwd = {
-        .seq_len = n_joint, .n_heads = FLUX_HEADS, .head_dim = FLUX_HEAD_DIM, .direction = 0,
+        .seq_len = n_joint, .n_heads = flux_heads, .head_dim = flux_head_dim, .direction = 0,
     };
     // Q → buf_a (transposed Q), K → buf_b (transposed K), V → buf_c (transposed V)
     g.dispatch(&dk.transpose_heads, { &a.q, &a.buf_a }, &th_fwd, transpose_groups);
@@ -727,19 +826,19 @@ fn void? flux_dual_stream_block(
     g.dispatch(&dk.transpose_heads, { &a.v, &a.buf_c }, &th_fwd, transpose_groups);
 
     // === Apply mRoPE to Q (buf_a) and K (buf_b) ===
-    zimage::MRoPEPC mrope_pc = { .seq_len = n_joint, .n_heads = FLUX_HEADS };
-    uint mrope_groups_y = FLUX_HEADS * n_joint;
+    zimage::MRoPEPC mrope_pc = { .seq_len = n_joint, .n_heads = flux_heads };
+    uint mrope_groups_y = flux_heads * n_joint;
     g.dispatch(&dk.mrope, { &a.buf_a, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
     g.dispatch(&dk.mrope, { &a.buf_b, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
 
     // === Flash Attention ===
     // Input: Q=buf_a, K=buf_b, V=buf_c in [heads, n_joint, head_dim]
     // Output: attn_out in [n_joint, dim] (already transposed back by FA kernel)
-    float scale = 1.0f / math::sqrt((float)FLUX_HEAD_DIM);
-    zimage::FlashAttentionPC fa_pc = { .head_dim = FLUX_HEAD_DIM, .n_heads = FLUX_HEADS, .seq_len = n_joint, .scale = scale };
+    float scale = 1.0f / math::sqrt((float)flux_head_dim);
+    zimage::FlashAttentionPC fa_pc = { .head_dim = flux_head_dim, .n_heads = flux_heads, .seq_len = n_joint, .scale = scale };
     uint fa_q_blocks = llm::ceil_div(n_joint, 8);
     g.dispatch(&dk.flash_attention, { &a.buf_a, &a.buf_b, &a.buf_c, &a.attn_out },
-        &fa_pc, fa_q_blocks, FLUX_HEADS);
+        &fa_pc, fa_q_blocks, flux_heads);
 
     // === Split attention output and project ===
     // TXT portion: attn_out[0:n_txt*dim] → txt_proj → buf_b
@@ -850,8 +949,8 @@ fn void? flux_single_stream_block(
 ) {
     zimage::DiTKernels* dk = &model.dk.dit;
     FluxDiTActivations* a = &model.acts;
-    uint dim = FLUX_DIM;
-    uint mlp = FLUX_MLP_DIM;
+    uint dim = flux_dim;
+    uint mlp = flux_mlp_dim;
     uint seq = model.n_joint;
     llm::Tensor* ls = ll != null ? &a.lora_scratch : null;
 
@@ -888,32 +987,32 @@ fn void? flux_single_stream_block(
     }
 
     // === Per-head Q/K norm ===
-    zimage::BatchHeadNormPC hn_pc = { .n_heads = FLUX_HEADS, .head_dim = FLUX_HEAD_DIM, .seq_len = seq, .eps = 1e-6f };
-    g.dispatch(&dk.batch_head_norm, { &a.q, &lw.q_norm }, &hn_pc, seq * FLUX_HEADS);
-    g.dispatch(&dk.batch_head_norm, { &a.k, &lw.k_norm }, &hn_pc, seq * FLUX_HEADS);
+    zimage::BatchHeadNormPC hn_pc = { .n_heads = flux_heads, .head_dim = flux_head_dim, .seq_len = seq, .eps = 1e-6f };
+    g.dispatch(&dk.batch_head_norm, { &a.q, &lw.q_norm }, &hn_pc, seq * flux_heads);
+    g.dispatch(&dk.batch_head_norm, { &a.k, &lw.k_norm }, &hn_pc, seq * flux_heads);
 
     // === Transpose Q/K/V: [seq, dim] → [heads, seq, head_dim] ===
     uint total_elems = seq * dim;
     uint transpose_groups = llm::ceil_div(total_elems, 256);
     zimage::TransposeHeadsPC th_fwd = {
-        .seq_len = seq, .n_heads = FLUX_HEADS, .head_dim = FLUX_HEAD_DIM, .direction = 0,
+        .seq_len = seq, .n_heads = flux_heads, .head_dim = flux_head_dim, .direction = 0,
     };
     g.dispatch(&dk.transpose_heads, { &a.q, &a.buf_a }, &th_fwd, transpose_groups);   // Q transposed → buf_a
     g.dispatch(&dk.transpose_heads, { &a.k, &a.buf_b }, &th_fwd, transpose_groups);   // K transposed → buf_b
     g.dispatch(&dk.transpose_heads, { &a.v, &a.buf_c }, &th_fwd, transpose_groups);   // V transposed → buf_c
 
     // === mRoPE on Q and K ===
-    zimage::MRoPEPC mrope_pc = { .seq_len = seq, .n_heads = FLUX_HEADS };
-    uint mrope_groups_y = FLUX_HEADS * seq;
+    zimage::MRoPEPC mrope_pc = { .seq_len = seq, .n_heads = flux_heads };
+    uint mrope_groups_y = flux_heads * seq;
     g.dispatch(&dk.mrope, { &a.buf_a, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
     g.dispatch(&dk.mrope, { &a.buf_b, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
 
     // === Flash Attention ===
-    float scale = 1.0f / math::sqrt((float)FLUX_HEAD_DIM);
-    zimage::FlashAttentionPC fa_pc = { .head_dim = FLUX_HEAD_DIM, .n_heads = FLUX_HEADS, .seq_len = seq, .scale = scale };
+    float scale = 1.0f / math::sqrt((float)flux_head_dim);
+    zimage::FlashAttentionPC fa_pc = { .head_dim = flux_head_dim, .n_heads = flux_heads, .seq_len = seq, .scale = scale };
     uint fa_q_blocks = llm::ceil_div(seq, 8);
     g.dispatch(&dk.flash_attention, { &a.buf_a, &a.buf_b, &a.buf_c, &a.attn_out },
-        &fa_pc, fa_q_blocks, FLUX_HEADS);
+        &fa_pc, fa_q_blocks, flux_heads);
 
     // === SwiGLU on MLP portion: SiLU(x1) * x2 (x1 = first half, x2 = second half) ===
     llm::SiluPC silu_pc = { .n = seq * mlp };
@@ -943,14 +1042,14 @@ fn void? flux_single_stream_block(
 
 fn void? FluxDiTModel.forward(
     &self,
-    llm::Tensor* text_embeddings, // [n_txt, FLUX_TEXT_DIM]
+    llm::Tensor* text_embeddings, // [n_txt, flux_text_dim]
     float sigma                   // timestep (0=clean, 1=noise)
 ) {
     llm::DeviceContext* ctx = self.ctx;
     zimage::DiTKernels* dk = &self.dk.dit;
     FluxDiTActivations* a = &self.acts;
     FluxDiTGlobalWeights* w = &self.global;
-    uint dim = FLUX_DIM;
+    uint dim = flux_dim;
     uint n_img = self.n_img;
     uint n_txt = self.n_txt;
     uint n_joint = self.n_joint;
@@ -963,10 +1062,10 @@ fn void? FluxDiTModel.forward(
     // With PATCH_SIZE=1, patchify just reshapes [128, H, W] → [H*W, 128]
     // (n_noise = latent_h * latent_w; reference patches, if any, are appended below.)
     zimage::PatchifyPC patch_pc = {
-        .channels = FLUX_LATENT_CH, .height = self.latent_h, .width = self.latent_w, .patch_size = FLUX_PATCH_SIZE,
+        .channels = flux_latent_ch, .height = self.latent_h, .width = self.latent_w, .patch_size = flux_patch_size,
     };
     g.dispatch(&dk.patchify, { &a.latent, &a.patches }, &patch_pc,
-        llm::ceil_div(self.n_noise * FLUX_PATCH_DIM, 256));
+        llm::ceil_div(self.n_noise * flux_patch_dim, 256));
 
     // 1b. Kontext: append reference image patches into patches[n_noise..n_img].
     // The diffusers Klein pipeline does `cat([latents, image_latents], dim=1)` —
@@ -974,25 +1073,25 @@ fn void? FluxDiTModel.forward(
     // existing `patches` buffer so all downstream code (img_in, attention,
     // single-stream blocks, final layer) sees one unified image-token sequence.
     if (self.n_ref > 0) {
-        copy_to_offset(&g, &self.ref_patches, &a.patches, self.n_noise * FLUX_PATCH_DIM, self.n_ref * FLUX_PATCH_DIM);
+        copy_to_offset(&g, &self.ref_patches, &a.patches, self.n_noise * flux_patch_dim, self.n_ref * flux_patch_dim);
     }
 
     // 2. img_in: [n_patches, 128] → [n_patches, dim]
-    flux_matmul(&g, dk, &w.img_in_w, &a.patches, &a.img_hidden, dim, FLUX_PATCH_DIM, n_img, 0);
+    flux_matmul(&g, dk, &w.img_in_w, &a.patches, &a.img_hidden, dim, flux_patch_dim, n_img, 0);
 
     // 3. txt_in: [n_txt, 12288] → [n_txt, dim]
-    flux_matmul(&g, dk, &w.txt_in_w, text_embeddings, &a.txt_hidden, dim, FLUX_TEXT_DIM, n_txt, 0);
+    flux_matmul(&g, dk, &w.txt_in_w, text_embeddings, &a.txt_hidden, dim, flux_text_dim, n_txt, 0);
 
     // 4. Timestep embedding: sigma * 1000 → sincos[256] → MLP → [dim]
     // diffusers Klein pipeline passes timestep/1000 = sigma into the transformer,
     // and Flux2Transformer.forward then multiplies by 1000 again before time_proj
     // (transformer_flux2.py line ~825), so time_proj sees sigma*1000.
     float timestep_val = sigma * 1000.0f;
-    zimage::DiTTimestepPC ts_pc = { .dim = FLUX_T_EMB_DIM, .timestep = timestep_val };
-    g.dispatch(&dk.dit_timestep_embed, { &a.t_emb }, &ts_pc, llm::ceil_div(FLUX_T_EMB_DIM, 256));
+    zimage::DiTTimestepPC ts_pc = { .dim = flux_t_emb_dim, .timestep = timestep_val };
+    g.dispatch(&dk.dit_timestep_embed, { &a.t_emb }, &ts_pc, llm::ceil_div(flux_t_emb_dim, 256));
 
     // MLP: t_emb[256] → w0 → [dim] → SiLU → w1 → [dim]
-    flux_matmul(&g, dk, &w.time_in_w0, &a.t_emb, &a.t_emb_mlp, dim, FLUX_T_EMB_DIM, 1, 0);
+    flux_matmul(&g, dk, &w.time_in_w0, &a.t_emb, &a.t_emb_mlp, dim, flux_t_emb_dim, 1, 0);
     llm::SiluPC silu1_pc = { .n = dim };
     g.dispatch(&dk.shared.silu, { &a.t_emb_mlp }, &silu1_pc, llm::ceil_div(dim, 256));
     flux_matmul(&g, dk, &w.time_in_w1, &a.t_emb_mlp, &a.silu_t, dim, dim, 1, 0);
@@ -1060,13 +1159,13 @@ fn void? FluxDiTModel.forward(
             &final_mod, llm::ceil_div(n_img * dim, 256));
 
         // Final projection: [n_img, dim] → [n_img, patch_dim]
-        flux_matmul(&gf, dk, &w.final_linear_w, &a.buf_a, &a.velocity, FLUX_PATCH_DIM, dim, n_img, 0);
+        flux_matmul(&gf, dk, &w.final_linear_w, &a.buf_a, &a.velocity, flux_patch_dim, dim, n_img, 0);
 
         // Unpatchify: [n_patches, 128] → [128, h, w]
         zimage::UnpatchifyPC unpatch_pc = {
-            .channels = FLUX_LATENT_CH, .height = self.latent_h, .width = self.latent_w, .patch_size = FLUX_PATCH_SIZE,
+            .channels = flux_latent_ch, .height = self.latent_h, .width = self.latent_w, .patch_size = flux_patch_size,
         };
-        uint latent_total = FLUX_LATENT_CH * self.latent_h * self.latent_w;
+        uint latent_total = flux_latent_ch * self.latent_h * self.latent_w;
         gf.dispatch(&dk.unpatchify, { &a.velocity, &a.buf_a }, &unpatch_pc,
             llm::ceil_div(latent_total, 256));
 

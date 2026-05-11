@@ -211,7 +211,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	uint n_img        = lat_h * lat_w;
 	uint n_txt        = text_len;
 	uint n_joint      = n_img + n_txt;
-	uint latent_elems = FLUX_LATENT_CH * lat_h * lat_w;
+	uint latent_elems = flux_latent_ch * lat_h * lat_w;
 
 	if (img_h != req_h || img_w != req_w)
 	{
@@ -288,16 +288,16 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		defer mem::free(ref_chw);
 
 		kontext_n_ref = lat_h * lat_w;
-		kontext_ref_packed = mem::new_array(float, (usz)kontext_n_ref * FLUX_LATENT_CH);
+		kontext_ref_packed = mem::new_array(float, (usz)kontext_n_ref * flux_latent_ch);
 		for (uint sp = 0; sp < kontext_n_ref; sp++)
 		{
-			for (uint c = 0; c < FLUX_LATENT_CH; c++)
+			for (uint c = 0; c < flux_latent_ch; c++)
 			{
-				kontext_ref_packed[sp * FLUX_LATENT_CH + c] = ref_chw[c * kontext_n_ref + sp];
+				kontext_ref_packed[sp * flux_latent_ch + c] = ref_chw[c * kontext_n_ref + sp];
 			}
 		}
 		ctx.allocator.release_empty_pages();
-		io::printfn("  Reference packed: %d tokens x %d ch (T-offset 10)", kontext_n_ref, FLUX_LATENT_CH);
+		io::printfn("  Reference packed: %d tokens x %d ch (T-offset 10)", kontext_n_ref, flux_latent_ch);
 	}
 
 	// --- Phase 2: Resolve DiT model ---
@@ -349,7 +349,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 
 	if (kontext_n_ref > 0)
 	{
-		usz ref_bytes = (usz)kontext_n_ref * FLUX_LATENT_CH * 4;
+		usz ref_bytes = (usz)kontext_n_ref * flux_latent_ch * 4;
 		vk::Memory ref_buf = vk::new_buffer(
 			allocator: &ctx.allocator,
 			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT
@@ -362,7 +362,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			.gpu_buffer = ref_buf,
 			.dtype = llm::GGML_F32,
 			.n_dims = 1,
-			.shape = { (ulong)kontext_n_ref * FLUX_LATENT_CH, 0, 0, 0 },
+			.shape = { (ulong)kontext_n_ref * flux_latent_ch, 0, 0, 0 },
 			.size_bytes = ref_bytes,
 		};
 		mem::free(kontext_ref_packed);
@@ -595,9 +595,9 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 
 	uint vae_h         = lat_h * 2;
 	uint vae_w         = lat_w * 2;
-	uint vae_elems     = FLUX_VAE_CH * vae_h * vae_w;
+	uint vae_elems     = flux_vae_ch * vae_h * vae_w;
 	float[] vae_latent = mem::new_array(float, vae_elems);
-	pixel_shuffle_cpu(latent_cpu, vae_latent, FLUX_LATENT_CH, lat_h, lat_w, 2);
+	pixel_shuffle_cpu(latent_cpu, vae_latent, flux_latent_ch, lat_h, lat_w, 2);
 	mem::free(latent_cpu);
 
 
