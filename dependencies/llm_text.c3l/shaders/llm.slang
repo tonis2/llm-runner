@@ -1281,13 +1281,19 @@ void ffn_swiglu_split(uint3 tid: SV_DispatchThreadID) {
 [vk_binding(1, 0)] RWStructuredBuffer<float> bmq8_input;
 [vk_binding(2, 0)] RWStructuredBuffer<float> bmq8_output;
 
-// Mixed-precision tiles: A and B stored as fp16 in LDS (half the memory of fp32),
-// fp32 accumulator preserved. Halves LDS footprint per workgroup (~16KB → ~8KB),
-// which lets more workgroups co-reside on each RDNA3 WGP. The fp16→fp32 conversion
-// on read is free on modern GPUs (V_CVT_F32_F16 dual-issues with the fma chain).
-groupshared float16_t q8_A[32 * 65];  // [BK=32][BM=64+1] padding avoids bank conflicts
-groupshared float16_t q8_B[32 * 65];  // [BK=32][BN=64+1]
-groupshared float16_t q8_scales[64]; // dequant scale per N-row, stored as fp16 (original storage precision)
+// Mixed-precision tiles with packed-half2 layout:
+// Layout: q8_A[m * 17 + kp] holds (a[m, k=2*kp], a[m, k=2*kp+1]) as fp16x2.
+// Each LDS read is a single 32-bit ds_read_b32 returning two K-adjacent halves.
+// The inner loop is shaped `acc += a.x*b.x + a.y*b.y` (V_DOT2-ish pattern).
+// Padding +1 (stride 17) — analyzed as already 2-bank-broadcast safe; +4
+// stride was tried and regressed 24% (likely LDS-allocation bucket bump).
+// NOTE: Tried double-buffering — LDS doubled to ~17KB, occupancy dropped on
+// RDNA3 / Mesa RADV, net regression of ~6%. Single-buffered wins here.
+// NOTE: Tried inlining per-thread scale fetch in B load to save the scales→B
+// barrier — 4× extra uint loads/thread/K-tile cost more than the barrier saved.
+groupshared vector<float16_t, 2> q8_A[64 * 17]; // [BM=64][BK_pair=16+1 pad]
+groupshared vector<float16_t, 2> q8_B[64 * 17]; // [BN=64][BK_pair=16+1 pad]
+groupshared float16_t q8_scales[64]; // dequant scale per N-row, stored as fp16
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -1311,19 +1317,24 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     for (uint t = 0; t < k_tiles; t++) {
         uint k_base = t * 32;
 
-        // Load A tile (F32 input → fp16 LDS): 256 threads load 64*32 = 2048 elements (8 per thread)
-        for (uint i = 0; i < 8; i++) {
+        // Load A tile. 64 M × 16 K-pairs = 1024 half2 entries / 256 threads = 4 per thread.
+        // Map flat = gi + i*256 to (m_local, kp) so adjacent lanes read adjacent K (coalesced
+        // global memory access): m_local = flat / 16, kp = flat & 15.
+        for (uint i = 0; i < 4; i++) {
             uint flat = gi + i * 256;
-            uint m_local = flat >> 5;
-            uint k_local = flat & 31u;
+            uint m_local = flat >> 4;
+            uint kp = flat & 15u;
             uint gm = pos_base + m_local;
-            float v = (gm < bmq8_pc.seq_len) ?
-                bmq8_input[gm * bmq8_pc.in_dim + k_base + k_local] : 0.0;
-            q8_A[k_local * 65 + m_local] = float16_t(v);
+            float v0 = 0.0, v1 = 0.0;
+            if (gm < bmq8_pc.seq_len) {
+                uint base = gm * bmq8_pc.in_dim + k_base + 2 * kp;
+                v0 = bmq8_input[base];
+                v1 = bmq8_input[base + 1];
+            }
+            q8_A[m_local * 17 + kp] = vector<float16_t,2>(float16_t(v0), float16_t(v1));
         }
 
-        // Cooperatively load the 64 row scales for this K-tile once into shared mem.
-        // bb = gn * blocks_per_row * 34 + t * 34. 34 is even, so bb % 4 ∈ {0, 2}.
+        // Cooperatively load 64 row scales (fp16) for this K-tile.
         if (gi < 64) {
             uint gn = row_base + gi;
             float16_t scale = float16_t(0);
@@ -1337,39 +1348,66 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // Load B tile (Q8_0 dequantize into fp16 LDS) — scale comes from shared mem,
-        // so each thread only reads the int8 byte from the weight buffer.
-        for (uint i = 0; i < 8; i++) {
+        // Load B tile. Same (n_local, kp) layout: each entry holds two K-adjacent halves.
+        for (uint i = 0; i < 4; i++) {
             uint flat = gi + i * 256;
-            uint n_local = flat >> 5;
-            uint k_local = flat & 31u;
+            uint n_local = flat >> 4;
+            uint kp = flat & 15u;
             uint gn = row_base + n_local;
+            float16_t v0 = float16_t(0), v1 = float16_t(0);
             if (gn < row_upper) {
                 uint bb = gn * blocks_per_row * 34 + t * 34;
-                int q = sign_extend_i8(read_byte(bmq8_weight, bb + 2 + k_local));
-                q8_B[k_local * 65 + n_local] = q8_scales[n_local] * float16_t(q);
-            } else {
-                q8_B[k_local * 65 + n_local] = float16_t(0);
+                int q0 = sign_extend_i8(read_byte(bmq8_weight, bb + 2 + 2 * kp));
+                int q1 = sign_extend_i8(read_byte(bmq8_weight, bb + 2 + 2 * kp + 1));
+                float16_t s = q8_scales[n_local];
+                v0 = s * float16_t(q0);
+                v1 = s * float16_t(q1);
             }
+            q8_B[n_local * 17 + kp] = vector<float16_t,2>(v0, v1);
         }
 
         GroupMemoryBarrierWithGroupSync();
 
-        // Accumulate: each thread computes a 4x4 sub-tile of the output.
-        // fp16 LDS reads → convert to fp32 once → fp32 fma chain.
-        for (uint k = 0; k < 32; k++) {
-            float a0 = float(q8_A[k * 65 + tm * 4]);
-            float a1 = float(q8_A[k * 65 + tm * 4 + 1]);
-            float a2 = float(q8_A[k * 65 + tm * 4 + 2]);
-            float a3 = float(q8_A[k * 65 + tm * 4 + 3]);
-            float b0 = float(q8_B[k * 65 + tn * 4]);
-            float b1 = float(q8_B[k * 65 + tn * 4 + 1]);
-            float b2 = float(q8_B[k * 65 + tn * 4 + 2]);
-            float b3 = float(q8_B[k * 65 + tn * 4 + 3]);
-            acc[0]  += a0 * b0; acc[1]  += a0 * b1; acc[2]  += a0 * b2; acc[3]  += a0 * b3;
-            acc[4]  += a1 * b0; acc[5]  += a1 * b1; acc[6]  += a1 * b2; acc[7]  += a1 * b3;
-            acc[8]  += a2 * b0; acc[9]  += a2 * b1; acc[10] += a2 * b2; acc[11] += a2 * b3;
-            acc[12] += a3 * b0; acc[13] += a3 * b1; acc[14] += a3 * b2; acc[15] += a3 * b3;
+        // Inner loop over 16 K-pairs (each pair = 2 K elements).
+        // Each thread reads 4 a-half2 + 4 b-half2 per pair = 8 LDS reads,
+        // computes 32 fp32 multiply-adds in the V_DOT2 form `a.x*b.x + a.y*b.y`.
+        uint a_base = tm * 4 * 17;
+        uint b_base = tn * 4 * 17;
+        for (uint kp = 0; kp < 16; kp++) {
+            vector<float16_t,2> a0h = q8_A[a_base + kp];
+            vector<float16_t,2> a1h = q8_A[a_base + 17 + kp];
+            vector<float16_t,2> a2h = q8_A[a_base + 34 + kp];
+            vector<float16_t,2> a3h = q8_A[a_base + 51 + kp];
+            vector<float16_t,2> b0h = q8_B[b_base + kp];
+            vector<float16_t,2> b1h = q8_B[b_base + 17 + kp];
+            vector<float16_t,2> b2h = q8_B[b_base + 34 + kp];
+            vector<float16_t,2> b3h = q8_B[b_base + 51 + kp];
+
+            float a0x = float(a0h.x), a0y = float(a0h.y);
+            float a1x = float(a1h.x), a1y = float(a1h.y);
+            float a2x = float(a2h.x), a2y = float(a2h.y);
+            float a3x = float(a3h.x), a3y = float(a3h.y);
+            float b0x = float(b0h.x), b0y = float(b0h.y);
+            float b1x = float(b1h.x), b1y = float(b1h.y);
+            float b2x = float(b2h.x), b2y = float(b2h.y);
+            float b3x = float(b3h.x), b3y = float(b3h.y);
+
+            acc[0]  += a0x * b0x + a0y * b0y;
+            acc[1]  += a0x * b1x + a0y * b1y;
+            acc[2]  += a0x * b2x + a0y * b2y;
+            acc[3]  += a0x * b3x + a0y * b3y;
+            acc[4]  += a1x * b0x + a1y * b0y;
+            acc[5]  += a1x * b1x + a1y * b1y;
+            acc[6]  += a1x * b2x + a1y * b2y;
+            acc[7]  += a1x * b3x + a1y * b3y;
+            acc[8]  += a2x * b0x + a2y * b0y;
+            acc[9]  += a2x * b1x + a2y * b1y;
+            acc[10] += a2x * b2x + a2y * b2y;
+            acc[11] += a2x * b3x + a2y * b3y;
+            acc[12] += a3x * b0x + a3y * b0y;
+            acc[13] += a3x * b1x + a3y * b1y;
+            acc[14] += a3x * b2x + a3y * b2y;
+            acc[15] += a3x * b3x + a3y * b3y;
         }
 
         GroupMemoryBarrierWithGroupSync();

@@ -1,5 +1,5 @@
 {
-    "model": "/home/tonis/Documents/AI/models/z-image-turbo-Q8_0.gguf",
+    "model": "/home/tonis/Documents/AI/models/z-image-turbo-Q4_0.gguf",
     "prompt": "a photo of a cat",
     "text_model": "/home/tonis/Documents/AI/models/Qwen3-4B-Q8_0.gguf",
     "vae": "/home/tonis/Documents/AI/models/ae.safetensors",
@@ -7,5 +7,5 @@
     "cfg_scale": 0.0,
     "seed": 42,
     "size": 512,
-    "output": "output_Q4.png"
+    "output": "output_q4_test.png"
 }
