@@ -1281,9 +1281,13 @@ void ffn_swiglu_split(uint3 tid: SV_DispatchThreadID) {
 [vk_binding(1, 0)] RWStructuredBuffer<float> bmq8_input;
 [vk_binding(2, 0)] RWStructuredBuffer<float> bmq8_output;
 
-groupshared float q8_A[32 * 65];  // [BK=32][BM=64+1] padding avoids bank conflicts
-groupshared float q8_B[32 * 65];  // [BK=32][BN=64+1]
-groupshared float q8_scales[64]; // dequant scale per N-row for the current K-tile
+// Mixed-precision tiles: A and B stored as fp16 in LDS (half the memory of fp32),
+// fp32 accumulator preserved. Halves LDS footprint per workgroup (~16KB → ~8KB),
+// which lets more workgroups co-reside on each RDNA3 WGP. The fp16→fp32 conversion
+// on read is free on modern GPUs (V_CVT_F32_F16 dual-issues with the fma chain).
+groupshared float16_t q8_A[32 * 65];  // [BK=32][BM=64+1] padding avoids bank conflicts
+groupshared float16_t q8_B[32 * 65];  // [BK=32][BN=64+1]
+groupshared float16_t q8_scales[64]; // dequant scale per N-row, stored as fp16 (original storage precision)
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -1307,32 +1311,33 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     for (uint t = 0; t < k_tiles; t++) {
         uint k_base = t * 32;
 
-        // Load A tile (F32 input): 256 threads load 64*32 = 2048 elements (8 per thread)
+        // Load A tile (F32 input → fp16 LDS): 256 threads load 64*32 = 2048 elements (8 per thread)
         for (uint i = 0; i < 8; i++) {
             uint flat = gi + i * 256;
             uint m_local = flat >> 5;
             uint k_local = flat & 31u;
             uint gm = pos_base + m_local;
-            q8_A[k_local * 65 + m_local] = (gm < bmq8_pc.seq_len) ?
+            float v = (gm < bmq8_pc.seq_len) ?
                 bmq8_input[gm * bmq8_pc.in_dim + k_base + k_local] : 0.0;
+            q8_A[k_local * 65 + m_local] = float16_t(v);
         }
 
         // Cooperatively load the 64 row scales for this K-tile once into shared mem.
         // bb = gn * blocks_per_row * 34 + t * 34. 34 is even, so bb % 4 ∈ {0, 2}.
         if (gi < 64) {
             uint gn = row_base + gi;
-            float scale = 0.0;
+            float16_t scale = float16_t(0);
             if (gn < row_upper) {
                 uint bb = gn * blocks_per_row * 34 + t * 34;
                 uint scale_word = bmq8_weight[bb >> 2];
                 uint scale_bits = ((bb & 2u) == 0u) ? (scale_word & 0xFFFFu) : ((scale_word >> 16) & 0xFFFFu);
-                scale = unpack_f16(scale_bits);
+                scale = float16_t(unpack_f16(scale_bits));
             }
             q8_scales[gi] = scale;
         }
         GroupMemoryBarrierWithGroupSync();
 
-        // Load B tile (Q8_0 dequantize into shared memory) — scale comes from shared mem,
+        // Load B tile (Q8_0 dequantize into fp16 LDS) — scale comes from shared mem,
         // so each thread only reads the int8 byte from the weight buffer.
         for (uint i = 0; i < 8; i++) {
             uint flat = gi + i * 256;
@@ -1342,24 +1347,25 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
             if (gn < row_upper) {
                 uint bb = gn * blocks_per_row * 34 + t * 34;
                 int q = sign_extend_i8(read_byte(bmq8_weight, bb + 2 + k_local));
-                q8_B[k_local * 65 + n_local] = q8_scales[n_local] * float(q);
+                q8_B[k_local * 65 + n_local] = q8_scales[n_local] * float16_t(q);
             } else {
-                q8_B[k_local * 65 + n_local] = 0.0;
+                q8_B[k_local * 65 + n_local] = float16_t(0);
             }
         }
 
         GroupMemoryBarrierWithGroupSync();
 
-        // Accumulate: each thread computes a 4x4 sub-tile of the output
+        // Accumulate: each thread computes a 4x4 sub-tile of the output.
+        // fp16 LDS reads → convert to fp32 once → fp32 fma chain.
         for (uint k = 0; k < 32; k++) {
-            float a0 = q8_A[k * 65 + tm * 4];
-            float a1 = q8_A[k * 65 + tm * 4 + 1];
-            float a2 = q8_A[k * 65 + tm * 4 + 2];
-            float a3 = q8_A[k * 65 + tm * 4 + 3];
-            float b0 = q8_B[k * 65 + tn * 4];
-            float b1 = q8_B[k * 65 + tn * 4 + 1];
-            float b2 = q8_B[k * 65 + tn * 4 + 2];
-            float b3 = q8_B[k * 65 + tn * 4 + 3];
+            float a0 = float(q8_A[k * 65 + tm * 4]);
+            float a1 = float(q8_A[k * 65 + tm * 4 + 1]);
+            float a2 = float(q8_A[k * 65 + tm * 4 + 2]);
+            float a3 = float(q8_A[k * 65 + tm * 4 + 3]);
+            float b0 = float(q8_B[k * 65 + tn * 4]);
+            float b1 = float(q8_B[k * 65 + tn * 4 + 1]);
+            float b2 = float(q8_B[k * 65 + tn * 4 + 2]);
+            float b3 = float(q8_B[k * 65 + tn * 4 + 3]);
             acc[0]  += a0 * b0; acc[1]  += a0 * b1; acc[2]  += a0 * b2; acc[3]  += a0 * b3;
             acc[4]  += a1 * b0; acc[5]  += a1 * b1; acc[6]  += a1 * b2; acc[7]  += a1 * b3;
             acc[8]  += a2 * b0; acc[9]  += a2 * b1; acc[10] += a2 * b2; acc[11] += a2 * b3;
