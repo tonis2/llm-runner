@@ -3,6 +3,7 @@ module llm;
 import vk;
 import std::math;
 import std::io;
+import std::os::env;
 import std::collections::list;
 import std::collections::map;
 
@@ -117,11 +118,24 @@ fn DeviceContext? createContext() {
         driverProps.driverID == vk::DriverId.DRIVER_ID_MESA_RADV
         || driverProps.driverID == vk::DriverId.DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
+    // Opt-in override: set LLM_FORCE_COOPMAT=1 to bypass the Mesa blacklist.
+    // Mesa #10847 may be fixed for newer Mesa versions / specific hardware,
+    // so this lets the user test correctness vs the tiled fallback.
+    bool force_coopmat = false;
+    if (try String v = env::tget_var("LLM_FORCE_COOPMAT")) {
+        if (v == "1" || v == "true" || v == "yes") force_coopmat = true;
+    }
+    if (force_coopmat && driver_blacklisted_for_coopmat) {
+        io::printfn("  cooperative matrix: LLM_FORCE_COOPMAT=1 — bypassing Mesa blacklist (verify output!)");
+        driver_blacklisted_for_coopmat = false;
+    }
+
     // Probe for cooperative matrix support: device must advertise the extension
     // AND expose a 16x16x16 fp16xfp16->fp32 subgroup-scope configuration.
     bool coopmat_supported = false;
     if (driver_blacklisted_for_coopmat) {
         io::printfn("  cooperative matrix: blacklisted on this driver (Mesa #10847 — wrong results)");
+        io::printfn("  set LLM_FORCE_COOPMAT=1 to override and test if your driver is fixed");
     } else {
         ZStringList probe;
         probe.push_all({"VK_KHR_cooperative_matrix"});

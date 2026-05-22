@@ -185,6 +185,8 @@ struct BatchMatMulAddScaledPC
 	float scale;
 	uint row_offset;        // added to output column index — lets LoRA write into a sub-range of a wider buffer
 	uint weight_row_offset; // added to B row index — lets a fused LoRA B [N*dim, rank] read a single slot's slice
+	uint b_rows;            // number of B rows the LoRA correction writes (≤ out_dim — may be a sub-slot of the full output)
+	uint _pad;
 }
 
 struct FFNSwigluSplitPC
@@ -1277,8 +1279,10 @@ fn void dispatch_lora_correction(
 	g.dispatch(&dk.batch_matmul_simple, { &lora.a, input, lora_scratch },
 		&a_pc, seq_len, lora.rank);
 
-	// Hop 2: output[seq, row_offset + r] += scale * B[weight_row_offset + r, rank] @ scratch[seq, rank]
+	// Hop 2: output[pos * out_dim + row_offset + r] += scale * B[weight_row_offset + r, rank] @ scratch[seq, rank]
 	// for r in [0, b_rows).
+	// 1D dispatch: one workgroup writes 256 outputs for one seq pos.
+	// Reduces workgroup count from `seq * b_rows` to `seq * ceil(b_rows/256)`.
 	BatchMatMulAddScaledPC b_pc = {
 		.out_dim = out_dim,
 		.in_dim = lora.rank,
@@ -1286,9 +1290,12 @@ fn void dispatch_lora_correction(
 		.scale = lora.scale,
 		.row_offset = row_offset,
 		.weight_row_offset = weight_row_offset,
+		.b_rows = b_rows,
+		._pad = 0,
 	};
+	uint tiles_n = (b_rows + 255) / 256;
 	g.dispatch(&dk.batch_matmul_add_scaled, { &lora.b, lora_scratch, output },
-		&b_pc, seq_len, b_rows);
+		&b_pc, seq_len * tiles_n);
 }
 
 // Run a single DiT transformer layer (Lumina2 architecture)

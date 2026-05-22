@@ -1186,11 +1186,13 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
 struct BatchMatMulAddScaledParams {
     uint  out_dim;            // row stride of `output` (columns per sequence position)
-    uint  in_dim;
+    uint  in_dim;             // = rank for LoRA hop 2 (typically ≤ 64)
     uint  seq_len;
     float scale;
     uint  row_offset;         // added to the column index of every output write
     uint  weight_row_offset;  // added to the row index when reading B — lets a single LoRA's B sub-range write to a fused-QKV slot
+    uint  b_rows;             // number of outputs to write (≤ out_dim)
+    uint  _pad;
 };
 
 [vk_push_constant] const BatchMatMulAddScaledParams bm_addscaled_pc;
@@ -1199,41 +1201,46 @@ struct BatchMatMulAddScaledParams {
 [vk_binding(1, 0)] RWStructuredBuffer<float> bm_addscaled_input;
 [vk_binding(2, 0)] RWStructuredBuffer<float> bm_addscaled_output;
 
-groupshared float bm_addscaled_shared[256];
+// LoRA hop 2: in_dim = rank (≤ 64), out_dim is large (often thousands).
+// Tile layout: each workgroup writes 256 outputs for one seq position.
+// Scratch row (length = rank) is loaded once into shared mem and reused
+// by all 256 output threads — eliminates the per-output scratch reread.
+//
+// Dispatch: gid.x = pos * tiles_n + tile_n, where tiles_n = ceil(out_dim/256).
+// One thread per output: 32 madds for a rank-32 LoRA, fully unrolled.
+groupshared float bm_addscaled_scratch[64];
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void batch_matmul_add_scaled(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
-    // 2D dispatch: gid.x = pos, gid.y = out_idx
-    uint pos = gid.x;
-    uint out_idx = gid.y;
+    uint rank = bm_addscaled_pc.in_dim;
+    uint out_dim = bm_addscaled_pc.out_dim;
+    uint b_rows = bm_addscaled_pc.b_rows;
 
+    uint tiles_n = (b_rows + 255) / 256;
+    uint pos = gid.x / tiles_n;
+    uint tile_n = gid.x % tiles_n;
     if (pos >= bm_addscaled_pc.seq_len) return;
 
-    uint in_base = pos * bm_addscaled_pc.in_dim;
-    uint actual_b_row = bm_addscaled_pc.weight_row_offset + out_idx;
-
-    float partial = 0.0;
-    for (uint k = gi; k < bm_addscaled_pc.in_dim; k += 256) {
-        partial += bm_addscaled_weight[actual_b_row * bm_addscaled_pc.in_dim + k]
-                 * bm_addscaled_input[in_base + k];
+    // Load scratch row for this seq pos into shared mem (once per workgroup).
+    if (gi < rank) {
+        bm_addscaled_scratch[gi] = bm_addscaled_input[pos * rank + gi];
     }
-
-    bm_addscaled_shared[gi] = partial;
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (gi < s) {
-            bm_addscaled_shared[gi] += bm_addscaled_shared[gi + s];
-        }
-        GroupMemoryBarrierWithGroupSync();
+    uint out_idx = tile_n * 256 + gi;
+    if (out_idx >= b_rows) return;
+
+    uint b_row = bm_addscaled_pc.weight_row_offset + out_idx;
+    uint b_base = b_row * rank;
+
+    float partial = 0.0;
+    for (uint r = 0; r < rank; r++) {
+        partial += bm_addscaled_weight[b_base + r] * bm_addscaled_scratch[r];
     }
 
-    if (gi == 0) {
-        uint out_offset = pos * bm_addscaled_pc.out_dim
-                        + bm_addscaled_pc.row_offset + out_idx;
-        bm_addscaled_output[out_offset] += bm_addscaled_pc.scale * bm_addscaled_shared[0];
-    }
+    uint out_offset = pos * out_dim + bm_addscaled_pc.row_offset + out_idx;
+    bm_addscaled_output[out_offset] += bm_addscaled_pc.scale * partial;
 }
 
 // --- Fused SwiGLU: Phase 1 FFN activation ---
@@ -1276,6 +1283,7 @@ void ffn_swiglu_split(uint3 tid: SV_DispatchThreadID) {
 
 groupshared float q8_A[32 * 65];  // [BK=32][BM=64+1] padding avoids bank conflicts
 groupshared float q8_B[32 * 65];  // [BK=32][BN=64+1]
+groupshared float q8_scales[64]; // dequant scale per N-row for the current K-tile
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -1294,6 +1302,7 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 
     uint blocks_per_row = bmq8_pc.in_dim / 32;
     uint k_tiles = bmq8_pc.in_dim / 32;
+    uint row_upper = bmq8_pc.row_offset + bmq8_pc.out_dim;
 
     for (uint t = 0; t < k_tiles; t++) {
         uint k_base = t * 32;
@@ -1308,37 +1317,32 @@ void batch_matmul_q8(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
                 bmq8_input[gm * bmq8_pc.in_dim + k_base + k_local] : 0.0;
         }
 
-        // Load B tile (Q8_0 dequantize into shared memory)
-        // Each Q8_0 block is 34 bytes: 2-byte F16 scale + 32 int8 values
-        // Since BK=32 = Q8_0 block size, tile t reads block t for each weight row
+        // Cooperatively load the 64 row scales for this K-tile once into shared mem.
+        // bb = gn * blocks_per_row * 34 + t * 34. 34 is even, so bb % 4 ∈ {0, 2}.
+        if (gi < 64) {
+            uint gn = row_base + gi;
+            float scale = 0.0;
+            if (gn < row_upper) {
+                uint bb = gn * blocks_per_row * 34 + t * 34;
+                uint scale_word = bmq8_weight[bb >> 2];
+                uint scale_bits = ((bb & 2u) == 0u) ? (scale_word & 0xFFFFu) : ((scale_word >> 16) & 0xFFFFu);
+                scale = unpack_f16(scale_bits);
+            }
+            q8_scales[gi] = scale;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // Load B tile (Q8_0 dequantize into shared memory) — scale comes from shared mem,
+        // so each thread only reads the int8 byte from the weight buffer.
         for (uint i = 0; i < 8; i++) {
             uint flat = gi + i * 256;
             uint n_local = flat >> 5;
             uint k_local = flat & 31u;
             uint gn = row_base + n_local;
-            if (gn < bmq8_pc.row_offset + bmq8_pc.out_dim) {
-                // Byte offset of Q8_0 block for row gn, block t
+            if (gn < row_upper) {
                 uint bb = gn * blocks_per_row * 34 + t * 34;
-
-                // Read F16 scale (2 bytes at offset bb)
-                uint scale_uint_idx = bb / 4;
-                uint scale_byte_off = bb % 4;
-                uint scale_word = bmq8_weight[scale_uint_idx];
-                uint scale_bits;
-                if (scale_byte_off == 0) {
-                    scale_bits = scale_word & 0xFFFFu;
-                } else if (scale_byte_off == 2) {
-                    scale_bits = (scale_word >> 16) & 0xFFFFu;
-                } else {
-                    uint next_word = bmq8_weight[scale_uint_idx + 1];
-                    scale_bits = ((scale_word >> (scale_byte_off * 8)) | (next_word << (32 - scale_byte_off * 8))) & 0xFFFFu;
-                }
-                float scale = unpack_f16(scale_bits);
-
-                // Read int8 quantized value at offset bb + 2 + k_local
                 int q = sign_extend_i8(read_byte(bmq8_weight, bb + 2 + k_local));
-
-                q8_B[k_local * 65 + n_local] = scale * float(q);
+                q8_B[k_local * 65 + n_local] = q8_scales[n_local] * float(q);
             } else {
                 q8_B[k_local * 65 + n_local] = 0.0;
             }
