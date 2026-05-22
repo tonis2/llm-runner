@@ -212,27 +212,27 @@ fn MMDiTKernels? create_mmdit_kernels(llm::DeviceContext* ctx) {
         diff_spv.len).setCode((uint*)&diff_spv[0]).build(ctx.device)!!;
 
     io::printfn("    Creating vit kernels...");
-    llm::ComputeKernel k_bln = llm::create_kernel(ctx, vit_shader, 3, BatchLayerNormAffinePC.sizeof, "batch_layernorm_affine")!!;
-    llm::ComputeKernel k_bb = llm::create_kernel(ctx, vit_shader, 2, BroadcastBiasPC.sizeof, "broadcast_bias_add")!!;
-    llm::ComputeKernel k_geglu = llm::create_kernel(ctx, vit_shader, 2, GeGLUPC.sizeof, "geglu_activation")!!;
-    llm::ComputeKernel k_adaln = llm::create_kernel(ctx, vit_shader, 3, AdaLNModPC.sizeof, "adaln_modulate_shift_scale")!!;
-    llm::ComputeKernel k_gres = llm::create_kernel(ctx, vit_shader, 3, GatedResidualPC.sizeof, "gated_residual_add")!!;
-    llm::ComputeKernel k_te = llm::create_kernel(ctx, vit_shader, 1, TimestepEmbedPC.sizeof, "sinusoidal_timestep_embed")!!;
-    llm::ComputeKernel k_patch = llm::create_kernel(ctx, vit_shader, 2, MMDiTPatchifyPC.sizeof, "mmdit_patchify")!!;
-    llm::ComputeKernel k_unpatch = llm::create_kernel(ctx, vit_shader, 4, MMDiTPatchifyPC.sizeof, "mmdit_unpatchify")!!;
-    llm::ComputeKernel k_euler = llm::create_kernel(ctx, vit_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!;
-    llm::ComputeKernel k_phrms = llm::create_kernel(ctx, vit_shader, 2, PerHeadRMSNormPC.sizeof, "perhead_rmsnorm")!!;
-    llm::ComputeKernel k_brms = llm::create_kernel(ctx, vit_shader, 3, BatchRMSNormAffinePC.sizeof, "batch_rmsnorm_affine")!!;
-    llm::ComputeKernel k_cfg = llm::create_kernel(ctx, vit_shader, 2, CfgPC.sizeof, "norm_preserving_cfg")!!;
+    llm::ComputeKernel k_bln = llm::create_kernel(ctx, vit_shader, 3, BatchLayerNormAffinePC::size, "batch_layernorm_affine")!!;
+    llm::ComputeKernel k_bb = llm::create_kernel(ctx, vit_shader, 2, BroadcastBiasPC::size, "broadcast_bias_add")!!;
+    llm::ComputeKernel k_geglu = llm::create_kernel(ctx, vit_shader, 2, GeGLUPC::size, "geglu_activation")!!;
+    llm::ComputeKernel k_adaln = llm::create_kernel(ctx, vit_shader, 3, AdaLNModPC::size, "adaln_modulate_shift_scale")!!;
+    llm::ComputeKernel k_gres = llm::create_kernel(ctx, vit_shader, 3, GatedResidualPC::size, "gated_residual_add")!!;
+    llm::ComputeKernel k_te = llm::create_kernel(ctx, vit_shader, 1, TimestepEmbedPC::size, "sinusoidal_timestep_embed")!!;
+    llm::ComputeKernel k_patch = llm::create_kernel(ctx, vit_shader, 2, MMDiTPatchifyPC::size, "mmdit_patchify")!!;
+    llm::ComputeKernel k_unpatch = llm::create_kernel(ctx, vit_shader, 4, MMDiTPatchifyPC::size, "mmdit_unpatchify")!!;
+    llm::ComputeKernel k_euler = llm::create_kernel(ctx, vit_shader, 2, FlowEulerPC::size, "flow_euler_step")!!;
+    llm::ComputeKernel k_phrms = llm::create_kernel(ctx, vit_shader, 2, PerHeadRMSNormPC::size, "perhead_rmsnorm")!!;
+    llm::ComputeKernel k_brms = llm::create_kernel(ctx, vit_shader, 3, BatchRMSNormAffinePC::size, "batch_rmsnorm_affine")!!;
+    llm::ComputeKernel k_cfg = llm::create_kernel(ctx, vit_shader, 2, CfgPC::size, "norm_preserving_cfg")!!;
 
     io::printfn("    Creating llm kernels...");
-    llm::ComputeKernel k_bm = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC.sizeof, "batch_matmul")!!;
-    llm::ComputeKernel k_bm_q4 = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC.sizeof, "batch_matmul_q4_0")!!;
-    llm::ComputeKernel k_bm_q41 = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC.sizeof, "batch_matmul_q4_1")!!;
-    llm::ComputeKernel k_bm_s = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC.sizeof, "batch_matmul_simple")!!;
+    llm::ComputeKernel k_bm = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC::size, "batch_matmul")!!;
+    llm::ComputeKernel k_bm_q4 = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC::size, "batch_matmul_q4_0")!!;
+    llm::ComputeKernel k_bm_q41 = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC::size, "batch_matmul_q4_1")!!;
+    llm::ComputeKernel k_bm_s = llm::create_kernel(ctx, llm_shader, 3, MMBatchMatMulPC::size, "batch_matmul_simple")!!;
 
     io::printfn("    Creating attention kernel...");
-    llm::ComputeKernel k_sa = llm::create_kernel(ctx, diff_shader, 5, MMSpatialAttentionPC.sizeof, "spatial_attention")!!;
+    llm::ComputeKernel k_sa = llm::create_kernel(ctx, diff_shader, 5, MMSpatialAttentionPC::size, "spatial_attention")!!;
 
     io::printfn("    Creating shared kernels...");
     llm::SharedKernels sk = llm::create_shared_kernels(ctx, llm_shader)!!;
@@ -656,7 +656,7 @@ fn void? MMDiTModel.forward_layer(&self, MMDiTLayerWeights* lw, uint n_img, uint
         char[] vit_spv = &VIT_SPV;
         vk::ShaderModule vit_shader = vk::shaderModuleCreateInfo().setCodeSize(
             vit_spv.len).setCode((uint*)&vit_spv[0]).build(ctx.device)!!;
-        llm::ComputeKernel th_kernel = llm::create_kernel(ctx, vit_shader, 2, VitTransposeHeadsPC.sizeof, "transpose_heads")!!;
+        llm::ComputeKernel th_kernel = llm::create_kernel(ctx, vit_shader, 2, VitTransposeHeadsPC::size, "transpose_heads")!!;
         vit_shader.free(ctx.device);
 
         // Transpose Q → attn_out (temp), then copy back

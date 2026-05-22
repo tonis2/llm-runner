@@ -135,7 +135,7 @@ struct DiffusionModel {
 }
 
 fn DiffusionConfig? load_diffusion_config(String json_text) {
-    Object* root = json::parse_string(mem, json_text)!;
+    Object* root = json::parse(mem, json_text)!;
 
     String name = root.get_string("name") ?? "stable-diffusion";
 
@@ -223,23 +223,23 @@ fn SDXSKernels? create_sdxs_kernels(llm::DeviceContext* ctx) {
         .build(ctx.device)!!;
 
     SDXSKernels kernels = {
-        .conv2d           = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC.sizeof, "conv2d")!!,
-        .conv2d_q8        = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC.sizeof, "conv2d_q8")!!,
-        .group_norm       = llm::create_kernel(ctx, shader, 4, pipelines::GroupNormPC.sizeof, "group_norm")!!,
-        .batched_matmul   = llm::create_kernel(ctx, shader, 3, BatchedMatMulPC.sizeof, "batched_matmul")!!,
-        .batched_matmul_q8 = llm::create_kernel(ctx, shader, 3, BatchedMatMulPC.sizeof, "batched_matmul_q8")!!,
-        .spatial_attention = llm::create_kernel(ctx, shader, 5, SpatialAttentionPC.sizeof, "spatial_attention")!!,
-        .cross_attention  = llm::create_kernel(ctx, shader, 5, CrossAttentionPC.sizeof, "cross_attention")!!,
-        .upsample_nearest = llm::create_kernel(ctx, shader, 2, pipelines::UpsamplePC.sizeof, "upsample_nearest")!!,
-        .timestep_embed   = llm::create_kernel(ctx, shader, 1, TimestepEmbedPC.sizeof, "timestep_embed")!!,
-        .broadcast_add    = llm::create_kernel(ctx, shader, 2, BroadcastAddPC.sizeof, "broadcast_add")!!,
-        .channel_concat   = llm::create_kernel(ctx, shader, 3, ChannelConcatPC.sizeof, "channel_concat")!!,
-        .ddim_step        = llm::create_kernel(ctx, shader, 2, pipelines::DdimStepPC.sizeof, "ddim_step")!!,
-        .euler_step       = llm::create_kernel(ctx, shader, 2, pipelines::EulerStepPC.sizeof, "euler_step")!!,
-        .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, pipelines::ScaleShiftPC.sizeof, "scale_shift_clamp")!!,
-        .f16_to_f32       = llm::create_kernel(ctx, shader, 2, F16ToF32PC.sizeof, "f16_to_f32")!!,
-        .relu             = llm::create_kernel(ctx, shader, 1, pipelines::ReluPC.sizeof, "relu")!!,
-        .tanh_clamp       = llm::create_kernel(ctx, shader, 1, pipelines::TanhClampPC.sizeof, "tanh_clamp")!!,
+        .conv2d           = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC::size, "conv2d")!!,
+        .conv2d_q8        = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC::size, "conv2d_q8")!!,
+        .group_norm       = llm::create_kernel(ctx, shader, 4, pipelines::GroupNormPC::size, "group_norm")!!,
+        .batched_matmul   = llm::create_kernel(ctx, shader, 3, BatchedMatMulPC::size, "batched_matmul")!!,
+        .batched_matmul_q8 = llm::create_kernel(ctx, shader, 3, BatchedMatMulPC::size, "batched_matmul_q8")!!,
+        .spatial_attention = llm::create_kernel(ctx, shader, 5, SpatialAttentionPC::size, "spatial_attention")!!,
+        .cross_attention  = llm::create_kernel(ctx, shader, 5, CrossAttentionPC::size, "cross_attention")!!,
+        .upsample_nearest = llm::create_kernel(ctx, shader, 2, pipelines::UpsamplePC::size, "upsample_nearest")!!,
+        .timestep_embed   = llm::create_kernel(ctx, shader, 1, TimestepEmbedPC::size, "timestep_embed")!!,
+        .broadcast_add    = llm::create_kernel(ctx, shader, 2, BroadcastAddPC::size, "broadcast_add")!!,
+        .channel_concat   = llm::create_kernel(ctx, shader, 3, ChannelConcatPC::size, "channel_concat")!!,
+        .ddim_step        = llm::create_kernel(ctx, shader, 2, pipelines::DdimStepPC::size, "ddim_step")!!,
+        .euler_step       = llm::create_kernel(ctx, shader, 2, pipelines::EulerStepPC::size, "euler_step")!!,
+        .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, pipelines::ScaleShiftPC::size, "scale_shift_clamp")!!,
+        .f16_to_f32       = llm::create_kernel(ctx, shader, 2, F16ToF32PC::size, "f16_to_f32")!!,
+        .relu             = llm::create_kernel(ctx, shader, 1, pipelines::ReluPC::size, "relu")!!,
+        .tanh_clamp       = llm::create_kernel(ctx, shader, 1, pipelines::TanhClampPC::size, "tanh_clamp")!!,
         .shared           = llm::create_shared_kernels(ctx, shader)!!,
     };
 

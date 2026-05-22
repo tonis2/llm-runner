@@ -356,7 +356,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 				| vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
 			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: kontext_ref_packed.ptr,
-			data_size: ref_bytes,
+			data_size: (sz)ref_bytes,
 		)!!;
 		dit.ref_patches = {
 			.gpu_buffer = ref_buf,
@@ -673,7 +673,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	io::printfn("\n--- Phase 5: Download result ---");
 
 	usz total_px     = (usz)img_h * img_w * 3;
-	float[] img_data = mem::new_array(float, total_px);
+	float[] img_data = mem::new_array(float, (sz)total_px);
 
 
 	{
@@ -682,7 +682,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
 			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: null,
-			data_size: total_px * 4,
+			data_size: (sz)(total_px * 4),
 		)!!;
 		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer img_cmd)
 		{
@@ -695,7 +695,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			);
 		}!!;
 		float* mapped = (float*)dl_staging.data();
-		mem::copy(img_data.ptr, mapped, total_px * 4);
+		mem::copy(img_data.ptr, mapped, (sz)(total_px * 4));
 		dl_staging.free();
 	}
 

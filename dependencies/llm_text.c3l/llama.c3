@@ -355,9 +355,9 @@ fn LlmKernels? create_llm_kernels(llm::DeviceContext* ctx) {
         .build(ctx.device)!!;
 
     LlmKernels kernels = {
-        .embedding    = llm::create_kernel(ctx, shader, 2, EmbeddingPC.sizeof, "embedding")!!,
-        .rope         = llm::create_kernel(ctx, shader, 1, RoPEPC.sizeof, "rope")!!,
-        .attention    = llm::create_kernel(ctx, shader, 5, AttentionPC.sizeof, "attention")!!,
+        .embedding    = llm::create_kernel(ctx, shader, 2, EmbeddingPC::size, "embedding")!!,
+        .rope         = llm::create_kernel(ctx, shader, 1, RoPEPC::size, "rope")!!,
+        .attention    = llm::create_kernel(ctx, shader, 5, AttentionPC::size, "attention")!!,
         .shared       = llm::create_shared_kernels(ctx, shader)!!,
     };
 

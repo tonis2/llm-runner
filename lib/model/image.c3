@@ -214,7 +214,7 @@ fn Tensor? upload_image_to_gpu(DeviceContext* ctx, image::Image* img) {
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: img.pixels.ptr,
-        data_size: total,  // 1 byte per pixel component
+        data_size: (sz)total,  // 1 byte per pixel component
     )!!;
 
     return {
@@ -230,7 +230,7 @@ fn Tensor? upload_image_to_gpu(DeviceContext* ctx, image::Image* img) {
 // Creates a grayscale image::Image from float data
 fn image::Image? download_tensor_as_image(DeviceContext* ctx, Tensor* tensor, uint width, uint height, uint channels) {
     usz total = (usz)channels * width * height;
-    float[] data = mem::new_array(float, total);
+    float[] data = mem::new_array(float, (sz)total);
 
     // Create staging buffer
     vk::Memory staging = vk::new_buffer(
@@ -238,7 +238,7 @@ fn image::Image? download_tensor_as_image(DeviceContext* ctx, Tensor* tensor, ui
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: null,
-        data_size: total * 4,
+        data_size: (sz)(total * 4),
     )!!;
 
     // Copy from device to staging
@@ -249,11 +249,11 @@ fn image::Image? download_tensor_as_image(DeviceContext* ctx, Tensor* tensor, ui
 
     // Read from staging buffer
     float* mapped = (float*)staging.data();
-    mem::copy(data.ptr, mapped, total * 4);
+    mem::copy(data.ptr, mapped, (sz)(total * 4));
     staging.free();
 
     // Convert float [0,1] to bytes
-    char[] pixels = mem::new_array(char, total);
+    char[] pixels = mem::new_array(char, (sz)total);
     for (usz i = 0; i < total; i++) {
         float val = data[i];
         if (val < 0.0f) val = 0.0f;

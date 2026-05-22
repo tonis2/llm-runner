@@ -28,14 +28,14 @@ fn ComputeKernel? create_kernel(
     for (uint i = 0; i < num_storage_buffers; i++) {
         bindings[i] = {
             .binding = i,
-            .descriptorType = vk::DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorType = vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
             .stageFlags = vk::SHADER_STAGE_COMPUTE_BIT,
         };
     }
 
     DescriptorSetLayout desc_layout = vk::descriptorSetLayoutCreateInfo()
-        .setFlags(vk::DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+        .setFlags(vk::DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT)
         .setBindings(bindings[0 .. num_storage_buffers - 1])
         .build(device)!!;
 
@@ -93,7 +93,7 @@ fn void dispatch_kernel(
     uint groups_y = 1,
     uint groups_z = 1
 ) {
-    vk::cmdBindPipeline(cmd, vk::PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+    vk::cmdBindPipeline(cmd, vk::PipelineBindPoint.PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
 
     // Build write descriptor sets for push descriptors
     DescriptorBufferInfo[MAX_BINDINGS] buffer_infos;
@@ -107,13 +107,13 @@ fn void dispatch_kernel(
         };
         writes[i] = vk::writeDescriptorSet()
             .setDstBinding(i)
-            .setDescriptorType(vk::DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            .setDescriptorType(vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER)
             .setBufferInfo(buffer_infos[i .. i]);
     }
 
     vk::cmdPushDescriptorSetKHR(
         cmd,
-        vk::PIPELINE_BIND_POINT_COMPUTE,
+        vk::PipelineBindPoint.PIPELINE_BIND_POINT_COMPUTE,
         kernel.pipeline_layout,
         0,
         kernel.num_buffers,

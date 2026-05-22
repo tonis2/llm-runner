@@ -294,7 +294,7 @@ fn void detect_flux_block_counts(llm::GGUFFile* gf, uint* n_dual, uint* n_single
         if (name.len > 14) {
             if (name.contains("double_blocks.")) {
                 if (try idx = name.index_of("double_blocks.")) {
-                    usz start = idx + 14;
+                    usz start = (usz)idx + 14;
                     uint n = 0;
                     while (start < name.len && name[start] >= '0' && name[start] <= '9') {
                         n = n * 10 + (uint)(name[start] - '0');
@@ -305,7 +305,7 @@ fn void detect_flux_block_counts(llm::GGUFFile* gf, uint* n_dual, uint* n_single
             }
             if (name.contains("single_blocks.")) {
                 if (try idx = name.index_of("single_blocks.")) {
-                    usz start = idx + 14;
+                    usz start = (usz)idx + 14;
                     uint n = 0;
                     while (start < name.len && name[start] >= '0' && name[start] <= '9') {
                         n = n * 10 + (uint)(name[start] - '0');
@@ -399,8 +399,8 @@ fn void? precompute_flux_mrope(
     // with scale=10 for the (single) reference image we support.
     const uint REF_T_OFFSET = 10;
 
-    float* cos_data = (float*)mem::calloc(table_size * 4);
-    float* sin_data = (float*)mem::calloc(table_size * 4);
+    float* cos_data = (float*)mem::calloc((sz)(table_size * 4));
+    float* sin_data = (float*)mem::calloc((sz)(table_size * 4));
 
     for (uint t = 0; t < seq_len; t++) {
         // 4-axis position: (pos_t, pos_h, pos_w, pos_l)
@@ -473,7 +473,7 @@ fn void? precompute_flux_mrope(
             usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
             properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             data: cos_data,
-            data_size: table_size * 4,
+            data_size: (sz)(table_size * 4),
         )!!,
         .size_bytes = table_size * 4,
         .shape = { seq_len, half_dim, 0, 0 },
@@ -486,7 +486,7 @@ fn void? precompute_flux_mrope(
             usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
             properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             data: sin_data,
-            data_size: table_size * 4,
+            data_size: (sz)(table_size * 4),
         )!!,
         .size_bytes = table_size * 4,
         .shape = { seq_len, half_dim, 0, 0 },

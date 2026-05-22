@@ -32,7 +32,7 @@ fn void? print_tensor_stats(llm::DeviceContext* ctx, llm::Tensor* tensor, String
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: bytes,
+        data_size: (sz)bytes,
     )!!;
     
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
@@ -100,7 +100,7 @@ fn void? print_tensor_first_n(llm::DeviceContext* ctx, llm::Tensor* tensor, Stri
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: bytes,
+        data_size: (sz)bytes,
     )!!;
     
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
@@ -133,7 +133,7 @@ fn void? dump_tensor_to_file(llm::DeviceContext* ctx, llm::Tensor* tensor, Strin
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: bytes,
+        data_size: (sz)bytes,
     )!!;
     
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
@@ -171,7 +171,7 @@ fn bool? validate_tensor_finite(llm::DeviceContext* ctx, llm::Tensor* tensor, St
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: bytes,
+        data_size: (sz)bytes,
     )!!;
     
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {

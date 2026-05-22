@@ -32,19 +32,19 @@ struct SharedKernels {
 
 fn SharedKernels? create_shared_kernels(DeviceContext* ctx, ShaderModule shader) {
     return {
-        .rmsnorm      = create_kernel(ctx, shader, 3, RMSNormPC.sizeof, "rmsnorm")!!,
-        .layernorm    = create_kernel(ctx, shader, 4, LayerNormPC.sizeof, "layernorm")!!,
-        .silu         = create_kernel(ctx, shader, 1, SiluPC.sizeof, "silu")!!,
-        .gelu         = create_kernel(ctx, shader, 1, GeluPC.sizeof, "gelu")!!,
-        .matmul       = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul")!!,
-        .matmul_q8    = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q8")!!,
-        .matmul_q4_0  = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q4_0")!!,
-        .matmul_q4k   = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q4k")!!,
-        .matmul_q5k   = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q5k")!!,
-        .matmul_q6k   = create_kernel(ctx, shader, 3, MatMulPC.sizeof, "matmul_q6k")!!,
-        .softmax      = create_kernel(ctx, shader, 1, SoftmaxPC.sizeof, "softmax")!!,
-        .residual_add = create_kernel(ctx, shader, 2, ResidualPC.sizeof, "residual_add")!!,
-        .elemwise_mul = create_kernel(ctx, shader, 2, ElemwisePC.sizeof, "elemwise_mul")!!,
+        .rmsnorm      = create_kernel(ctx, shader, 3, RMSNormPC::size, "rmsnorm")!!,
+        .layernorm    = create_kernel(ctx, shader, 4, LayerNormPC::size, "layernorm")!!,
+        .silu         = create_kernel(ctx, shader, 1, SiluPC::size, "silu")!!,
+        .gelu         = create_kernel(ctx, shader, 1, GeluPC::size, "gelu")!!,
+        .matmul       = create_kernel(ctx, shader, 3, MatMulPC::size, "matmul")!!,
+        .matmul_q8    = create_kernel(ctx, shader, 3, MatMulPC::size, "matmul_q8")!!,
+        .matmul_q4_0  = create_kernel(ctx, shader, 3, MatMulPC::size, "matmul_q4_0")!!,
+        .matmul_q4k   = create_kernel(ctx, shader, 3, MatMulPC::size, "matmul_q4k")!!,
+        .matmul_q5k   = create_kernel(ctx, shader, 3, MatMulPC::size, "matmul_q5k")!!,
+        .matmul_q6k   = create_kernel(ctx, shader, 3, MatMulPC::size, "matmul_q6k")!!,
+        .softmax      = create_kernel(ctx, shader, 1, SoftmaxPC::size, "softmax")!!,
+        .residual_add = create_kernel(ctx, shader, 2, ResidualPC::size, "residual_add")!!,
+        .elemwise_mul = create_kernel(ctx, shader, 2, ElemwisePC::size, "elemwise_mul")!!,
     };
 }
 

@@ -115,7 +115,7 @@ fn image::Image? QwenEditState.generate(QwenEditState* self, llm::DeviceContext*
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: img_size_bytes,
+        data_size: (sz)img_size_bytes,
     )!!;
     float* sdata = (float*)staging.data();
     
@@ -169,7 +169,7 @@ fn image::Image? QwenEditState.generate(QwenEditState* self, llm::DeviceContext*
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: latent_bytes,
+        data_size: (sz)latent_bytes,
     )!!;
     
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
@@ -222,13 +222,13 @@ fn image::Image? QwenEditState.generate(QwenEditState* self, llm::DeviceContext*
     
     // Download decoded image
     usz total_px = (usz)self.img_h * self.img_w * 3;
-    float[] img_data = mem::new_array(float, total_px);
+    float[] img_data = mem::new_array(float, (sz)total_px);
     
     vk::Memory download_staging = vk::new_buffer(
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: total_px * 4,
+        data_size: (sz)(total_px * 4),
     )!!;
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
         vk::cmdCopyBuffer(cmd, vae_acts.buf_a.gpu_buffer.buffer, download_staging.buffer, 1,
@@ -236,7 +236,7 @@ fn image::Image? QwenEditState.generate(QwenEditState* self, llm::DeviceContext*
     }!!;
     
     float* mapped = (float*)download_staging.data();
-    mem::copy(img_data.ptr, mapped, total_px * 4);
+    mem::copy(img_data.ptr, mapped, (sz)(total_px * 4));
     download_staging.free();
     
     // Convert to image and save

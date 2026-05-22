@@ -27,25 +27,25 @@ enum GGUFType : uint {
 // GGML tensor quantization types (has gaps, use typedef)
 typedef GGMLType = inline uint;
 
-const GGMLType GGML_F32    = 0;
-const GGMLType GGML_F16    = 1;
-const GGMLType GGML_Q4_0   = 2;
-const GGMLType GGML_Q4_1   = 3;
-const GGMLType GGML_Q5_0   = 6;
-const GGMLType GGML_Q5_1   = 7;
-const GGMLType GGML_Q8_0   = 8;
-const GGMLType GGML_Q8_1   = 9;
-const GGMLType GGML_Q2_K   = 10;
-const GGMLType GGML_Q3_K   = 11;
-const GGMLType GGML_Q4_K   = 12;
-const GGMLType GGML_Q5_K   = 13;
-const GGMLType GGML_Q6_K   = 14;
-const GGMLType GGML_I8     = 24;
-const GGMLType GGML_I16    = 25;
-const GGMLType GGML_I32    = 26;
-const GGMLType GGML_I64    = 27;
-const GGMLType GGML_F64    = 28;
-const GGMLType GGML_BF16   = 30;
+const GGMLType GGML_F32    = (GGMLType)0;
+const GGMLType GGML_F16    = (GGMLType)1;
+const GGMLType GGML_Q4_0   = (GGMLType)2;
+const GGMLType GGML_Q4_1   = (GGMLType)3;
+const GGMLType GGML_Q5_0   = (GGMLType)6;
+const GGMLType GGML_Q5_1   = (GGMLType)7;
+const GGMLType GGML_Q8_0   = (GGMLType)8;
+const GGMLType GGML_Q8_1   = (GGMLType)9;
+const GGMLType GGML_Q2_K   = (GGMLType)10;
+const GGMLType GGML_Q3_K   = (GGMLType)11;
+const GGMLType GGML_Q4_K   = (GGMLType)12;
+const GGMLType GGML_Q5_K   = (GGMLType)13;
+const GGMLType GGML_Q6_K   = (GGMLType)14;
+const GGMLType GGML_I8     = (GGMLType)24;
+const GGMLType GGML_I16    = (GGMLType)25;
+const GGMLType GGML_I32    = (GGMLType)26;
+const GGMLType GGML_I64    = (GGMLType)27;
+const GGMLType GGML_F64    = (GGMLType)28;
+const GGMLType GGML_BF16   = (GGMLType)30;
 
 fn usz GGMLType.block_size(self) {
     switch (self) {
@@ -195,7 +195,7 @@ fn String[]? GGUFFile.read_string_array(&self, String key) {
     foreach (&kv : self.metadata) {
         if (kv.key == key && kv.val_type == ARRAY && kv.array_type == STRING) {
             usz count = (usz)kv.array_len;
-            String[] result = mem::new_array(String, count);
+            String[] result = mem::new_array(String, (sz)count);
             // Create reader at the array data offset
             usz pos = kv.array_data_offset;
             for (usz i = 0; i < count; i++) {
@@ -219,7 +219,7 @@ fn float[]? GGUFFile.read_f32_array(&self, String key) {
     foreach (&kv : self.metadata) {
         if (kv.key == key && kv.val_type == ARRAY && kv.array_type == FLOAT32) {
             usz count = (usz)kv.array_len;
-            float[] result = mem::new_array(float, count);
+            float[] result = mem::new_array(float, (sz)count);
             usz pos = kv.array_data_offset;
             for (usz i = 0; i < count; i++) {
                 result[i] = bitcast(*(char[4]*)self.raw_data[pos..], float);
@@ -235,7 +235,7 @@ fn uint[]? GGUFFile.read_u32_array(&self, String key) {
     foreach (&kv : self.metadata) {
         if (kv.key == key && kv.val_type == ARRAY && (kv.array_type == UINT32 || kv.array_type == INT32)) {
             usz count = (usz)kv.array_len;
-            uint[] result = mem::new_array(uint, count);
+            uint[] result = mem::new_array(uint, (sz)count);
             usz pos = kv.array_data_offset;
             for (usz i = 0; i < count; i++) {
                 result[i] = bitcast(*(char[4]*)self.raw_data[pos..], uint);

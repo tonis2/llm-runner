@@ -94,7 +94,7 @@ fn QwenVaeConv load_conv3d_as_2d(llm::DeviceContext* ctx, llm::SafetensorsFile* 
     usz total_3d = (usz)out_c * in_c * k_t * kH * kW;
 
     // Decode BF16 → F32
-    float[] src = mem::new_array(float, total_3d);
+    float[] src = mem::new_array(float, (sz)total_3d);
     if (winfo.dtype == "BF16") {
         for (usz j = 0; j < total_3d; j++) {
             src[j] = llm::cpu_bf16_to_f32(data_ptr + j * 2);
@@ -104,12 +104,12 @@ fn QwenVaeConv load_conv3d_as_2d(llm::DeviceContext* ctx, llm::SafetensorsFile* 
             src[j] = llm::cpu_f16_to_f32(data_ptr + j * 2);
         }
     } else {
-        mem::copy(src.ptr, data_ptr, total_3d * 4);
+        mem::copy(src.ptr, data_ptr, (sz)(total_3d * 4));
     }
 
     // Extract last temporal slice + transpose: [out_c, in_c, k_t, kH, kW] → [kH, kW, in_c, out_c]
     usz elems_2d = (usz)out_c * in_c * kH * kW;
-    float[] dst = mem::new_array(float, elems_2d);
+    float[] dst = mem::new_array(float, (sz)elems_2d);
     uint last_t = k_t - 1;
 
     for (uint oc = 0; oc < out_c; oc++) {
@@ -129,7 +129,7 @@ fn QwenVaeConv load_conv3d_as_2d(llm::DeviceContext* ctx, llm::SafetensorsFile* 
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: dst.ptr, data_size: elems_2d * 4,
+        data: dst.ptr, data_size: (sz)(elems_2d * 4),
     )!!;
     mem::free(dst);
 
@@ -200,7 +200,7 @@ fn llm::Tensor upload_f32_data(llm::DeviceContext* ctx, float* data, usz n_elems
         allocator: &ctx.allocator,
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: data, data_size: size,
+        data: data, data_size: (sz)size,
     )!!;
     return { .gpu_buffer = gpu, .dtype = llm::GGML_F32, .size_bytes = size };
 }
@@ -211,7 +211,7 @@ fn void decode_bf16_or_f32(llm::SafetensorsTensorInfo* info, char* data_ptr, flo
     } else if (info.dtype == "F16") {
         for (usz j = 0; j < count; j++) dst[j] = llm::cpu_f16_to_f32(data_ptr + j * 2);
     } else {
-        mem::copy(dst.ptr, data_ptr, count * 4);
+        mem::copy(dst.ptr, data_ptr, (sz)(count * 4));
     }
 }
 
@@ -226,7 +226,7 @@ fn QwenVaeAttn load_qwen_vae_attn(llm::DeviceContext* ctx, llm::SafetensorsFile*
     llm::SafetensorsTensorInfo* winfo = sf.find_tensor(format_vae_name(&buf1, prefix, "to_qkv.weight"))!!;
     char* wdata = sf.data_base + (usz)winfo.data_start;
     usz total_w = (usz)3 * channels * channels;
-    float[] wsrc = mem::new_array(float, total_w);
+    float[] wsrc = mem::new_array(float, (sz)total_w);
     decode_bf16_or_f32(winfo, wdata, wsrc, total_w);
 
     usz slice_w = (usz)channels * channels;
@@ -239,7 +239,7 @@ fn QwenVaeAttn load_qwen_vae_attn(llm::DeviceContext* ctx, llm::SafetensorsFile*
     llm::SafetensorsTensorInfo* binfo = sf.find_tensor(format_vae_name(&buf1, prefix, "to_qkv.bias"))!!;
     char* bdata = sf.data_base + (usz)binfo.data_start;
     usz total_b = (usz)3 * channels;
-    float[] bsrc = mem::new_array(float, total_b);
+    float[] bsrc = mem::new_array(float, (sz)total_b);
     decode_bf16_or_f32(binfo, bdata, bsrc, total_b);
 
     llm::Tensor q_b = upload_f32_data(ctx, bsrc.ptr, channels);
@@ -330,7 +330,7 @@ fn QwenVaeDecoder? load_qwen_vae_decoder(llm::DeviceContext* ctx, llm::Safetenso
     char[] vit_spv = &VIT_SPV;
     vk::ShaderModule vit_shader = vk::shaderModuleCreateInfo().setCodeSize(
         vit_spv.len).setCode((uint*)&vit_spv[0]).build(ctx.device)!!;
-    dec.vae_rmsnorm_kernel = llm::create_kernel(ctx, vit_shader, 3, VaeRMSNormPC.sizeof, "vae_rmsnorm")!!;
+    dec.vae_rmsnorm_kernel = llm::create_kernel(ctx, vit_shader, 3, VaeRMSNormPC::size, "vae_rmsnorm")!!;
     vit_shader.free(ctx.device);
     dec.ctx = ctx;
 

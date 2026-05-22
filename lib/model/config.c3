@@ -76,7 +76,7 @@ fn float read_param_f32(Object* params, String param_name, GGUFFile* gf) {
 }
 
 fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
-    Object* root = json::parse_string(mem, json_text)!;
+    Object* root = json::parse(mem, json_text)!;
 
     String name = root.get_string("name") ?? "unknown";
 
@@ -136,7 +136,7 @@ fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
 }
 
 fn WeightNames? load_weight_names(String json_text) {
-    Object* root = json::parse_string(mem, json_text)!;
+    Object* root = json::parse(mem, json_text)!;
 
     Object* w = root.get("weights")!;
 

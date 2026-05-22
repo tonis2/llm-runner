@@ -32,7 +32,7 @@ fn Tensor? create_tensor(DeviceContext* ctx, GGMLType dtype, ulong[4] shape, uin
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: null,
-        data_size: size_bytes
+        data_size: (sz)size_bytes
     )!!;
 
     return {
@@ -52,7 +52,7 @@ fn Tensor? upload_weight(DeviceContext* ctx, GGUFTensorInfo* info, char* tensor_
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: data_ptr,
-        data_size: info.data_size,
+        data_size: (sz)info.data_size,
     )!!;
 
     return {
@@ -399,7 +399,7 @@ fn Tensor? upload_weight_as_q8(DeviceContext* ctx, float* f32_data, uint n_eleme
         n_blocks++;  // Handle partial block
     }
     usz q8_size = n_blocks * 34;
-    char* q8_data = (char*)mem::calloc(q8_size);
+    char* q8_data = (char*)mem::calloc((sz)q8_size);
 
     // Quantize each block
     for (usz b = 0; b < n_blocks; b++) {
@@ -423,7 +423,7 @@ fn Tensor? upload_weight_as_q8(DeviceContext* ctx, float* f32_data, uint n_eleme
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: q8_data,
-        data_size: q8_size,
+        data_size: (sz)q8_size,
     )!!;
 
     mem::free(q8_data);
@@ -456,7 +456,7 @@ fn CpuTensorData? dequant_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) {
         n_elements *= (usz)info.shape[i];
     }
     usz f32_size = n_elements * 4;
-    float* f32_data = (float*)mem::calloc(f32_size);
+    float* f32_data = (float*)mem::calloc((sz)f32_size);
 
     if (info.type == GGML_Q5_K) {
         usz n_blocks = n_elements / 256;
@@ -492,7 +492,7 @@ fn CpuTensorData? dequant_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) {
             f32_data[j] = cpu_bf16_to_f32(data_ptr + j * 2);
         }
     } else {
-        mem::copy(f32_data, data_ptr, f32_size);
+        mem::copy(f32_data, data_ptr, (sz)f32_size);
     }
 
     return {
@@ -510,7 +510,7 @@ fn Tensor? upload_cpu_data(DeviceContext* ctx, CpuTensorData* cpu) {
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: cpu.data,
-        data_size: cpu.size_bytes,
+        data_size: (sz)cpu.size_bytes,
     )!!;
 
     return {
@@ -529,7 +529,7 @@ fn Tensor? upload_cpu_data_raw(DeviceContext* ctx, CpuTensorData* cpu, GGMLType 
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: cpu.data,
-        data_size: cpu.size_bytes,
+        data_size: (sz)cpu.size_bytes,
     )!!;
 
     return {
@@ -545,8 +545,8 @@ fn Tensor? upload_cpu_data_raw(DeviceContext* ctx, CpuTensorData* cpu, GGMLType 
 fn CpuTensorData? copy_raw_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) {
     char* data_ptr = tensor_data_base + (usz)info.offset;
     usz size = info.data_size;
-    float* cpu_data = (float*)mem::calloc(size);
-    mem::copy(cpu_data, data_ptr, size);
+    float* cpu_data = (float*)mem::calloc((sz)size);
+    mem::copy(cpu_data, data_ptr, (sz)size);
 
     return {
         .data = cpu_data,

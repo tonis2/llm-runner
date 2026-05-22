@@ -393,27 +393,27 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		llm_spv.len
 	).setCode((uint*)&llm_spv[0]).build(ctx.device)!!;
 
-	llm::ComputeKernel k_patchify = llm::create_kernel(ctx, zi_shader, 2, PatchifyPC.sizeof, "patchify")!!;
-	llm::ComputeKernel k_unpatchify = llm::create_kernel(ctx, zi_shader, 2, UnpatchifyPC.sizeof, "unpatchify")!!;
-	llm::ComputeKernel k_adaln = llm::create_kernel(ctx, zi_shader, 4, AdalnModPC.sizeof, "adaln_modulate")!!;
-	llm::ComputeKernel k_euler = llm::create_kernel(ctx, zi_shader, 2, FlowEulerPC.sizeof, "flow_euler_step")!!;
-	llm::ComputeKernel k_linproj = llm::create_kernel(ctx, zi_shader, 4, LinearProjPC.sizeof, "linear_proj")!!;
+	llm::ComputeKernel k_patchify = llm::create_kernel(ctx, zi_shader, 2, PatchifyPC::size, "patchify")!!;
+	llm::ComputeKernel k_unpatchify = llm::create_kernel(ctx, zi_shader, 2, UnpatchifyPC::size, "unpatchify")!!;
+	llm::ComputeKernel k_adaln = llm::create_kernel(ctx, zi_shader, 4, AdalnModPC::size, "adaln_modulate")!!;
+	llm::ComputeKernel k_euler = llm::create_kernel(ctx, zi_shader, 2, FlowEulerPC::size, "flow_euler_step")!!;
+	llm::ComputeKernel k_linproj = llm::create_kernel(ctx, zi_shader, 4, LinearProjPC::size, "linear_proj")!!;
 	llm::ComputeKernel k_linproj_debug = llm::create_kernel(
 		ctx,
 		zi_shader,
 		6,
-		LinearProjPC.sizeof,
+		LinearProjPC::size,
 		"linear_proj_debug"
 	)!!;
-	llm::ComputeKernel k_timestep = llm::create_kernel(ctx, zi_shader, 1, DiTTimestepPC.sizeof, "dit_timestep_embed")!!;
+	llm::ComputeKernel k_timestep = llm::create_kernel(ctx, zi_shader, 1, DiTTimestepPC::size, "dit_timestep_embed")!!;
 	llm::ComputeKernel k_bcastadd = llm::create_kernel(
 		ctx,
 		zi_shader,
 		2,
-		BroadcastAddDimPC.sizeof,
+		BroadcastAddDimPC::size,
 		"broadcast_add_dim"
 	)!!;
-	llm::ComputeKernel k_scalebuf = llm::create_kernel(ctx, zi_shader, 1, ScalePC.sizeof, "scale_buffer")!!;
+	llm::ComputeKernel k_scalebuf = llm::create_kernel(ctx, zi_shader, 1, ScalePC::size, "scale_buffer")!!;
 	char[] fa_spv = &FLASH_ATTN_SPV;
 	vk::ShaderModule fa_shader = vk::shaderModuleCreateInfo().setCodeSize(
 		fa_spv.len
@@ -422,18 +422,18 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		ctx,
 		fa_shader,
 		4,
-		FlashAttentionPC.sizeof,
+		FlashAttentionPC::size,
 		"flash_attention_v2"
 	)!!;
 	fa_shader.free(ctx.device);
-	llm::ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC.sizeof, "scale_modulate")!!;
-	llm::ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC.sizeof, "gated_residual")!!;
-	llm::ComputeKernel k_clip = llm::create_kernel(ctx, zi_shader, 1, ClipParams.sizeof, "clip_values")!!;
+	llm::ComputeKernel k_scalemod = llm::create_kernel(ctx, zi_shader, 3, ScaleModPC::size, "scale_modulate")!!;
+	llm::ComputeKernel k_gatedres = llm::create_kernel(ctx, zi_shader, 3, GatedResidualPC::size, "gated_residual")!!;
+	llm::ComputeKernel k_clip = llm::create_kernel(ctx, zi_shader, 1, ClipParams::size, "clip_values")!!;
 	char[] mrope_spv = &MROPE_SPV;
 	vk::ShaderModule mrope_shader = vk::shaderModuleCreateInfo().setCodeSize(
 		mrope_spv.len
 	).setCode((uint*)&mrope_spv[0]).build(ctx.device)!!;
-	llm::ComputeKernel k_mrope = llm::create_kernel(ctx, mrope_shader, 3, MRoPEPC.sizeof, "mrope")!!;
+	llm::ComputeKernel k_mrope = llm::create_kernel(ctx, mrope_shader, 3, MRoPEPC::size, "mrope")!!;
 	mrope_shader.free(ctx.device);
 	DiTKernels kernels = {
 		.patchify = k_patchify,
@@ -449,29 +449,29 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		.scale_modulate = k_scalemod,
 		.gated_residual = k_gatedres,
 		.clip_values = k_clip,
-		.batch_layernorm = llm::create_kernel(ctx, zi_shader, 2, BatchLayerNormPC.sizeof, "batch_layernorm")!!,
+		.batch_layernorm = llm::create_kernel(ctx, zi_shader, 2, BatchLayerNormPC::size, "batch_layernorm")!!,
 		.mrope = k_mrope,
-		.batch_rmsnorm = llm::create_kernel(ctx, zi_shader, 3, BatchRMSNormPC.sizeof, "batch_rmsnorm")!!,
-		.transpose_heads = llm::create_kernel(ctx, zi_shader, 2, TransposeHeadsPC.sizeof, "transpose_heads")!!,
+		.batch_rmsnorm = llm::create_kernel(ctx, zi_shader, 3, BatchRMSNormPC::size, "batch_rmsnorm")!!,
+		.transpose_heads = llm::create_kernel(ctx, zi_shader, 2, TransposeHeadsPC::size, "transpose_heads")!!,
 		.transpose_channel_spatial = llm::create_kernel(
 			ctx,
 			zi_shader,
 			3,
-			TransposeChannelSpatialPC.sizeof,
+			TransposeChannelSpatialPC::size,
 			"transpose_channel_spatial"
 		)!!,
-		.batch_head_norm = llm::create_kernel(ctx, zi_shader, 2, BatchHeadNormPC.sizeof, "batch_head_norm")!!,
-		.batch_matmul = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul")!!,
-		.batch_matmul_simple = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_simple")!!,
-		.batch_matmul_q8 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q8")!!,
-		.batch_matmul_q4_0 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4_0")!!,
-		.batch_matmul_q4k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q4k")!!,
-		.batch_matmul_q5k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q5k")!!,
-		.batch_matmul_q6k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q6k")!!,
-		.batch_matmul_add_scaled = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulAddScaledPC.sizeof, "batch_matmul_add_scaled")!!,
-		.ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC.sizeof, "ffn_swiglu_split")!!,
-		.batch_matmul_swiglu_q8 = llm::create_kernel(ctx, llm_shader, 4, BatchMatMulPC.sizeof, "batch_matmul_swiglu_q8")!!,
-		.batch_matmul_q8_coopmat = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q8_coopmat")!!,
+		.batch_head_norm = llm::create_kernel(ctx, zi_shader, 2, BatchHeadNormPC::size, "batch_head_norm")!!,
+		.batch_matmul = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul")!!,
+		.batch_matmul_simple = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_simple")!!,
+		.batch_matmul_q8 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q8")!!,
+		.batch_matmul_q4_0 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q4_0")!!,
+		.batch_matmul_q4k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q4k")!!,
+		.batch_matmul_q5k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q5k")!!,
+		.batch_matmul_q6k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q6k")!!,
+		.batch_matmul_add_scaled = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulAddScaledPC::size, "batch_matmul_add_scaled")!!,
+		.ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC::size, "ffn_swiglu_split")!!,
+		.batch_matmul_swiglu_q8 = llm::create_kernel(ctx, llm_shader, 4, BatchMatMulPC::size, "batch_matmul_swiglu_q8")!!,
+		.batch_matmul_q8_coopmat = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q8_coopmat")!!,
 		.shared = llm::create_shared_kernels(ctx, llm_shader)!!,
 		.coopmat_supported = ctx.coopmat_supported,
 		};
@@ -560,8 +560,8 @@ fn void? precompute_mrope_tables(
 	uint half_dim = DIT_HEAD_DIM / 2; // 64
 	usz table_size = (usz)seq_len * half_dim;
 
-	float* cos_data = (float*)mem::calloc(table_size * 4);
-	float* sin_data = (float*)mem::calloc(table_size * 4);
+	float* cos_data = (float*)mem::calloc((sz)(table_size * 4));
+	float* sin_data = (float*)mem::calloc((sz)(table_size * 4));
 
 	// Image text-axis position = text_len (matches official Lumina2 position_ids)
 	// Official: position_ids[:, cap_len:cap_len+img_len, 0] = cap_len
@@ -677,7 +677,7 @@ fn void? precompute_mrope_tables(
 			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
 			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: cos_data,
-			data_size: table_size * 4,
+			data_size: (sz)(table_size * 4),
 		)!!,
 		.size_bytes = table_size * 4,
 		.shape = { seq_len, half_dim, 0, 0 },
@@ -690,7 +690,7 @@ fn void? precompute_mrope_tables(
 			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
 			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: sin_data,
-			data_size: table_size * 4,
+			data_size: (sz)(table_size * 4),
 		)!!,
 		.size_bytes = table_size * 4,
 		.shape = { seq_len, half_dim, 0, 0 },

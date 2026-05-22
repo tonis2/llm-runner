@@ -144,7 +144,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         // Override text_len with file tokens
         cond_text_len = file_tokens;
         usz data_size = (usz)file_tokens * file_dim * 4;
-        float* emb_data = (float*)mem::calloc(data_size);
+        float* emb_data = (float*)mem::calloc((sz)data_size);
         ef.read((char[])(((char*)emb_data)[:data_size]))!!;
         ef.close()!!;
         cond_embeddings = llm::create_f32_tensor(ctx, { (ulong)cond_text_len * text_config.dim, 0, 0, 0 }, 1)!!;
@@ -152,7 +152,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         vk::Memory upload_stg = vk::new_buffer(allocator: &ctx.allocator,
             usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
             properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data: emb_data, data_size: data_size)!!;
+            data: emb_data, data_size: (sz)data_size)!!;
         ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer ucmd) {
             vk::cmdCopyBuffer(ucmd, upload_stg.buffer, cond_embeddings.gpu_buffer.buffer, 1,
                 (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = data_size }});
@@ -650,14 +650,14 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
         // Download image from GPU
         usz total_px = (usz)img_size * img_size * 3;
-        float[] img_data = mem::new_array(float, total_px);
+        float[] img_data = mem::new_array(float, (sz)total_px);
 
         vk::Memory download_staging = vk::new_buffer(
             allocator: &ctx.allocator,
             usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
             properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: null,
-            data_size: total_px * 4,
+            data_size: (sz)(total_px * 4),
         )!!;
 
         ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer download_cmd) {
@@ -666,7 +666,7 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         }!!;
 
         float* mapped = (float*)download_staging.data();
-        mem::copy(img_data.ptr, mapped, total_px * 4);
+        mem::copy(img_data.ptr, mapped, (sz)(total_px * 4));
         download_staging.free();
 
         result = llm::pipelines::float_tensor_to_image(img_data, img_size, img_size, 3)!!;

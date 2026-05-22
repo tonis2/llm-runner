@@ -64,7 +64,7 @@ fn DeviceContext? createContext() {
         bool supports_extensions = entry.checkExtensionSupport(device_extensions)!!;
         QueuePropertiesList queue_properties = entry.getQueueProperties()!!;
 
-        int queue_index = queue_properties.find(fn (usz index, QueueFamilyProperties props) =>
+        int queue_index = queue_properties.find(fn (sz index, QueueFamilyProperties props) =>
             (QueueFlagBits)props.queueFlags & vk::QUEUE_COMPUTE_BIT != 0 && (QueueFlagBits)props.queueFlags & vk::QUEUE_TRANSFER_BIT);
 
         PhysicalDeviceProperties properties;
@@ -72,13 +72,13 @@ fn DeviceContext? createContext() {
 
         if (queue_index >= 0 && supports_extensions && properties.vendorID != 0) {
             uint score = 0;
-            if (properties.deviceType == 1) score += 100;
-            if (properties.deviceType == 2) score += 200;
+            if (properties.deviceType == (PhysicalDeviceType)1) score += 100;
+            if (properties.deviceType == (PhysicalDeviceType)2) score += 200;
 
             if (score > best_score) {
                 best_score = score;
                 physical_device = entry;
-                compute_queue.index = queue_index;
+                compute_queue.index = (uint)queue_index;
                 device_props = properties;
             }
         }
@@ -105,17 +105,17 @@ fn DeviceContext? createContext() {
     // the existing tiled GEMM on broken drivers and the coopmat shader
     // entirely on NVIDIA / fixed Mesa.
     PhysicalDeviceDriverProperties driverProps = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
         .pNext = null,
     };
     PhysicalDeviceProperties2 props2 = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
         .pNext = &driverProps,
     };
     vk::getPhysicalDeviceProperties2(physical_device, &props2);
     bool driver_blacklisted_for_coopmat =
-        driverProps.driverID == vk::DRIVER_ID_MESA_RADV
-        || driverProps.driverID == vk::DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+        driverProps.driverID == vk::DriverId.DRIVER_ID_MESA_RADV
+        || driverProps.driverID == vk::DriverId.DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
     // Probe for cooperative matrix support: device must advertise the extension
     // AND expose a 16x16x16 fp16xfp16->fp32 subgroup-scope configuration.
@@ -134,16 +134,16 @@ fn DeviceContext? createContext() {
             if (cnt > 0 && cnt <= 64) {
                 CooperativeMatrixPropertiesKHR[64] props;
                 for (uint i = 0; i < cnt; i++) {
-                    props[i].sType = vk::STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                    props[i].sType = vk::StructureType.STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
                 }
                 vk::getPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &cnt, &props[0])!!;
                 for (uint i = 0; i < cnt; i++) {
                     if (props[i].mSize == 16 && props[i].nSize == 16 && props[i].kSize == 16
-                        && props[i].aType == vk::COMPONENT_TYPE_FLOAT16_KHR
-                        && props[i].bType == vk::COMPONENT_TYPE_FLOAT16_KHR
-                        && props[i].cType == vk::COMPONENT_TYPE_FLOAT32_KHR
-                        && props[i].resultType == vk::COMPONENT_TYPE_FLOAT32_KHR
-                        && props[i].scope == vk::SCOPE_SUBGROUP_KHR) {
+                        && props[i].aType == vk::ComponentTypeKHR.COMPONENT_TYPE_FLOAT16_KHR
+                        && props[i].bType == vk::ComponentTypeKHR.COMPONENT_TYPE_FLOAT16_KHR
+                        && props[i].cType == vk::ComponentTypeKHR.COMPONENT_TYPE_FLOAT32_KHR
+                        && props[i].resultType == vk::ComponentTypeKHR.COMPONENT_TYPE_FLOAT32_KHR
+                        && props[i].scope == vk::ScopeKHR.SCOPE_SUBGROUP_KHR) {
                         coopmat_supported = true;
                         break;
                     }
@@ -160,31 +160,31 @@ fn DeviceContext? createContext() {
 
     // Feature chain (built bottom-up). Coop matrix tail node is conditional.
     PhysicalDeviceCooperativeMatrixFeaturesKHR coopmatFeatures = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
         .pNext = null,
         .cooperativeMatrix = vk::TRUE,
         .cooperativeMatrixRobustBufferAccess = 0,
     };
 
     PhysicalDeviceVulkan13Features vulkan13Features = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
         .pNext = coopmat_supported ? (void*)&coopmatFeatures : null,
         .synchronization2 = vk::TRUE,
         .maintenance4 = vk::TRUE,
     };
 
     PhysicalDeviceVulkan12Features vulkan12Features = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &vulkan13Features,
     };
 
     PhysicalDeviceVulkan11Features vulkan11Features = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
         .pNext = &vulkan12Features,
     };
 
     PhysicalDeviceFeatures2 device_features = {
-        .sType = vk::STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext = &vulkan11Features,
     };
 

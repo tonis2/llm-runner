@@ -304,19 +304,19 @@ fn ViTKernels? create_vit_kernels(llm::DeviceContext* ctx) {
         diff_spv.len).setCode((uint*)&diff_spv[0]).build(ctx.device)!!;
 
     ViTKernels kernels = {
-        .batch_ln_affine = llm::create_kernel(ctx, vit_shader, 3, BatchLayerNormAffinePC.sizeof, "batch_layernorm_affine")!!,
-        .broadcast_bias = llm::create_kernel(ctx, vit_shader, 2, BroadcastBiasPC.sizeof, "broadcast_bias_add")!!,
-        .image_normalize = llm::create_kernel(ctx, vit_shader, 1, ImageNormPC.sizeof, "image_normalize")!!,
-        .patch_embed = llm::create_kernel(ctx, vit_shader, 3, PatchEmbedPC.sizeof, "patch_embed_conv2d")!!,
-        .rope_2d = llm::create_kernel(ctx, vit_shader, 1, Rope2DPC.sizeof, "rope_2d")!!,
-        .transpose_heads = llm::create_kernel(ctx, vit_shader, 2, VitTransposeHeadsPC.sizeof, "transpose_heads")!!,
-        .window_partition = llm::create_kernel(ctx, vit_shader, 2, WindowPartitionPC.sizeof, "window_partition")!!,
-        .spatial_merge = llm::create_kernel(ctx, vit_shader, 2, SpatialMerge2x2PC.sizeof, "spatial_merge_2x2")!!,
-        .batch_matmul = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul")!!,
-        .batch_matmul_q8 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_q8")!!,
-        .batch_matmul_simple = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC.sizeof, "batch_matmul_simple")!!,
-        .ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC.sizeof, "ffn_swiglu_split")!!,
-        .spatial_attention = llm::create_kernel(ctx, diff_shader, 5, SpatialAttentionPC.sizeof, "spatial_attention")!!,
+        .batch_ln_affine = llm::create_kernel(ctx, vit_shader, 3, BatchLayerNormAffinePC::size, "batch_layernorm_affine")!!,
+        .broadcast_bias = llm::create_kernel(ctx, vit_shader, 2, BroadcastBiasPC::size, "broadcast_bias_add")!!,
+        .image_normalize = llm::create_kernel(ctx, vit_shader, 1, ImageNormPC::size, "image_normalize")!!,
+        .patch_embed = llm::create_kernel(ctx, vit_shader, 3, PatchEmbedPC::size, "patch_embed_conv2d")!!,
+        .rope_2d = llm::create_kernel(ctx, vit_shader, 1, Rope2DPC::size, "rope_2d")!!,
+        .transpose_heads = llm::create_kernel(ctx, vit_shader, 2, VitTransposeHeadsPC::size, "transpose_heads")!!,
+        .window_partition = llm::create_kernel(ctx, vit_shader, 2, WindowPartitionPC::size, "window_partition")!!,
+        .spatial_merge = llm::create_kernel(ctx, vit_shader, 2, SpatialMerge2x2PC::size, "spatial_merge_2x2")!!,
+        .batch_matmul = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul")!!,
+        .batch_matmul_q8 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q8")!!,
+        .batch_matmul_simple = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_simple")!!,
+        .ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC::size, "ffn_swiglu_split")!!,
+        .spatial_attention = llm::create_kernel(ctx, diff_shader, 5, SpatialAttentionPC::size, "spatial_attention")!!,
         .shared = llm::create_shared_kernels(ctx, llm_shader)!!,
     };
 

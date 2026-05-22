@@ -58,15 +58,15 @@ fn VaeKernels? create_vae_kernels(llm::DeviceContext* ctx) {
         .build(ctx.device)!!;
 
     VaeKernels kernels = {
-        .conv2d           = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC.sizeof, "conv2d")!!,
-        .group_norm       = llm::create_kernel(ctx, shader, 4, pipelines::GroupNormPC.sizeof, "group_norm")!!,
-        .upsample_nearest = llm::create_kernel(ctx, shader, 2, pipelines::UpsamplePC.sizeof, "upsample_nearest")!!,
-        .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, pipelines::ScaleShiftPC.sizeof, "scale_shift_clamp")!!,
-        .relu             = llm::create_kernel(ctx, shader, 1, pipelines::ReluPC.sizeof, "relu")!!,
-        .tanh_clamp       = llm::create_kernel(ctx, shader, 1, pipelines::TanhClampPC.sizeof, "tanh_clamp")!!,
-        .vae_attention     = llm::create_kernel(ctx, shader, 4, VaeAttentionPC.sizeof, "vae_attention")!!,
-        .linear_proj       = llm::create_kernel(ctx, shader, 4, VaeLinearProjPC.sizeof, "linear_proj")!!,
-        .transpose_channel_spatial = llm::create_kernel(ctx, shader, 2, TransposeChannelSpatialPC.sizeof, "transpose_channel_spatial")!!,
+        .conv2d           = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC::size, "conv2d")!!,
+        .group_norm       = llm::create_kernel(ctx, shader, 4, pipelines::GroupNormPC::size, "group_norm")!!,
+        .upsample_nearest = llm::create_kernel(ctx, shader, 2, pipelines::UpsamplePC::size, "upsample_nearest")!!,
+        .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, pipelines::ScaleShiftPC::size, "scale_shift_clamp")!!,
+        .relu             = llm::create_kernel(ctx, shader, 1, pipelines::ReluPC::size, "relu")!!,
+        .tanh_clamp       = llm::create_kernel(ctx, shader, 1, pipelines::TanhClampPC::size, "tanh_clamp")!!,
+        .vae_attention     = llm::create_kernel(ctx, shader, 4, VaeAttentionPC::size, "vae_attention")!!,
+        .linear_proj       = llm::create_kernel(ctx, shader, 4, VaeLinearProjPC::size, "linear_proj")!!,
+        .transpose_channel_spatial = llm::create_kernel(ctx, shader, 2, TransposeChannelSpatialPC::size, "transpose_channel_spatial")!!,
         .shared           = llm::create_shared_kernels(ctx, shader)!!,
     };
 

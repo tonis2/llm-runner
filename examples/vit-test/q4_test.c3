@@ -143,7 +143,7 @@ fn void? test_q4_0_matmul(llm::DeviceContext* ctx) {
         llm_spv.len
     ).setCode((uint*)&llm_spv[0]).build(ctx.device)!!;
 
-    llm::ComputeKernel kernel = llm::create_kernel(ctx, shader, 3, BatchMatMulParams.sizeof, "batch_matmul_q4_0")!!;
+    llm::ComputeKernel kernel = llm::create_kernel(ctx, shader, 3, BatchMatMulParams::size, "batch_matmul_q4_0")!!;
     defer kernel.free(ctx.device);
 
     // Dispatch

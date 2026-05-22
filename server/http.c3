@@ -29,7 +29,7 @@ fn HttpRequest? read_request(net::Socket* sock)
 {
     // Grow a header buffer until we see "\r\n\r\n".
     usz cap = 4096;
-    char[] hbuf = mem::new_array(char, cap);
+    char[] hbuf = mem::new_array(char, (sz)cap);
     usz n = 0;
     usz hdr_end = 0;
     bool found = false;
@@ -40,7 +40,7 @@ fn HttpRequest? read_request(net::Socket* sock)
             if (cap >= MAX_HEADER_BYTES) { mem::free(hbuf); return REQUEST_TOO_LARGE~; }
             usz new_cap = cap * 2;
             if (new_cap > MAX_HEADER_BYTES) new_cap = MAX_HEADER_BYTES;
-            char[] grown = mem::new_array(char, new_cap);
+            char[] grown = mem::new_array(char, (sz)new_cap);
             for (usz i = 0; i < n; i++) grown[i] = hbuf[i];
             mem::free(hbuf);
             hbuf = grown;
@@ -49,7 +49,7 @@ fn HttpRequest? read_request(net::Socket* sock)
         usz r;
         if (try got = sock.read(hbuf[n..cap - 1]))
         {
-            r = got;
+            r = (usz)got;
         }
         else
         {
@@ -156,7 +156,7 @@ fn HttpRequest? read_request(net::Socket* sock)
     char[] body = (char[]){};
     if (content_length > 0)
     {
-        body = mem::new_array(char, content_length);
+        body = mem::new_array(char, (sz)content_length);
         usz copied = body_in_hbuf < content_length ? body_in_hbuf : content_length;
         for (usz i = 0; i < copied; i++) body[i] = hbuf[hdr_end + 4 + i];
         usz remaining = content_length - copied;
@@ -166,7 +166,7 @@ fn HttpRequest? read_request(net::Socket* sock)
             usz r;
             if (try got = sock.read(body[offset..offset + remaining - 1]))
             {
-                r = got;
+                r = (usz)got;
             }
             else
             {
@@ -199,7 +199,7 @@ fn void write_all(net::Socket* sock, char[] data)
         if (try w = sock.write(data[off..data.len - 1]))
         {
             if (w == 0) return;
-            off += w;
+            off += (usz)w;
         }
         else
         {

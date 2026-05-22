@@ -64,7 +64,7 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
     }
 
     Object* body;
-    if (try parsed = json::parse_string(mem, (String)req.body))
+    if (try parsed = json::parse(mem, (String)req.body))
     {
         body = parsed;
     }
@@ -184,7 +184,7 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
     String prefix = "{\"data\":\"";
     String suffix = "\"}";
     usz total     = prefix.len + b64_str.len + suffix.len;
-    char[] resp   = mem::new_array(char, total);
+    char[] resp   = mem::new_array(char, (sz)total);
     usz off       = 0;
     for (usz i = 0; i < prefix.len; i++) resp[off++] = prefix[i];
     for (usz i = 0; i < b64_str.len; i++) resp[off++] = b64_str[i];

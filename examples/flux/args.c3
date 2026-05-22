@@ -94,7 +94,7 @@ fn flux::FluxConfig? parse_flux_args(String[] args, ServerOptions* server_opts) 
 
 fn void load_flux_config(String path, flux::FluxConfig* config) {
     char[] data = file::load(mem, path)!!;
-    Object* cfg = json::parse_string(mem, (String)data)!!;
+    Object* cfg = json::parse(mem, (String)data)!!;
 
     if (try v = cfg.get_string("model")) config.model_path = v;
     if (try v = cfg.get_string("text_model")) config.text_model_path = v;

@@ -55,7 +55,7 @@ fn SafetensorsFile? safetensors_open(String path) {
 
     // Parse JSON header using std library parser
     String header_str = (String)data[8 .. 8 + (usz)header_len - 1];
-    Object* root = json::parse_string(mem, header_str)!;
+    Object* root = json::parse(mem, header_str)!;
 
     if (!root.is_map()) {
         root.free();
@@ -98,7 +98,7 @@ fn SafetensorsFile? safetensors_open(String path) {
         }
     }
 
-    SafetensorsTensorInfo[] tensors = mem::new_array(SafetensorsTensorInfo, tensor_count);
+    SafetensorsTensorInfo[] tensors = mem::new_array(SafetensorsTensorInfo, (sz)tensor_count);
     usz n_tensors = 0;
 
     foreach (key : keys) {
@@ -183,19 +183,19 @@ fn Tensor? upload_safetensor_f32(DeviceContext* ctx, SafetensorsFile* sf, String
     if (info.dtype == "F32") {
         f32_data = (float*)data_ptr;
     } else if (info.dtype == "F16") {
-        f32_data = (float*)mem::calloc(f32_size);
+        f32_data = (float*)mem::calloc((sz)f32_size);
         needs_free = true;
         for (usz j = 0; j < n_elements; j++) {
             f32_data[j] = cpu_f16_to_f32(data_ptr + j * 2);
         }
     } else if (info.dtype == "BF16") {
-        f32_data = (float*)mem::calloc(f32_size);
+        f32_data = (float*)mem::calloc((sz)f32_size);
         needs_free = true;
         for (usz j = 0; j < n_elements; j++) {
             f32_data[j] = cpu_bf16_to_f32(data_ptr + j * 2);
         }
     } else if (info.dtype == "F8_E4M3") {
-        f32_data = (float*)mem::calloc(f32_size);
+        f32_data = (float*)mem::calloc((sz)f32_size);
         needs_free = true;
         for (usz j = 0; j < n_elements; j++) {
             f32_data[j] = cpu_fp8e4m3_to_f32(data_ptr + j);
@@ -210,7 +210,7 @@ fn Tensor? upload_safetensor_f32(DeviceContext* ctx, SafetensorsFile* sf, String
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: f32_data,
-        data_size: f32_size,
+        data_size: (sz)f32_size,
     )!!;
 
     if (needs_free) mem::free(f32_data);
@@ -256,19 +256,19 @@ fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, S
     if (info.dtype == "F32") {
         src_data = (float*)data_ptr;
     } else if (info.dtype == "F16") {
-        src_data = (float*)mem::calloc(f32_size);
+        src_data = (float*)mem::calloc((sz)f32_size);
         needs_free_src = true;
         for (usz j = 0; j < n_elements; j++) {
             src_data[j] = cpu_f16_to_f32(data_ptr + j * 2);
         }
     } else if (info.dtype == "BF16") {
-        src_data = (float*)mem::calloc(f32_size);
+        src_data = (float*)mem::calloc((sz)f32_size);
         needs_free_src = true;
         for (usz j = 0; j < n_elements; j++) {
             src_data[j] = cpu_bf16_to_f32(data_ptr + j * 2);
         }
     } else if (info.dtype == "F8_E4M3") {
-        src_data = (float*)mem::calloc(f32_size);
+        src_data = (float*)mem::calloc((sz)f32_size);
         needs_free_src = true;
         for (usz j = 0; j < n_elements; j++) {
             src_data[j] = cpu_fp8e4m3_to_f32(data_ptr + j);
@@ -279,7 +279,7 @@ fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, S
     }
 
     // Transpose: [C_out, C_in, kH, kW] → [kH, kW, C_in, C_out]
-    float* dst_data = (float*)mem::calloc(f32_size);
+    float* dst_data = (float*)mem::calloc((sz)f32_size);
     for (usz oc = 0; oc < c_out; oc++) {
         for (usz ic = 0; ic < c_in; ic++) {
             for (usz h = 0; h < kh; h++) {
@@ -299,7 +299,7 @@ fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, S
         usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: dst_data,
-        data_size: f32_size,
+        data_size: (sz)f32_size,
     )!!;
 
     mem::free(dst_data);

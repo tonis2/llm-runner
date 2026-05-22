@@ -293,7 +293,7 @@ fn float[]? encode_image_object_to_dit_latent(
 			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
 			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: input_chw.ptr,
-			data_size: img_bytes,
+			data_size: (sz)img_bytes,
 		)!!;
 		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer up_cmd)
 		{
@@ -325,7 +325,7 @@ fn float[]? encode_image_object_to_dit_latent(
 			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
 			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: null,
-			data_size: enc_bytes,
+			data_size: (sz)enc_bytes,
 		)!!;
 		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer dl_cmd)
 		{
@@ -337,7 +337,7 @@ fn float[]? encode_image_object_to_dit_latent(
 				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = 0, .size = enc_bytes } }
 			);
 		}!!;
-		mem::copy(enc_out_cpu.ptr, dl_staging.data(), enc_bytes);
+		mem::copy(enc_out_cpu.ptr, dl_staging.data(), (sz)enc_bytes);
 		dl_staging.free();
 	}
 
@@ -467,13 +467,13 @@ fn llm::Tensor? encode_text_multilayer(
 	// 3. Concatenate: interleave 3 layer outputs → [seq_len, 3*dim]
 	uint out_dim       = dim * 3;
 	usz out_size       = (usz)seq_len * out_dim;
-	float[] concat_cpu = mem::new_array(float, out_size);
+	float[] concat_cpu = mem::new_array(float, (sz)out_size);
 
 	// Download all 3 layer outputs
 	float*[3] layer_data;
 	for (uint i = 0; i < 3; i++)
 	{
-		layer_data[i] = (float*)mem::calloc((usz)seq_len * dim * 4);
+		layer_data[i] = (float*)mem::calloc((sz)((usz)seq_len * dim * 4));
 		vk::Memory dl = vk::new_buffer(
 			allocator: &ctx.allocator,
 			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -519,7 +519,7 @@ fn llm::Tensor? encode_text_multilayer(
 			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
 			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: concat_cpu.ptr,
-			data_size: out_size * 4,
+			data_size: (sz)(out_size * 4),
 		)!!;
 		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer ul_cmd)
 		{

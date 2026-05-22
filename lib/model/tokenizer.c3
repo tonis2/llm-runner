@@ -2,7 +2,7 @@ module llm;
 
 import std::io;
 import std::core::mem;
-import std::ascii;
+import std::core::ascii;
 
 const uint TOKEN_NORMAL       = 1;
 const uint TOKEN_CONTROL      = 3;
@@ -29,10 +29,10 @@ fn VocabMap create_vocab_map(String[] vocab, float[] scores, uint[] token_types)
     VocabMap map;
     usz cap = next_pow2(vocab.len * 2);
     map.capacity = cap;
-    map.keys = mem::new_array(String, cap);
-    map.ids = mem::new_array(uint, cap);
-    map.scores = mem::new_array(float, cap);
-    map.occupied = mem::new_array(bool, cap);
+    map.keys = mem::new_array(String, (sz)cap);
+    map.ids = mem::new_array(uint, (sz)cap);
+    map.scores = mem::new_array(float, (sz)cap);
+    map.occupied = mem::new_array(bool, (sz)cap);
 
     for (usz i = 0; i < cap; i++) {
         map.occupied[i] = false;
@@ -116,10 +116,10 @@ fn MergeMap create_merge_map(usz expected_count) {
     usz cap = next_pow2(expected_count * 2);
     if (cap < 1024) cap = 1024;
     map.capacity = cap;
-    map.keys_a = mem::new_array(String, cap);
-    map.keys_b = mem::new_array(String, cap);
-    map.ranks = mem::new_array(uint, cap);
-    map.occupied = mem::new_array(bool, cap);
+    map.keys_a = mem::new_array(String, (sz)cap);
+    map.keys_b = mem::new_array(String, (sz)cap);
+    map.ranks = mem::new_array(uint, (sz)cap);
+    map.occupied = mem::new_array(bool, (sz)cap);
     for (usz i = 0; i < cap; i++) {
         map.occupied[i] = false;
     }
@@ -446,7 +446,7 @@ fn uint[]? Tokenizer.encode_spm(&self, String text) {
 
     // Build escaped text: prepend ▁, replace spaces with ▁ (3 bytes: E2 96 81)
     usz max_esc = text.len * 3 + 3;
-    char[] esc = mem::new_array(char, max_esc);
+    char[] esc = mem::new_array(char, (sz)max_esc);
     defer mem::free(esc);
 
     usz esc_len = 0;
@@ -467,7 +467,7 @@ fn uint[]? Tokenizer.encode_spm(&self, String text) {
 
     // Split into UTF-8 codepoints -> initial BPE symbols
     usz max_syms = esc_len * 4;
-    BPESymbol[] syms = mem::new_array(BPESymbol, max_syms);
+    BPESymbol[] syms = mem::new_array(BPESymbol, (sz)max_syms);
     defer mem::free(syms);
 
     usz n_syms = 0;
@@ -547,7 +547,7 @@ fn uint[]? Tokenizer.encode_spm(&self, String text) {
     }
 
     // Build output token array
-    uint[] tokens = mem::new_array(uint, n_tokens);
+    uint[] tokens = mem::new_array(uint, (sz)n_tokens);
     s = 0;
     usz ti = 0;
     while (s != -1) {
@@ -618,7 +618,7 @@ struct WordSpan {
 
 fn WordSpan[] pre_tokenize(String text, usz* out_count) {
     usz max_words = text.len + 1;
-    WordSpan[] words = mem::new_array(WordSpan, max_words);
+    WordSpan[] words = mem::new_array(WordSpan, (sz)max_words);
     usz n_words = 0;
     usz pos = 0;
 
@@ -637,17 +637,17 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
 
         // Optionally consume a single leading space (0x20) before non-whitespace.
         // This matches GPT-2 regex patterns like ` ?\p{L}+` which group space with word.
-        if (c == ' ' && pos + 1 < text.len && !ascii::is_space_m(text[pos + 1])) {
+        if (c == ' ' && pos + 1 < text.len && !ascii::is_space(text[pos + 1])) {
             pos++;
             c = text[pos];
         }
 
         // Letters (including UTF-8 multi-byte sequences)
-        if (ascii::is_alpha_m(c) || (c & 0x80) != 0) {
+        if (ascii::is_alpha(c) || (c & 0x80) != 0) {
             pos++;
             while (pos < text.len) {
                 char nc = text[pos];
-                if (ascii::is_alpha_m(nc) || is_utf8_cont(nc) || (nc & 0x80) != 0) {
+                if (ascii::is_alpha(nc) || is_utf8_cont(nc) || (nc & 0x80) != 0) {
                     pos++;
                 } else {
                     break;
@@ -659,9 +659,9 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
         }
 
         // Digits (1-3 at a time)
-        if (ascii::is_digit_m(c)) {
+        if (ascii::is_digit(c)) {
             usz count = 0;
-            while (pos < text.len && ascii::is_digit_m(text[pos]) && count < 3) {
+            while (pos < text.len && ascii::is_digit(text[pos]) && count < 3) {
                 pos++;
                 count++;
             }
@@ -671,8 +671,8 @@ fn WordSpan[] pre_tokenize(String text, usz* out_count) {
         }
 
         // Whitespace
-        if (ascii::is_space_m(c)) {
-            while (pos < text.len && ascii::is_space_m(text[pos])) {
+        if (ascii::is_space(c)) {
+            while (pos < text.len && ascii::is_space(text[pos])) {
                 pos++;
             }
             words[n_words] = { .start = start, .len = pos - start };
@@ -734,17 +734,17 @@ fn uint[]? Tokenizer.encode_bpe(&self, String text) {
 
     // Collect all tokens into a dynamic list
     usz max_tokens = text.len + n_words;
-    uint[] all_tokens = mem::new_array(uint, max_tokens);
+    uint[] all_tokens = mem::new_array(uint, (sz)max_tokens);
     usz total_tokens = 0;
 
     // Buffer for GPT-2 byte encoding (each raw byte -> up to 2 UTF-8 bytes)
     usz enc_buf_size = text.len * 3 + 16;
-    char[] enc_buf = mem::new_array(char, enc_buf_size);
+    char[] enc_buf = mem::new_array(char, (sz)enc_buf_size);
     defer mem::free(enc_buf);
 
     // Allocate shared BPE symbol buffer
     usz max_syms = text.len * 4;
-    BPESymbol[] syms = mem::new_array(BPESymbol, max_syms);
+    BPESymbol[] syms = mem::new_array(BPESymbol, (sz)max_syms);
     defer mem::free(syms);
 
     for (usz w = 0; w < n_words; w++) {
@@ -815,7 +815,7 @@ fn uint[]? Tokenizer.encode_bpe(&self, String text) {
     }
 
     // Trim to actual size
-    uint[] result = mem::new_array(uint, total_tokens);
+    uint[] result = mem::new_array(uint, (sz)total_tokens);
     for (usz i = 0; i < total_tokens; i++) {
         result[i] = all_tokens[i];
     }
@@ -898,7 +898,7 @@ fn uint[]? Tokenizer.encode_with_specials(&self, String text) {
         pos = seg_end;
     }
 
-    uint[] trimmed = mem::new_array(uint, n);
+    uint[] trimmed = mem::new_array(uint, (sz)n);
     for (usz i = 0; i < n; i++) trimmed[i] = result[i];
     mem::free(result);
     return trimmed;

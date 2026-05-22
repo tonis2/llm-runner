@@ -181,13 +181,13 @@ fn GGUFFile? gguf_parse(char[] data) {
 
 
     // Allocate metadata array
-    GGUFMetaKV[] metadata = mem::new_array(GGUFMetaKV, (usz)n_kv);
+    GGUFMetaKV[] metadata = mem::new_array(GGUFMetaKV, (sz)n_kv);
     for (ulong i = 0; i < n_kv; i++) {
         metadata[(usz)i] = reader.read_meta_kv();
     }
 
     // Allocate tensor info array
-    GGUFTensorInfo[] tensors = mem::new_array(GGUFTensorInfo, (usz)n_tensors);
+    GGUFTensorInfo[] tensors = mem::new_array(GGUFTensorInfo, (sz)n_tensors);
     for (ulong i = 0; i < n_tensors; i++) {
         tensors[(usz)i] = reader.read_tensor_info();
     }

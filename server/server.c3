@@ -13,7 +13,7 @@ alias HandlerFn = fn void(net::Socket* sock, http::HttpRequest* req);
 // a module-level variable.
 fn void? serve(String host, uint port, HandlerFn handler)
 {
-    tcp::TcpServerSocket listen_sock = tcp::listen(host, port, 16, net::SocketOption.REUSEADDR)!;
+    tcp::TcpServerSocket listen_sock = tcp::listen(host, (int)port, 16, net::SocketOption.REUSEADDR)!;
     defer (void)listen_sock.close();
     io::printfn("[server] listening on %s:%d", host, port);
 

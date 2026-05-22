@@ -27,7 +27,7 @@ fn FluxDiTKernels? create_flux_dit_kernels(llm::DeviceContext* ctx)
 		ctx,
 		zi_shader,
 		3,
-		zimage::GatedResidualPC.sizeof,
+		zimage::GatedResidualPC::size,
 		"gated_residual_linear"
 	)!!;
 
