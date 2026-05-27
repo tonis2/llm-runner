@@ -167,3 +167,111 @@ fn void? flux_merge_lora_into_weights(FluxDiTModel* model) {
     double ms = t0.to_now().to_sec() * 1000.0;
     io::printfn("  Flux LoRA merged into Q8_0 weights: %d sites, %.0f ms", total_sites_merged, ms);
 }
+
+// One LoKr site: dispatch the q8_lokr_merge kernel for `base` and clear
+// `lokr.present`. No-op on miss or unsupported base dtype.
+fn void merge_one_lokr_site(
+    llm::RenderGraph* g,
+    FluxDiTKernels* dk,
+    llm::Tensor* base,
+    llm::LokrTensor* lokr,
+) {
+    if (!lokr.present) return;
+    if (base.dtype != llm::GGML_Q8_0) return;
+
+    uint in_dim = (uint)base.shape[0];
+    uint b_rows = lokr.w1_rows * lokr.w2_rows;
+
+    if ((in_dim % 256) != 0) {
+        io::printfn("    LoKr merge: in_dim=%d not a multiple of 256, skipping", in_dim);
+        return;
+    }
+    if (lokr.w1_rows * lokr.w1_cols > 256) {
+        io::printfn("    LoKr merge: W1 too large (%dx%d), skipping", lokr.w1_rows, lokr.w1_cols);
+        return;
+    }
+    if (lokr.w1_cols * lokr.w2_cols != in_dim) {
+        io::printfn("    LoKr merge: shape mismatch (w1_cols*w2_cols=%d != in_dim=%d), skipping",
+            lokr.w1_cols * lokr.w2_cols, in_dim);
+        return;
+    }
+
+    zimage::Q8LokrMergePC pc = {
+        .in_dim         = in_dim,
+        .b_rows         = b_rows,
+        .dst_row_offset = 0,
+        .w1_rows        = lokr.w1_rows,
+        .w1_cols        = lokr.w1_cols,
+        .w2_rows        = lokr.w2_rows,
+        .w2_cols        = lokr.w2_cols,
+        .scale          = lokr.scale,
+    };
+    uint chunks = in_dim / 256;
+    g.dispatch(&dk.dit.q8_lokr_merge, { base, &lokr.w1, &lokr.w2 }, &pc, chunks, b_rows);
+    lokr.present = false;
+}
+
+// Fold every present LoKr site in `adapter` into the Q8_0 DiT weights and
+// free the adapter. Idempotent: no-op when adapter is not loaded.
+fn void? flux_merge_lokr_into_weights(FluxDiTModel* model, llm::FluxLokrAdapter* adapter) {
+    if (!adapter.loaded) return;
+
+    Clock t0 = clock::now();
+
+    llm::RenderGraph g;
+    g.init(model.ctx)!!;
+
+    for (uint l = 0; l < model.n_dual_blocks; l++) {
+        FluxDualBlockWeights* bw = &model.dual_blocks[l];
+        llm::FluxDualLokrLayer* lo = &adapter.dual_layers[l];
+
+        merge_one_lokr_site(&g, model.dk, &bw.img_qkv_w,      &lo.img_qkv);
+        merge_one_lokr_site(&g, model.dk, &bw.img_proj_w,     &lo.img_proj);
+        merge_one_lokr_site(&g, model.dk, &bw.img_mlp_up_w,   &lo.img_mlp_up);
+        merge_one_lokr_site(&g, model.dk, &bw.img_mlp_down_w, &lo.img_mlp_down);
+        merge_one_lokr_site(&g, model.dk, &bw.txt_qkv_w,      &lo.txt_qkv);
+        merge_one_lokr_site(&g, model.dk, &bw.txt_proj_w,     &lo.txt_proj);
+        merge_one_lokr_site(&g, model.dk, &bw.txt_mlp_up_w,   &lo.txt_mlp_up);
+        merge_one_lokr_site(&g, model.dk, &bw.txt_mlp_down_w, &lo.txt_mlp_down);
+    }
+
+    for (uint l = 0; l < model.n_single_blocks; l++) {
+        FluxSingleBlockWeights* sw = &model.single_blocks[l];
+        llm::FluxSingleLokrLayer* lo = &adapter.single_layers[l];
+
+        merge_one_lokr_site(&g, model.dk, &sw.linear1_w, &lo.linear1);
+        merge_one_lokr_site(&g, model.dk, &sw.linear2_w, &lo.linear2);
+    }
+
+    g.flush()!!;
+
+    // Free W1/W2 tensors of all sites that merged. Sites that bailed (wrong
+    // shape, non-Q8_0 base) are left untouched by adapter.free() below.
+    uint total_sites_merged = 0;
+    for (uint l = 0; l < model.n_dual_blocks; l++) {
+        llm::FluxDualLokrLayer* lo = &adapter.dual_layers[l];
+        if (!lo.img_qkv.present      && lo.img_qkv.w1_rows      > 0) { lo.img_qkv.w1.free();      lo.img_qkv.w2.free();      total_sites_merged++; }
+        if (!lo.img_proj.present     && lo.img_proj.w1_rows     > 0) { lo.img_proj.w1.free();     lo.img_proj.w2.free();     total_sites_merged++; }
+        if (!lo.img_mlp_up.present   && lo.img_mlp_up.w1_rows   > 0) { lo.img_mlp_up.w1.free();   lo.img_mlp_up.w2.free();   total_sites_merged++; }
+        if (!lo.img_mlp_down.present && lo.img_mlp_down.w1_rows > 0) { lo.img_mlp_down.w1.free(); lo.img_mlp_down.w2.free(); total_sites_merged++; }
+        if (!lo.txt_qkv.present      && lo.txt_qkv.w1_rows      > 0) { lo.txt_qkv.w1.free();      lo.txt_qkv.w2.free();      total_sites_merged++; }
+        if (!lo.txt_proj.present     && lo.txt_proj.w1_rows     > 0) { lo.txt_proj.w1.free();     lo.txt_proj.w2.free();     total_sites_merged++; }
+        if (!lo.txt_mlp_up.present   && lo.txt_mlp_up.w1_rows   > 0) { lo.txt_mlp_up.w1.free();   lo.txt_mlp_up.w2.free();   total_sites_merged++; }
+        if (!lo.txt_mlp_down.present && lo.txt_mlp_down.w1_rows > 0) { lo.txt_mlp_down.w1.free(); lo.txt_mlp_down.w2.free(); total_sites_merged++; }
+    }
+    for (uint l = 0; l < model.n_single_blocks; l++) {
+        llm::FluxSingleLokrLayer* lo = &adapter.single_layers[l];
+        if (!lo.linear1.present && lo.linear1.w1_rows > 0) { lo.linear1.w1.free(); lo.linear1.w2.free(); total_sites_merged++; }
+        if (!lo.linear2.present && lo.linear2.w1_rows > 0) { lo.linear2.w1.free(); lo.linear2.w2.free(); total_sites_merged++; }
+    }
+    if (adapter.n_dual > 0)   std::core::mem::free(adapter.dual_layers);
+    if (adapter.n_single > 0) std::core::mem::free(adapter.single_layers);
+    adapter.loaded = false;
+    adapter.dual_layers = null;
+    adapter.single_layers = null;
+    adapter.n_dual = 0;
+    adapter.n_single = 0;
+
+    double ms = t0.to_now().to_sec() * 1000.0;
+    io::printfn("  Flux LoKr merged into Q8_0 weights: %d sites, %.0f ms", total_sites_merged, ms);
+}

@@ -207,6 +207,23 @@ struct Q8LoraMergePC
 	uint  _pad2;
 }
 
+// Push-constants for q8_lokr_merge: one shot at load time, folds the LoKr's
+// scale*(W1 ⊗ W2) correction into the Q8_0 base weight in place.
+// (i, j) maps to W1[i / w2_rows, j / w2_cols] * W2[i % w2_rows, j % w2_cols].
+// b_rows = w1_rows * w2_rows (LyCORIS LoKr files never target sub-ranges, but
+// dst_row_offset is kept for API symmetry with q8_lora_merge).
+struct Q8LokrMergePC
+{
+	uint  in_dim;
+	uint  b_rows;
+	uint  dst_row_offset;
+	uint  w1_rows;
+	uint  w1_cols;
+	uint  w2_rows;
+	uint  w2_cols;
+	float scale;
+}
+
 struct FFNSwigluSplitPC
 {
 	uint n_elements; // seq_len * ffn_dim
@@ -367,6 +384,7 @@ struct DiTKernels
 	llm::ComputeKernel batch_matmul_q6k;
 	llm::ComputeKernel batch_matmul_add_scaled; // F32 LoRA hop 2: output += scale * (B @ scratch)
 	llm::ComputeKernel q8_lora_merge; // One-shot: fold scale*B@A into Q8_0 base weight in place
+	llm::ComputeKernel q8_lokr_merge; // One-shot: fold scale*(W1 ⊗ W2) into Q8_0 base weight in place
 	llm::ComputeKernel ffn_swiglu_split; // Phase 1: out[i] = silu(in[i]) * in[ffn_dim + i]
 	llm::ComputeKernel batch_matmul_swiglu_q8; // Phase 2: fused gate+up Q8_0 matmul + SwiGLU
 	llm::ComputeKernel batch_matmul_q8_coopmat; // Phase 3: Q8_0 matmul via cooperative matrix
@@ -491,6 +509,7 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		.batch_matmul_q6k = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q6k")!!,
 		.batch_matmul_add_scaled = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulAddScaledPC::size, "batch_matmul_add_scaled")!!,
 		.q8_lora_merge = llm::create_kernel(ctx, llm_shader, 3, Q8LoraMergePC::size, "q8_lora_merge")!!,
+		.q8_lokr_merge = llm::create_kernel(ctx, llm_shader, 3, Q8LokrMergePC::size, "q8_lokr_merge")!!,
 		.ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC::size, "ffn_swiglu_split")!!,
 		.batch_matmul_swiglu_q8 = llm::create_kernel(ctx, llm_shader, 4, BatchMatMulPC::size, "batch_matmul_swiglu_q8")!!,
 		.batch_matmul_q8_coopmat = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q8_coopmat")!!,
@@ -2026,6 +2045,7 @@ fn void DiTModel.free(&self)
 	self.kernels.batch_matmul_q6k.free(self.ctx.device);
 	self.kernels.batch_matmul_add_scaled.free(self.ctx.device);
 	self.kernels.q8_lora_merge.free(self.ctx.device);
+	self.kernels.q8_lokr_merge.free(self.ctx.device);
 	self.kernels.ffn_swiglu_split.free(self.ctx.device);
 	self.kernels.batch_matmul_swiglu_q8.free(self.ctx.device);
 	self.kernels.batch_matmul_q8_coopmat.free(self.ctx.device);

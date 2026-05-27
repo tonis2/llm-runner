@@ -799,3 +799,276 @@ fn FluxLoraAdapter? load_flux_lora_safetensors(
         .loaded = true,
     };
 }
+
+// ============================================================================
+// Flux 2 Klein LoKr (Low-rank Kronecker) adapter support.
+//
+// LyCORIS LoKr files (e.g. trained with ai-toolkit) decompose the delta as a
+// Kronecker product instead of a low-rank product:
+//   ΔW = scale * (W1 ⊗ W2)
+// where W1 is small ([w1_rows, w1_cols], typically 4×4) and W2 is rectangular
+// of shape [w2_rows, w2_cols], satisfying w1_rows * w2_rows = out_dim and
+// w1_cols * w2_cols = in_dim.
+//
+// We only support the "full" variant where both lokr_w1 and lokr_w2 are stored
+// as dense matrices (no further low-rank factorisation into _a / _b pairs).
+// All sites observed in the Flux 2 Klein ai-toolkit LoKr files use this form.
+//
+// Naming uses scheme #2 (ComfyUI "diffusion_model." prefix) — no sub-range
+// targeting (Q/K/V are always inside the fused qkv weight), so we only carry
+// the fused module slots.
+// ============================================================================
+
+// One adapted linear in LoKr form. The two factor matrices are uploaded as
+// F32 tensors; the kernel does the Kronecker expansion element-wise on the
+// fly during the Q8_0 merge pass.
+struct LokrTensor {
+    Tensor w1;       // [w1_rows, w1_cols] F32 (after upload reversal: shape[0]=w1_cols, shape[1]=w1_rows)
+    Tensor w2;       // [w2_rows, w2_cols] F32 (after upload reversal: shape[0]=w2_cols, shape[1]=w2_rows)
+    uint   w1_rows;
+    uint   w1_cols;
+    uint   w2_rows;
+    uint   w2_cols;
+    float  scale;
+    bool   present;
+}
+
+fn void LokrTensor.free(&self) {
+    if (self.present) {
+        self.w1.free();
+        self.w2.free();
+        self.present = false;
+    }
+}
+
+struct FluxDualLokrLayer {
+    LokrTensor img_qkv;
+    LokrTensor img_proj;
+    LokrTensor img_mlp_up;     // img_mlp.0
+    LokrTensor img_mlp_down;   // img_mlp.2
+    LokrTensor txt_qkv;
+    LokrTensor txt_proj;
+    LokrTensor txt_mlp_up;
+    LokrTensor txt_mlp_down;
+}
+
+fn void FluxDualLokrLayer.free(&self) {
+    self.img_qkv.free(); self.img_proj.free();
+    self.img_mlp_up.free(); self.img_mlp_down.free();
+    self.txt_qkv.free(); self.txt_proj.free();
+    self.txt_mlp_up.free(); self.txt_mlp_down.free();
+}
+
+struct FluxSingleLokrLayer {
+    LokrTensor linear1;
+    LokrTensor linear2;
+}
+
+fn void FluxSingleLokrLayer.free(&self) {
+    self.linear1.free(); self.linear2.free();
+}
+
+struct FluxLokrAdapter {
+    String path;
+    float  strength;
+    FluxDualLokrLayer*   dual_layers;
+    FluxSingleLokrLayer* single_layers;
+    uint   n_dual;
+    uint   n_single;
+    uint   covered_sites;
+    bool   loaded;
+}
+
+fn void FluxLokrAdapter.free(&self) {
+    if (!self.loaded) return;
+    for (uint l = 0; l < self.n_dual; l++)   self.dual_layers[l].free();
+    for (uint l = 0; l < self.n_single; l++) self.single_layers[l].free();
+    if (self.n_dual > 0)   mem::free(self.dual_layers);
+    if (self.n_single > 0) mem::free(self.single_layers);
+    self.loaded = false;
+}
+
+// Try to load one LoKr site (one lokr_w1 + one lokr_w2 + one alpha scalar)
+// under module path "{prefix}{layer}{suffix}{module}". Returns a populated
+// LokrTensor on success or zero-init (present=false) on miss.
+fn LokrTensor try_load_flux_lokr_site(
+    DeviceContext* ctx,
+    SafetensorsFile* sf,
+    String layer_prefix,
+    uint layer,
+    String layer_suffix,
+    String module_suffix,
+    float strength,
+) {
+    LokrTensor result;
+    if (module_suffix.len == 0) return result;
+
+    char[256] mod_buf;
+    String full_module = flux_build_module_path(&mod_buf, layer_prefix, layer, layer_suffix, module_suffix);
+
+    char[256] w1_buf;
+    char[256] w2_buf;
+    usz p1 = append_str(&w1_buf, 0, full_module);
+    p1 = append_str(&w1_buf, p1, ".lokr_w1");
+    usz p2 = append_str(&w2_buf, 0, full_module);
+    p2 = append_str(&w2_buf, p2, ".lokr_w2");
+    String w1_name = (String)w1_buf[0:p1];
+    String w2_name = (String)w2_buf[0:p2];
+
+    SafetensorsTensorInfo* w1_info;
+    SafetensorsTensorInfo* w2_info;
+    if (try info = sf.find_tensor(w1_name)) { w1_info = info; } else { return result; }
+    if (try info = sf.find_tensor(w2_name)) { w2_info = info; } else { return result; }
+
+    if (w1_info.n_dims != 2 || w2_info.n_dims != 2) return result;
+
+    // Safetensors header shapes are in [rows, cols] = [out, in] order.
+    uint w1_rows = (uint)w1_info.shape[0];
+    uint w1_cols = (uint)w1_info.shape[1];
+    uint w2_rows = (uint)w2_info.shape[0];
+    uint w2_cols = (uint)w2_info.shape[1];
+
+    Tensor w1_tensor;
+    Tensor w2_tensor;
+    if (try t = upload_safetensor_f32(ctx, sf, w1_name)) {
+        w1_tensor = t;
+    } else {
+        return result;
+    }
+    if (try t = upload_safetensor_f32(ctx, sf, w2_name)) {
+        w2_tensor = t;
+    } else {
+        w1_tensor.free();
+        return result;
+    }
+
+    // Scale calibration: ai-toolkit LoKr files declare a per-site `.alpha`
+    // tensor (often mislabelled as BF16 but actually F16-encoded) with values
+    // around ~32. The LyCORIS canonical scale is `alpha / lora_dim`, but
+    // lora_dim is not in metadata. Empirically, raw scale = strength (i.e.
+    // alpha treated as already-normalised by the trainer) produces sensible
+    // output for ai-toolkit's files.
+    float scale = strength;
+
+    result.w1 = w1_tensor;
+    result.w2 = w2_tensor;
+    result.w1_rows = w1_rows;
+    result.w1_cols = w1_cols;
+    result.w2_rows = w2_rows;
+    result.w2_cols = w2_cols;
+    result.scale = scale;
+    result.present = true;
+    return result;
+}
+
+// Probe the file for any `.lokr_w1` tensor under one of our known Flux schemes.
+// Returns the matching scheme or null.
+fn FluxLoraScheme* detect_flux_lokr_scheme(SafetensorsFile* sf) {
+    String[*] dual_modules = { "img_attn.qkv", "img_attn.proj", "img_mlp.0", "txt_attn.qkv" };
+    String[*] single_modules = { "linear1", "linear2" };
+    for (uint i = 0; i < FLUX_LORA_SCHEMES.len; i++) {
+        FluxLoraScheme* s = &FLUX_LORA_SCHEMES[i];
+        // Only native-fused schemes have a meaningful LoKr layout — the
+        // Diffusers scheme uses split Q/K/V and isn't observed in LoKr files.
+        if (s.img_qkv.len == 0) continue;
+        for (uint m = 0; m < dual_modules.len; m++) {
+            char[256] mod_buf;
+            String full = flux_build_module_path(&mod_buf, s.dual_prefix, 0, s.layer_suffix, dual_modules[m]);
+            char[256] w_buf;
+            usz pw = append_str(&w_buf, 0, full);
+            pw = append_str(&w_buf, pw, ".lokr_w1");
+            String w_name = (String)w_buf[0:pw];
+            if (try _info = sf.find_tensor(w_name)) return s;
+        }
+        for (uint m = 0; m < single_modules.len; m++) {
+            char[256] mod_buf;
+            String full = flux_build_module_path(&mod_buf, s.single_prefix, 0, s.layer_suffix, single_modules[m]);
+            char[256] w_buf;
+            usz pw = append_str(&w_buf, 0, full);
+            pw = append_str(&w_buf, pw, ".lokr_w1");
+            String w_name = (String)w_buf[0:pw];
+            if (try _info = sf.find_tensor(w_name)) return s;
+        }
+    }
+    return null;
+}
+
+// Public entry point: open a safetensors file, autodetect the naming scheme,
+// and populate a FluxLokrAdapter for the model's block counts.
+fn FluxLokrAdapter? load_flux_lokr_safetensors(
+    DeviceContext* ctx,
+    String path,
+    float strength,
+    uint n_dual,
+    uint n_single,
+) {
+    io::printfn("  Loading Flux LoKr: %s", path);
+    SafetensorsFile sf = safetensors_open(path)!;
+    defer sf.close();
+
+    FluxLoraScheme* scheme = detect_flux_lokr_scheme(&sf);
+    if (scheme == null) {
+        io::printfn("  Flux LoKr: no recognised tensor naming scheme. Header keys (first 8):");
+        usz max = sf.n_tensors < 8 ? sf.n_tensors : 8;
+        for (usz i = 0; i < max; i++) {
+            io::printfn("    %s", sf.tensors[i].name);
+        }
+        return COMPUTE_ERROR~;
+    }
+    io::printfn("  Flux LoKr scheme: dual=\"%s\", single=\"%s\"", scheme.dual_prefix, scheme.single_prefix);
+
+    FluxDualLokrLayer[]   dual   = n_dual   > 0 ? mem::new_array(FluxDualLokrLayer, n_dual)     : (FluxDualLokrLayer[]){};
+    FluxSingleLokrLayer[] single = n_single > 0 ? mem::new_array(FluxSingleLokrLayer, n_single) : (FluxSingleLokrLayer[]){};
+
+    uint covered = 0;
+    for (uint l = 0; l < n_dual; l++) {
+        FluxDualLokrLayer* dl = &dual[l];
+        dl.img_qkv      = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_qkv,      strength);
+        dl.img_proj     = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_proj,     strength);
+        dl.img_mlp_up   = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_mlp_up,   strength);
+        dl.img_mlp_down = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.img_mlp_down, strength);
+        dl.txt_qkv      = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_qkv,      strength);
+        dl.txt_proj     = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_proj,     strength);
+        dl.txt_mlp_up   = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_mlp_up,   strength);
+        dl.txt_mlp_down = try_load_flux_lokr_site(ctx, &sf, scheme.dual_prefix, l, scheme.layer_suffix, scheme.txt_mlp_down, strength);
+
+        if (dl.img_qkv.present)      covered++;
+        if (dl.img_proj.present)     covered++;
+        if (dl.img_mlp_up.present)   covered++;
+        if (dl.img_mlp_down.present) covered++;
+        if (dl.txt_qkv.present)      covered++;
+        if (dl.txt_proj.present)     covered++;
+        if (dl.txt_mlp_up.present)   covered++;
+        if (dl.txt_mlp_down.present) covered++;
+    }
+
+    for (uint l = 0; l < n_single; l++) {
+        FluxSingleLokrLayer* sl = &single[l];
+        sl.linear1 = try_load_flux_lokr_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_linear1, strength);
+        sl.linear2 = try_load_flux_lokr_site(ctx, &sf, scheme.single_prefix, l, scheme.layer_suffix, scheme.single_linear2, strength);
+
+        if (sl.linear1.present) covered++;
+        if (sl.linear2.present) covered++;
+    }
+
+    io::printfn("  Flux LoKr loaded: strength=%.2f, covered %d sites", strength, covered);
+
+    if (covered == 0) {
+        io::printfn("  Flux LoKr: 0 sites covered — first 10 file keys for diagnosis:");
+        usz max = sf.n_tensors < 10 ? sf.n_tensors : 10;
+        for (usz i = 0; i < max; i++) {
+            io::printfn("    %s", sf.tensors[i].name);
+        }
+    }
+
+    return {
+        .path = path,
+        .strength = strength,
+        .dual_layers = n_dual > 0 ? &dual[0] : null,
+        .single_layers = n_single > 0 ? &single[0] : null,
+        .n_dual = n_dual,
+        .n_single = n_single,
+        .covered_sites = covered,
+        .loaded = true,
+    };
+}

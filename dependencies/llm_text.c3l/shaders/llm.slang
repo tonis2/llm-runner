@@ -1391,6 +1391,147 @@ void q8_lora_merge(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// --- LoKr merge into Q8_0 base weight (one-shot, at load time) ---
+//
+// LyCORIS LoKr decomposes the delta as a Kronecker product:
+//   ΔW = scale * (W1 ⊗ W2)
+// where W1 is small ([w1_rows, w1_cols], typically 4×4) and W2 is rectangular
+// of shape [w2_rows, w2_cols] with w1_rows * w2_rows = out_dim and
+// w1_cols * w2_cols = in_dim. Per element:
+//   ΔW[i, j] = scale * W1[i / w2_rows, j / w2_cols] * W2[i % w2_rows, j % w2_cols]
+//
+// Dispatch shape and Q8_0 pack/unpack/requant logic mirror q8_lora_merge.
+
+struct Q8LokrMergeParams {
+    uint  in_dim;
+    uint  b_rows;
+    uint  dst_row_offset;
+    uint  w1_rows;
+    uint  w1_cols;
+    uint  w2_rows;
+    uint  w2_cols;
+    float scale;
+};
+
+[vk_push_constant] const Q8LokrMergeParams q8lkm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint>  q8lkm_base;   // Q8_0 base weight (in-place)
+[vk_binding(1, 0)] RWStructuredBuffer<float> q8lkm_w1;     // [w1_rows, w1_cols] F32
+[vk_binding(2, 0)] RWStructuredBuffer<float> q8lkm_w2;     // [w2_rows, w2_cols] F32
+
+groupshared float q8lkm_W1[256];
+groupshared float q8lkm_scratch[256];
+groupshared uint  q8lkm_quants[256];
+groupshared uint  q8lkm_scales[8];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void q8_lokr_merge(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint in_dim   = q8lkm_pc.in_dim;
+    uint b_rows   = q8lkm_pc.b_rows;
+    uint w1_cols  = q8lkm_pc.w1_cols;
+    uint w2_rows  = q8lkm_pc.w2_rows;
+    uint w2_cols  = q8lkm_pc.w2_cols;
+    uint lora_row = gid.y;
+    if (lora_row >= b_rows) return;
+
+    uint base_row          = q8lkm_pc.dst_row_offset + lora_row;
+    uint k_start           = gid.x * 256;
+    uint bytes_per_row     = (in_dim / 32) * 34;
+    uint row_byte_offset   = base_row * bytes_per_row;
+    uint chunk_byte_offset = row_byte_offset + (k_start / 32) * 34;
+    uint chunk_uint_offset = chunk_byte_offset / 4;
+
+    uint block_in_wg   = gi / 32;
+    uint elem_in_block = gi % 32;
+    uint k             = k_start + gi;
+
+    // 1) Cooperative load of W1 into shared.
+    uint w1_count = q8lkm_pc.w1_rows * w1_cols;
+    if (gi < w1_count) {
+        q8lkm_W1[gi] = q8lkm_w1[gi];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 2) Dequantize existing Q8_0 element at (base_row, k).
+    uint base_block_byte    = chunk_byte_offset + block_in_wg * 34;
+    uint scale_uint_idx     = base_block_byte / 4;
+    uint scale_byte_in_uint = base_block_byte % 4;
+    uint scale_word         = q8lkm_base[scale_uint_idx];
+    uint old_scale_bits;
+    if (scale_byte_in_uint == 0) {
+        old_scale_bits = scale_word & 0xFFFFu;
+    } else {
+        old_scale_bits = (scale_word >> 16) & 0xFFFFu;
+    }
+    float old_d = unpack_f16(old_scale_bits);
+
+    uint q_byte_off     = base_block_byte + 2 + elem_in_block;
+    uint q_uint_idx     = q_byte_off / 4;
+    uint q_byte_in_uint = q_byte_off % 4;
+    uint q_word         = q8lkm_base[q_uint_idx];
+    uint q_byte         = (q_word >> (q_byte_in_uint * 8)) & 0xFFu;
+    int  old_int8       = sign_extend_i8(q_byte);
+    float base_val      = old_d * float(old_int8);
+
+    // 3) delta = scale * W1[i1, j1] * W2[i2, j2]
+    uint i1 = lora_row / w2_rows;
+    uint i2 = lora_row - i1 * w2_rows;
+    uint j1 = k / w2_cols;
+    uint j2 = k - j1 * w2_cols;
+    float w1v = q8lkm_W1[i1 * w1_cols + j1];
+    float w2v = q8lkm_w2[i2 * w2_cols + j2];
+    float delta = q8lkm_pc.scale * w1v * w2v;
+    float updated = base_val + delta;
+
+    // 4) Per-32-block absmax reduction.
+    q8lkm_scratch[gi] = abs(updated);
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (elem_in_block < s) {
+            uint base_idx = block_in_wg * 32 + elem_in_block;
+            float a = q8lkm_scratch[base_idx];
+            float b = q8lkm_scratch[base_idx + s];
+            q8lkm_scratch[base_idx] = max(a, b);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float block_max = q8lkm_scratch[block_in_wg * 32];
+    float d_new = block_max / 127.0;
+    if (d_new < 1e-8) d_new = 1e-8;
+
+    // 5) Quantize.
+    float qf = updated / d_new;
+    int q_int = qf >= 0.0 ? int(qf + 0.5) : int(qf - 0.5);
+    q_int = clamp(q_int, -127, 127);
+    q8lkm_quants[gi] = uint(q_int) & 0xFFu;
+    if (elem_in_block == 0) {
+        q8lkm_scales[block_in_wg] = f32tof16(d_new);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 6) Pack 272 bytes = 68 uints.
+    if (gi < 68) {
+        uint out_uint_byte = gi * 4;
+        uint packed = 0;
+        for (uint i = 0; i < 4; i++) {
+            uint byte_off      = out_uint_byte + i;
+            uint block_idx     = byte_off / 34;
+            uint byte_in_block = byte_off % 34;
+            uint v;
+            if (byte_in_block < 2) {
+                uint sbits = q8lkm_scales[block_idx];
+                v = (sbits >> (byte_in_block * 8)) & 0xFFu;
+            } else {
+                uint quant_idx = block_idx * 32 + (byte_in_block - 2);
+                v = q8lkm_quants[quant_idx] & 0xFFu;
+            }
+            packed |= (v << (i * 8));
+        }
+        q8lkm_base[chunk_uint_offset + gi] = packed;
+    }
+}
+
 // --- Fused SwiGLU: Phase 1 FFN activation ---
 // In-place on the gate buffer: gate[i] = silu(gate[i]) * up[i]
 // Replaces the previous SiLU + elementwise_mul pair (2 dispatches → 1).

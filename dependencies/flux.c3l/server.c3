@@ -349,6 +349,12 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			// runtime LoRA overhead per denoising step.
 			flux_merge_lora_into_weights(dit)!!;
 		}
+		else if (try lokr = llm::load_flux_lokr_safetensors(
+			ctx, req.lora_path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+		{
+			// LyCORIS LoKr adapter — merge-only, no runtime path.
+			flux_merge_lokr_into_weights(dit, &lokr)!!;
+		}
 		else
 		{
 			io::printfn("  Flux LoRA load failed for %s — continuing without LoRA", req.lora_path);

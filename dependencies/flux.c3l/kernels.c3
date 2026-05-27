@@ -66,6 +66,7 @@ fn void FluxDiTKernels.free(&self, vk::Device device)
 	self.dit.batch_matmul_q6k.free(device);
 	self.dit.batch_matmul_add_scaled.free(device);
 	self.dit.q8_lora_merge.free(device);
+	self.dit.q8_lokr_merge.free(device);
 	self.dit.ffn_swiglu_split.free(device);
 	self.dit.batch_matmul_swiglu_q8.free(device);
 	self.dit.batch_matmul_q8_coopmat.free(device);
