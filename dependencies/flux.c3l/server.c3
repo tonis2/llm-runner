@@ -344,6 +344,10 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			ctx, req.lora_path, strength, dit.n_dual_blocks, dit.n_single_blocks))
 		{
 			dit.lora = adapter;
+			// Fold the LoRA delta into the Q8_0 base weights once, then drop
+			// the adapter. This trades a ~0.5–1.5 s one-shot pass for ~0 ms
+			// runtime LoRA overhead per denoising step.
+			flux_merge_lora_into_weights(dit)!!;
 		}
 		else
 		{

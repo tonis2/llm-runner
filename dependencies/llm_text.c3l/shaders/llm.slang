@@ -1243,6 +1243,154 @@ void batch_matmul_add_scaled(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     bm_addscaled_output[out_offset] += bm_addscaled_pc.scale * partial;
 }
 
+// --- LoRA merge into Q8_0 base weight (one-shot, at load time) ---
+//
+// For each LoRA-affected output row `lora_row` and 256-element input chunk:
+//   updated[k] = scale_q8 * int8(base[row,k]) + scale * sum_r B[lora_row,r] * A[r,k]
+// then per 32-element block: new_d = absmax/127, new_q[i] = round(updated[i]/new_d).
+//
+// Layout assumption: base weight is Q8_0 stored as 34-byte blocks (f16 d, then 32 int8)
+// in row-major [out_dim, in_dim/32] order. A: [rank, in_dim] row-major.
+// B: [b_rows, rank] row-major (b_rows = LoRA's output dim, may be a sub-range of base).
+//
+// Dispatch: gid.x = chunk index along in_dim (1 chunk = 256 elems = 8 blocks).
+//           gid.y = lora_row in [0, b_rows).
+// Workgroup = 256 threads = one full chunk of one row.
+// All chunk byte boundaries are uint-aligned (chunk size = 8 blocks = 272 bytes = 68 uints),
+// so adjacent WGs never write to the same uint. Within a WG, threads 0..67 each write
+// one uint by packing 4 bytes assembled from groupshared quants/scales.
+//
+// Rank is capped at 256 (matches DIT_MAX_LORA_RANK).
+
+struct Q8LoraMergeParams {
+    uint  in_dim;
+    uint  b_rows;
+    uint  dst_row_offset;
+    uint  rank;
+    float scale;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+};
+
+[vk_push_constant] const Q8LoraMergeParams q8lm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint>  q8lm_base;   // Q8_0 base weight (in-place)
+[vk_binding(1, 0)] RWStructuredBuffer<float> q8lm_a;      // [rank, in_dim] row-major
+[vk_binding(2, 0)] RWStructuredBuffer<float> q8lm_b;      // [b_rows, rank] row-major
+
+groupshared float q8lm_B_row[256];
+groupshared float q8lm_scratch[256];   // first holds updated, then |updated| for reduce
+groupshared uint  q8lm_quants[256];    // one per byte (low 8 bits)
+groupshared uint  q8lm_scales[8];      // f16 bits per block
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void q8_lora_merge(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint in_dim   = q8lm_pc.in_dim;
+    uint b_rows   = q8lm_pc.b_rows;
+    uint rank     = q8lm_pc.rank;
+    uint lora_row = gid.y;
+    if (lora_row >= b_rows) return;
+
+    uint base_row          = q8lm_pc.dst_row_offset + lora_row;
+    uint k_start           = gid.x * 256;
+    uint bytes_per_row     = (in_dim / 32) * 34;
+    uint row_byte_offset   = base_row * bytes_per_row;
+    uint chunk_byte_offset = row_byte_offset + (k_start / 32) * 34;
+    // chunk_byte_offset is always a multiple of 4: k_start is a multiple of 256
+    // => k_start/32 is a multiple of 8 => 8*34 = 272 is a multiple of 4.
+    uint chunk_uint_offset = chunk_byte_offset / 4;
+
+    uint block_in_wg   = gi / 32;
+    uint elem_in_block = gi % 32;
+    uint k             = k_start + gi;
+
+    // 1) Cooperative load of B[lora_row, :rank] into shared.
+    if (gi < rank) {
+        q8lm_B_row[gi] = q8lm_b[lora_row * rank + gi];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 2) Dequantize the existing Q8_0 element at (base_row, k).
+    uint base_block_byte = chunk_byte_offset + block_in_wg * 34;
+    // block byte offset mod 4 is 0 for even block_in_wg, 2 for odd
+    // (because 34 = 32 + 2). 8 blocks per WG, so block 0 is aligned, block 1 is at +34, etc.
+    uint scale_uint_idx     = base_block_byte / 4;
+    uint scale_byte_in_uint = base_block_byte % 4;        // 0 or 2
+    uint scale_word         = q8lm_base[scale_uint_idx];
+    uint old_scale_bits;
+    if (scale_byte_in_uint == 0) {
+        old_scale_bits = scale_word & 0xFFFFu;
+    } else {
+        old_scale_bits = (scale_word >> 16) & 0xFFFFu;
+    }
+    float old_d = unpack_f16(old_scale_bits);
+
+    uint q_byte_off    = base_block_byte + 2 + elem_in_block;
+    uint q_uint_idx    = q_byte_off / 4;
+    uint q_byte_in_uint = q_byte_off % 4;
+    uint q_word        = q8lm_base[q_uint_idx];
+    uint q_byte        = (q_word >> (q_byte_in_uint * 8)) & 0xFFu;
+    int  old_int8      = sign_extend_i8(q_byte);
+    float base_val     = old_d * float(old_int8);
+
+    // 3) delta = scale * <B[lora_row, :], A[:, k]>
+    float delta = 0.0;
+    for (uint r = 0; r < rank; r++) {
+        delta += q8lm_B_row[r] * q8lm_a[r * in_dim + k];
+    }
+    delta *= q8lm_pc.scale;
+    float updated = base_val + delta;
+
+    // 4) Per-32-block absmax via groupshared reduction.
+    q8lm_scratch[gi] = abs(updated);
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (elem_in_block < s) {
+            uint base_idx = block_in_wg * 32 + elem_in_block;
+            float a = q8lm_scratch[base_idx];
+            float b = q8lm_scratch[base_idx + s];
+            q8lm_scratch[base_idx] = max(a, b);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float block_max = q8lm_scratch[block_in_wg * 32];
+    float d_new = block_max / 127.0;
+    if (d_new < 1e-8) d_new = 1e-8;
+
+    // 5) Quantize my element to int8.
+    float qf = updated / d_new;
+    int q_int = qf >= 0.0 ? int(qf + 0.5) : int(qf - 0.5);
+    q_int = clamp(q_int, -127, 127);
+    q8lm_quants[gi] = uint(q_int) & 0xFFu;
+    if (elem_in_block == 0) {
+        q8lm_scales[block_in_wg] = f32tof16(d_new);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // 6) Pack 8 × 34 bytes = 272 bytes = 68 uints. Threads 0..67 each emit one uint.
+    if (gi < 68) {
+        uint out_uint_byte = gi * 4;
+        uint packed = 0;
+        for (uint i = 0; i < 4; i++) {
+            uint byte_off       = out_uint_byte + i;
+            uint block_idx      = byte_off / 34;
+            uint byte_in_block  = byte_off % 34;
+            uint v;
+            if (byte_in_block < 2) {
+                uint sbits = q8lm_scales[block_idx];
+                v = (sbits >> (byte_in_block * 8)) & 0xFFu;
+            } else {
+                uint quant_idx = block_idx * 32 + (byte_in_block - 2);
+                v = q8lm_quants[quant_idx] & 0xFFu;
+            }
+            packed |= (v << (i * 8));
+        }
+        q8lm_base[chunk_uint_offset + gi] = packed;
+    }
+}
+
 // --- Fused SwiGLU: Phase 1 FFN activation ---
 // In-place on the gate buffer: gate[i] = silu(gate[i]) * up[i]
 // Replaces the previous SiLU + elementwise_mul pair (2 dispatches → 1).
