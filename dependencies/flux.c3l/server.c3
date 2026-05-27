@@ -149,10 +149,32 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	llm::WeightNames text_names  = llm::load_weight_names(config_json)!!;
 	llm::Tokenizer tok           = llm::load_tokenizer(&text_gf)!!;
 
-	// Raw prompt encoding (no Qwen3 chat template) — matches the Diffusers Klein
-	// reference pipeline. Avoids priming Qwen3-Instruct's RLHF assistant-mode
-	// behavior, which otherwise reshapes the prompt embeddings the DiT conditions on.
-	uint[] raw_tokens = tok.encode_with_specials(req.prompt)!!;
+	// Flux 2 Klein was trained with the Qwen3 chat-template wrap around the
+	// prompt; encoding raw produces out-of-distribution conditioning and the
+	// DiT outputs noise. Keep the user/assistant/<think> wrap as the model
+	// expects, even though it inherits some of Qwen3-Instruct's RLHF bias.
+	char[4096] cond_buf;
+	usz cond_len      = 0;
+	String cond_parts = "<|im_start|>user\n";
+	for (usz i = 0; i < cond_parts.len; i++)
+	{
+		cond_buf[cond_len] = cond_parts[i];
+		cond_len++;
+	}
+	for (usz i = 0; i < req.prompt.len; i++)
+	{
+		cond_buf[cond_len] = req.prompt[i];
+		cond_len++;
+	}
+	String cond_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+	for (usz i = 0; i < cond_suffix.len; i++)
+	{
+		cond_buf[cond_len] = cond_suffix[i];
+		cond_len++;
+	}
+	String cond_prompt = (String)cond_buf[0..cond_len - 1];
+
+	uint[] raw_tokens = tok.encode_with_specials(cond_prompt)!!;
 	uint raw_len      = (uint)raw_tokens.len;
 
 	const uint FLUX2_TEXT_LEN = 512;

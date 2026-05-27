@@ -73,7 +73,11 @@ fn HttpRequest? read_request(net::Socket* sock)
     }
 
     // Parse request line: "METHOD SP PATH SP HTTP/x.y\r\n"
-    String headers_view = ((String)hbuf[..hdr_end - 1]);
+    // hdr_end is the position of the first \r in the \r\n\r\n separator, which
+    // means the LAST header's terminating \r\n sits at hdr_end and hdr_end+1.
+    // We need that CRLF inside the slice so the header-iterator can detect the
+    // last line; cutting at hdr_end-1 would chop it off.
+    String headers_view = ((String)hbuf[..hdr_end + 1]);
 
     usz sp1 = 0;
     bool sp1_found = false;
