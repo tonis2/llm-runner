@@ -17,6 +17,7 @@ import server::http;
 // HandlerFn is a plain function pointer (no closure capture), so we stash
 // state here at run_server() time.
 flux::FluxServerState* g_state = null;
+flux::FluxConfig*      g_cfg   = null;
 
 fn void? run_server(
     flux::FluxConfig* cfg,
@@ -33,7 +34,9 @@ fn void? run_server(
     )!!;
     defer state.free();
     g_state = &state;
+    g_cfg   = cfg;
     defer g_state = null;
+    defer g_cfg   = null;
 
     server::serve(bind_addr, (uint)port, &handle_request)!!;
 }
@@ -97,8 +100,8 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
         .num_steps     = 4,
         .strength      = 0.6f,
         .seed          = 42,
-        .lora_path     = "",
-        .lora_strength = 1.0f,
+        .lora_path     = g_cfg != null ? g_cfg.lora_path     : "",
+        .lora_strength = g_cfg != null ? g_cfg.lora_strength : 1.0f,
     };
     if (try v = body.get_uint("steps"))  greq.num_steps    = (uint)v;
     if (try v = body.get_uint("seed"))   greq.seed         = (uint)v;
