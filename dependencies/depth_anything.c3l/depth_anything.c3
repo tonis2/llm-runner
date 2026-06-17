@@ -36,6 +36,7 @@ struct DepthConfig {
     uint n_layers;       // 12
     uint patch_size;     // 14
     uint pretrain_grid;  // 37   (pos_embed trained at 518/14 = 37x37)
+    uint infer_grid;     // inference grid (>= pretrain_grid for higher-res depth); set by loader
     float ln_eps;        // 1e-6
     uint[4] tap_layers;  // {2, 5, 8, 11}  intermediate features fed to DPT
     uint[4] proj_dims;   // {48, 96, 192, 384}  DPT reassemble channels
@@ -53,6 +54,7 @@ fn DepthConfig vits_config() {
         .n_layers = 12,
         .patch_size = 14,
         .pretrain_grid = 37,
+        .infer_grid = 37,
         .ln_eps = 1e-6f,
         .tap_layers = { 2, 5, 8, 11 },
         .proj_dims = { 48, 96, 192, 384 },
@@ -217,7 +219,10 @@ fn RefineNet load_refinenet(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, S
 // Loader
 // =====================================================================
 
-fn DepthModel? load_depth_model(llm::DeviceContext* ctx, String path) {
+// box_px = requested longest-side inference resolution (snapped to a patch multiple).
+// Larger -> finer depth detail, but attention memory grows O(grid^4): grid 37 (518px)
+// uses a ~45 MB score buffer, grid 74 (1036px) ~720 MB, grid 111 (1554px) ~3.6 GB.
+fn DepthModel? load_depth_model(llm::DeviceContext* ctx, String path, uint box_px) {
     io::printfn("\n=== Loading Depth Anything V2 (ViT-S/14) ===");
     io::printfn("  Path: %s", path);
 
@@ -225,6 +230,10 @@ fn DepthModel? load_depth_model(llm::DeviceContext* ctx, String path) {
     io::printfn("  Tensors in file: %d", sf.n_tensors);
 
     DepthConfig config = vits_config();
+    // Inference grid from the requested resolution (snap to a multiple of patch_size).
+    uint infer_grid = (box_px + config.patch_size / 2) / config.patch_size;
+    if (infer_grid < 1) infer_grid = 1;
+    config.infer_grid = infer_grid;
 
     // --- Encoder ---
     DinoEncoder enc;
@@ -293,10 +302,11 @@ fn DepthModel? load_depth_model(llm::DeviceContext* ctx, String path) {
 
     io::printfn("  DPT head: projects + resize + scratch + 4 refinenets + output convs loaded");
 
-    // Kernels + activation buffers (sized for the full 518x518 -> 37x37 grid).
+    // Kernels + activation buffers (sized for the chosen inference grid; upper bounds).
     DepthKernels kernels = create_depth_kernels(ctx)!!;
-    uint grid = config.pretrain_grid;
+    uint grid = config.infer_grid;
     uint n_tokens = 1 + grid * grid;        // + CLS
+    io::printfn("  Inference grid: %dx%d (input %dpx)", grid, grid, grid * config.patch_size);
     DepthActivations acts = allocate_activations(ctx, &config, n_tokens)!!;
     DptActivations dpt = allocate_dpt_activations(ctx, grid, grid * config.patch_size)!!;
 
@@ -526,7 +536,7 @@ fn float[] interp_pos_embed(float[] pos, uint src_grid, uint gh, uint gw, uint d
 fn PreprocInfo? preprocess_image(llm::DeviceContext* ctx, String path, DepthModel* model) {
     DepthConfig* c = &model.config;
     uint patch = c.patch_size;
-    uint box = c.pretrain_grid * patch;          // 518
+    uint box = c.infer_grid * patch;             // longest-side inference resolution
 
     image::Image img = llm::load_image(path)!!;
     uint ow = img.width;
@@ -539,8 +549,8 @@ fn PreprocInfo? preprocess_image(llm::DeviceContext* ctx, String path, DepthMode
     uint gh = (uint)((float)oh * scale / (float)patch + 0.5f);
     if (gw < 1) gw = 1;
     if (gh < 1) gh = 1;
-    if (gw > c.pretrain_grid) gw = c.pretrain_grid;
-    if (gh > c.pretrain_grid) gh = c.pretrain_grid;
+    if (gw > c.infer_grid) gw = c.infer_grid;
+    if (gh > c.infer_grid) gh = c.infer_grid;
     uint tw = gw * patch;
     uint th = gh * patch;
 
@@ -947,6 +957,172 @@ fn void? save_depth_png(llm::DeviceContext* ctx, DepthKernels* k, llm::Tensor* d
     png::save_file(&img, path)!!;
     mem::free(pixels);
     io::printfn("  wrote %s (%dx%d grayscale, depth range %.3f..%.3f)", path, ow, oh, mn, mx);
+}
+
+// =====================================================================
+// Texture height-map pipeline (detrend + albedo detail blend)
+//
+// Depth Anything predicts *scene* depth, which for a flat, head-on game
+// texture shows up as a smooth global gradient (e.g. top brighter than
+// bottom) plus low-frequency blobs — useless as a tiling height/displacement
+// map. This path removes that low-frequency component (high-pass via a large
+// box blur) so the result reads as surface relief, then optionally folds in
+// the albedo's fine luminance detail that the model can't resolve.
+// =====================================================================
+
+// Clamped-window box blur via a double-precision summed-area table. O(W*H).
+fn void box_blur(float[] src, float[] dst, uint w, uint h, int r) {
+    usz sw = (usz)w + 1;
+    usz sat_len = sw * ((usz)h + 1);
+    double[] sat = mem::new_array(double, (sz)sat_len);
+    for (uint y = 0; y < h; y++) {
+        double rowsum = 0.0;
+        usz cur = (usz)(y + 1) * sw;
+        usz prev = (usz)y * sw;
+        usz srow = (usz)y * w;
+        for (uint x = 0; x < w; x++) {
+            rowsum += (double)src[srow + x];
+            sat[cur + (usz)x + 1] = sat[prev + (usz)x + 1] + rowsum;
+        }
+    }
+    for (uint y = 0; y < h; y++) {
+        int ya = (int)y - r; if (ya < 0) ya = 0;
+        int yb = (int)y + r; if (yb > (int)h - 1) yb = (int)h - 1;
+        usz rb = (usz)(yb + 1) * sw;
+        usz ra = (usz)ya * sw;
+        usz drow = (usz)y * w;
+        for (uint x = 0; x < w; x++) {
+            int xa = (int)x - r; if (xa < 0) xa = 0;
+            int xb = (int)x + r; if (xb > (int)w - 1) xb = (int)w - 1;
+            usz ca = (usz)xa;
+            usz cb = (usz)(xb + 1);
+            double s = sat[rb + cb] - sat[ra + cb] - sat[rb + ca] + sat[ra + ca];
+            double area = (double)((yb - ya + 1) * (xb - xa + 1));
+            dst[drow + (usz)x] = (float)(s / area);
+        }
+    }
+    mem::free(sat);
+}
+
+// Normalize `buf` in place to [lo, hi] by its own min/max.
+fn void normalize_to(float[] buf, usz count, float lo, float hi) {
+    float mn = buf[0]; float mx = buf[0];
+    for (usz i = 0; i < count; i++) {
+        if (buf[i] < mn) mn = buf[i];
+        if (buf[i] > mx) mx = buf[i];
+    }
+    float range = mx - mn;
+    if (range < 1e-8f) range = 1.0f;
+    float span = hi - lo;
+    for (usz i = 0; i < count; i++) buf[i] = lo + (buf[i] - mn) / range * span;
+}
+
+// Build a tiling height/relief map. Two height sources are blended by `albedo_w`:
+//   * model depth (good for real 3D shape, e.g. rounded stones): high-passed by a
+//     box blur of radius detrend_frac*longest-side to strip the scene-depth gradient.
+//   * albedo luminance (good for flat-but-detailed surfaces, e.g. wood grain, carving,
+//     cracks, nails — which the depth model cannot resolve): partially flattened by
+//     `albedo_flatten` (1 = fully local relief, 0 = keep all plank-to-plank tone).
+// `detail_w` adds an extra fine high-pass of the luminance on top for crispness.
+//   rocks:  albedo_w 0, detail ~0.3   |   flat carved wood: albedo_w ~1, flatten ~0.7
+fn void? save_height_map(llm::DeviceContext* ctx, DepthKernels* k, llm::Tensor* depth,
+        uint sh, uint sw, uint ow, uint oh, String albedo_path,
+        float detrend_frac, float detail_w, float albedo_w, float albedo_flatten, String path) {
+    usz count = (usz)ow * oh;
+    uint longest = ow > oh ? ow : oh;
+    int r = (int)(detrend_frac * (float)longest + 0.5f);
+    if (r < 1) r = 1;
+
+    // --- Model-depth base: GPU resize [sh,sw] -> [oh,ow], download, high-pass, normalize.
+    float[] base = mem::new_array(float, (sz)count);
+    if (albedo_w < 1.0f) {
+        llm::Tensor full = llm::create_f32_tensor(ctx, { (ulong)count, 0, 0, 0 }, 1)!!;
+        {
+            llm::RenderGraph g;
+            g.init(ctx)!!;
+            dpt_bilinear(&g, k, depth, &full, 1, sh, sw, oh, ow);
+            g.flush()!!;
+        }
+        vk::Memory staging = vk::new_buffer(
+            allocator: &ctx.allocator,
+            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            data: null,
+            data_size: (sz)(count * 4),
+        )!!;
+        ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
+            vk::cmdCopyBuffer(cmd, full.gpu_buffer.buffer, staging.buffer, 1,
+                (vk::BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = count * 4 }});
+        }!!;
+        float* sp = (float*)staging.data();
+        for (usz i = 0; i < count; i++) base[i] = sp[i];
+        staging.free();
+
+        float[] mean = mem::new_array(float, (sz)count);
+        box_blur(base, mean, ow, oh, r);
+        for (usz i = 0; i < count; i++) base[i] -= mean[i];   // strip scene-depth gradient
+        mem::free(mean);
+        normalize_to(base, count, 0.0f, 1.0f);
+    }
+
+    // --- Albedo luminance (needed if it contributes to the base or to the detail pass).
+    bool need_albedo = albedo_w > 0.0f || detail_w > 0.0f;
+    float[] lum;
+    if (need_albedo) {
+        image::Image img = llm::load_image(albedo_path)!!;
+        image::Image rs = img.resize(ow, oh);
+        img.free();
+        float[] rgb = llm::image_to_float_nchw(&rs)!!;   // [3, oh, ow] in [0,1]
+        rs.free();
+        lum = mem::new_array(float, (sz)count);
+        for (usz i = 0; i < count; i++) {
+            lum[i] = 0.299f * rgb[i] + 0.587f * rgb[count + i] + 0.114f * rgb[2 * count + i];
+        }
+        mem::free(rgb);
+    }
+
+    // --- Albedo height base: partially flatten plank-to-plank tone, keep the grain.
+    if (albedo_w > 0.0f) {
+        float[] amean = mem::new_array(float, (sz)count);
+        box_blur(lum, amean, ow, oh, r);
+        float[] alb = mem::new_array(float, (sz)count);
+        for (usz i = 0; i < count; i++) alb[i] = lum[i] - albedo_flatten * amean[i];
+        mem::free(amean);
+        normalize_to(alb, count, 0.0f, 1.0f);
+        for (usz i = 0; i < count; i++) base[i] = base[i] * (1.0f - albedo_w) + alb[i] * albedo_w;
+        mem::free(alb);
+    }
+
+    // --- Optional fine detail: small-radius luminance high-pass added on top.
+    if (detail_w > 0.0f) {
+        int r2 = r / 8; if (r2 < 1) r2 = 1;
+        float[] lmean = mem::new_array(float, (sz)count);
+        box_blur(lum, lmean, ow, oh, r2);
+        float[] hp = mem::new_array(float, (sz)count);
+        for (usz i = 0; i < count; i++) hp[i] = lum[i] - lmean[i];
+        mem::free(lmean);
+        normalize_to(hp, count, -0.5f, 0.5f);
+        for (usz i = 0; i < count; i++) {
+            float v = base[i] + detail_w * hp[i];
+            base[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        }
+        mem::free(hp);
+    }
+    if (need_albedo) mem::free(lum);
+
+    // --- Quantize and save.
+    char[] pixels = mem::new_array(char, (sz)count);
+    for (usz i = 0; i < count; i++) pixels[i] = (char)(base[i] * 255.0f + 0.5f);
+    mem::free(base);
+
+    image::Image out = {
+        .width = ow, .height = oh, .bit_depth = 8,
+        .format = image::PixelFormat.GRAYSCALE, .pixels = pixels,
+    };
+    png::save_file(&out, path)!!;
+    mem::free(pixels);
+    io::printfn("  wrote %s (%dx%d height map, detrend r=%d, detail=%.2f, albedo=%.2f)",
+        path, ow, oh, r, detail_w, albedo_w);
 }
 
 // --- Debug: download a buffer region and write raw F32 to a file ---
