@@ -25,6 +25,14 @@ import std::collections::list;
 //   5. Pixel shuffle + VAE decode → output image
 //   6. Save
 
+// One LoRA/LoKr adapter to fold into the base weights. Multiple specs are
+// merged sequentially in-place, so their deltas accumulate with no runtime cost.
+struct FluxLoraSpec
+{
+	String path;      // safetensors adapter file
+	float strength;   // strength multiplier (<= 0 treated as 1.0)
+}
+
 struct FluxConfig
 {
 	String model_path;       // Flux DiT GGUF
@@ -40,8 +48,7 @@ struct FluxConfig
 	uint num_steps;
 	float strength;          // img2img only: noise fraction (0=keep input, 1=full re-roll)
 	uint seed;
-	String lora_path;        // Optional LoRA safetensors (empty = no LoRA)
-	float lora_strength;     // LoRA strength multiplier
+	List{FluxLoraSpec} loras; // Optional LoRA/LoKr adapters, folded in order (empty = none)
 }
 
 fn FluxConfig flux_config_defaults()
@@ -54,8 +61,6 @@ fn FluxConfig flux_config_defaults()
 		.num_steps = 4,        // Klein is distilled to 4 steps
 		.strength = 0.6f,
 		.seed = 42,
-		.lora_path = "",
-		.lora_strength = 1.0f,
 	};
 }
 
@@ -85,8 +90,7 @@ fn void? run_flux_pipeline(FluxConfig* config)
 		.num_steps     = config.num_steps,
 		.strength      = config.strength,
 		.seed          = config.seed,
-		.lora_path     = config.lora_path,
-		.lora_strength = config.lora_strength,
+		.loras         = config.loras.array_view(),
 	};
 
 	image::Image result = flux_generate(&state, &req)!!;

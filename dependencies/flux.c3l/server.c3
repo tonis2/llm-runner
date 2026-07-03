@@ -61,8 +61,7 @@ struct FluxGenerateRequest
 	uint num_steps;
 	float strength;
 	uint seed;
-	String lora_path;        // empty = no LoRA
-	float lora_strength;     // 1.0 if not specified
+	FluxLoraSpec[] loras;    // LoRA/LoKr adapters folded in order (empty = none)
 }
 
 fn FluxServerState? init_flux_server(String dit_path, String text_model_path, String vae_path, bool keep_dit)
@@ -119,7 +118,6 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	uint req_w = req.image_width > 0 ? req.image_width : req.image_size;
 	uint req_h = req.image_height > 0 ? req.image_height : req.image_size;
 	io::printfn("\n=== Flux generate ===");
-	io::printfn("  Prompt: %s", req.prompt);
 	io::printfn(
 		"  Size: %dx%d, Steps: %d, Seed: %d, Mode: %s",
 		req_w,
@@ -390,33 +388,37 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	dit.latent_h = lat_h;
 	dit.latent_w = lat_w;
 
-	bool use_lora = req.lora_path.len > 0;
+	bool use_lora = req.loras.len > 0;
 	dit.acts = allocate_flux_activations(ctx, n_img_total, n_txt, latent_elems, use_lora)!!;
 
-	// Load LoRA after DiT weights so the file's tensors land into VRAM next to
-	// the DiT block weights. We always free per request — this keeps keep_dit
-	// servers able to swap the LoRA between requests.
-	if (use_lora)
+	// Load LoRA(s) after DiT weights so the file's tensors land into VRAM next
+	// to the DiT block weights. Each adapter is folded into the Q8_0 base
+	// weights in place and then dropped, so multiple adapters accumulate their
+	// deltas (W += s1·B1@A1 += s2·B2@A2 …) with ~0 ms runtime overhead per
+	// denoising step — we pay one ~0.5–1.5 s merge pass per adapter here. We
+	// always free per request — this keeps keep_dit servers able to swap the
+	// LoRA set between requests.
+	foreach (spec : req.loras)
 	{
-		float strength = req.lora_strength > 0.0f ? req.lora_strength : 1.0f;
+		if (spec.path.len == 0) continue;
+		float strength = spec.strength > 0.0f ? spec.strength : 1.0f;
 		if (try adapter = llm::load_flux_lora_safetensors(
-			ctx, req.lora_path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+			ctx, spec.path, strength, dit.n_dual_blocks, dit.n_single_blocks))
 		{
 			dit.lora = adapter;
-			// Fold the LoRA delta into the Q8_0 base weights once, then drop
-			// the adapter. This trades a ~0.5–1.5 s one-shot pass for ~0 ms
-			// runtime LoRA overhead per denoising step.
+			// Fold this adapter's delta in, then drop it. The next iteration
+			// reads the already-updated base weights, so folds compose.
 			flux_merge_lora_into_weights(dit)!!;
 		}
 		else if (try lokr = llm::load_flux_lokr_safetensors(
-			ctx, req.lora_path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+			ctx, spec.path, strength, dit.n_dual_blocks, dit.n_single_blocks))
 		{
 			// LyCORIS LoKr adapter — merge-only, no runtime path.
 			flux_merge_lokr_into_weights(dit, &lokr)!!;
 		}
 		else
 		{
-			io::printfn("  Flux LoRA load failed for %s — continuing without LoRA", req.lora_path);
+			io::printfn("  Flux LoRA load failed for %s — continuing without it", spec.path);
 		}
 	}
 

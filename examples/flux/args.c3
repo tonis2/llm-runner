@@ -61,8 +61,13 @@ fn flux::FluxConfig? parse_flux_args(String[] args, ServerOptions* server_opts) 
             else if (args[i] == "--input") { config.input_paths.push(args[i + 1]); i += 2; }
             else if (args[i] == "--edit-mode") { config.edit_mode = args[i + 1]; i += 2; }
             else if (args[i] == "--strength") { config.strength = args[i + 1].to_float() ?? 0.6f; i += 2; }
-            else if (args[i] == "--lora") { config.lora_path = args[i + 1]; i += 2; }
-            else if (args[i] == "--lora-strength") { config.lora_strength = args[i + 1].to_float() ?? 1.0f; i += 2; }
+            else if (args[i] == "--lora") { config.loras.push({ .path = args[i + 1], .strength = 1.0f }); i += 2; }
+            else if (args[i] == "--lora-strength") {
+                // Binds to the most recently added --lora.
+                float s = args[i + 1].to_float() ?? 1.0f;
+                if (config.loras.len() > 0) config.loras.get_ref(config.loras.len() - 1).strength = s;
+                i += 2;
+            }
             else if (args[i] == "--bind") { server_opts.bind_addr = args[i + 1]; i += 2; }
             else if (args[i] == "--port") { server_opts.port = (int)(args[i + 1].to_uint() ?? 7860); i += 2; }
             else if (args[i] == "--config") { i += 2; }
@@ -121,16 +126,38 @@ fn void load_flux_config(String path, flux::FluxConfig* config) {
     if (try v = cfg.get_uint("height")) config.image_height = v;
     if (try v = cfg.get_string("edit_mode")) config.edit_mode = v;
 
-    // LoRA: accept either { "lora": "path.safetensors" } (strength defaults to 1.0)
-    // or { "lora": { "path": "...", "strength": 0.8 } }
+    // LoRA: accept any of
+    //   "lora": "path.safetensors"                       (strength 1.0)
+    //   "lora": { "path": "...", "strength": 0.8 }
+    //   "lora": [ "a.safetensors", { "path": "b...", "strength": 0.7 } ]  (folded in order)
     if (try lv = cfg.get_string("lora")) {
-        config.lora_path = lv;
-    } else if (try lobj = cfg.get("lora")) {
-        if (try p = lobj.get_string("path")) config.lora_path = p;
-        if (try s = lobj.get_float("strength")) config.lora_strength = (float)s;
+        config.loras.push({ .path = lv, .strength = 1.0f });
+    } else if (try lval = cfg.get("lora")) {
+        if (lval.is_array()) {
+            for (sz idx = 0; idx < lval.get_len(); idx++) {
+                Object* el = lval.get_at(idx);
+                if (el.is_string()) {
+                    config.loras.push({ .path = el.s, .strength = 1.0f });
+                } else {
+                    push_lora_object(config, el);
+                }
+            }
+        } else {
+            push_lora_object(config, lval);
+        }
     }
 
     io::printfn("Flux config loaded from: %s", path);
+}
+
+// Push one { "path": "...", "strength": 0.8 } LoRA object onto config.loras.
+// Missing strength defaults to 1.0; a missing path is skipped.
+fn void push_lora_object(flux::FluxConfig* config, Object* obj) {
+    if (try p = obj.get_string("path")) {
+        float s = 1.0f;
+        if (try sv = obj.get_float("strength")) s = (float)sv;
+        config.loras.push({ .path = p, .strength = s });
+    }
 }
 
 fn void print_usage() {
@@ -152,8 +179,9 @@ fn void print_usage() {
     io::printfn("                 Repeatable for kontext with multiple reference images (max %d).", flux::FLUX_MAX_REF_IMAGES);
     io::printfn("  --edit-mode    Edit mode: img2img | kontext (default: txt2img)");
     io::printfn("  --strength     img2img strength 0..1 (default: 0.75)");
-    io::printfn("  --lora         Optional LoRA safetensors file");
-    io::printfn("  --lora-strength LoRA strength multiplier (default: 1.0)");
+    io::printfn("  --lora         Optional LoRA/LoKr safetensors file. Repeatable — all listed");
+    io::printfn("                 adapters are folded into the base weights in order.");
+    io::printfn("  --lora-strength Strength multiplier for the preceding --lora (default: 1.0)");
     io::printfn("  --config       Load from JSON config file");
     io::printfn("");
     io::printfn("Server mode:");

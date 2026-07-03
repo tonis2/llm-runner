@@ -1,14 +1,14 @@
 {
 	"model": "/home/tonis/Documents/AI/models/flux-2-klein-9b-Q8_0.gguf",
-	"text_model": "/home/tonis/Documents/AI/models/Qwen3-8B-Uncensor-v2.Q8_0.gguf",
+	"text_model": "/home/tonis/Documents/AI/models/Qwen3-8B.gguf",
 	"vae": "/home/tonis/Documents/AI/models/flux_vae.safetensors",
-	"input": "./cat.png",
+	"input": "./test.jpg",
 	"edit_mode": "kontext",
-	"prompt": "Turn this image into PULPKHOR style. vintage comic illustration. Keep composition. distressed paper textures, scratches, and faint halftone printing dots.",
+	"prompt": "in the style of mad-mdrnmnmlsm, green and black,woman wearing a black dress standing in front of white background made of brush strokes and colored panels, casual poses, turn slightly one hand on her waist",
 	"steps": 4,
 	"seed": 42,
 	"height": 512,
 	"width": 512,
-	"lora": "/home/tonis/Documents/AI/models/loras/PULPKHOR.safetensors",
+	"lora": [{"path": "/home/tonis/Documents/AI/models/loras/flux2_klein_9b_refcontrol_depth.safetensors", "strength": 0.8 }],
 	"output": "./flux_output.png"
 }

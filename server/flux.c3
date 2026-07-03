@@ -5,6 +5,7 @@ import std::core::mem;
 import std::encoding::json;
 import std::encoding::base64;
 import std::collections::object;
+import std::collections::list;
 import std::net;
 import image;
 import image::png;
@@ -100,15 +101,50 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
         .num_steps     = 4,
         .strength      = 0.6f,
         .seed          = 42,
-        .lora_path     = g_cfg != null ? g_cfg.lora_path     : "",
-        .lora_strength = g_cfg != null ? g_cfg.lora_strength : 1.0f,
+        .loras         = {},
     };
     if (try v = body.get_uint("steps"))  greq.num_steps    = (uint)v;
     if (try v = body.get_uint("seed"))   greq.seed         = (uint)v;
     if (try v = body.get_uint("width"))  greq.image_width  = (uint)v;
     if (try v = body.get_uint("height")) greq.image_height = (uint)v;
-    if (try v = body.get_string("lora")) greq.lora_path    = v;
-    if (try v = body.get_float("lora_strength")) greq.lora_strength = (float)v;
+
+    // LoRA selection. A request that names any adapter replaces the server's
+    // configured set entirely; otherwise it inherits the config's loras.
+    //   "loras": [ "a.safetensors", { "path": "b...", "strength": 0.7 } ]
+    //   "lora": "path" (+ optional "lora_strength")   — single-adapter shorthand
+    List{flux::FluxLoraSpec} lora_list;
+    defer lora_list.free();
+    if (try arr = body.get("loras"))
+    {
+        if (arr.is_array())
+        {
+            for (sz idx = 0; idx < arr.get_len(); idx++)
+            {
+                Object* el = arr.get_at(idx);
+                if (el.is_string())
+                {
+                    lora_list.push({ .path = el.s, .strength = 1.0f });
+                }
+                else if (try p = el.get_string("path"))
+                {
+                    float s = 1.0f;
+                    if (try sv = el.get_float("strength")) s = (float)sv;
+                    lora_list.push({ .path = p, .strength = s });
+                }
+            }
+        }
+    }
+    else if (try v = body.get_string("lora"))
+    {
+        float s = 1.0f;
+        if (try sv = body.get_float("lora_strength")) s = (float)sv;
+        lora_list.push({ .path = v, .strength = s });
+    }
+    else if (g_cfg != null)
+    {
+        foreach (sp : g_cfg.loras) lora_list.push(sp);
+    }
+    greq.loras = lora_list.array_view();
 
     image::Image[] input_imgs;
     image::Image*[] input_ptrs;
