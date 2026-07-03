@@ -139,6 +139,83 @@ fn image::Image? resize_center_crop(image::Image* src, uint target_w, uint targe
     };
 }
 
+// --- Bilinear resize preserving aspect ratio, no crop ---
+// Scales so the long side maps to `max_long_side`, then rounds both dims down
+// to the nearest multiple of 16 (VAE patchify constraint). Unlike
+// resize_center_crop, every source pixel contributes and nothing is cut off —
+// used for multi-image kontext references, which each keep their own native
+// aspect ratio instead of being forced to the output canvas's shape.
+fn image::Image? resize_aspect_fit_round16(image::Image* src, uint max_long_side) {
+    uint channels;
+    switch (src.format) {
+        case PixelFormat.GRAYSCALE: channels = 1;
+        case PixelFormat.RGB: channels = 3;
+        case PixelFormat.RGBA: channels = 4;
+        default: channels = 3;
+    }
+
+    uint long_side = src.width > src.height ? src.width : src.height;
+    float scale = (float)max_long_side / (float)long_side;
+    uint target_w = (uint)((float)src.width * scale + 0.5f);
+    uint target_h = (uint)((float)src.height * scale + 0.5f);
+
+    target_w = (target_w / 16) * 16;
+    target_h = (target_h / 16) * 16;
+    if (target_w < 16) target_w = 16;
+    if (target_h < 16) target_h = 16;
+
+    float scale_x = (float)target_w / (float)src.width;
+    float scale_y = (float)target_h / (float)src.height;
+
+    char[] out_pixels = mem::new_array(char, (usz)target_w * target_h * channels);
+    usz src_bpp = (usz)src.bytes_per_pixel();
+
+    for (uint oy = 0; oy < target_h; oy++) {
+        float src_y = ((float)oy + 0.5f) / scale_y - 0.5f;
+        if (src_y < 0.0f) src_y = 0.0f;
+        if (src_y > (float)(src.height - 1)) src_y = (float)(src.height - 1);
+        uint y0 = (uint)src_y;
+        uint y1 = y0 + 1 < src.height ? y0 + 1 : y0;
+        float fy = src_y - (float)y0;
+
+        for (uint ox = 0; ox < target_w; ox++) {
+            float src_x = ((float)ox + 0.5f) / scale_x - 0.5f;
+            if (src_x < 0.0f) src_x = 0.0f;
+            if (src_x > (float)(src.width - 1)) src_x = (float)(src.width - 1);
+            uint x0 = (uint)src_x;
+            uint x1 = x0 + 1 < src.width ? x0 + 1 : x0;
+            float fx = src_x - (float)x0;
+
+            usz i00 = ((usz)y0 * src.width + x0) * src_bpp;
+            usz i01 = ((usz)y0 * src.width + x1) * src_bpp;
+            usz i10 = ((usz)y1 * src.width + x0) * src_bpp;
+            usz i11 = ((usz)y1 * src.width + x1) * src_bpp;
+            usz out_idx = ((usz)oy * target_w + ox) * channels;
+
+            for (uint c = 0; c < channels; c++) {
+                float v00 = (float)(uint)src.pixels[i00 + c];
+                float v01 = (float)(uint)src.pixels[i01 + c];
+                float v10 = (float)(uint)src.pixels[i10 + c];
+                float v11 = (float)(uint)src.pixels[i11 + c];
+                float v0 = v00 * (1.0f - fx) + v01 * fx;
+                float v1 = v10 * (1.0f - fx) + v11 * fx;
+                float v = v0 * (1.0f - fy) + v1 * fy;
+                if (v < 0.0f) v = 0.0f;
+                if (v > 255.0f) v = 255.0f;
+                out_pixels[out_idx + c] = (char)(v + 0.5f);
+            }
+        }
+    }
+
+    return {
+        .width = target_w,
+        .height = target_h,
+        .bit_depth = 8,
+        .format = src.format,
+        .pixels = out_pixels,
+    };
+}
+
 // --- Convert image::Image to NCHW float tensor in [-1, 1] ---
 // Same as image_to_float_nchw but maps [0, 255] to [-1, 1] for VAE encoder input.
 // Caller must free the returned data.

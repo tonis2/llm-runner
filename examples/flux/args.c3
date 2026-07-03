@@ -4,6 +4,7 @@ import std::io;
 import std::io::file;
 import std::encoding::json;
 import std::collections::object;
+import std::collections::list;
 import std::core::mem;
 import flux;
 
@@ -57,7 +58,7 @@ fn flux::FluxConfig? parse_flux_args(String[] args, ServerOptions* server_opts) 
             else if (args[i] == "--height") { config.image_height = args[i + 1].to_uint() ?? 0; i += 2; }
             else if (args[i] == "--steps") { config.num_steps = args[i + 1].to_uint() ?? 4; i += 2; }
             else if (args[i] == "--seed") { config.seed = args[i + 1].to_uint() ?? 42; i += 2; }
-            else if (args[i] == "--input") { config.input_path = args[i + 1]; i += 2; }
+            else if (args[i] == "--input") { config.input_paths.push(args[i + 1]); i += 2; }
             else if (args[i] == "--edit-mode") { config.edit_mode = args[i + 1]; i += 2; }
             else if (args[i] == "--strength") { config.strength = args[i + 1].to_float() ?? 0.6f; i += 2; }
             else if (args[i] == "--lora") { config.lora_path = args[i + 1]; i += 2; }
@@ -100,7 +101,17 @@ fn void load_flux_config(String path, flux::FluxConfig* config) {
     if (try v = cfg.get_string("text_model")) config.text_model_path = v;
     if (try v = cfg.get_string("vae")) config.vae_path = v;
     if (try v = cfg.get_string("prompt")) config.prompt = v;
-    if (try v = cfg.get_string("input")) config.input_path = v;
+    // Kontext reference image(s): accept a single string (back-compat, becomes
+    // a 1-element list) or a JSON array of strings.
+    if (try v = cfg.get_string("input")) {
+        config.input_paths.push(v);
+    } else if (try arr = cfg.get("input")) {
+        if (arr.is_array()) {
+            for (sz idx = 0; idx < arr.get_len(); idx++) {
+                if (try p = arr.get_string_at(idx)) config.input_paths.push(p);
+            }
+        }
+    }
     if (try v = cfg.get_string("output")) config.output_path = v;
     if (try v = cfg.get_uint("steps")) config.num_steps = v;
     if (try v = cfg.get_float("strength")) config.strength = (float)v;
@@ -137,7 +148,8 @@ fn void print_usage() {
     io::printfn("  --height       Image height (overrides --size for height)");
     io::printfn("  --steps        Denoising steps (default: 4)");
     io::printfn("  --seed         Random seed (default: 42)");
-    io::printfn("  --input        Input image (PNG or JPG) for img2img / kontext modes");
+    io::printfn("  --input        Input image (PNG or JPG) for img2img / kontext modes.");
+    io::printfn("                 Repeatable for kontext with multiple reference images (max %d).", flux::FLUX_MAX_REF_IMAGES);
     io::printfn("  --edit-mode    Edit mode: img2img | kontext (default: txt2img)");
     io::printfn("  --strength     img2img strength 0..1 (default: 0.75)");
     io::printfn("  --lora         Optional LoRA safetensors file");

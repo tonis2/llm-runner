@@ -92,8 +92,8 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
     flux::FluxGenerateRequest greq = {
         .prompt        = prompt,
         .edit_mode     = "",
-        .input_path    = "",
-        .input_image   = null,
+        .input_paths   = {},
+        .input_images  = {},
         .image_size    = 1024,
         .image_width   = 0,
         .image_height  = 0,
@@ -110,51 +110,83 @@ fn void handle_request(net::Socket* sock, http::HttpRequest* req)
     if (try v = body.get_string("lora")) greq.lora_path    = v;
     if (try v = body.get_float("lora_strength")) greq.lora_strength = (float)v;
 
-    image::Image input_img;
+    image::Image[] input_imgs;
+    image::Image*[] input_ptrs;
     bool have_input = false;
     if (try arr = body.get("init_images"))
     {
-        if (arr.is_array() && arr.get_len() > 0)
+        if (arr.is_array())
         {
-            String b64;
-            if (try s = arr.get_string_at(0))
+            sz n = arr.get_len();
+            if (n > (sz)flux::FLUX_MAX_REF_IMAGES)
             {
-                b64 = s;
+                respond_error(sock, 400, "init_images exceeds max reference image count");
+                return;
             }
-            else
+            if (n > 0)
             {
-                b64 = "";
-            }
-            if (b64.len > 0)
-            {
-                char[] raw;
-                if (try decoded = base64::decode(mem, (char[])b64))
+                input_imgs = mem::new_array(image::Image, n);
+                input_ptrs = mem::new_array(image::Image*, n);
+                for (sz idx = 0; idx < n; idx++)
                 {
-                    raw = decoded;
-                }
-                else
-                {
-                    respond_error(sock, 400, "init_images[0] is not valid base64");
-                    return;
-                }
-                defer mem::free(raw);
+                    String b64;
+                    if (try s = arr.get_string_at(idx))
+                    {
+                        b64 = s;
+                    }
+                    else
+                    {
+                        b64 = "";
+                    }
+                    if (b64.len == 0)
+                    {
+                        for (sz f = 0; f < idx; f++) input_imgs[f].free();
+                        mem::free(input_imgs);
+                        mem::free(input_ptrs);
+                        respond_error(sock, 400, "init_images entry is not a string");
+                        return;
+                    }
+                    char[] raw;
+                    if (try decoded = base64::decode(mem, (char[])b64))
+                    {
+                        raw = decoded;
+                    }
+                    else
+                    {
+                        for (sz f = 0; f < idx; f++) input_imgs[f].free();
+                        mem::free(input_imgs);
+                        mem::free(input_ptrs);
+                        respond_error(sock, 400, "init_images entry is not valid base64");
+                        return;
+                    }
+                    defer mem::free(raw);
 
-                if (try img = llm::load_image_from_bytes(raw))
-                {
-                    input_img        = img;
-                    have_input       = true;
-                    greq.input_image = &input_img;
-                    greq.edit_mode   = "kontext";
+                    if (try img = llm::load_image_from_bytes(raw))
+                    {
+                        input_imgs[idx] = img;
+                        input_ptrs[idx] = &input_imgs[idx];
+                    }
+                    else
+                    {
+                        for (sz f = 0; f < idx; f++) input_imgs[f].free();
+                        mem::free(input_imgs);
+                        mem::free(input_ptrs);
+                        respond_error(sock, 400, "init_images entry is not a valid PNG/JPEG");
+                        return;
+                    }
                 }
-                else
-                {
-                    respond_error(sock, 400, "init_images[0] is not a valid PNG/JPEG");
-                    return;
-                }
+                have_input        = true;
+                greq.input_images = input_ptrs;
+                greq.edit_mode    = "kontext";
             }
         }
     }
-    defer if (have_input) input_img.free();
+    defer if (have_input)
+    {
+        for (sz idx = 0; idx < input_imgs.len; idx++) input_imgs[idx].free();
+        mem::free(input_imgs);
+        mem::free(input_ptrs);
+    }
 
     image::Image result;
     if (try r = flux::flux_generate(g_state, &greq))
