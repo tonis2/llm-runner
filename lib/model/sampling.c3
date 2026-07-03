@@ -12,8 +12,8 @@ fn void? debug_readback(DeviceContext* ctx, Tensor* tensor, String label, uint c
     usz size = (usz)count * 4;
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: null,
         data_size: (sz)size,
     )!!;
@@ -60,8 +60,8 @@ fn uint? sample_token(DeviceContext* ctx, Tensor* logits, uint vocab_size, Sampl
     // Read logits from GPU
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: null,
         data_size: (sz)size,
     )!!;

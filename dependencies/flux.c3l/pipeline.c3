@@ -290,8 +290,8 @@ fn float[]? encode_image_object_to_dit_latent(
 		usz img_bytes = (usz)3 * img_h * img_w * 4;
 		vk::Memory in_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: input_chw.ptr,
 			data_size: (sz)img_bytes,
 		)!!;
@@ -322,8 +322,8 @@ fn float[]? encode_image_object_to_dit_latent(
 		usz enc_bytes = (usz)enc_elems * 4;
 		vk::Memory dl_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: null,
 			data_size: (sz)enc_bytes,
 		)!!;
@@ -476,8 +476,8 @@ fn llm::Tensor? encode_text_multilayer(
 		layer_data[i] = (float*)mem::calloc((sz)((usz)seq_len * dim * 4));
 		vk::Memory dl = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: null,
 			data_size: (usz)seq_len * dim * 4,
 		)!!;
@@ -516,8 +516,8 @@ fn llm::Tensor? encode_text_multilayer(
 	{
 		vk::Memory ul = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: concat_cpu.ptr,
 			data_size: (sz)(out_size * 4),
 		)!!;

@@ -715,8 +715,8 @@ fn void? precompute_mrope_tables(
 	*cos_out = (llm::Tensor) {
 		.gpu_buffer = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: cos_data,
 			data_size: (sz)(table_size * 4),
 		)!!,
@@ -728,8 +728,8 @@ fn void? precompute_mrope_tables(
 	*sin_out = (llm::Tensor) {
 		.gpu_buffer = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: sin_data,
 			data_size: (sz)(table_size * 4),
 		)!!,

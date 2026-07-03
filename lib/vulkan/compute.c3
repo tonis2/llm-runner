@@ -30,12 +30,12 @@ fn ComputeKernel? create_kernel(
             .binding = i,
             .descriptorType = vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = vk::SHADER_STAGE_COMPUTE_BIT,
+            .stageFlags = SHADER_STAGE_COMPUTE_BIT,
         };
     }
 
     DescriptorSetLayout desc_layout = vk::descriptorSetLayoutCreateInfo()
-        .setFlags(vk::DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT)
+        .setFlags(DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT)
         .setBindings(bindings[0 .. num_storage_buffers - 1])
         .build(device)!!;
 
@@ -43,7 +43,7 @@ fn ComputeKernel? create_kernel(
     PipelineLayout pipeline_layout;
     if (push_constant_size > 0) {
         PushConstantRange pc_range = {
-            .stageFlags = vk::SHADER_STAGE_COMPUTE_BIT,
+            .stageFlags = SHADER_STAGE_COMPUTE_BIT,
             .offset = 0,
             .size = push_constant_size,
         };
@@ -59,7 +59,7 @@ fn ComputeKernel? create_kernel(
 
     // Create compute pipeline
     PipelineShaderStageCreateInfo stage = vk::pipelineShaderStageCreateInfo()
-        .setStage(vk::SHADER_STAGE_COMPUTE_BIT)
+        .setStage(SHADER_STAGE_COMPUTE_BIT)
         .setMod(shader_module)
         .setName(entry_point);
 
@@ -124,7 +124,7 @@ fn void dispatch_kernel(
         vk::cmdPushConstants(
             cmd,
             kernel.pipeline_layout,
-            vk::SHADER_STAGE_COMPUTE_BIT,
+            SHADER_STAGE_COMPUTE_BIT,
             0,
             kernel.push_constant_size,
             push_constants
@@ -136,16 +136,16 @@ fn void dispatch_kernel(
 
 fn void compute_barrier(CommandBuffer cmd) {
     MemoryBarrier2 barrier = vk::memoryBarrier2()
-        .setSrcStageMask(vk::PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
-        .setSrcAccessMask(vk::ACCESS_2_SHADER_WRITE_BIT)
-        .setDstStageMask(vk::PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
-        .setDstAccessMask(vk::ACCESS_2_SHADER_READ_BIT | vk::ACCESS_2_SHADER_WRITE_BIT);
+        .setSrcStageMask(PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+        .setSrcAccessMask(ACCESS_2_SHADER_WRITE_BIT)
+        .setDstStageMask(PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+        .setDstAccessMask(ACCESS_2_SHADER_READ_BIT | ACCESS_2_SHADER_WRITE_BIT);
 
     vk::cmdPipelineBarrier2(cmd, &&vk::dependencyInfo().setMemoryBarriers({ barrier }));
 }
 
 fn void? begin_compute(CommandBuffer cmd) {
-    vk::resetCommandBuffer(cmd, 0)!!;
+    vk::resetCommandBuffer(cmd, (vk::CommandBufferResetFlags)0)!!;
     vk::beginCommandBuffer(cmd, &&vk::commandBufferBeginInfo())!!;
 }
 

@@ -47,7 +47,7 @@ fn DeviceContext? createContext() {
 
     InstanceCreateInfo instanceInfo = vk::instanceCreateInfo()
         .setApplicationInfo(&info)
-        .setFlags(env::os_is_darwin() ? vk::INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0);
+        .setFlags(env::os_is_darwin() ? INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0);
 
     if (catch err = vk::createInstance(&instanceInfo, null, &instance)) {
         io::printfn("Instance creation error");
@@ -66,7 +66,8 @@ fn DeviceContext? createContext() {
         QueuePropertiesList queue_properties = entry.getQueueProperties()!!;
 
         int queue_index = queue_properties.find(fn (sz index, QueueFamilyProperties props) =>
-            (QueueFlagBits)props.queueFlags & vk::QUEUE_COMPUTE_BIT != 0 && (QueueFlagBits)props.queueFlags & vk::QUEUE_TRANSFER_BIT);
+            ((QueueFlagBits)props.queueFlags & QUEUE_COMPUTE_BIT) != (QueueFlagBits)0
+                && ((QueueFlagBits)props.queueFlags & QUEUE_TRANSFER_BIT) != (QueueFlagBits)0);
 
         PhysicalDeviceProperties properties;
         vk::getPhysicalDeviceProperties(entry, &properties);
@@ -228,7 +229,7 @@ fn DeviceContext? createContext() {
     CommandBufferList command_buffers = device.createCommandBuffers(command_pool, 1)!;
 
     Fence compute_fence = vk::fenceCreateInfo()
-        .setFlags(vk::FENCE_CREATE_SIGNALED_BIT)
+        .setFlags(FENCE_CREATE_SIGNALED_BIT)
         .build(device)!!;
 
     // 256MB page size for model weights
@@ -237,7 +238,7 @@ fn DeviceContext? createContext() {
         .pdevice = physical_device,
         .queue = compute_queue,
         .default_page_size = 256_000_000,
-        .flags = vk::MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | vk::MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT,
+        .flags = MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT | MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT,
     }.init()!;
 
     return (DeviceContext) {

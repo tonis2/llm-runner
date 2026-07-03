@@ -30,8 +30,8 @@ fn void? print_tensor_stats(llm::DeviceContext* ctx, llm::Tensor* tensor, String
     usz bytes = total * 4; // Assume F32 for now
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: (sz)bytes,
     )!!;
     
@@ -98,8 +98,8 @@ fn void? print_tensor_first_n(llm::DeviceContext* ctx, llm::Tensor* tensor, Stri
     usz bytes = total * 4;
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: (sz)bytes,
     )!!;
     
@@ -131,8 +131,8 @@ fn void? dump_tensor_to_file(llm::DeviceContext* ctx, llm::Tensor* tensor, Strin
     usz bytes = total * 4;
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: (sz)bytes,
     )!!;
     
@@ -169,8 +169,8 @@ fn bool? validate_tensor_finite(llm::DeviceContext* ctx, llm::Tensor* tensor, St
     usz bytes = total * 4;
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: (sz)bytes,
     )!!;
     

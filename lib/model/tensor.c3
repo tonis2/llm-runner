@@ -29,8 +29,8 @@ fn Tensor? create_tensor(DeviceContext* ctx, GGMLType dtype, ulong[4] shape, uin
 
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: null,
         data_size: (sz)size_bytes
     )!!;
@@ -49,8 +49,8 @@ fn Tensor? upload_weight(DeviceContext* ctx, GGUFTensorInfo* info, char* tensor_
 
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: data_ptr,
         data_size: (sz)info.data_size,
     )!!;
@@ -420,8 +420,8 @@ fn Tensor? upload_weight_as_q8(DeviceContext* ctx, float* f32_data, uint n_eleme
 
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: q8_data,
         data_size: (sz)q8_size,
     )!!;
@@ -507,8 +507,8 @@ fn CpuTensorData? dequant_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) {
 fn Tensor? upload_cpu_data(DeviceContext* ctx, CpuTensorData* cpu) {
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: cpu.data,
         data_size: (sz)cpu.size_bytes,
     )!!;
@@ -526,8 +526,8 @@ fn Tensor? upload_cpu_data(DeviceContext* ctx, CpuTensorData* cpu) {
 fn Tensor? upload_cpu_data_raw(DeviceContext* ctx, CpuTensorData* cpu, GGMLType dtype) {
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: cpu.data,
         data_size: (sz)cpu.size_bytes,
     )!!;

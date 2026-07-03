@@ -127,8 +127,8 @@ fn QwenVaeConv load_conv3d_as_2d(llm::DeviceContext* ctx, llm::SafetensorsFile* 
 
     vk::Memory gpu_buf = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: dst.ptr, data_size: (sz)(elems_2d * 4),
     )!!;
     mem::free(dst);
@@ -198,8 +198,8 @@ fn llm::Tensor upload_f32_data(llm::DeviceContext* ctx, float* data, usz n_elems
     usz size = n_elems * 4;
     vk::Memory gpu = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: data, data_size: (sz)size,
     )!!;
     return { .gpu_buffer = gpu, .dtype = llm::GGML_F32, .size_bytes = size };

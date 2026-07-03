@@ -150,8 +150,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         cond_embeddings = llm::create_f32_tensor(ctx, { (ulong)cond_text_len * text_config.dim, 0, 0, 0 }, 1)!!;
         // Upload to GPU
         vk::Memory upload_stg = vk::new_buffer(allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: emb_data, data_size: (sz)data_size)!!;
         ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer ucmd) {
             vk::cmdCopyBuffer(ucmd, upload_stg.buffer, cond_embeddings.gpu_buffer.buffer, 1,
@@ -431,8 +431,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: latent_data.ptr,
         data_size: (usz)latent_elems * 4,
     )!!;
@@ -461,8 +461,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     if (use_cfg) {
         cfg_staging = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_SRC_BIT | BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: null, data_size: (usz)latent_elems * 4,
         )!!;
     }
@@ -471,8 +471,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     if (use_cfg) {
         latent_save = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            usage: BUFFER_USAGE_TRANSFER_SRC_BIT | BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             data: null, data_size: (usz)latent_elems * 4,
         )!!;
     }
@@ -576,8 +576,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     {
         vk::Memory lat_readback = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: null, data_size: (usz)latent_elems * 4,
         )!!;
         ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer rb_cmd) {
@@ -608,8 +608,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
         if (use_taesd) {
             vk::Memory lat_staging = vk::new_buffer(
                 allocator: &ctx.allocator,
-                usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+                properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
                 data: latent_cpu.ptr, data_size: (usz)latent_elems * 4,
             )!!;
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
@@ -632,8 +632,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
             vk::Memory lat_staging = vk::new_buffer(
                 allocator: &ctx.allocator,
-                usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-                properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+                properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
                 data: latent_cpu.ptr, data_size: (usz)latent_elems * 4,
             )!!;
             ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer copy_cmd) {
@@ -654,8 +654,8 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
 
         vk::Memory download_staging = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: null,
             data_size: (sz)(total_px * 4),
         )!!;

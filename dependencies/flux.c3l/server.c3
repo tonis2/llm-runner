@@ -366,9 +366,9 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		usz ref_bytes = (usz)kontext_n_ref * flux_latent_ch * 4;
 		vk::Memory ref_buf = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT
-				| vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-			properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT
+				| BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			data: kontext_ref_packed.ptr,
 			data_size: (sz)ref_bytes,
 		)!!;
@@ -468,8 +468,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	{
 		vk::Memory lat_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: latent_cpu.ptr,
 			data_size: (usz)latent_elems * 4,
 		)!!;
@@ -526,8 +526,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	{
 		vk::Memory dl_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: null,
 			data_size: (usz)latent_elems * 4,
 		)!!;
@@ -662,8 +662,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	{
 		vk::Memory lat_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: vae_latent.ptr,
 			data_size: (usz)vae_elems * 4,
 		)!!;
@@ -693,8 +693,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	{
 		vk::Memory dl_staging = vk::new_buffer(
 			allocator: &ctx.allocator,
-			usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-			properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
 			data: null,
 			data_size: (sz)(total_px * 4),
 		)!!;

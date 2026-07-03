@@ -376,8 +376,8 @@ fn LlmModel? load_llm_model(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::Mod
     if (encode_only) {
         embedding_staging = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: null,
             data_size: (usz)config.dim * 4,
         )!!;

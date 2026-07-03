@@ -452,8 +452,8 @@ fn llm::Tensor upload_f32_array(llm::DeviceContext* ctx, float[] data) {
     ulong[4] shape = { (ulong)data.len, 0, 0, 0 };
     vk::Memory buf = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: data.ptr,
         data_size: (sz)(data.len * 4),
     )!!;
@@ -921,8 +921,8 @@ fn void? save_depth_png(llm::DeviceContext* ctx, DepthKernels* k, llm::Tensor* d
 
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: null,
         data_size: (sz)(count * 4),
     )!!;
@@ -1045,8 +1045,8 @@ fn void? save_height_map(llm::DeviceContext* ctx, DepthKernels* k, llm::Tensor* 
         }
         vk::Memory staging = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data: null,
             data_size: (sz)(count * 4),
         )!!;
@@ -1129,8 +1129,8 @@ fn void? save_height_map(llm::DeviceContext* ctx, DepthKernels* k, llm::Tensor* 
 fn void? dump_raw(llm::DeviceContext* ctx, llm::Tensor* t, String path, usz count) {
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: null,
         data_size: (sz)(count * 4),
     )!!;
@@ -1150,8 +1150,8 @@ fn void? dump_raw(llm::DeviceContext* ctx, llm::Tensor* t, String path, usz coun
 fn void? print_stats(llm::DeviceContext* ctx, llm::Tensor* t, String label, usz count) {
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data: null,
         data_size: (sz)(count * 4),
     )!!;

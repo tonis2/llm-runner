@@ -86,8 +86,8 @@ fn int main(String[] args) {
 
         vk::Memory staging = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-            properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+            properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
             data_size: img_size,
         )!!;
         float* sdata = (float*)staging.data();
@@ -149,8 +149,8 @@ fn int main(String[] args) {
     usz latent_bytes = (usz)latent_elems * 4;
     vk::Memory lat_staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: latent_bytes,
     )!!;
 
@@ -224,8 +224,8 @@ fn int main(String[] args) {
 
     vk::Memory download_staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: total_px * 4,
     )!!;
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {

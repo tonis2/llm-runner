@@ -207,8 +207,8 @@ fn Tensor? upload_safetensor_f32(DeviceContext* ctx, SafetensorsFile* sf, String
 
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: f32_data,
         data_size: (sz)f32_size,
     )!!;
@@ -296,8 +296,8 @@ fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, S
 
     vk::Memory gpu_buffer = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT | vk::BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         data: dst_data,
         data_size: (sz)f32_size,
     )!!;

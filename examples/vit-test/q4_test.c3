@@ -100,8 +100,8 @@ fn void? test_q4_0_matmul(llm::DeviceContext* ctx) {
     llm::Tensor weight = {
         .gpu_buffer = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            usage: BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             data: weight_data.ptr,
             data_size: total_bytes,
         )!!,
@@ -120,8 +120,8 @@ fn void? test_q4_0_matmul(llm::DeviceContext* ctx) {
     llm::Tensor input = {
         .gpu_buffer = vk::new_buffer(
             allocator: &ctx.allocator,
-            usage: vk::BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            properties: vk::MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            usage: BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             data: input_data.ptr,
             data_size: (usz)(in_dim * 4),
         )!!,
@@ -156,8 +156,8 @@ fn void? test_q4_0_matmul(llm::DeviceContext* ctx) {
     // Download and verify
     vk::Memory staging = vk::new_buffer(
         allocator: &ctx.allocator,
-        usage: vk::BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: vk::MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
         data_size: output_bytes,
     )!!;
     defer staging.free();
