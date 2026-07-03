@@ -12,6 +12,7 @@ import std::io::file;
 import std::io::file::mmap;
 import std::math;
 import std::core::mem;
+import std::collections::list;
 
 // Flux 2 Klein 9B pipeline: txt2img, img2img, and Kontext-style image editing.
 //
@@ -30,7 +31,7 @@ struct FluxConfig
 	String text_model_path;  // Qwen3-8B GGUF (text encoder)
 	String vae_path;         // Flux VAE safetensors
 	String prompt;
-	String input_path;       // Input image for img2img / kontext
+	List{String} input_paths; // Input image(s) for img2img (uses [0] only) / kontext (uses all)
 	String output_path;
 	String edit_mode;        // "" (txt2img, default) | "img2img" | "kontext"
 	uint image_size;         // Square shortcut. If image_width/height are 0, both are derived from this.
@@ -76,8 +77,8 @@ fn void? run_flux_pipeline(FluxConfig* config)
 	FluxGenerateRequest req = {
 		.prompt        = config.prompt,
 		.edit_mode     = config.edit_mode,
-		.input_path    = config.input_path,
-		.input_image   = null,
+		.input_paths   = config.input_paths.array_view(),
+		.input_images  = {},
 		.image_width   = config.image_width,
 		.image_height  = config.image_height,
 		.image_size    = config.image_size,

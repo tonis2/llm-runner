@@ -19,6 +19,7 @@ import std::io::file::mmap;
 import std::math;
 import std::core::mem;
 import std::time::clock;
+import std::collections::list;
 
 // Persistent state held across requests. What lives here is the pre-loaded
 // stuff the server pays for once at startup. The text encoder and VAE still
@@ -41,12 +42,19 @@ struct FluxServerState
 
 // Request-scoped inputs. Mirrors the relevant subset of FluxConfig, plus an
 // optional in-memory image (server passes pre-decoded init_images here).
+
+// Hard cap on kontext reference images: attention cost/VRAM grow with total
+// reference-token count (n_joint), and this is well beyond what Flux Kontext /
+// Qwen-Image-Edit-style models are trained/tested with — reject rather than
+// silently truncate or risk an OOM deep inside VAE encode / DiT allocation.
+const uint FLUX_MAX_REF_IMAGES = 4;
+
 struct FluxGenerateRequest
 {
 	String prompt;
 	String edit_mode; // "" | "img2img" | "kontext"
-	String input_path; // used iff input_image == null
-	image::Image* input_image; // optional, takes precedence over input_path
+	String[] input_paths; // used iff input_images[i] == null / array shorter
+	image::Image*[] input_images; // optional per-slot, takes precedence over input_paths[i]
 	uint image_width;
 	uint image_height;
 	uint image_size; // fallback when width/height are 0
@@ -228,20 +236,23 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	float[] img2img_ref_latent = (float[]) { };
 	float[] kontext_ref_packed = (float[]) { };
 	uint kontext_n_ref         = 0;
+	List{FluxRefImageGeom} kontext_ref_geoms;
 	if (req.edit_mode == "img2img")
 	{
-		if (req.input_image == null && req.input_path.len == 0)
+		image::Image* img2img_image = req.input_images.len > 0 ? req.input_images[0] : null;
+		String img2img_path         = req.input_paths.len > 0 ? req.input_paths[0] : "";
+		if (img2img_image == null && img2img_path.len == 0)
 		{
 			io::printfn("ERROR: edit_mode=img2img requires input image");
 			text_embeddings.free();
 			return llm::COMPUTE_ERROR~;
 		}
 		io::printfn("\n--- Phase 1.5: VAE Encoding (mode=img2img) ---");
-		if (req.input_image != null)
+		if (img2img_image != null)
 		{
 			img2img_ref_latent = encode_image_object_to_dit_latent(
 				ctx,
-				req.input_image,
+				img2img_image,
 				state.vae_path,
 				img_h,
 				img_w,
@@ -253,7 +264,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		{
 			img2img_ref_latent = encode_image_to_dit_latent(
 				ctx,
-				req.input_path,
+				img2img_path,
 				state.vae_path,
 				img_h,
 				img_w,
@@ -265,43 +276,91 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	}
 	else if (req.edit_mode == "kontext")
 	{
-		if (req.input_image == null && req.input_path.len == 0)
+		uint n_slots = (uint)(req.input_images.len > req.input_paths.len ? req.input_images.len : req.input_paths.len);
+		if (n_slots == 0)
 		{
-			io::printfn("ERROR: edit_mode=kontext requires input image");
+			io::printfn("ERROR: edit_mode=kontext requires at least one input image");
 			text_embeddings.free();
 			return llm::COMPUTE_ERROR~;
 		}
-		io::printfn("\n--- Phase 1.5: VAE Encoding (mode=kontext) ---");
-		float[] ref_chw;
-		if (req.input_image != null)
+		if (n_slots > FLUX_MAX_REF_IMAGES)
 		{
-			ref_chw = encode_image_object_to_dit_latent(
-				ctx,
-				req.input_image,
-				state.vae_path,
-				img_h,
-				img_w,
-				lat_h,
-				lat_w
-			)!!;
+			io::printfn("ERROR: kontext supports at most %d reference images (got %d)", FLUX_MAX_REF_IMAGES, n_slots);
+			text_embeddings.free();
+			return llm::COMPUTE_ERROR~;
 		}
-		else
-		{
-			ref_chw = encode_image_to_dit_latent(ctx, req.input_path, state.vae_path, img_h, img_w, lat_h, lat_w)!!;
-		}
-		defer mem::free(ref_chw);
+		io::printfn("\n--- Phase 1.5: VAE Encoding (mode=kontext, %d image(s)) ---", n_slots);
 
-		kontext_n_ref = lat_h * lat_w;
-		kontext_ref_packed = mem::new_array(float, (usz)kontext_n_ref * flux_latent_ch);
-		for (uint sp = 0; sp < kontext_n_ref; sp++)
+		// Pass 1: load + aspect-preserving resize each reference image (each
+		// keeps its own native aspect ratio — not forced to the output canvas),
+		// recording per-image patch-grid geometry so we can preallocate the
+		// packed buffer exactly once.
+		uint ref_max_long_side = img_h > img_w ? img_h : img_w;
+		image::Image[] resized_imgs = mem::new_array(image::Image, (usz)n_slots);
+		for (uint i = 0; i < n_slots; i++)
 		{
-			for (uint c = 0; c < flux_latent_ch; c++)
+			image::Image* src_ptr = i < (uint)req.input_images.len ? req.input_images[i] : null;
+			String src_path       = i < (uint)req.input_paths.len ? req.input_paths[i] : "";
+			image::Image loaded;
+			bool owns_loaded = false;
+			if (src_ptr == null)
 			{
-				kontext_ref_packed[sp * flux_latent_ch + c] = ref_chw[c * kontext_n_ref + sp];
+				if (src_path.len == 0)
+				{
+					io::printfn("ERROR: kontext image %d missing (neither input_images nor input_paths set)", i);
+					text_embeddings.free();
+					return llm::COMPUTE_ERROR~;
+				}
+				loaded = llm::load_image(src_path)!!;
+				owns_loaded = true;
+				src_ptr = &loaded;
 			}
+			resized_imgs[i] = llm::resize_aspect_fit_round16(src_ptr, ref_max_long_side)!!;
+			if (owns_loaded) loaded.free();
+
+			uint w_i = resized_imgs[i].width / 16;
+			uint h_i = resized_imgs[i].height / 16;
+			kontext_ref_geoms.push({ .n_patches = w_i * h_i, .w = w_i, .h = h_i });
+			kontext_n_ref += w_i * h_i;
 		}
+
+		// Pass 2: VAE-encode each resized image and pack sequentially into one
+		// token-major buffer at its running offset.
+		kontext_ref_packed = mem::new_array(float, (usz)kontext_n_ref * flux_latent_ch);
+		uint running_offset = 0;
+		for (uint i = 0; i < n_slots; i++)
+		{
+			FluxRefImageGeom geom = kontext_ref_geoms[i];
+			float[] ref_chw = encode_image_object_to_dit_latent(
+				ctx,
+				&resized_imgs[i],
+				state.vae_path,
+				resized_imgs[i].height,
+				resized_imgs[i].width,
+				geom.h,
+				geom.w
+			)!!;
+			for (uint sp = 0; sp < geom.n_patches; sp++)
+			{
+				for (uint c = 0; c < flux_latent_ch; c++)
+				{
+					kontext_ref_packed[(running_offset + sp) * flux_latent_ch + c] = ref_chw[c * geom.n_patches + sp];
+				}
+			}
+			mem::free(ref_chw);
+			running_offset += geom.n_patches;
+			resized_imgs[i].free();
+		}
+		mem::free(resized_imgs);
+
 		ctx.allocator.release_empty_pages();
-		io::printfn("  Reference packed: %d tokens x %d ch (T-offset 10)", kontext_n_ref, flux_latent_ch);
+		io::printfn(
+			"  Reference packed: %d image(s), %d tokens total x %d ch (T-offsets 10..%d)",
+			n_slots,
+			kontext_n_ref,
+			flux_latent_ch,
+			10 * n_slots
+		);
 	}
 
 	// --- Phase 2: Resolve DiT model ---
@@ -390,9 +449,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		n_noise,
 		lat_w,
 		lat_h,
-		kontext_n_ref,
-		lat_w,
-		lat_h
+		kontext_ref_geoms.array_view()
 	)!!;
 
 	// --- Phase 3: Denoising ---

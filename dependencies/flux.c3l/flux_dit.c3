@@ -376,6 +376,14 @@ fn FluxDiTActivations? allocate_flux_activations(
 // Text token at position p: ids = (T=0, H=0, W=0, L=p)
 // Image token at (row, col): ids = (T=0, H=row, W=col, L=0)
 
+// Geometry of one reference/kontext image's patch grid, in the token-major
+// layout it contributes to `FluxDiTModel.ref_patches`.
+struct FluxRefImageGeom {
+    uint n_patches; // w * h — how many joint-sequence tokens this image occupies
+    uint w;         // patch-grid width  (lat_w for this image)
+    uint h;         // patch-grid height (lat_h for this image)
+}
+
 fn void? precompute_flux_mrope(
     llm::DeviceContext* ctx,
     llm::Tensor* cos_out,
@@ -384,11 +392,11 @@ fn void? precompute_flux_mrope(
     uint n_noise,
     uint patches_w,
     uint patches_h,
-    uint n_ref = 0,
-    uint ref_patches_w = 0,
-    uint ref_patches_h = 0
+    FluxRefImageGeom[] ref_images = {}
 ) {
-    // Sequence layout: [text(n_txt) | noise_img(n_noise) | ref_img(n_ref)]
+    // Sequence layout: [text(n_txt) | noise_img(n_noise) | ref_img_0 | ref_img_1 | ...]
+    uint n_ref = 0;
+    for (usz i = 0; i < ref_images.len; i++) n_ref += ref_images[i].n_patches;
     uint n_img   = n_noise + n_ref;
     uint seq_len = n_txt + n_img;
     uint half_dim = flux_head_dim / 2; // 64
@@ -396,8 +404,9 @@ fn void? precompute_flux_mrope(
 
     // T-axis offset for reference image tokens. Matches diffusers
     // `_prepare_image_ids` (pipeline_flux2_klein.py:352): t = scale + scale * i
-    // with scale=10 for the (single) reference image we support.
-    const uint REF_T_OFFSET = 10;
+    // with scale=10 for the i-th reference image (0-indexed) — each image
+    // keeps its own H/W spatial grid and is disambiguated purely by T.
+    const uint REF_T_OFFSET_STEP = 10;
 
     float* cos_data = (float*)mem::calloc((sz)(table_size * 4));
     float* sin_data = (float*)mem::calloc((sz)(table_size * 4));
@@ -420,11 +429,23 @@ fn void? precompute_flux_mrope(
             pos_w = img_idx % patches_w;
             pos_l = 0;
         } else {
-            // Reference image token: spatial position on H/W axes, T=REF_T_OFFSET
+            // Reference image token: find which ref image this flattened index
+            // falls into, then use that image's own H/W grid + T-offset.
             uint ref_idx = t - n_txt - n_noise;
-            pos_t = REF_T_OFFSET;
-            pos_h = ref_idx / ref_patches_w;
-            pos_w = ref_idx % ref_patches_w;
+            uint local_idx = ref_idx;
+            uint img_w = 0;
+            uint img_i = 0;
+            for (usz r = 0; r < ref_images.len; r++) {
+                if (local_idx < ref_images[r].n_patches) {
+                    img_w = ref_images[r].w;
+                    img_i = (uint)r;
+                    break;
+                }
+                local_idx -= ref_images[r].n_patches;
+            }
+            pos_t = REF_T_OFFSET_STEP * (img_i + 1);
+            pos_h = local_idx / img_w;
+            pos_w = local_idx % img_w;
             pos_l = 0;
         }
 
