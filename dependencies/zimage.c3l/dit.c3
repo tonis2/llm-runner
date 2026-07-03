@@ -1441,9 +1441,10 @@ fn void? dit_transformer_layer(
 	if (rope_cos != null && rope_cos.size_bytes > 0)
 	{
 		MRoPEPC mrope_pc = { .seq_len = seq_len, .n_heads = DIT_HEADS };
-		uint groups_y = DIT_HEADS * seq_len;
-		g.dispatch(&dk.mrope, { &a.buf_c, rope_cos, rope_sin }, &mrope_pc, 1, groups_y);
-		g.dispatch(&dk.mrope, { &a.norm_out, rope_cos, rope_sin }, &mrope_pc, 1, groups_y);
+		// 3D grid: y=pos (seq_len), z=head (DIT_HEADS). Packing head*seq_len into
+		// y overflowed the 65535 grid-dim cap on long sequences.
+		g.dispatch(&dk.mrope, { &a.buf_c, rope_cos, rope_sin }, &mrope_pc, 1, seq_len, DIT_HEADS);
+		g.dispatch(&dk.mrope, { &a.norm_out, rope_cos, rope_sin }, &mrope_pc, 1, seq_len, DIT_HEADS);
 	}
 
 	// Flash attention v2: tiled FA2-style with online softmax

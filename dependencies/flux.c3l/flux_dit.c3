@@ -848,9 +848,10 @@ fn void? flux_dual_stream_block(
 
     // === Apply mRoPE to Q (buf_a) and K (buf_b) ===
     zimage::MRoPEPC mrope_pc = { .seq_len = n_joint, .n_heads = flux_heads };
-    uint mrope_groups_y = flux_heads * n_joint;
-    g.dispatch(&dk.mrope, { &a.buf_a, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
-    g.dispatch(&dk.mrope, { &a.buf_b, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
+    // 3D grid: y=pos (n_joint), z=head (flux_heads). Keeps both axes under the
+    // 65535 grid-dim cap; packing head*seq_len into y overflowed on long seqs.
+    g.dispatch(&dk.mrope, { &a.buf_a, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, n_joint, flux_heads);
+    g.dispatch(&dk.mrope, { &a.buf_b, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, n_joint, flux_heads);
 
     // === Flash Attention ===
     // Input: Q=buf_a, K=buf_b, V=buf_c in [heads, n_joint, head_dim]
@@ -1024,9 +1025,10 @@ fn void? flux_single_stream_block(
 
     // === mRoPE on Q and K ===
     zimage::MRoPEPC mrope_pc = { .seq_len = seq, .n_heads = flux_heads };
-    uint mrope_groups_y = flux_heads * seq;
-    g.dispatch(&dk.mrope, { &a.buf_a, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
-    g.dispatch(&dk.mrope, { &a.buf_b, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, mrope_groups_y);
+    // 3D grid: y=pos (seq), z=head. Avoids the 65535 grid-dim overflow that
+    // packing head*seq into y caused on long sequences (NVIDIA drops them).
+    g.dispatch(&dk.mrope, { &a.buf_a, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, seq, flux_heads);
+    g.dispatch(&dk.mrope, { &a.buf_b, &model.rope_cos, &model.rope_sin }, &mrope_pc, 1, seq, flux_heads);
 
     // === Flash Attention ===
     float scale = 1.0f / math::sqrt((float)flux_head_dim);

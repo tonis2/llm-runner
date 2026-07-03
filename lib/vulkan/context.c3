@@ -131,12 +131,28 @@ fn DeviceContext? createContext() {
         driver_blacklisted_for_coopmat = false;
     }
 
+    // Opt-out override: set LLM_DISABLE_COOPMAT=1 to force the tiled GEMM
+    // fallback even on drivers that aren't on the Mesa blacklist above (e.g.
+    // NVIDIA), in case that specific driver/GPU also miscomputes
+    // OpCooperativeMatrixStoreKHR for some input shapes. Symmetric with
+    // LLM_FORCE_COOPMAT — one opts in past a blacklist, this opts out of a
+    // driver that isn't (yet) blacklisted.
+    bool disable_coopmat = false;
+    if (try String v = env::tget_var("LLM_DISABLE_COOPMAT")) {
+        if (v == "1" || v == "true" || v == "yes") disable_coopmat = true;
+    }
+    if (disable_coopmat) {
+        io::printfn("  cooperative matrix: LLM_DISABLE_COOPMAT=1 — forcing tiled GEMM fallback");
+    }
+
     // Probe for cooperative matrix support: device must advertise the extension
     // AND expose a 16x16x16 fp16xfp16->fp32 subgroup-scope configuration.
     bool coopmat_supported = false;
     if (driver_blacklisted_for_coopmat) {
         io::printfn("  cooperative matrix: blacklisted on this driver (Mesa #10847 — wrong results)");
         io::printfn("  set LLM_FORCE_COOPMAT=1 to override and test if your driver is fixed");
+    } else if (disable_coopmat) {
+        // Already printed the LLM_DISABLE_COOPMAT message above; skip the probe entirely.
     } else {
         ZStringList probe;
         probe.push_all({"VK_KHR_cooperative_matrix"});

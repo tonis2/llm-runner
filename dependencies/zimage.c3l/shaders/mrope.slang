@@ -6,7 +6,13 @@
 // Rotation convention: standard RoPE e^{+iθ} (matches official diffusers):
 //   out[2j]   = x[2j]*cos - x[2j+1]*sin
 //   out[2j+1] = x[2j]*sin + x[2j+1]*cos
-// Dispatched as 2D: gid.x = pair index (0..63), gid.y = head*seq_len + pos
+// Dispatched as 3D: gid.x = pair index (0..63), gid.y = pos, gid.z = head.
+// pos and head are separate axes (not packed into y as head*seq_len+pos) so
+// neither grid dimension can exceed maxComputeWorkGroupCount[y/z] = 65535.
+// The old packed layout (head*seq_len in y) overflowed 65535 once
+// n_heads*seq_len passed ~65k (e.g. Flux kontext / >=1024px), and NVIDIA
+// silently drops the excess workgroups (AMD RADV happened to run them),
+// leaving the tail tokens un-rotated and destroying long-range attention.
 
 struct MRoPEParams {
     uint seq_len;
@@ -28,12 +34,11 @@ static const uint ROPE_HEAD_DIM = 128;
 [numthreads(64, 1, 1)]
 void mrope(uint3 tid: SV_DispatchThreadID) {
     uint pair = tid.x;
-    uint head_pos = tid.y;
+    uint pos  = tid.y;
+    uint head = tid.z;
     if (pair >= ROPE_HALF_DIM) return;
-    if (head_pos >= mrope_pc.n_heads * mrope_pc.seq_len) return;
-
-    uint head = head_pos / mrope_pc.seq_len;
-    uint pos = head_pos % mrope_pc.seq_len;
+    if (pos >= mrope_pc.seq_len) return;
+    if (head >= mrope_pc.n_heads) return;
 
     uint cs_idx = pos * ROPE_HALF_DIM + pair;
     float cv = mrope_cos[cs_idx];
