@@ -21,6 +21,48 @@ struct DeviceContext {
     bool coopmat_supported; // VK_KHR_cooperative_matrix + fp16x16x16x16->fp32 mode available
 }
 
+// VRAM pressure snapshot for the main device-local (VRAM) heap, via
+// VK_EXT_memory_budget. `used` = this process's current device-local usage;
+// `budget` = how much it may use before the driver starts evicting pages to GTT
+// (system RAM over PCIe). `budget` already discounts VRAM held by other
+// processes (e.g. the desktop compositor), so `used` reaching `budget` is the
+// real "about to spill and run slow" signal — not just our own footprint vs the
+// card size. `total` = physical heap size. If the driver reports no budget,
+// falls back to our own committed bytes vs ~94% of the heap.
+fn void DeviceContext.vram_status(&self, ulong* used, ulong* budget, ulong* total) {
+    PhysicalDeviceMemoryBudgetPropertiesEXT bud = {
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
+        .pNext = null,
+    };
+    PhysicalDeviceMemoryProperties2 mp = {
+        .sType = vk::StructureType.STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+        .pNext = &bud,
+    };
+    vk::getPhysicalDeviceMemoryProperties2(self.pdevice, &mp);
+
+    // The main VRAM heap is the largest DEVICE_LOCAL heap (skip the small
+    // resizable-BAR host-visible+device-local heap some GPUs also expose).
+    uint idx = 0;
+    ulong best = 0;
+    for (uint i = 0; i < mp.memoryProperties.memoryHeapCount; i++) {
+        MemoryHeap h = mp.memoryProperties.memoryHeaps[i];
+        // VK_MEMORY_HEAP_DEVICE_LOCAL_BIT = 0x1 (constdef member doesn't resolve
+        // unqualified across modules; the value is fixed by the Vulkan spec).
+        if (((uint)h.flags & 0x1) != 0 && (ulong)h.size > best) {
+            best = (ulong)h.size;
+            idx = i;
+        }
+    }
+    *total = best;
+    if ((ulong)bud.heapBudget[idx] > 0) {
+        *used = (ulong)bud.heapUsage[idx];
+        *budget = (ulong)bud.heapBudget[idx];
+    } else {
+        *used = (ulong)self.allocator.total_allocated();
+        *budget = best * 94 / 100;
+    }
+}
+
 fn DeviceContext? createContext() {
     ZStringList extensions;
     ZStringList device_extensions;

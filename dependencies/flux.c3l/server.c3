@@ -592,6 +592,29 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	io::printfn("  [phase] dit_setup (ref-encode + load + LoRA + rope): %.2fs", phase_clock.to_now().to_sec());
 	phase_clock = clock::now();
 
+	// VRAM pressure check: the full denoise resident set (DiT weights +
+	// activations + refs + RoPE) is now committed. If it has reached the
+	// device-local budget, the driver evicts pages to GTT (system RAM over
+	// PCIe) and every forward step reads weights over the bus — the denoise
+	// runs 10-30x slower and the GPU goes quiet. Warn loudly so this isn't a
+	// silent slowdown the user only notices by the missing fan noise.
+	{
+		ulong vram_used, vram_budget, vram_total;
+		ctx.vram_status(&vram_used, &vram_budget, &vram_total);
+		double gb = 1073741824.0;
+		io::printfn("  [vram] %.1f GB used / %.1f GB budget (%.1f GB card)",
+			(double)vram_used / gb, (double)vram_budget / gb, (double)vram_total / gb);
+		if (vram_budget > 0 && vram_used * 100 >= vram_budget * 95)
+		{
+			io::printfn("  #########################################################");
+			io::printfn("  ##  WARNING: VRAM AT/OVER BUDGET — spilling to system   ##");
+			io::printfn("  ##  RAM (GTT). Denoise reads weights over PCIe: often   ##");
+			io::printfn("  ##  10-30x slower, GPU goes quiet. Lower resolution /    ##");
+			io::printfn("  ##  reference-image size, or free other GPU apps.        ##");
+			io::printfn("  #########################################################");
+		}
+	}
+
 	// --- Phase 3: Denoising ---
 	io::printfn("\n--- Phase 3: Denoising (%d steps) ---", req.num_steps);
 
