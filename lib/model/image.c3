@@ -236,7 +236,41 @@ fn float[]? image_to_float_nchw_signed(image::Image* img) {
         for (uint x = 0; x < img.width; x++) {
             uint pixel_idx = y * img.width + x;
             for (uint c = 0; c < channels; c++) {
-                char val = img.pixels[(usz)pixel_idx * bpp + c];
+            char val = img.pixels[(usz)pixel_idx * bpp + c];
+                data[c * total_pixels + pixel_idx] = (float)(uint)val / 127.5f - 1.0f;
+            }
+        }
+    }
+
+    return data;
+}
+
+// Like image_to_float_nchw_signed but ALWAYS emits 3 channels [3, H, W] in
+// [-1, 1]. Grayscale is replicated across R/G/B; RGBA drops alpha. The Flux VAE
+// encoder's conv_in has exactly 3 input channels, and the upload path sizes its
+// staging copy as 3*H*W*4 — feeding a 1-channel (grayscale, e.g. a depth map)
+// array otherwise makes that memcpy over-read past the array (garbage at low
+// res, a hard segfault once the over-read crosses an unmapped page at high res).
+fn float[]? image_to_float_nchw_signed_rgb(image::Image* img) {
+    uint src_ch;
+    switch (img.format) {
+        case PixelFormat.GRAYSCALE: src_ch = 1;
+        case PixelFormat.RGB: src_ch = 3;
+        case PixelFormat.RGBA: src_ch = 4;
+        default: src_ch = 3;
+    }
+
+    uint total_pixels = img.width * img.height;
+    float[] data = mem::new_array(float, (usz)total_pixels * 3);
+    usz bpp = (usz)img.bytes_per_pixel();
+
+    for (uint y = 0; y < img.height; y++) {
+        for (uint x = 0; x < img.width; x++) {
+            uint pixel_idx = y * img.width + x;
+            for (uint c = 0; c < 3; c++) {
+                // Grayscale: read channel 0 for all three outputs (replicate).
+                uint sc = src_ch == 1 ? 0 : c;
+                char val = img.pixels[(usz)pixel_idx * bpp + sc];
                 data[c * total_pixels + pixel_idx] = (float)(uint)val / 127.5f - 1.0f;
             }
         }
