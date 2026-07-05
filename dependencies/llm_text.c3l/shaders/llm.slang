@@ -2457,3 +2457,234 @@ void batch_matmul_q6k(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
         }
     }
 }
+
+// ============================================================
+// Prefill (batched) kernels — process all prompt positions in
+// single dispatches instead of one forward_layer per token.
+// Used by the text-encoder prefill path (encode_text_multilayer).
+// ============================================================
+
+struct RMSNormBatchParams {
+    uint dim;
+    float eps;
+    uint n_rows;
+};
+
+[vk_push_constant] const RMSNormBatchParams rmsnorm_batch_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> rmsnorm_b_input;
+[vk_binding(1, 0)] RWStructuredBuffer<float> rmsnorm_b_weight;
+[vk_binding(2, 0)] RWStructuredBuffer<float> rmsnorm_b_output;
+
+groupshared float rmsnorm_b_shared[256];
+
+// One workgroup per row.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void rmsnorm_batch(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    if (row >= rmsnorm_batch_pc.n_rows) return;
+    uint dim = rmsnorm_batch_pc.dim;
+    uint base = row * dim;
+
+    float sum_sq = 0.0;
+    for (uint i = gi; i < dim; i += 256) {
+        float val = rmsnorm_b_input[base + i];
+        sum_sq += val * val;
+    }
+    rmsnorm_b_shared[gi] = sum_sq;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) rmsnorm_b_shared[gi] += rmsnorm_b_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float rms = 1.0 / sqrt(rmsnorm_b_shared[0] / float(dim) + rmsnorm_batch_pc.eps);
+
+    for (uint i = gi; i < dim; i += 256) {
+        rmsnorm_b_output[base + i] = rmsnorm_b_input[base + i] * rms * rmsnorm_b_weight[i];
+    }
+}
+
+// Per-head RMSNorm over a [n_rows, n_heads * head_dim] tensor, in place.
+// One thread per (row, head) — head_dim is small (128), the serial loop is fine.
+struct HeadRMSNormBatchParams {
+    uint head_dim;
+    uint n_heads;
+    uint n_rows;
+    float eps;
+};
+
+[vk_push_constant] const HeadRMSNormBatchParams head_rmsnorm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> head_rmsnorm_data;
+[vk_binding(1, 0)] RWStructuredBuffer<float> head_rmsnorm_weight;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void head_rmsnorm_batch(uint3 tid: SV_DispatchThreadID) {
+    uint total = head_rmsnorm_pc.n_rows * head_rmsnorm_pc.n_heads;
+    if (tid.x >= total) return;
+    uint hd = head_rmsnorm_pc.head_dim;
+    uint base = tid.x * hd;
+
+    float sum_sq = 0.0;
+    for (uint d = 0; d < hd; d++) {
+        float val = head_rmsnorm_data[base + d];
+        sum_sq += val * val;
+    }
+    float rms = 1.0 / sqrt(sum_sq / float(hd) + head_rmsnorm_pc.eps);
+    for (uint d = 0; d < hd; d++) {
+        head_rmsnorm_data[base + d] = head_rmsnorm_data[base + d] * rms * head_rmsnorm_weight[d];
+    }
+}
+
+// RoPE over a [n_tokens, n_heads * dim] tensor, position = row index.
+struct RoPEBatchParams {
+    uint dim;       // head_dim
+    uint n_heads;
+    uint n_tokens;
+    float theta;
+};
+
+[vk_push_constant] const RoPEBatchParams rope_batch_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> rope_batch_data;
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void rope_batch(uint3 tid: SV_DispatchThreadID) {
+    uint half_dim = rope_batch_pc.dim / 2;
+    uint pairs_per_tok = rope_batch_pc.n_heads * half_dim;
+    if (tid.x >= rope_batch_pc.n_tokens * pairs_per_tok) return;
+
+    uint pos  = tid.x / pairs_per_tok;
+    uint rem  = tid.x % pairs_per_tok;
+    uint head = rem / half_dim;
+    uint pair = rem % half_dim;
+
+    float freq = 1.0 / pow(rope_batch_pc.theta, float(2 * pair) / float(rope_batch_pc.dim));
+    float angle = float(pos) * freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    uint base = pos * rope_batch_pc.n_heads * rope_batch_pc.dim + head * rope_batch_pc.dim + pair * 2;
+    float x0 = rope_batch_data[base];
+    float x1 = rope_batch_data[base + 1];
+    rope_batch_data[base]     = x0 * cos_val - x1 * sin_val;
+    rope_batch_data[base + 1] = x0 * sin_val + x1 * cos_val;
+}
+
+// Scatter batched K/V [n_tokens, kv_dim] into the KV cache layout
+// [n_kv_heads, max_seq_len, head_dim] in one dispatch.
+struct KVStoreParams {
+    uint n_tokens;
+    uint kv_dim;
+    uint head_dim;
+    uint max_seq_len;
+};
+
+[vk_push_constant] const KVStoreParams kv_store_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> kv_store_k_in;
+[vk_binding(1, 0)] RWStructuredBuffer<float> kv_store_v_in;
+[vk_binding(2, 0)] RWStructuredBuffer<float> kv_store_k_cache;
+[vk_binding(3, 0)] RWStructuredBuffer<float> kv_store_v_cache;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void kv_cache_store(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= kv_store_pc.n_tokens * kv_store_pc.kv_dim) return;
+    uint pos = tid.x / kv_store_pc.kv_dim;
+    uint rem = tid.x % kv_store_pc.kv_dim;
+    uint h   = rem / kv_store_pc.head_dim;
+    uint d   = rem % kv_store_pc.head_dim;
+    uint dst = h * kv_store_pc.max_seq_len * kv_store_pc.head_dim + pos * kv_store_pc.head_dim + d;
+    kv_store_k_cache[dst] = kv_store_k_in[tid.x];
+    kv_store_v_cache[dst] = kv_store_v_in[tid.x];
+}
+
+// Causal GQA attention over all prompt positions: one workgroup per
+// (q_head, q_position), scores kept in LDS (n_tokens <= 1024).
+struct AttentionPrefillParams {
+    uint head_dim;
+    uint n_kv_heads;
+    uint n_q_heads;
+    uint n_tokens;
+    float scale;
+    uint max_seq_len;
+};
+
+[vk_push_constant] const AttentionPrefillParams apf_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> apf_q;       // [n_tokens, n_q_heads * head_dim]
+[vk_binding(1, 0)] RWStructuredBuffer<float> apf_k_cache; // [n_kv_heads, max_seq_len, head_dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> apf_v_cache;
+[vk_binding(3, 0)] RWStructuredBuffer<float> apf_output;  // [n_tokens, n_q_heads * head_dim]
+
+groupshared float apf_scores[1024];
+groupshared float apf_qtile[128];
+groupshared float apf_red[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void attention_prefill(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint q_head = gid.x;
+    uint q_pos  = gid.y;
+    if (q_head >= apf_pc.n_q_heads || q_pos >= apf_pc.n_tokens) return;
+
+    uint hd = apf_pc.head_dim;
+    uint kv_head = q_head / (apf_pc.n_q_heads / apf_pc.n_kv_heads);
+    uint seq = q_pos + 1; // causal: attend to positions 0..q_pos
+    uint kv_base = kv_head * apf_pc.max_seq_len * hd;
+    uint q_base = q_pos * apf_pc.n_q_heads * hd + q_head * hd;
+
+    if (gi < hd) apf_qtile[gi] = apf_q[q_base + gi];
+    GroupMemoryBarrierWithGroupSync();
+
+    // Q @ K^T
+    for (uint pos = gi; pos < seq; pos += 256) {
+        float dot_val = 0.0;
+        for (uint d = 0; d < hd; d++) {
+            dot_val += apf_qtile[d] * apf_k_cache[kv_base + pos * hd + d];
+        }
+        apf_scores[pos] = dot_val * apf_pc.scale;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Softmax max
+    float max_val = -1.0e30;
+    for (uint i = gi; i < seq; i += 256) max_val = max(max_val, apf_scores[i]);
+    apf_red[gi] = max_val;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) apf_red[gi] = max(apf_red[gi], apf_red[gi + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float global_max = apf_red[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    // exp + sum
+    float sum = 0.0;
+    for (uint i = gi; i < seq; i += 256) {
+        float val = exp(apf_scores[i] - global_max);
+        apf_scores[i] = val;
+        sum += val;
+    }
+    apf_red[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) apf_red[gi] += apf_red[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float inv_sum = 1.0 / apf_red[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    // Weighted sum of V
+    for (uint d = gi; d < hd; d += 256) {
+        float acc = 0.0;
+        for (uint pos = 0; pos < seq; pos++) {
+            acc += apf_scores[pos] * apf_v_cache[kv_base + pos * hd + d];
+        }
+        apf_output[q_base + d] = acc * inv_sum;
+    }
+}

@@ -71,6 +71,18 @@ struct LlmKernels {
     llm::ComputeKernel embedding;
     llm::ComputeKernel rope;
     llm::ComputeKernel attention;
+    // Batched prefill path (encode_text_multilayer)
+    llm::ComputeKernel rmsnorm_batch;
+    llm::ComputeKernel head_rmsnorm_batch;
+    llm::ComputeKernel rope_batch;
+    llm::ComputeKernel kv_cache_store;
+    llm::ComputeKernel attention_prefill;
+    llm::ComputeKernel batch_matmul_simple;
+    llm::ComputeKernel batch_matmul_q8;
+    llm::ComputeKernel batch_matmul_q4_0;
+    llm::ComputeKernel batch_matmul_q4k;
+    llm::ComputeKernel batch_matmul_q5k;
+    llm::ComputeKernel batch_matmul_q6k;
     llm::SharedKernels shared;
 }
 
@@ -93,6 +105,13 @@ struct LlmModel {
 struct EmbeddingPC { uint token_id; uint dim; }
 struct RoPEPC { uint dim; uint n_heads; uint position; float theta; }
 struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_len; float scale; uint max_seq_len; }
+// Batched prefill push constants (must match llm.slang prefill kernels)
+struct RMSNormBatchPC { uint dim; float eps; uint n_rows; }
+struct HeadRMSNormBatchPC { uint head_dim; uint n_heads; uint n_rows; float eps; }
+struct RoPEBatchPC { uint dim; uint n_heads; uint n_tokens; float theta; }
+struct KVStorePC { uint n_tokens; uint kv_dim; uint head_dim; uint max_seq_len; }
+struct AttentionPrefillPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint n_tokens; float scale; uint max_seq_len; }
+struct BatchMatMulPC { uint out_dim; uint in_dim; uint seq_len; uint row_offset; }
 
 fn LlmWeights? load_llm_weights(llm::DeviceContext* ctx, llm::GGUFFile* gf, llm::ModelConfig* config, llm::WeightNames* names, bool encode_only = false) {
 
@@ -358,6 +377,17 @@ fn LlmKernels? create_llm_kernels(llm::DeviceContext* ctx) {
         .embedding    = llm::create_kernel(ctx, shader, 2, EmbeddingPC::size, "embedding")!!,
         .rope         = llm::create_kernel(ctx, shader, 1, RoPEPC::size, "rope")!!,
         .attention    = llm::create_kernel(ctx, shader, 5, AttentionPC::size, "attention")!!,
+        .rmsnorm_batch      = llm::create_kernel(ctx, shader, 3, RMSNormBatchPC::size, "rmsnorm_batch")!!,
+        .head_rmsnorm_batch = llm::create_kernel(ctx, shader, 2, HeadRMSNormBatchPC::size, "head_rmsnorm_batch")!!,
+        .rope_batch         = llm::create_kernel(ctx, shader, 1, RoPEBatchPC::size, "rope_batch")!!,
+        .kv_cache_store     = llm::create_kernel(ctx, shader, 4, KVStorePC::size, "kv_cache_store")!!,
+        .attention_prefill  = llm::create_kernel(ctx, shader, 4, AttentionPrefillPC::size, "attention_prefill")!!,
+        .batch_matmul_simple = llm::create_kernel(ctx, shader, 3, BatchMatMulPC::size, "batch_matmul_simple")!!,
+        .batch_matmul_q8    = llm::create_kernel(ctx, shader, 3, BatchMatMulPC::size, "batch_matmul_q8")!!,
+        .batch_matmul_q4_0  = llm::create_kernel(ctx, shader, 3, BatchMatMulPC::size, "batch_matmul_q4_0")!!,
+        .batch_matmul_q4k   = llm::create_kernel(ctx, shader, 3, BatchMatMulPC::size, "batch_matmul_q4k")!!,
+        .batch_matmul_q5k   = llm::create_kernel(ctx, shader, 3, BatchMatMulPC::size, "batch_matmul_q5k")!!,
+        .batch_matmul_q6k   = llm::create_kernel(ctx, shader, 3, BatchMatMulPC::size, "batch_matmul_q6k")!!,
         .shared       = llm::create_shared_kernels(ctx, shader)!!,
     };
 
@@ -551,6 +581,170 @@ fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, ui
 
     // Residual add: hidden += ffn_down_out
     g.dispatch(&sk.residual_add, { &a.hidden, &a.ffn_down_out }, &res_pc, llm::ceil_div(c.dim, 256));
+}
+
+// --- Batched prefill path ---
+// Processes all prompt positions of a layer with batched GEMMs / norms /
+// RoPE / attention instead of one forward_layer call per token. Used by
+// encode_text_multilayer; ~15 dispatches per layer instead of ~150 commands
+// per token position.
+
+struct PrefillActivations {
+    llm::Tensor norm_out;
+    llm::Tensor q;
+    llm::Tensor k;
+    llm::Tensor v;
+    llm::Tensor attn_out;
+    llm::Tensor ffn_gate_out;
+    llm::Tensor ffn_up_out;
+    llm::Tensor ffn_down_out;
+}
+
+fn PrefillActivations? allocate_prefill_activations(llm::DeviceContext* ctx, llm::ModelConfig* config, uint n_tokens) {
+    ulong n = n_tokens;
+    ulong dim = config.dim;
+    ulong q_dim = (ulong)config.n_heads * config.head_dim;
+    ulong kv_dim = (ulong)config.n_kv_heads * config.head_dim;
+    ulong ffn_dim = config.ffn_dim;
+    return {
+        .norm_out     = llm::create_f32_tensor(ctx, { n * dim, 0, 0, 0 }, 1)!!,
+        .q            = llm::create_f32_tensor(ctx, { n * q_dim, 0, 0, 0 }, 1)!!,
+        .k            = llm::create_f32_tensor(ctx, { n * kv_dim, 0, 0, 0 }, 1)!!,
+        .v            = llm::create_f32_tensor(ctx, { n * kv_dim, 0, 0, 0 }, 1)!!,
+        .attn_out     = llm::create_f32_tensor(ctx, { n * q_dim, 0, 0, 0 }, 1)!!,
+        .ffn_gate_out = llm::create_f32_tensor(ctx, { n * ffn_dim, 0, 0, 0 }, 1)!!,
+        .ffn_up_out   = llm::create_f32_tensor(ctx, { n * ffn_dim, 0, 0, 0 }, 1)!!,
+        .ffn_down_out = llm::create_f32_tensor(ctx, { n * dim, 0, 0, 0 }, 1)!!,
+    };
+}
+
+fn void PrefillActivations.free(&self) {
+    self.norm_out.free();
+    self.q.free();
+    self.k.free();
+    self.v.free();
+    self.attn_out.free();
+    self.ffn_gate_out.free();
+    self.ffn_up_out.free();
+    self.ffn_down_out.free();
+}
+
+// Arch gate for the prefill path (per-layer bias is checked at dispatch time).
+fn bool LlmModel.prefill_supported(&self, uint n_tokens) {
+    return self.config.norm_type == RMSNORM
+        && self.config.ffn_type == SWIGLU
+        && n_tokens <= 1024              // attention_prefill LDS score buffer
+        && n_tokens <= self.max_seq_len;
+}
+
+fn void dispatch_matmul_batch(
+    llm::RenderGraph* g,
+    LlmKernels* k,
+    llm::Tensor* weight,
+    llm::Tensor* input,
+    llm::Tensor* output,
+    uint out_dim,
+    uint in_dim,
+    uint n_tokens
+) {
+    BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = n_tokens, .row_offset = 0 };
+    llm::ComputeKernel* kernel;
+    bool tiled_2d = false;
+    if (weight.dtype == llm::GGML_Q8_0) {
+        kernel = &k.batch_matmul_q8;
+        tiled_2d = true;
+    } else if (weight.dtype == llm::GGML_Q4_K) {
+        kernel = &k.batch_matmul_q4k;
+        tiled_2d = true;
+    } else if (weight.dtype == llm::GGML_Q5_K) {
+        kernel = &k.batch_matmul_q5k;
+        tiled_2d = true;
+    } else if (weight.dtype == llm::GGML_Q6_K) {
+        kernel = &k.batch_matmul_q6k;
+        tiled_2d = true;
+    } else if (weight.dtype == llm::GGML_Q4_0) {
+        kernel = &k.batch_matmul_q4_0;
+    } else {
+        // F32/F16-as-F32 weights: 2D dispatch (seq_len, out_dim)
+        g.dispatch(&k.batch_matmul_simple, { weight, input, output }, &pc, n_tokens, out_dim);
+        return;
+    }
+    uint groups = tiled_2d
+        ? llm::ceil_div(n_tokens, 64) * llm::ceil_div(out_dim, 64)
+        : n_tokens * out_dim;
+    g.dispatch(kernel, { weight, input, output }, &pc, groups);
+}
+
+// Batched layer forward over `hidden` [n_tokens, dim]. Requires RMSNorm +
+// SwiGLU without QKV bias (e.g. Qwen3) — callers check prefill_supported()
+// and lw.wq_bias before dispatching.
+fn void? LlmModel.forward_layer_prefill(&self, llm::RenderGraph* g, LayerWeights* lw, uint layer, llm::Tensor* hidden, PrefillActivations* pa, uint n_tokens) {
+    llm::ModelConfig* c = &self.config;
+    LlmKernels* k = &self.kernels;
+    llm::SharedKernels* sk = &k.shared;
+    uint q_dim = c.n_heads * c.head_dim;
+    uint kv_dim = c.n_kv_heads * c.head_dim;
+
+    // Attention norm
+    RMSNormBatchPC rms_pc = { .dim = c.dim, .eps = c.rms_eps, .n_rows = n_tokens };
+    g.dispatch(&k.rmsnorm_batch, { hidden, &lw.attn_norm, &pa.norm_out }, &rms_pc, n_tokens);
+
+    // Q/K/V projections (batched GEMM)
+    dispatch_matmul_batch(g, k, &lw.wq, &pa.norm_out, &pa.q, q_dim, c.dim, n_tokens);
+    dispatch_matmul_batch(g, k, &lw.wk, &pa.norm_out, &pa.k, kv_dim, c.dim, n_tokens);
+    dispatch_matmul_batch(g, k, &lw.wv, &pa.norm_out, &pa.v, kv_dim, c.dim, n_tokens);
+
+    // Q/K per-head RMSNorm (e.g. Qwen3) — two dispatches instead of
+    // 3 commands x heads per position
+    if (lw.wq_norm.size_bytes > 0) {
+        HeadRMSNormBatchPC qn_pc = { .head_dim = c.head_dim, .n_heads = c.n_heads, .n_rows = n_tokens, .eps = c.rms_eps };
+        g.dispatch(&k.head_rmsnorm_batch, { &pa.q, &lw.wq_norm }, &qn_pc, llm::ceil_div(n_tokens * c.n_heads, 256));
+        HeadRMSNormBatchPC kn_pc = { .head_dim = c.head_dim, .n_heads = c.n_kv_heads, .n_rows = n_tokens, .eps = c.rms_eps };
+        g.dispatch(&k.head_rmsnorm_batch, { &pa.k, &lw.wk_norm }, &kn_pc, llm::ceil_div(n_tokens * c.n_kv_heads, 256));
+    }
+
+    // RoPE (position = row index)
+    RoPEBatchPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .n_tokens = n_tokens, .theta = c.rope_theta };
+    g.dispatch(&k.rope_batch, { &pa.q }, &rope_q_pc, llm::ceil_div(n_tokens * c.n_heads * (c.head_dim / 2), 128));
+    RoPEBatchPC rope_k_pc = { .dim = c.head_dim, .n_heads = c.n_kv_heads, .n_tokens = n_tokens, .theta = c.rope_theta };
+    g.dispatch(&k.rope_batch, { &pa.k }, &rope_k_pc, llm::ceil_div(n_tokens * c.n_kv_heads * (c.head_dim / 2), 128));
+
+    // KV cache fill (one dispatch instead of 2 copies x kv_heads x positions)
+    KVStorePC kvs_pc = { .n_tokens = n_tokens, .kv_dim = kv_dim, .head_dim = c.head_dim, .max_seq_len = self.max_seq_len };
+    g.dispatch(&k.kv_cache_store,
+        { &pa.k, &pa.v, &self.kv.k_cache[layer], &self.kv.v_cache[layer] },
+        &kvs_pc, llm::ceil_div(n_tokens * kv_dim, 256));
+
+    // Causal attention over all positions: one workgroup per (head, position)
+    AttentionPrefillPC apf_pc = {
+        .head_dim = c.head_dim,
+        .n_kv_heads = c.n_kv_heads,
+        .n_q_heads = c.n_heads,
+        .n_tokens = n_tokens,
+        .scale = 1.0f / std::math::sqrt((float)c.head_dim),
+        .max_seq_len = self.max_seq_len,
+    };
+    g.dispatch(&k.attention_prefill,
+        { &pa.q, &self.kv.k_cache[layer], &self.kv.v_cache[layer], &pa.attn_out },
+        &apf_pc, c.n_heads, n_tokens);
+
+    // Output projection + residual
+    dispatch_matmul_batch(g, k, &lw.wo, &pa.attn_out, &pa.norm_out, c.dim, q_dim, n_tokens);
+    llm::ResidualPC res_pc = { .n = n_tokens * c.dim };
+    g.dispatch(&sk.residual_add, { hidden, &pa.norm_out }, &res_pc, llm::ceil_div(n_tokens * c.dim, 256));
+
+    // FFN norm
+    g.dispatch(&k.rmsnorm_batch, { hidden, &lw.ffn_norm, &pa.norm_out }, &rms_pc, n_tokens);
+
+    // FFN (SwiGLU)
+    dispatch_matmul_batch(g, k, &lw.ffn_gate, &pa.norm_out, &pa.ffn_gate_out, c.ffn_dim, c.dim, n_tokens);
+    dispatch_matmul_batch(g, k, &lw.ffn_up, &pa.norm_out, &pa.ffn_up_out, c.ffn_dim, c.dim, n_tokens);
+    llm::SiluPC silu_pc = { .n = n_tokens * c.ffn_dim };
+    g.dispatch(&sk.silu, { &pa.ffn_gate_out }, &silu_pc, llm::ceil_div(n_tokens * c.ffn_dim, 256));
+    llm::ElemwisePC emul_pc = { .n = n_tokens * c.ffn_dim };
+    g.dispatch(&sk.elemwise_mul, { &pa.ffn_gate_out, &pa.ffn_up_out }, &emul_pc, llm::ceil_div(n_tokens * c.ffn_dim, 256));
+    dispatch_matmul_batch(g, k, &lw.ffn_down, &pa.ffn_gate_out, &pa.ffn_down_out, c.dim, c.ffn_dim, n_tokens);
+    g.dispatch(&sk.residual_add, { hidden, &pa.ffn_down_out }, &res_pc, llm::ceil_div(n_tokens * c.dim, 256));
 }
 
 fn void? LlmModel.forward(&self, uint token, uint position) {
@@ -807,6 +1001,17 @@ fn void LlmModel.free(&self) {
     self.kernels.embedding.free(self.ctx.device);
     self.kernels.rope.free(self.ctx.device);
     self.kernels.attention.free(self.ctx.device);
+    self.kernels.rmsnorm_batch.free(self.ctx.device);
+    self.kernels.head_rmsnorm_batch.free(self.ctx.device);
+    self.kernels.rope_batch.free(self.ctx.device);
+    self.kernels.kv_cache_store.free(self.ctx.device);
+    self.kernels.attention_prefill.free(self.ctx.device);
+    self.kernels.batch_matmul_simple.free(self.ctx.device);
+    self.kernels.batch_matmul_q8.free(self.ctx.device);
+    self.kernels.batch_matmul_q4_0.free(self.ctx.device);
+    self.kernels.batch_matmul_q4k.free(self.ctx.device);
+    self.kernels.batch_matmul_q5k.free(self.ctx.device);
+    self.kernels.batch_matmul_q6k.free(self.ctx.device);
     // Free shared kernels
     self.kernels.shared.free(self.ctx.device);
 

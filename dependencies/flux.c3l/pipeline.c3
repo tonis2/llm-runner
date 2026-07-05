@@ -13,6 +13,7 @@ import std::io::file::mmap;
 import std::math;
 import std::core::mem;
 import std::collections::list;
+import std::time::clock;
 
 // Flux 2 Klein 9B pipeline: txt2img, img2img, and Kontext-style image editing.
 //
@@ -392,61 +393,93 @@ fn llm::Tensor? encode_text_multilayer(
 		layer_outputs[i] = llm::create_f32_tensor(ctx, { (ulong)seq_len * dim, 0, 0, 0 }, 1)!!;
 	}
 
-	// 1. Embed all tokens
-	for (uint pos = 0; pos < seq_len; pos++)
+	// 1. Embed all tokens: dequant every row into one staging buffer, single copy
+	Clock embed_clock = clock::now();
 	{
-		float* staging_ptr = (float*)model.embedding_staging.data();
-		llm::dequant_embedding_row(
-			model.weights.embedding_data,
-			&model.weights.embedding_info,
-			tokens[pos],
-			staging_ptr,
-			dim
-		);
+		vk::Memory emb_staging = vk::new_buffer(
+			allocator: &ctx.allocator,
+			usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+			properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			data: null,
+			data_size: (usz)seq_len * dim * 4,
+		)!!;
+		float* staging_ptr = (float*)emb_staging.data();
+		for (uint pos = 0; pos < seq_len; pos++)
+		{
+			llm::dequant_embedding_row(
+				model.weights.embedding_data,
+				&model.weights.embedding_info,
+				tokens[pos],
+				staging_ptr + (usz)pos * dim,
+				dim
+			);
+		}
 		ctx.device.@single_time_command(ctx.compute_queue ; vk::CommandBuffer emb_cmd)
 		{
 			vk::cmdCopyBuffer(
 				emb_cmd,
-				model.embedding_staging.buffer,
+				emb_staging.buffer,
 				hidden_states.gpu_buffer.buffer,
 				1,
-				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = (ulong)pos * dim * 4, .size = (ulong)dim * 4 } }
+				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = 0, .size = (ulong)seq_len * dim * 4 } }
 			);
 		}!!;
+		emb_staging.free();
 	}
 
-	// 2. Process layers, snapshot at extract points
+	io::printfn("  [text] embed upload: %.2fs", embed_clock.to_now().to_sec());
+
+	// 2. Process layers, snapshot at extract points. Batched prefill when the
+	// arch supports it (RMSNorm + SwiGLU); per-token fallback otherwise (or
+	// per-layer when a layer carries QKV bias).
+	bool use_prefill = model.prefill_supported(seq_len);
+	llm_text::PrefillActivations prefill_acts;
+	if (use_prefill) prefill_acts = llm_text::allocate_prefill_activations(ctx, c, seq_len)!!;
+
+	double load_s    = 0.0;
+	double forward_s = 0.0;
 	for (uint l = 0; l < c.n_layers; l++)
 	{
+		Clock layer_clock = clock::now();
 		llm_text::LayerWeights lw = llm_text::load_single_layer(ctx, model.gf, model.names, c, l)!!;
+		load_s += layer_clock.to_now().to_sec();
+		layer_clock = clock::now();
 
 		llm::RenderGraph g;
 		g.init(ctx)!!;
-		for (uint pos = 0; pos < seq_len; pos++)
+		if (use_prefill && lw.wq_bias.size_bytes == 0)
 		{
-			if (g.needs_barrier) llm::compute_barrier(g.cmd);
-			vk::cmdCopyBuffer(
-				g.cmd,
-				hidden_states.gpu_buffer.buffer,
-				model.acts.hidden.gpu_buffer.buffer,
-				1,
-				(vk::BufferCopy[]) { { .srcOffset = (ulong)pos * dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 } }
-			);
-			g.needs_barrier = true;
+			model.forward_layer_prefill(&g, &lw, l, &hidden_states, &prefill_acts, seq_len)!!;
+		}
+		else
+		{
+			for (uint pos = 0; pos < seq_len; pos++)
+			{
+				if (g.needs_barrier) llm::compute_barrier(g.cmd);
+				vk::cmdCopyBuffer(
+					g.cmd,
+					hidden_states.gpu_buffer.buffer,
+					model.acts.hidden.gpu_buffer.buffer,
+					1,
+					(vk::BufferCopy[]) { { .srcOffset = (ulong)pos * dim * 4, .dstOffset = 0, .size = (ulong)dim * 4 } }
+				);
+				g.needs_barrier = true;
 
-			model.forward_layer(&g, &lw, l, pos)!!;
+				model.forward_layer(&g, &lw, l, pos)!!;
 
-			if (g.needs_barrier) llm::compute_barrier(g.cmd);
-			vk::cmdCopyBuffer(
-				g.cmd,
-				model.acts.hidden.gpu_buffer.buffer,
-				hidden_states.gpu_buffer.buffer,
-				1,
-				(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = (ulong)pos * dim * 4, .size = (ulong)dim * 4 } }
-			);
-			g.needs_barrier = true;
+				if (g.needs_barrier) llm::compute_barrier(g.cmd);
+				vk::cmdCopyBuffer(
+					g.cmd,
+					model.acts.hidden.gpu_buffer.buffer,
+					hidden_states.gpu_buffer.buffer,
+					1,
+					(vk::BufferCopy[]) { { .srcOffset = 0, .dstOffset = (ulong)pos * dim * 4, .size = (ulong)dim * 4 } }
+				);
+				g.needs_barrier = true;
+			}
 		}
 		g.flush()!!;
+		forward_s += layer_clock.to_now().to_sec();
 		llm_text::free_layer_weights(&lw, c);
 
 		// Snapshot if this is an extraction layer
@@ -467,7 +500,10 @@ fn llm::Tensor? encode_text_multilayer(
 			}
 		}
 	}
+	if (use_prefill) prefill_acts.free();
 	hidden_states.free();
+	io::printfn("  [text] layers: weight load %.2fs, forward %.2fs (%d layers x %d tokens, %s)",
+		load_s, forward_s, c.n_layers, seq_len, use_prefill ? "prefill" : "per-token");
 
 	// 3. Concatenate: interleave 3 layer outputs → [seq_len, 3*dim]
 	uint out_dim       = dim * 3;

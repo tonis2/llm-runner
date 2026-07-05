@@ -101,6 +101,110 @@ void conv2d(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
 }
 
 // ============================================================
+// Tiled 3x3 Conv2D — stride 1, pad 1, groups 1 (the dominant VAE case)
+// ============================================================
+// 16x16 output tile per workgroup, 4 output channels per workgroup (gid.z),
+// input channels in chunks of 4 staged through an LDS tile with 1-px halo.
+// Each staged input element is reused 9 (kernel) x 4 (oc) times instead of
+// being re-fetched from global memory once per output channel like the
+// generic conv2d kernel does.
+// Same bindings + push constants as conv2d.
+
+static const uint C3_TILE = 16;      // output tile edge
+static const uint C3_IN_EDGE = 18;   // tile + 2 halo
+static const uint C3_IN_STRIDE = 19; // +1 pad against LDS bank conflicts
+static const uint C3_ICC = 4;        // input channels per chunk
+static const uint C3_OCB = 4;        // output channels per workgroup
+
+groupshared float c3_in[C3_ICC * C3_IN_EDGE * C3_IN_STRIDE]; // ~5.5 KB
+groupshared float c3_w[9 * C3_ICC * C3_OCB];                 // 576 B
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void conv2d_3x3(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint out_w = conv2d_pc.out_w;
+    uint out_h = conv2d_pc.out_h;
+    uint in_c  = conv2d_pc.in_c;
+    uint out_c = conv2d_pc.out_c;
+
+    uint tx = gi % C3_TILE;
+    uint ty = gi / C3_TILE;
+    uint ow = gid.x * C3_TILE + tx;
+    uint oh = gid.y * C3_TILE + ty;
+    uint oc0 = gid.z * C3_OCB;
+
+    float acc[C3_OCB];
+    for (uint i = 0; i < C3_OCB; i++) acc[i] = 0.0;
+
+    int in_x0 = int(gid.x * C3_TILE) - 1;
+    int in_y0 = int(gid.y * C3_TILE) - 1;
+    uint hw = conv2d_pc.in_h * conv2d_pc.in_w;
+
+    for (uint ic0 = 0; ic0 < in_c; ic0 += C3_ICC) {
+        // Stage input tile [ICC x 18 x 18] (zero-padded at borders / tail channels)
+        for (uint i = 0; i < 6; i++) {
+            uint flat = gi + i * 256;
+            if (flat < C3_ICC * C3_IN_EDGE * C3_IN_EDGE) {
+                uint c   = flat / (C3_IN_EDGE * C3_IN_EDGE);
+                uint rem = flat % (C3_IN_EDGE * C3_IN_EDGE);
+                uint r   = rem / C3_IN_EDGE;
+                uint col = rem % C3_IN_EDGE;
+                int ih = in_y0 + int(r);
+                int iw = in_x0 + int(col);
+                uint ic = ic0 + c;
+                float v = 0.0;
+                if (ic < in_c && ih >= 0 && ih < int(conv2d_pc.in_h)
+                    && iw >= 0 && iw < int(conv2d_pc.in_w)) {
+                    v = conv2d_input[ic * hw + uint(ih) * conv2d_pc.in_w + uint(iw)];
+                }
+                c3_in[c * C3_IN_EDGE * C3_IN_STRIDE + r * C3_IN_STRIDE + col] = v;
+            }
+        }
+        // Stage weights [3x3 x ICC x OCB]; global layout is [kH, kW, C_in, C_out]
+        if (gi < 9 * C3_ICC * C3_OCB) {
+            uint k   = gi / (C3_ICC * C3_OCB); // 0..8 -> kh*3+kw
+            uint rem = gi % (C3_ICC * C3_OCB);
+            uint icl = rem / C3_OCB;
+            uint ocl = rem % C3_OCB;
+            uint ic = ic0 + icl;
+            uint oc = oc0 + ocl;
+            float v = 0.0;
+            if (ic < in_c && oc < out_c) {
+                v = conv2d_weight[k * in_c * out_c + ic * out_c + oc];
+            }
+            c3_w[gi] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        for (uint icl = 0; icl < C3_ICC; icl++) {
+            uint in_base = icl * C3_IN_EDGE * C3_IN_STRIDE + ty * C3_IN_STRIDE + tx;
+            for (uint k = 0; k < 9; k++) {
+                uint kh = k / 3;
+                uint kw = k % 3;
+                float in_val = c3_in[in_base + kh * C3_IN_STRIDE + kw];
+                uint w_base = (k * C3_ICC + icl) * C3_OCB;
+                acc[0] += in_val * c3_w[w_base];
+                acc[1] += in_val * c3_w[w_base + 1];
+                acc[2] += in_val * c3_w[w_base + 2];
+                acc[3] += in_val * c3_w[w_base + 3];
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (oh < out_h && ow < out_w) {
+        for (uint ocl = 0; ocl < C3_OCB; ocl++) {
+            uint oc = oc0 + ocl;
+            if (oc < out_c) {
+                float v = acc[ocl];
+                if (conv2d_pc.has_bias != 0) v += conv2d_bias[oc];
+                conv2d_output[oc * out_h * out_w + oh * out_w + ow] = v;
+            }
+        }
+    }
+}
+
+// ============================================================
 // Q8_0 Conv2D - Dequantize weights on the fly
 // ============================================================
 

@@ -39,6 +39,7 @@ struct VaeLinearProjPC {
 
 struct VaeKernels {
     llm::ComputeKernel conv2d;
+    llm::ComputeKernel conv2d_3x3;  // tiled fast path: kH=kW=3, stride=1, pad=1, groups=1
     llm::ComputeKernel group_norm;
     llm::ComputeKernel upsample_nearest;
     llm::ComputeKernel scale_shift_clamp;
@@ -59,6 +60,7 @@ fn VaeKernels? create_vae_kernels(llm::DeviceContext* ctx) {
 
     VaeKernels kernels = {
         .conv2d           = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC::size, "conv2d")!!,
+        .conv2d_3x3       = llm::create_kernel(ctx, shader, 4, pipelines::Conv2dPC::size, "conv2d_3x3")!!,
         .group_norm       = llm::create_kernel(ctx, shader, 4, pipelines::GroupNormPC::size, "group_norm")!!,
         .upsample_nearest = llm::create_kernel(ctx, shader, 2, pipelines::UpsamplePC::size, "upsample_nearest")!!,
         .scale_shift_clamp = llm::create_kernel(ctx, shader, 2, pipelines::ScaleShiftPC::size, "scale_shift_clamp")!!,
@@ -76,6 +78,7 @@ fn VaeKernels? create_vae_kernels(llm::DeviceContext* ctx) {
 
 fn void VaeKernels.free(&self, vk::Device device) {
     self.conv2d.free(device);
+    self.conv2d_3x3.free(device);
     self.group_norm.free(device);
     self.upsample_nearest.free(device);
     self.scale_shift_clamp.free(device);

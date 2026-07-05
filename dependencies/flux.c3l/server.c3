@@ -18,6 +18,7 @@ import std::io::file;
 import std::io::file::mmap;
 import std::math;
 import std::core::mem;
+import std::os::env;
 import std::time::clock;
 import std::collections::list;
 
@@ -129,6 +130,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 
 	// --- Phase 1: Text encoding with Qwen3 ---
 	io::printfn("\n--- Phase 1: Qwen3 Text Encoding ---");
+	Clock gen_clock   = clock::now();
+	Clock phase_clock = clock::now();
 
 	mmap::FileMmap text_mm = file::mmap_open(state.text_model_path, "rb")!!;
 	char[] text_data       = text_mm.bytes();
@@ -184,13 +187,24 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	uint raw_len      = (uint)raw_tokens.len;
 
 	const uint FLUX2_TEXT_LEN = 512;
-	uint text_len             = FLUX2_TEXT_LEN;
 	if (raw_len > FLUX2_TEXT_LEN) raw_len = FLUX2_TEXT_LEN;
+	// Diffusers Klein tokenizes with padding=False (see analyze/export_diffusers_embeddings.py),
+	// and this implementation has no attention mask, so pad tokens fully participate in joint
+	// attention. Padding only to the matmul tile (64) instead of a fixed 512 both matches the
+	// reference more closely and shrinks the O(n²) joint sequence. FLUX_TEXT_PAD=512 restores
+	// the legacy fixed pad for A/B comparison.
+	uint text_len = (raw_len + 63) / 64 * 64;
+	if (try String v = env::tget_var("FLUX_TEXT_PAD"))
+	{
+		uint forced = v.to_uint() ?? 0;
+		if (forced > 0) text_len = (forced + 63) / 64 * 64;
+	}
+	if (text_len > FLUX2_TEXT_LEN) text_len = FLUX2_TEXT_LEN;
 	uint flux_pad_id = tok.find_special_token("<|endoftext|>");
 	if (flux_pad_id == 0) flux_pad_id = tok.pad_id;
-	uint[] cond_tokens = mem::new_array(uint, FLUX2_TEXT_LEN);
+	uint[] cond_tokens = mem::new_array(uint, text_len);
 	for (uint i = 0; i < raw_len; i++) cond_tokens[i] = raw_tokens[i];
-	for (uint i = raw_len; i < FLUX2_TEXT_LEN; i++) cond_tokens[i] = flux_pad_id;
+	for (uint i = raw_len; i < text_len; i++) cond_tokens[i] = flux_pad_id;
 	mem::free(raw_tokens);
 	io::printfn("  Tokenized: %d real tokens, padded to %d (pad_id=%d)", raw_len, text_len, flux_pad_id);
 
@@ -212,6 +226,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	text_gf.free();
 	text_mm.destroy();
 	ctx.allocator.release_empty_pages();
+	io::printfn("  [phase] text_encode: %.2fs", phase_clock.to_now().to_sec());
+	phase_clock = clock::now();
 
 	// --- Compute output dims (rounded to multiple of 16) ---
 	uint img_h        = (req_h + 15) / 16 * 16;
@@ -271,6 +287,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			)!!;
 		}
 		ctx.allocator.release_empty_pages();
+		io::printfn("  [phase] ref_vae_encode: %.2fs", phase_clock.to_now().to_sec());
+		phase_clock = clock::now();
 	}
 	else if (req.edit_mode == "kontext")
 	{
@@ -359,6 +377,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			flux_latent_ch,
 			10 * n_slots
 		);
+		io::printfn("  [phase] ref_vae_encode: %.2fs", phase_clock.to_now().to_sec());
+		phase_clock = clock::now();
 	}
 
 	// --- Phase 2: Resolve DiT model ---
@@ -453,6 +473,9 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		lat_h,
 		kontext_ref_geoms.array_view()
 	)!!;
+
+	io::printfn("  [phase] dit_setup (ref-encode + load + LoRA + rope): %.2fs", phase_clock.to_now().to_sec());
+	phase_clock = clock::now();
 
 	// --- Phase 3: Denoising ---
 	io::printfn("\n--- Phase 3: Denoising (%d steps) ---", req.num_steps);
@@ -577,6 +600,8 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		total_fwd_ms / (double)req.num_steps,
 		total_step_ms / (double)req.num_steps,
 		req.num_steps);
+	io::printfn("  [phase] denoise: %.2fs", phase_clock.to_now().to_sec());
+	phase_clock = clock::now();
 
 	// --- Phase 4: VAE decode ---
 	io::printfn("\n--- Phase 4: VAE Decoding ---");
@@ -740,7 +765,13 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	}
 	mem::free(vae_latent);
 
+	Clock vae_fwd_clock = clock::now();
 	vae_dec.forward(&vae_acts, vae_h, vae_w)!!;
+	io::printfn("  [phase] vae_decode: %.2fs (gpu forward: %.2fs, cpu prep + load: %.2fs)",
+		phase_clock.to_now().to_sec(),
+		vae_fwd_clock.to_now().to_sec(),
+		phase_clock.to_now().to_sec() - vae_fwd_clock.to_now().to_sec());
+	phase_clock = clock::now();
 
 	// --- Phase 5: Download result ---
 	io::printfn("\n--- Phase 5: Download result ---");
@@ -777,6 +808,7 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 
 	text_embeddings.free();
 	ctx.allocator.release_empty_pages();
-	io::printfn("\n=== Generation complete ===");
+	io::printfn("  [phase] download + convert: %.2fs", phase_clock.to_now().to_sec());
+	io::printfn("\n=== Generation complete (total %.2fs) ===", gen_clock.to_now().to_sec());
 	return result;
 }

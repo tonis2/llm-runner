@@ -367,6 +367,13 @@ fn void flux_conv_block(
         .out_w = out_w,
         .has_bias = 1,
     };
+    if (pc.kH == 3 && pc.kW == 3 && pc.stride == 1 && pc.pad == 1 && pc.groups == 1)
+    {
+        g.dispatch(&k.conv2d_3x3,
+            { &conv.weight, &conv.bias, input, output },
+            &pc, llm::ceil_div(out_w, 16), llm::ceil_div(out_h, 16), llm::ceil_div(conv.out_c, 4));
+        return;
+    }
     uint spatial_groups = llm::ceil_div(out_h * out_w, 256);
     g.dispatch(&k.conv2d,
         { &conv.weight, &conv.bias, input, output },
@@ -382,6 +389,13 @@ fn void flux_conv2d_block(
     llm::Tensor* output,
     pipelines::Conv2dPC* pc,
 ) {
+    if (pc.kH == 3 && pc.kW == 3 && pc.stride == 1 && pc.pad == 1 && pc.groups == 1)
+    {
+        g.dispatch(&k.conv2d_3x3,
+            { weight, bias, input, output },
+            pc, llm::ceil_div(pc.out_w, 16), llm::ceil_div(pc.out_h, 16), llm::ceil_div(pc.out_c, 4));
+        return;
+    }
     uint spatial_groups = llm::ceil_div(pc.out_h * pc.out_w, 256);
     g.dispatch(&k.conv2d,
         { weight, bias, input, output },

@@ -1451,7 +1451,7 @@ fn void? dit_transformer_layer(
 	// 2D dispatch: gid.x = Q-block index, gid.y = head index
 	float scale = 1.0f / math::sqrt((float)DIT_HEAD_DIM);
 	FlashAttentionPC fa_pc = { .head_dim = DIT_HEAD_DIM, .n_heads = DIT_HEADS, .seq_len = seq_len, .scale = scale, };
-	uint fa_q_blocks = llm::ceil_div(seq_len, 8);  // FA2_BR = 8
+	uint fa_q_blocks = llm::ceil_div(seq_len, 16);  // FA2_BR = 16
 	g.dispatch(&dk.flash_attention,
 		{ &a.buf_c, &a.norm_out, &a.buf_b, &a.k },
 		&fa_pc, fa_q_blocks, DIT_HEADS);

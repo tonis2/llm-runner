@@ -858,7 +858,7 @@ fn void? flux_dual_stream_block(
     // Output: attn_out in [n_joint, dim] (already transposed back by FA kernel)
     float scale = 1.0f / math::sqrt((float)flux_head_dim);
     zimage::FlashAttentionPC fa_pc = { .head_dim = flux_head_dim, .n_heads = flux_heads, .seq_len = n_joint, .scale = scale };
-    uint fa_q_blocks = llm::ceil_div(n_joint, 8);
+    uint fa_q_blocks = llm::ceil_div(n_joint, 16);  // FA2_BR = 16
     g.dispatch(&dk.flash_attention, { &a.buf_a, &a.buf_b, &a.buf_c, &a.attn_out },
         &fa_pc, fa_q_blocks, flux_heads);
 
@@ -1033,7 +1033,7 @@ fn void? flux_single_stream_block(
     // === Flash Attention ===
     float scale = 1.0f / math::sqrt((float)flux_head_dim);
     zimage::FlashAttentionPC fa_pc = { .head_dim = flux_head_dim, .n_heads = flux_heads, .seq_len = seq, .scale = scale };
-    uint fa_q_blocks = llm::ceil_div(seq, 8);
+    uint fa_q_blocks = llm::ceil_div(seq, 16);  // FA2_BR = 16
     g.dispatch(&dk.flash_attention, { &a.buf_a, &a.buf_b, &a.buf_c, &a.attn_out },
         &fa_pc, fa_q_blocks, flux_heads);
 
