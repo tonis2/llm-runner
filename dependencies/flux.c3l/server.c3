@@ -18,6 +18,7 @@ import std::io::file;
 import std::io::file::mmap;
 import std::math;
 import std::core::mem;
+import std::core::string;
 import std::os::env;
 import std::time::clock;
 import std::collections::list;
@@ -39,6 +40,30 @@ struct FluxServerState
 	bool keep_dit;
 	bool dit_loaded; // true if `dit` holds weights
 	FluxDiTModel dit; // valid only if dit_loaded
+	// keep_dit only: LoRA merge folds deltas destructively into the resident
+	// Q8_0 weights (requantised in place — irreversible). To avoid deltas
+	// accumulating across requests, we track which LoRA set is currently baked
+	// in; a request with a different set reloads pristine weights first, and a
+	// request with the same set skips the merge entirely.
+	bool dit_dirty;             // resident weights have a LoRA set folded in
+	char[1024] merged_sig_buf;  // signature of that set
+	usz merged_sig_len;
+}
+
+// Order-sensitive signature of a LoRA set ("path|strength;" per entry) written
+// into `buf`. Merge order matters, so this is a plain concatenation. Returns
+// the filled slice ("" for an empty set).
+fn String flux_lora_sig(FluxLoraSpec[] loras, char[] buf)
+{
+	usz n = 0;
+	foreach (spec : loras)
+	{
+		if (spec.path.len == 0) continue;
+		String piece = string::tformat("%s|%.4f;", spec.path, spec.strength);
+		if (n + piece.len > buf.len) break;
+		for (usz i = 0; i < piece.len; i++) buf[n++] = piece[i];
+	}
+	return (String)buf[0:n];
 }
 
 // Request-scoped inputs. Mirrors the relevant subset of FluxConfig, plus an
@@ -89,12 +114,12 @@ fn FluxServerState? init_flux_server(String dit_path, String text_model_path, St
 		.dit_loaded = false,
 	};
 
-	if (keep_dit)
-	{
-		io::printfn("  Loading DiT weights into VRAM...");
-		state.dit = load_flux_dit(&ctx, &state.dit_gf, &state.dit_kernels)!!;
-		state.dit_loaded = true;
-	}
+	// NB: with keep_dit we do NOT load the DiT here. init_flux_server returns
+	// FluxServerState by value, so weights allocated through this local `ctx`
+	// would keep dangling back-pointers (each buffer stores `&allocator`).
+	// flux_generate loads the resident DiT lazily on the first request through
+	// the persistent state instead.
+	if (keep_dit) io::printfn("  keep_dit: DiT loads into VRAM on the first request");
 	return state;
 }
 
@@ -382,19 +407,60 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	}
 
 	// --- Phase 2: Resolve DiT model ---
-	io::printfn("\n--- Phase 2: %s Flux DiT ---", state.dit_loaded ? "Reusing preloaded" : "Loading");
+	// Signature of the LoRA set this request wants folded in.
+	char[1024] req_sig_buf;
+	String req_sig = flux_lora_sig(req.loras, &req_sig_buf);
 
-	bool owns_dit = !state.dit_loaded;
 	FluxDiTModel local_dit;
 	FluxDiTModel* dit;
-	if (state.dit_loaded)
+	bool owns_dit;   // true → weights are request-scoped, freed at the end
+	bool needs_merge;
+	if (state.keep_dit)
 	{
+		// Resident DiT. It is loaded lazily on the first request rather than in
+		// init_flux_server: that function returns FluxServerState by value, so
+		// anything allocated through its local ctx keeps back-pointers into
+		// dead stack (every weight buffer stores `&allocator`, and the model
+		// stores `&ctx`/`&dit_kernels`). Loading here, through the persistent
+		// `state`, makes all of those pointers stable for the server's life.
+		if (!state.dit_loaded)
+		{
+			io::printfn("\n--- Phase 2: Loading resident Flux DiT (first request) ---");
+			state.dit = load_flux_dit(ctx, &state.dit_gf, &state.dit_kernels)!!;
+			state.dit_loaded = true;
+		}
+		else
+		{
+			io::printfn("\n--- Phase 2: Reusing resident Flux DiT ---");
+		}
+		owns_dit = false;
 		dit = &state.dit;
+
+		// The LoRA merge is destructive: it dequantises the Q8_0 weights, adds
+		// the delta and requantises in place — irreversible. Re-merging on top
+		// of an already-merged base accumulates deltas until the weights blow
+		// up (black images). So reuse the resident weights only when the exact
+		// same LoRA set is already folded in; otherwise reload pristine weights
+		// and re-merge the new set.
+		String cur_sig = (String)state.merged_sig_buf[0:state.merged_sig_len];
+		bool same_set = state.dit_dirty && cur_sig == req_sig;
+		if (state.dit_dirty && !same_set)
+		{
+			io::printfn("  LoRA set changed — reloading pristine DiT weights");
+			state.dit.free();
+			state.dit = load_flux_dit(ctx, &state.dit_gf, &state.dit_kernels)!!;
+			state.dit_dirty = false;
+			state.merged_sig_len = 0;
+		}
+		needs_merge = req.loras.len > 0 && !same_set;
 	}
 	else
 	{
+		io::printfn("\n--- Phase 2: Loading Flux DiT ---");
 		local_dit = load_flux_dit(ctx, &state.dit_gf, &state.dit_kernels)!!;
+		owns_dit = true;
 		dit = &local_dit;
+		needs_merge = req.loras.len > 0;
 	}
 
 	uint n_noise     = n_img;
@@ -415,31 +481,47 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	// to the DiT block weights. Each adapter is folded into the Q8_0 base
 	// weights in place and then dropped, so multiple adapters accumulate their
 	// deltas (W += s1·B1@A1 += s2·B2@A2 …) with ~0 ms runtime overhead per
-	// denoising step — we pay one ~0.5–1.5 s merge pass per adapter here. We
-	// always free per request — this keeps keep_dit servers able to swap the
-	// LoRA set between requests.
-	foreach (spec : req.loras)
+	// denoising step — we pay one ~0.5–1.5 s merge pass per adapter here. The
+	// merge is destructive/irreversible, so with keep_dit we only merge when
+	// the resident weights don't already hold this exact set (needs_merge);
+	// see the DiT-resolve block above.
+	if (needs_merge)
 	{
-		if (spec.path.len == 0) continue;
-		float strength = spec.strength > 0.0f ? spec.strength : 1.0f;
-		if (try adapter = llm::load_flux_lora_safetensors(
-			ctx, spec.path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+		foreach (spec : req.loras)
 		{
-			dit.lora = adapter;
-			// Fold this adapter's delta in, then drop it. The next iteration
-			// reads the already-updated base weights, so folds compose.
-			flux_merge_lora_into_weights(dit)!!;
+			if (spec.path.len == 0) continue;
+			float strength = spec.strength > 0.0f ? spec.strength : 1.0f;
+			if (try adapter = llm::load_flux_lora_safetensors(
+				ctx, spec.path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+			{
+				dit.lora = adapter;
+				// Fold this adapter's delta in, then drop it. The next iteration
+				// reads the already-updated base weights, so folds compose.
+				flux_merge_lora_into_weights(dit)!!;
+			}
+			else if (try lokr = llm::load_flux_lokr_safetensors(
+				ctx, spec.path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+			{
+				// LyCORIS LoKr adapter — merge-only, no runtime path.
+				flux_merge_lokr_into_weights(dit, &lokr)!!;
+			}
+			else
+			{
+				io::printfn("  Flux LoRA load failed for %s — continuing without it", spec.path);
+			}
 		}
-		else if (try lokr = llm::load_flux_lokr_safetensors(
-			ctx, spec.path, strength, dit.n_dual_blocks, dit.n_single_blocks))
+		if (!owns_dit)
 		{
-			// LyCORIS LoKr adapter — merge-only, no runtime path.
-			flux_merge_lokr_into_weights(dit, &lokr)!!;
+			// keep_dit: record the set now baked into the resident weights so
+			// the next request can reuse or reload as appropriate.
+			state.dit_dirty = true;
+			for (usz i = 0; i < req_sig.len; i++) state.merged_sig_buf[i] = req_sig[i];
+			state.merged_sig_len = req_sig.len;
 		}
-		else
-		{
-			io::printfn("  Flux LoRA load failed for %s — continuing without it", spec.path);
-		}
+	}
+	else if (req.loras.len > 0)
+	{
+		io::printfn("  LoRA set already merged into resident DiT — skipping merge");
 	}
 
 	if (kontext_n_ref > 0)
