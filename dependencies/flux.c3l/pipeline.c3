@@ -273,7 +273,11 @@ fn float[]? encode_image_object_to_dit_latent(
 	// 1. Preprocess input image (resize + center-crop + normalize to [-1, 1])
 	image::Image preprocessed = llm::resize_center_crop(src_img, img_w, img_h)!!;
 	defer preprocessed.free();
-	float[] input_chw = llm::image_to_float_nchw_signed(&preprocessed)!!;
+	// Always 3-channel: grayscale refs (e.g. depth maps) are replicated to RGB.
+	// The upload below copies exactly 3*H*W*4 bytes, and the VAE conv_in needs 3
+	// input channels — a 1-channel array here would under-run that copy (segfault
+	// at high res) and feed the encoder garbage.
+	float[] input_chw = llm::image_to_float_nchw_signed_rgb(&preprocessed)!!;
 	defer mem::free(input_chw);
 	io::printfn("  Preprocessed: %dx%d, range [-1, 1]", img_w, img_h);
 

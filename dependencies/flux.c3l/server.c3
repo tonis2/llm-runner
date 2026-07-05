@@ -366,7 +366,16 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 				owns_loaded = true;
 				src_ptr = &loaded;
 			}
-			resized_imgs[i] = llm::resize_aspect_fit_round16(src_ptr, ref_max_long_side)!!;
+			// Reference images are downscale-only: never upscale a ref past its
+			// native resolution. Upscaling adds no real detail but multiplies the
+			// ref's token count — a 512² appearance ref blown up to the 1280
+			// output long side is 6400 joint tokens vs ~1024 at native, which
+			// dominates the sequence length and VRAM. Refs already >= the output
+			// (e.g. a full-res depth/structure map) still cap at the output long
+			// side, exactly as before.
+			uint ref_native_long = src_ptr.width > src_ptr.height ? src_ptr.width : src_ptr.height;
+			uint ref_target = ref_max_long_side < ref_native_long ? ref_max_long_side : ref_native_long;
+			resized_imgs[i] = llm::resize_aspect_fit_round16(src_ptr, ref_target)!!;
 			if (owns_loaded) loaded.free();
 
 			uint w_i = resized_imgs[i].width / 16;
