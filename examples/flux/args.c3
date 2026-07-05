@@ -18,7 +18,7 @@ struct ServerOptions {
 }
 
 fn ServerOptions server_opts_defaults() {
-    return { .enabled = false, .keep_dit = false, .bind_addr = "127.0.0.1", .port = 7860 };
+    return { .enabled = false, .keep_dit = true, .bind_addr = "127.0.0.1", .port = 7860 };
 }
 
 fn flux::FluxConfig? parse_flux_args(String[] args, ServerOptions* server_opts) {

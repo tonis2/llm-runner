@@ -39,6 +39,12 @@ fn void? run_server(
     defer g_state = null;
     defer g_cfg   = null;
 
+    // keep_dit: load the 9 GB DiT into (empty) VRAM now, before serving, so it
+    // lands DEVICE_LOCAL instead of spilling to GTT on the first request. `state`
+    // lives in this frame for the whole serve() call, so its back-pointers stay
+    // valid. No-op when keep_dit is off.
+    flux::flux_server_warmup(&state)!!;
+
     server::serve(bind_addr, (uint)port, &handle_request)!!;
 }
 

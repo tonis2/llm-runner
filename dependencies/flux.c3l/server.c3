@@ -117,10 +117,20 @@ fn FluxServerState? init_flux_server(String dit_path, String text_model_path, St
 	// NB: with keep_dit we do NOT load the DiT here. init_flux_server returns
 	// FluxServerState by value, so weights allocated through this local `ctx`
 	// would keep dangling back-pointers (each buffer stores `&allocator`).
-	// flux_generate loads the resident DiT lazily on the first request through
-	// the persistent state instead.
-	if (keep_dit) io::printfn("  keep_dit: DiT loads into VRAM on the first request");
+	// The caller must call flux_server_warmup(&state) once the state has
+	// reached its final storage location — that loads the resident DiT into
+	// empty VRAM up front (see flux_server_warmup for why the timing matters).
+	if (keep_dit) io::printfn("  keep_dit: DiT loads into VRAM at warmup (before serving)");
 	return state;
+}
+
+
+fn void? flux_server_warmup(FluxServerState* state)
+{
+	if (!state.keep_dit || state.dit_loaded) return;
+	io::printfn("  keep_dit: loading resident DiT into VRAM (warmup)...");
+	state.dit = load_flux_dit(&state.ctx, &state.dit_gf, &state.dit_kernels)!;
+	state.dit_loaded = true;
 }
 
 fn void FluxServerState.free(&self)
@@ -417,15 +427,14 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	bool needs_merge;
 	if (state.keep_dit)
 	{
-		// Resident DiT. It is loaded lazily on the first request rather than in
-		// init_flux_server: that function returns FluxServerState by value, so
-		// anything allocated through its local ctx keeps back-pointers into
-		// dead stack (every weight buffer stores `&allocator`, and the model
-		// stores `&ctx`/`&dit_kernels`). Loading here, through the persistent
-		// `state`, makes all of those pointers stable for the server's life.
+		// Resident DiT. Normally already loaded by flux_server_warmup() before
+		// the server began accepting requests (which places it in DEVICE_LOCAL
+		// VRAM — see that function). This lazy branch is only a fallback for
+		// callers that skipped warmup; loading mid-request risks the weights
+		// spilling to GTT, so warmup is strongly preferred.
 		if (!state.dit_loaded)
 		{
-			io::printfn("\n--- Phase 2: Loading resident Flux DiT (first request) ---");
+			io::printfn("\n--- Phase 2: Loading resident Flux DiT (first request, no warmup) ---");
 			state.dit = load_flux_dit(ctx, &state.dit_gf, &state.dit_kernels)!!;
 			state.dit_loaded = true;
 		}
@@ -509,6 +518,11 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 			{
 				io::printfn("  Flux LoRA load failed for %s — continuing without it", spec.path);
 			}
+			// Reclaim this adapter's dead staging (factors + dequant scratch)
+			// before loading the next, so N adapters don't stack their scratch
+			// into one peak. The merge above submits and waits, so the GPU is
+			// idle here and release_empty_pages is safe.
+			ctx.allocator.release_empty_pages();
 		}
 		if (!owns_dit)
 		{
@@ -555,6 +569,16 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		lat_h,
 		kontext_ref_geoms.array_view()
 	)!!;
+
+	// Return the LoRA/LoKr merge scratch to the driver before denoising. The
+	// merge dequantises Q8_0 weights, folds the adapter and requantises, then
+	// frees the adapter factors + dequant scratch — but Memory.free only marks
+	// those regions free *within* their 256 MB pages; the pages stay committed
+	// until released. On a 16 GB card that ~2 GB of dead merge staging is the
+	// difference between the denoise fitting in VRAM and spilling to GTT (each
+	// weight then read over PCIe → ~20x slower forward). Purely reclaims dead
+	// pages — live weights/activations are untouched, so output is bit-identical.
+	ctx.allocator.release_empty_pages();
 
 	io::printfn("  [phase] dit_setup (ref-encode + load + LoRA + rope): %.2fs", phase_clock.to_now().to_sec());
 	phase_clock = clock::now();
