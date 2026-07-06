@@ -1179,6 +1179,56 @@ void batch_matmul_simple(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
     }
 }
 
+// --- Native fp16 batch matmul (fp16 weights, F32 activations) ---
+// Mirrors batch_matmul_simple, but the weight is resident as fp16 (2 bytes/elem,
+// two halves packed per 32-bit word) and up-converted to f32 via unpack_f16.
+// in_dim is even (load path enforces shape[0] % 32 == 0) so half-pairing is aligned.
+// Declared as a uint buffer to avoid requiring 16-bit SSBO storage support.
+
+[vk_push_constant] const BatchMatMulParams bmf16_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> bmf16_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bmf16_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bmf16_output;
+
+groupshared float bmf16_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void batch_matmul_f16(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    // 2D dispatch: gid.x = pos, gid.y = out_idx
+    uint pos = gid.x;
+    uint out_idx = gid.y;
+
+    if (pos >= bmf16_pc.seq_len) return;
+
+    uint actual_out = bmf16_pc.row_offset + out_idx;
+    uint in_base = pos * bmf16_pc.in_dim;
+
+    float partial = 0.0;
+    for (uint k = gi; k < bmf16_pc.in_dim; k += 256) {
+        // Weight layout: [out_dim, in_dim] row-major, fp16 packed 2 per uint word.
+        uint widx = actual_out * bmf16_pc.in_dim + k;
+        uint word = bmf16_weight[widx >> 1];
+        uint half_bits = (widx & 1u) != 0u ? (word >> 16) : (word & 0xFFFFu);
+        partial += unpack_f16(half_bits) * bmf16_input[in_base + k];
+    }
+
+    bmf16_shared[gi] = partial;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) {
+            bmf16_shared[gi] += bmf16_shared[gi + s];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (gi == 0) {
+        bmf16_output[pos * bmf16_pc.out_dim + out_idx] = bmf16_shared[0];
+    }
+}
+
 // --- F32 batch matmul with scaled additive accumulate (LoRA hop 2) ---
 // Computes: output[seq, o] += scale * sum_k weight[o, k] * input[seq, k]
 // Used for the second hop of LoRA application: y += (alpha/r) * B @ scratch
@@ -1967,6 +2017,79 @@ void batch_matmul_q8_coopmat(uint3 gid: SV_GroupID, uint3 ltid: SV_GroupThreadID
 
     uint out_base = pos_base * bmq8cm_pc.out_dim + tile_n * 16;
     acc.Store<linalg.CoopMatMatrixLayout.RowMajor>(bmq8cm_output, out_base, bmq8cm_pc.out_dim);
+}
+
+// --- Native fp16 cooperative matrix matmul ---
+// Same 16x16x16 subgroup tiling as batch_matmul_q8_coopmat, but the weight is
+// already fp16 (packed 2 per uint word), so the B tile is read straight with
+// unpack_f16 — no Q8_0 scale/int8 decode. Practical-speed replacement for the
+// scalar batch_matmul_f16 on coopmat-capable devices (NVIDIA Tensor Cores; the
+// groupshared-fp16 visibility caveat noted above is Mesa RADV / RDNA3 only).
+
+[vk_push_constant] const BatchMatMulParams bmf16cm_pc;
+[vk_binding(0, 0)] RWStructuredBuffer<uint>  bmf16cm_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> bmf16cm_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> bmf16cm_output;
+
+groupshared float16_t f16cm_A[16 * 16];
+groupshared float16_t f16cm_B[16 * 16];
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void batch_matmul_f16_coopmat(uint3 gid: SV_GroupID, uint3 ltid: SV_GroupThreadID) {
+    uint tiles_n = (bmf16cm_pc.out_dim + 15) / 16;
+    uint tile_m = gid.x / tiles_n;
+    uint tile_n = gid.x % tiles_n;
+    uint pos_base = tile_m * 16;
+    uint row_base = bmf16cm_pc.row_offset + tile_n * 16;
+    uint tid = ltid.x;
+
+    var acc = linalg.CoopMat<float, MemoryScope.Subgroup, 16, 16, linalg.CoopMatMatrixUse.MatrixAccumulator>(0.0);
+
+    uint k_chunks = bmf16cm_pc.in_dim / 16;
+
+    for (uint kc = 0; kc < k_chunks; kc++) {
+        uint k_base = kc * 16;
+
+        // A tile [16 M rows × 16 K cols]: input F32 → fp16, 4 elems/thread.
+        for (uint i = 0; i < 4; i++) {
+            uint flat = tid + i * 64;
+            uint m_local = flat >> 4;
+            uint k_local = flat & 15u;
+            uint gm = pos_base + m_local;
+            float v = (gm < bmf16cm_pc.seq_len)
+                ? bmf16cm_input[gm * bmf16cm_pc.in_dim + k_base + k_local]
+                : 0.0;
+            f16cm_A[m_local * 16 + k_local] = float16_t(v);
+        }
+
+        // B tile [16 K × 16 N], K-major: weight[out_dim, in_dim] fp16, read direct.
+        for (uint i = 0; i < 4; i++) {
+            uint flat = tid + i * 64;
+            uint n_local = flat >> 4;
+            uint k_local = flat & 15u;
+            uint gn = row_base + n_local;
+            float v = 0.0;
+            if (gn < bmf16cm_pc.row_offset + bmf16cm_pc.out_dim) {
+                uint widx = gn * bmf16cm_pc.in_dim + k_base + k_local;
+                uint word = bmf16cm_weight[widx >> 1];
+                uint half_bits = (widx & 1u) != 0u ? (word >> 16) : (word & 0xFFFFu);
+                v = unpack_f16(half_bits);
+            }
+            f16cm_B[k_local * 16 + n_local] = float16_t(v);
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        var matA = linalg.coopMatLoad<half, MemoryScope.Subgroup, 16, 16, linalg.CoopMatMatrixUse.MatrixA, linalg.CoopMatMatrixLayout.RowMajor>(f16cm_A, 0, 16);
+        var matB = linalg.coopMatLoad<half, MemoryScope.Subgroup, 16, 16, linalg.CoopMatMatrixUse.MatrixB, linalg.CoopMatMatrixLayout.RowMajor>(f16cm_B, 0, 16);
+        acc = linalg.coopMatMulAdd<float, false>(matA, matB, acc);
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    uint out_base = pos_base * bmf16cm_pc.out_dim + tile_n * 16;
+    acc.Store<linalg.CoopMatMatrixLayout.RowMajor>(bmf16cm_output, out_base, bmf16cm_pc.out_dim);
 }
 
 // --- Q4_0 batch matmul ---

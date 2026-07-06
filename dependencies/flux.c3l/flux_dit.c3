@@ -190,23 +190,16 @@ fn String flux_block_name(char[256]* buf, String prefix, uint layer, String suff
 
 fn llm::Tensor load_dit_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) {
     llm::GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    // No GPU matmul kernel consumes F16/BF16 directly. A DiT GGUF whose big weight
-    // matrices ship as F16 (e.g. a "Q8_0"-named file that is really MOSTLY_F16)
-    // would otherwise be expanded to F32 in VRAM — ~4x the Q8 size, ~36 GB for
-    // Klein-9B — and OOM on drivers that don't overcommit device-local memory
-    // (NVIDIA hard-fails; AMD/RADV silently spills to GTT and runs ~1000x slower).
-    // Re-quantize the 2D weight matrices to Q8_0 at load instead: an F16 file then
-    // lands at the same ~10.5 GB footprint and same output as a real Q8_0 GGUF
-    // (Q8_0 is near-lossless vs F16 for this model). Non-block-aligned / 1D F16 and
-    // all BF16 stay F32 — those are the norm/embed/modulation weights the Q8 matmul
-    // path never touches (and which a real Q8_0 GGUF also keeps in F32/BF16).
+    // F16 2D weight matrices are kept resident at full fp16 precision (~18 GB for
+    // Klein-9B — fits the 32 GB RTX 5090; too big for the 16 GB AMD card, use a real
+    // Q8_0 GGUF there) and run through the native fp16 matmul kernel (batch_matmul_f16).
+    // No Q8_0 down-conversion.
     if (info.type == llm::GGML_F16 && info.n_dims >= 2 && (info.shape[0] % 32) == 0) {
-        llm::CpuTensorData cpu = llm::dequant_to_cpu(info, gf.tensor_data_base)!!;
-        defer cpu.free();
-        uint n_elements = 1;
-        for (uint i = 0; i < info.n_dims; i++) n_elements *= (uint)info.shape[i];
-        return llm::upload_weight_as_q8(ctx, cpu.data, n_elements, info.shape, info.n_dims)!!;
+        return llm::upload_weight(ctx, info, gf.tensor_data_base)!!;
     }
+    // BF16 and 1D / non-block-aligned F16 → F32 (norm/embed/modulation weights; no
+    // GPU matmul kernel consumes F16/BF16 for these, and a real Q8_0 GGUF also keeps
+    // this exact set in F32/BF16).
     if (info.type == llm::GGML_BF16 || info.type == llm::GGML_F16) {
         return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base)!!;
     }

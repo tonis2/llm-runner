@@ -388,6 +388,8 @@ struct DiTKernels
 	llm::ComputeKernel ffn_swiglu_split; // Phase 1: out[i] = silu(in[i]) * in[ffn_dim + i]
 	llm::ComputeKernel batch_matmul_swiglu_q8; // Phase 2: fused gate+up Q8_0 matmul + SwiGLU
 	llm::ComputeKernel batch_matmul_q8_coopmat; // Phase 3: Q8_0 matmul via cooperative matrix
+	llm::ComputeKernel batch_matmul_f16; // Native fp16 weight matmul (keep-F16 path)
+	llm::ComputeKernel batch_matmul_f16_coopmat; // Native fp16 matmul via cooperative matrix
 	llm::SharedKernels shared;
 	bool coopmat_supported; // mirror of DeviceContext.coopmat_supported for fast access in dispatch_*
 }
@@ -513,6 +515,8 @@ fn DiTKernels? create_dit_kernels(llm::DeviceContext* ctx)
 		.ffn_swiglu_split = llm::create_kernel(ctx, llm_shader, 2, FFNSwigluSplitPC::size, "ffn_swiglu_split")!!,
 		.batch_matmul_swiglu_q8 = llm::create_kernel(ctx, llm_shader, 4, BatchMatMulPC::size, "batch_matmul_swiglu_q8")!!,
 		.batch_matmul_q8_coopmat = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_q8_coopmat")!!,
+		.batch_matmul_f16 = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_f16")!!,
+		.batch_matmul_f16_coopmat = llm::create_kernel(ctx, llm_shader, 3, BatchMatMulPC::size, "batch_matmul_f16_coopmat")!!,
 		.shared = llm::create_shared_kernels(ctx, llm_shader)!!,
 		.coopmat_supported = ctx.coopmat_supported,
 		};
@@ -1227,6 +1231,19 @@ fn void dispatch_batch_matmul(
 		return;
 	}
 
+	// Phase 3 fast path: native fp16 weights via cooperative matrix (same gate as Q8).
+	if (dk.coopmat_supported
+		&& weight.dtype == llm::GGML_F16
+		&& (lora == null || !lora.present)
+		&& (out_dim % 16) == 0
+		&& (in_dim % 16) == 0
+		&& (seq_len % 16) == 0)
+	{
+		uint groups = (seq_len / 16) * (out_dim / 16);
+		g.dispatch(&dk.batch_matmul_f16_coopmat, { weight, input, output }, &pc, groups);
+		return;
+	}
+
 	llm::ComputeKernel* kernel;
 	bool tiled_2d = false;
 	if (weight.dtype == llm::GGML_Q4_K)
@@ -1252,6 +1269,15 @@ fn void dispatch_batch_matmul(
 	else if (weight.dtype == llm::GGML_Q4_0)
 	{
 		kernel = &dk.batch_matmul_q4_0;
+	}
+	else if (weight.dtype == llm::GGML_F16)
+	{
+		// Native fp16 weights: mirror the F32 simple path — 2D dispatch (seq_len, out_dim)
+		// plus the dtype-agnostic runtime LoRA correction.
+		g.dispatch(&dk.batch_matmul_f16, { weight, input, output }, &pc, seq_len, out_dim);
+		dispatch_lora_correction(g, dk, lora, lora_scratch, input, output, in_dim, out_dim, seq_len,
+			lora_b_rows, lora_row_offset, lora_weight_row_offset);
+		return;
 	}
 	else
 	{

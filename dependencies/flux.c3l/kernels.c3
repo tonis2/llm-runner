@@ -70,6 +70,8 @@ fn void FluxDiTKernels.free(&self, vk::Device device)
 	self.dit.ffn_swiglu_split.free(device);
 	self.dit.batch_matmul_swiglu_q8.free(device);
 	self.dit.batch_matmul_q8_coopmat.free(device);
+	self.dit.batch_matmul_f16.free(device);
+	self.dit.batch_matmul_f16_coopmat.free(device);
 	self.dit.shared.free(device);
 	self.gated_residual_linear.free(device);
 }
