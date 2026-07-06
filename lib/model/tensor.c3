@@ -103,18 +103,23 @@ fn float cpu_f16_to_f32(char* ptr) {
 fn void cpu_f32_to_f16(char* ptr, float val) {
     uint f32_bits = bitcast(val, uint);
     uint sign = (f32_bits >> 31) & 1;
-    uint exp_bits = ((f32_bits >> 23) & 0xFF) - 127 + 15;  // Convert exponent bias
+    // Signed exponent on purpose: a `uint` subtraction wraps small/zero inputs into
+    // a huge value that skips the underflow branch below and is then misread as
+    // Infinity. For a Q8_0 scale of ~0 (all-zero / tiny weight block) that makes the
+    // GPU dequant `scale * quant` produce Inf/NaN, which propagates through the DiT
+    // and yields a pure-black image. Keeping it signed flushes genuine underflow to 0.
+    int exp_bits = (int)((f32_bits >> 23) & 0xFF) - 127 + 15;  // Convert exponent bias
     uint mant = (f32_bits >> 13) & 0x3FF;  // Take top 10 bits of mantissa
-    
+
     ushort f16_bits;
     if (exp_bits < 1) {
-        // Underflow to zero
+        // Underflow / zero / subnormal → signed zero
         f16_bits = (ushort)(sign << 15);
     } else if (exp_bits >= 31) {
-        // Overflow to infinity
+        // Overflow / Inf / NaN → infinity
         f16_bits = (ushort)((sign << 15) | (31 << 10));
     } else {
-        f16_bits = (ushort)((sign << 15) | (exp_bits << 10) | mant);
+        f16_bits = (ushort)((sign << 15) | ((uint)exp_bits << 10) | mant);
     }
     
     char[2] bytes = bitcast(f16_bits, char[2]);

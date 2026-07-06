@@ -346,7 +346,29 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 		// keeps its own native aspect ratio — not forced to the output canvas),
 		// recording per-image patch-grid geometry so we can preallocate the
 		// packed buffer exactly once.
+		// Default ref long-side ceiling = the OUTPUT long side. Combined with the
+		// per-ref `min(ceiling, native)` below this is downscale-only: a big ref is
+		// shrunk to the output size, a small ref stays native.
 		uint ref_max_long_side = img_h > img_w ? img_h : img_w;
+		// FLUX_MAX_REF_LONG_SIDE overrides that ceiling and is checked against the
+		// SOURCE image, decoupled from the output/prompt size. This is the knob to
+		// shrink a large source ref: an 1800x1800 source with =1400 → a 1400 ref,
+		// regardless of the 820x1280 output. A large ref resized to the output long
+		// side contributes as many joint tokens as the noise image itself (e.g. a
+		// 1497x1999 ref at a 1280 output → ~4720 tokens), doubling the sequence and
+		// activation VRAM → GTT spill. Still downscale-only (min with native), so it
+		// never upscales. Unset / 0 = ceiling follows the output long side.
+		// NOTE: to REDUCE VRAM/tokens you must set this BELOW the output long side —
+		// a value above it makes the ref larger than the default, not smaller.
+		if (try String v = env::tget_var("FLUX_MAX_REF_LONG_SIDE"))
+		{
+			uint cap = (v.to_uint() ?? 0) / 16 * 16;
+			if (cap > 0)
+			{
+				io::printfn("  Ref long-side ceiling: %d -> %d (FLUX_MAX_REF_LONG_SIDE, vs source)", ref_max_long_side, cap);
+				ref_max_long_side = cap;
+			}
+		}
 		image::Image[] resized_imgs = mem::new_array(image::Image, (usz)n_slots);
 		for (uint i = 0; i < n_slots; i++)
 		{
