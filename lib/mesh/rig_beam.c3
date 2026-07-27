@@ -107,7 +107,7 @@ fn double log_normaliser(float[] logits, bool[] allowed, float temperature) @loc
  @return? RIG_TOO_MANY_BEAMS : `More beams than MAX_BEAMS, or none.`
  @return? RIG_PREFIX_TOO_LONG : `The prefix does not fit the prefill path.`
  @return? RIG_NO_BEAM_FINISHED : `No beam reached eos within max_new_tokens.`
- @return? RIG_CONTEXT_EXHAUSTED : `Prefix plus max_new_tokens exceeds the model's max_seq_len.`
+ @return? RIG_CONTEXT_EXHAUSTED : `The prefix alone fills the model's KV cache.`
 *>
 fn RigResult? generate_rig_beam(
     alloc::Allocator allocator,
@@ -127,7 +127,8 @@ fn RigResult? generate_rig_beam(
     uint[2] start_tokens = { TOKEN_BOS, options.rig_class.token() };
     usz n_prefix = latents + start_tokens.len;
     if (!model.prefill_supported((uint)n_prefix)) return RIG_PREFIX_TOO_LONG~;
-    if (!context_fits(model, n_prefix, options.max_new_tokens)) return RIG_CONTEXT_EXHAUSTED~;
+    uint budget = decode_budget(model, n_prefix, options.max_new_tokens);
+    if (budget == 0) return RIG_CONTEXT_EXHAUSTED~;
 
     // --- One prefill, shared by every beam ---
 
@@ -167,7 +168,7 @@ fn RigResult? generate_rig_beam(
 
     // --- Working memory ---
 
-    usz capacity = start_tokens.len + (usz)options.max_new_tokens + 1;
+    usz capacity = start_tokens.len + (usz)budget + 1;
     uint[] pool_a = alloc::new_array(allocator, uint, (sz)(capacity * options.beams));
     uint[] pool_b = alloc::new_array(allocator, uint, (sz)(capacity * options.beams));
     bool[] allowed = alloc::new_array(allocator, bool, (sz)vocab);
@@ -203,7 +204,7 @@ fn RigResult? generate_rig_beam(
 
     BeamCandidate[MAX_BEAMS * 2] candidates;
 
-    for (uint step = 0; step < options.max_new_tokens; step++) {
+    for (uint step = 0; step < budget; step++) {
         usz limit = options.beams * 2;
         usz candidate_count = 0;
 

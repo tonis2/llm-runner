@@ -32,14 +32,26 @@ import std::math::random;
 faultdef RIG_PREFIX_TOO_LONG, RIG_DECODE_STALLED, RIG_CONTEXT_EXHAUSTED;
 
 <*
- Positions the KV cache must hold: the prefix plus everything generated after
- it. Writing past the cache does not fault — `kv_cache_store` indexes
+ How many tokens may still be generated after a prefix of `n_prefix`.
+
+ Writing past the KV cache does not fault — `kv_cache_store` indexes
  `h * max_seq_len * head_dim + pos * head_dim`, so an overrun lands in the next
  head's rows and then off the end of the buffer, and the damage only shows up
- later as a crash somewhere unrelated.
+ later as a crash somewhere unrelated. Something has to bound it.
+
+ `max_new_tokens` is a cap rather than a reservation: decoding terminates in a
+ few hundred tokens in practice, so refusing to start whenever prefix plus
+ budget exceeds the cache would reject every default run — 2040 against a
+ 512-latent prefix and a 2048-position cache. It is clamped to what the cache
+ can hold instead. Zero means the prefix has filled the cache and nothing can
+ follow it.
 *>
-fn bool context_fits(llm_text::LlmModel* model, usz n_prefix, uint max_new_tokens)
-    => n_prefix + (usz)max_new_tokens <= (usz)model.max_seq_len;
+fn uint decode_budget(llm_text::LlmModel* model, usz n_prefix, uint max_new_tokens)
+{
+    if (n_prefix >= (usz)model.max_seq_len) return 0;
+    usz room = (usz)model.max_seq_len - n_prefix;
+    return room < (usz)max_new_tokens ? (uint)room : max_new_tokens;
+}
 
 // generate_kwargs.max_new_tokens from the checkpoint.
 const uint DEFAULT_MAX_NEW_TOKENS = 2040;
@@ -104,13 +116,50 @@ fn Vec3[] RigResult.joints_in_model_space(&self, alloc::Allocator allocator) {
 }
 
 <*
+ The share of bones sitting outside the mesh they were generated for.
+
+ A quality signal, not a correctness one. The model wanders when a sequence runs
+ long, and the reference implementation does it too — on this cow it put 62 of
+ 96 joints off the mesh on a 299-token sample while its 13- to 38-joint samples
+ stayed entirely clean. So it is worth sampling a few seeds and picking between
+ them rather than taking the first that parses.
+
+ Measured against the bounding box rather than the surface: a joint inside the
+ box but outside the body still reads as plausible, and testing properly means
+ an inside-outside test against the mesh. This catches the failure that matters,
+ which is limbs flung out into space.
+
+ @param tolerance : `Slack around the box, as a fraction of its longest side.`
+*>
+fn float RigResult.off_mesh_fraction(&self, Bounds bounds, float tolerance = 0.02f) {
+    usz bones = self.skeleton.joints.len;
+    if (bones == 0) return 1.0f;
+
+    Vec3 extent = bounds.extent();
+    float longest = math::max(extent.x, math::max(extent.y, extent.z));
+    float slack = longest * tolerance;
+
+    usz outside = 0;
+    foreach (joint : self.skeleton.joints) {
+        Vec3 world = self.normalization.inverse(joint);
+        for (usz axis = 0; axis < 3; axis++) {
+            if (world[axis] < bounds.min[axis] - slack || world[axis] > bounds.max[axis] + slack) {
+                outside++;
+                break;
+            }
+        }
+    }
+    return (float)outside / (float)bones;
+}
+
+<*
  Encode a mesh, generate a skeleton for it, and decode the result.
 
  @param geometry : `The mesh, in its own coordinates; not modified.`
  @return? ENCODER_SHAPE_MISMATCH : `The encoder and the input disagree on width.`
  @return? RIG_PREFIX_TOO_LONG : `The prefix does not fit the prefill path.`
  @return? RIG_DECODE_STALLED : `Generation hit max_new_tokens without terminating.`
- @return? RIG_CONTEXT_EXHAUSTED : `Prefix plus max_new_tokens exceeds the model's max_seq_len.`
+ @return? RIG_CONTEXT_EXHAUSTED : `The prefix alone fills the model's KV cache.`
 *>
 fn RigResult? generate_rig(
     alloc::Allocator allocator,
@@ -153,7 +202,8 @@ fn RigResult? generate_rig_from_prefix(
     uint[2] start_tokens = { TOKEN_BOS, options.rig_class.token() };
     usz n_tokens = latents + start_tokens.len;
     if (!model.prefill_supported((uint)n_tokens)) return RIG_PREFIX_TOO_LONG~;
-    if (!context_fits(model, n_tokens, options.max_new_tokens)) return RIG_CONTEXT_EXHAUSTED~;
+    uint budget = decode_budget(model, n_tokens, options.max_new_tokens);
+    if (budget == 0) return RIG_CONTEXT_EXHAUSTED~;
 
     llm::Tensor hidden = llm::create_f32_tensor(ctx, { (ulong)(n_tokens * dim), 0, 0, 0 }, 1)!;
     defer hidden.free();
@@ -180,7 +230,7 @@ fn RigResult? generate_rig_from_prefix(
 
     // Decode. The prefix already produced logits for the position after the
     // last start token, so the first pick comes before any forward() call.
-    usz capacity = start_tokens.len + (usz)options.max_new_tokens;
+    usz capacity = start_tokens.len + (usz)budget;
     uint[] tokens = alloc::new_array(allocator, uint, (sz)capacity);
     defer catch alloc::free(allocator, tokens);
     usz produced = 0;
@@ -204,7 +254,7 @@ fn RigResult? generate_rig_from_prefix(
     defer alloc::free(allocator, allowed);
 
     bool terminated = false;
-    for (uint step = 0; step < options.max_new_tokens; step++) {
+    for (uint step = 0; step < budget; step++) {
         // The penalty looks only at what has been generated, not at the start
         // tokens: bos is meant to appear once and penalising it changes nothing.
         uint[] history = tokens[start_tokens.len:produced - start_tokens.len];

@@ -40,6 +40,10 @@
     "depth": {
 			"type": "executable",
       "sources": ["examples/depth/**"]
+		},
+    "rig": {
+			"type": "executable",
+      "sources": ["examples/rig/**"]
 		}
   },
   "cpu": "generic",
