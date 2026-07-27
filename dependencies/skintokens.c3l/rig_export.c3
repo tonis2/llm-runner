@@ -10,7 +10,7 @@
      `RigResult rig = mesh::generate_rig(mem, &ctx, &encoder, &model, geometry)!;`
      `mesh::export_rig_glb(mem, "cow_rigged.glb", geometry, &rig)!;`
 *>
-module llm::mesh;
+module skintokens;
 
 import gltf;
 import std::core::mem;

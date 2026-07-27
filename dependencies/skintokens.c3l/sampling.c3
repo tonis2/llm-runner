@@ -11,7 +11,7 @@
    features at these indices — so this is not an optimisation, it is where the
    queries come from.
 *>
-module llm::mesh;
+module skintokens;
 
 import std::core::mem;
 import std::core::mem::allocator;

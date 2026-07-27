@@ -1,6 +1,6 @@
 module llm;
 
-import llm::mesh;
+import skintokens;
 import std::io;
 import std::io::file;
 import std::core::mem;
@@ -24,7 +24,7 @@ uint[36] cube_indices = {
     3, 7, 6,  3, 6, 2,   // +y
 };
 
-fn mesh::TriMesh unit_cube()
+fn skintokens::TriMesh unit_cube()
 {
     return { .positions = cube_positions[..], .indices = cube_indices[..] };
 }
@@ -34,14 +34,14 @@ fn bool approx(float a, float b, float epsilon = 1e-5f) => math::abs(a - b) <= e
 fn void test_fourier_embed_layout() @test
 {
     // 3 xyz + 3 axes * 8 sin + 3 axes * 8 cos + 3 normal.
-    assert(mesh::fourier_dim(8) == 51);
-    assert(mesh::encoder_input_dim() == 54, "input_proj is [512, 54]");
+    assert(skintokens::fourier_dim(8) == 51);
+    assert(skintokens::encoder_input_dim() == 54, "input_proj is [512, 54]");
 
     Vec3 position = { 0.25, -0.5, 0.75 };
     Vec3 normal = { 0, 1, 0 };
 
     float[54] row;
-    mesh::embed_point(row[..], position, normal)!!;
+    skintokens::embed_point(row[..], position, normal)!!;
 
     assert(approx(row[0], 0.25f) && approx(row[1], -0.5f) && approx(row[2], 0.75f),
         "raw coordinates lead");
@@ -68,19 +68,19 @@ fn void test_fourier_embed_layout() @test
 fn void test_embed_point_rejects_short_buffer() @test
 {
     float[53] row;
-    assert(@catch(mesh::embed_point(row[..], { 0, 0, 0 }, { 0, 0, 1 })) == mesh::BUFFER_TOO_SMALL);
+    assert(@catch(skintokens::embed_point(row[..], { 0, 0, 0 }, { 0, 0, 1 })) == skintokens::BUFFER_TOO_SMALL);
 }
 
 fn void test_surface_area() @test
 {
-    mesh::TriMesh cube = unit_cube();
+    skintokens::TriMesh cube = unit_cube();
     assert(cube.triangle_count() == 12);
     assert(math::abs(cube.surface_area() - 6.0) < 1e-5);
 }
 
 fn void test_samples_lie_on_the_surface() @test
 {
-    mesh::PointCloud cloud = mesh::sample_surface(mem, unit_cube(), 4000)!!;
+    skintokens::PointCloud cloud = skintokens::sample_surface(mem, unit_cube(), 4000)!!;
     defer cloud.free(mem);
 
     assert(cloud.len() == 4000);
@@ -109,7 +109,7 @@ fn void test_normals_default_to_the_face() @test
     Vec3[3] leaning = { { 1, 0, 0 }, { 0, 1, 0 }, { 0.6, 0.8, 0 } };
     uint[3] indices = { 0, 1, 2 };
 
-    mesh::TriMesh sloped = {
+    skintokens::TriMesh sloped = {
         .positions = positions[..],
         .normals = leaning[..],
         .indices = indices[..],
@@ -118,14 +118,14 @@ fn void test_normals_default_to_the_face() @test
 
     // SkinTokens pairs every sample with the normal of the face it landed on,
     // so that is the default here even when vertex normals are available.
-    mesh::PointCloud flat = mesh::sample_surface(mem, sloped, 64)!!;
+    skintokens::PointCloud flat = skintokens::sample_surface(mem, sloped, 64)!!;
     defer flat.free(mem);
     foreach (normal : flat.normals)
     {
         assert(approx(normal[2], 1.0f), "the face normal is +z");
     }
 
-    mesh::PointCloud smooth = mesh::sample_surface(mem, sloped, 64, 0, true)!!;
+    skintokens::PointCloud smooth = skintokens::sample_surface(mem, sloped, 64, 0, true)!!;
     defer smooth.free(mem);
     foreach (normal : smooth.normals)
     {
@@ -144,10 +144,10 @@ fn void test_sampling_is_area_weighted() @test
     };
     uint[12] indices = { 0, 1, 2,  0, 2, 3,  4, 5, 6,  4, 6, 7 };
 
-    mesh::TriMesh quads = { .positions = positions[..], .indices = indices[..] };
+    skintokens::TriMesh quads = { .positions = positions[..], .indices = indices[..] };
     assert(math::abs(quads.surface_area() - 5.0) < 1e-5);
 
-    mesh::PointCloud cloud = mesh::sample_surface(mem, quads, 20000)!!;
+    skintokens::PointCloud cloud = skintokens::sample_surface(mem, quads, 20000)!!;
     defer cloud.free(mem);
 
     usz big = 0;
@@ -163,11 +163,11 @@ fn void test_sampling_is_area_weighted() @test
 
 fn void test_sampling_is_deterministic() @test
 {
-    mesh::PointCloud a = mesh::sample_surface(mem, unit_cube(), 256, 7)!!;
+    skintokens::PointCloud a = skintokens::sample_surface(mem, unit_cube(), 256, 7)!!;
     defer a.free(mem);
-    mesh::PointCloud b = mesh::sample_surface(mem, unit_cube(), 256, 7)!!;
+    skintokens::PointCloud b = skintokens::sample_surface(mem, unit_cube(), 256, 7)!!;
     defer b.free(mem);
-    mesh::PointCloud c = mesh::sample_surface(mem, unit_cube(), 256, 8)!!;
+    skintokens::PointCloud c = skintokens::sample_surface(mem, unit_cube(), 256, 8)!!;
     defer c.free(mem);
 
     usz matches = 0;
@@ -181,21 +181,21 @@ fn void test_sampling_is_deterministic() @test
 
 fn void test_sampling_rejects_bad_meshes() @test
 {
-    mesh::TriMesh empty;
-    assert(@catch(mesh::sample_surface(mem, empty, 16)) == mesh::EMPTY_MESH);
+    skintokens::TriMesh empty;
+    assert(@catch(skintokens::sample_surface(mem, empty, 16)) == skintokens::EMPTY_MESH);
 
     Vec3[3] positions = { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 } };
     uint[4] ragged = { 0, 1, 2, 0 };
-    mesh::TriMesh not_triangulated = { .positions = positions[..], .indices = ragged[..] };
-    assert(@catch(mesh::sample_surface(mem, not_triangulated, 16)) == mesh::NOT_TRIANGULATED);
+    skintokens::TriMesh not_triangulated = { .positions = positions[..], .indices = ragged[..] };
+    assert(@catch(skintokens::sample_surface(mem, not_triangulated, 16)) == skintokens::NOT_TRIANGULATED);
 
     uint[3] past_the_end = { 0, 1, 3 };
-    mesh::TriMesh bad_index = { .positions = positions[..], .indices = past_the_end[..] };
-    assert(@catch(mesh::sample_surface(mem, bad_index, 16)) == mesh::INDEX_OUT_OF_RANGE);
+    skintokens::TriMesh bad_index = { .positions = positions[..], .indices = past_the_end[..] };
+    assert(@catch(skintokens::sample_surface(mem, bad_index, 16)) == skintokens::INDEX_OUT_OF_RANGE);
 
     uint[3] degenerate_indices = { 0, 0, 0 };
-    mesh::TriMesh degenerate = { .positions = positions[..], .indices = degenerate_indices[..] };
-    assert(@catch(mesh::sample_surface(mem, degenerate, 16)) == mesh::NO_SURFACE_AREA);
+    skintokens::TriMesh degenerate = { .positions = positions[..], .indices = degenerate_indices[..] };
+    assert(@catch(skintokens::sample_surface(mem, degenerate, 16)) == skintokens::NO_SURFACE_AREA);
 }
 
 fn void test_farthest_point_sample_takes_the_extremes() @test
@@ -203,7 +203,7 @@ fn void test_farthest_point_sample_takes_the_extremes() @test
     Vec3[10] line;
     for (usz i = 0; i < 10; i++) line[i] = { (float)i, 0, 0 };
 
-    usz[] picked = mesh::farthest_point_sample(mem, line[..], 3)!!;
+    usz[] picked = skintokens::farthest_point_sample(mem, line[..], 3)!!;
     defer mem::free(picked);
 
     assert(picked[0] == 0, "the start is the first pick");
@@ -223,7 +223,7 @@ fn void test_farthest_point_sample_spreads_over_a_grid() @test
         }
     }
 
-    usz[] picked = mesh::farthest_point_sample(mem, grid[..], 4)!!;
+    usz[] picked = skintokens::farthest_point_sample(mem, grid[..], 4)!!;
     defer mem::free(picked);
 
     bool[25] seen;
@@ -236,21 +236,21 @@ fn void test_farthest_point_sample_rejects_bad_counts() @test
 {
     Vec3[4] points;
     Vec3[] nothing;
-    assert(@catch(mesh::farthest_point_sample(mem, nothing, 1)) == mesh::EMPTY_MESH);
-    assert(@catch(mesh::farthest_point_sample(mem, points[..], 5)) == mesh::TOO_FEW_POINTS);
-    assert(@catch(mesh::farthest_point_sample(mem, points[..], 0)) == mesh::TOO_FEW_POINTS);
-    assert(@catch(mesh::farthest_point_sample(mem, points[..], 2, 4)) == mesh::INDEX_OUT_OF_RANGE);
+    assert(@catch(skintokens::farthest_point_sample(mem, nothing, 1)) == skintokens::EMPTY_MESH);
+    assert(@catch(skintokens::farthest_point_sample(mem, points[..], 5)) == skintokens::TOO_FEW_POINTS);
+    assert(@catch(skintokens::farthest_point_sample(mem, points[..], 0)) == skintokens::TOO_FEW_POINTS);
+    assert(@catch(skintokens::farthest_point_sample(mem, points[..], 2, 4)) == skintokens::INDEX_OUT_OF_RANGE);
 }
 
 fn void test_normalization_round_trips() @test
 {
     Vec3[3] positions = { { -4, 0, -1 }, { 2, 1, 1 }, { 0, 0.5, 0 } };
     uint[3] indices = { 0, 1, 2 };
-    mesh::TriMesh geometry = { .positions = positions[..], .indices = indices[..] };
+    skintokens::TriMesh geometry = { .positions = positions[..], .indices = indices[..] };
 
     // Extent (6, 1, 2), so the longest half-axis is 3 and the fit scales by 1/3
     // about the box centre (-1, 0.5, 0).
-    mesh::Normalization transform = geometry.unit_cube_transform();
+    skintokens::Normalization transform = geometry.unit_cube_transform();
     assert(approx(transform.scale, 1.0f / 3.0f));
     assert(approx(transform.center[0], -1.0f) && approx(transform.center[1], 0.5f));
 
@@ -266,12 +266,12 @@ fn void test_normalization_round_trips() @test
 
 fn void test_prepare_shape_input() @test
 {
-    mesh::PrepareOptions options = mesh::DEFAULT_PREPARE;
+    skintokens::PrepareOptions options = skintokens::DEFAULT_PREPARE;
     options.samples = 2000;
     options.latents = 32;   // draws a pool of 128 and keeps 32
 
-    mesh::TriMesh cube = unit_cube();
-    mesh::ShapeEncoderInput input = mesh::prepare_shape_input(mem, cube, options)!!;
+    skintokens::TriMesh cube = unit_cube();
+    skintokens::ShapeEncoderInput input = skintokens::prepare_shape_input(mem, cube, options)!!;
     defer input.free(mem);
 
     assert(input.dim == 54);
@@ -307,16 +307,16 @@ fn void test_prepare_shape_input() @test
 
 fn void test_prepare_rejects_a_pool_bigger_than_the_cloud() @test
 {
-    mesh::PrepareOptions options = mesh::DEFAULT_PREPARE;
+    skintokens::PrepareOptions options = skintokens::DEFAULT_PREPARE;
     options.samples = 16;
     options.latents = 32;
-    assert(@catch(mesh::prepare_shape_input(mem, unit_cube(), options)) == mesh::TOO_FEW_POINTS);
+    assert(@catch(skintokens::prepare_shape_input(mem, unit_cube(), options)) == skintokens::TOO_FEW_POINTS);
 
     // The pool is four times the latents, so this is short even though there
     // are more samples than queries.
     options.samples = 100;
     options.latents = 32;
-    assert(@catch(mesh::prepare_shape_input(mem, unit_cube(), options)) == mesh::TOO_FEW_POINTS);
+    assert(@catch(skintokens::prepare_shape_input(mem, unit_cube(), options)) == skintokens::TOO_FEW_POINTS);
 }
 
 fn void test_pick_queries_spreads_over_a_uniform_draw() @test
@@ -326,7 +326,7 @@ fn void test_pick_queries_spreads_over_a_uniform_draw() @test
     Vec3[400] line;
     for (usz i = 0; i < 400; i++) line[i] = { (float)i, 0, 0 };
 
-    usz[] picked = mesh::pick_queries(mem, line[..], 8, 4, 1)!!;
+    usz[] picked = skintokens::pick_queries(mem, line[..], 8, 4, 1)!!;
     defer mem::free(picked);
 
     assert(picked.len == 8);
@@ -348,7 +348,7 @@ fn void test_pick_queries_spreads_over_a_uniform_draw() @test
     // 32 points drawn from 400, so the extremes of the pool land near the ends.
     assert(lowest < 40 && highest > 360, "the picks span the line");
 
-    assert(@catch(mesh::pick_queries(mem, line[..], 200, 4)) == mesh::TOO_FEW_POINTS);
+    assert(@catch(skintokens::pick_queries(mem, line[..], 200, 4)) == skintokens::TOO_FEW_POINTS);
 }
 
 // The glTF adapter is exercised against a fixture that ships with the gltf
@@ -367,7 +367,7 @@ fn void test_load_gltf() @test
         return;
     }
 
-    mesh::TriMesh geometry = mesh::load_gltf(mem, TRUCK_GLB)!!;
+    skintokens::TriMesh geometry = skintokens::load_gltf(mem, TRUCK_GLB)!!;
     defer geometry.free(mem);
 
     assert(geometry.positions.len > 0);
@@ -381,11 +381,11 @@ fn void test_load_gltf() @test
         assert(approx(normal.length(), 1.0f, 1e-3f), "normals come out unit length");
     }
 
-    mesh::PrepareOptions options = mesh::DEFAULT_PREPARE;
+    skintokens::PrepareOptions options = skintokens::DEFAULT_PREPARE;
     options.samples = 4096;
     options.latents = 256;
 
-    mesh::ShapeEncoderInput input = mesh::prepare_shape_input(mem, geometry, options)!!;
+    skintokens::ShapeEncoderInput input = skintokens::prepare_shape_input(mem, geometry, options)!!;
     defer input.free(mem);
 
     assert(input.features.len == 4096 * 54);

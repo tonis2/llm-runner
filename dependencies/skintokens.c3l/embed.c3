@@ -16,7 +16,7 @@
  coordinate to work from; the sinusoids only supply the high-frequency detail
  that a linear layer on three inputs cannot represent.
 *>
-module llm::mesh;
+module skintokens;
 
 import std::core::mem;
 import std::core::mem::allocator;

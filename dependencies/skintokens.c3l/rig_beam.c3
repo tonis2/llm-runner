@@ -18,7 +18,7 @@
  and then only of the positions generated so far — the prefix is identical
  across beams and is written once.
 *>
-module llm::mesh;
+module skintokens;
 
 import vk;
 import llm;

@@ -19,7 +19,7 @@
      `defer encoder.free();`
      `float[] latents = encoder.encode(mem, &input)!;   // 256 x 896`
 *>
-module llm::mesh;
+module skintokens;
 
 import vk;
 import llm;
@@ -31,8 +31,8 @@ import std::core::mem::allocator;
 import std::core::string;
 import std::math;
 
-const char[*] MESH_ENCODER_SPV = $embed("../shaders/mesh_encoder.spv");
-const char[*] MESH_ATTENTION_SPV = $embed("../shaders/mesh_attention.spv");
+const char[*] MESH_ENCODER_SPV = $embed("./shaders/mesh_encoder.spv");
+const char[*] MESH_ATTENTION_SPV = $embed("./shaders/mesh_attention.spv");
 
 faultdef ENCODER_SHAPE_MISMATCH, ENCODER_TOO_MANY_POINTS;
 

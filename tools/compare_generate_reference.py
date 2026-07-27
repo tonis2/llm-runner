@@ -159,7 +159,14 @@ for seed in range(args.seeds):
               kids[p] = kids.get(p, 0) + 1
       forks = sum(1 for v in kids.values() if v > 1)
       off = int(((joints < -1.0) | (joints > 1.0)).any(axis=1).sum())
+      # The cow normalised the way AugmentAffine does it — uniform scale by the
+      # largest extent — occupies x +/-0.339, y +/-0.746, z +/-1.0. Joints
+      # outside that are off the mesh even though they are inside the cube,
+      # which is the weaker test.
+      half = np.array([0.339, 0.746, 1.0])
+      offmesh = int((np.abs(joints) > half + 0.02).any(axis=1).sum())
       print(f"{line}, {len(joints)} joints, {roots} roots, {forks} forking joints, "
-            f"{off} outside [-1,1]")
+            f"{off} outside cube, {offmesh} off mesh, "
+            f"x {joints[:,0].min():+.2f}..{joints[:,0].max():+.2f}")
   except Exception as e:
       print(f"{line} -- detokenize failed: {type(e).__name__}: {e}")

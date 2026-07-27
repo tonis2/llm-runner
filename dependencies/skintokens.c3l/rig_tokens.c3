@@ -18,7 +18,7 @@
  Nothing here touches the GPU. It is the half of generation that can be checked
  exactly, so it is worth keeping separable from the half that cannot.
 *>
-module llm::mesh;
+module skintokens;
 
 import std::core::mem;
 import std::core::mem::allocator;

@@ -11,7 +11,7 @@
  in the space it was asked in. Bone positions come back normalised, and mapping
  them onto the original mesh is `Normalization.inverse`.
 *>
-module llm::mesh;
+module skintokens;
 
 import std::core::mem;
 import std::core::mem::allocator;

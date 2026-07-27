@@ -1,6 +1,6 @@
 module llm;
 
-import llm::mesh;
+import skintokens;
 import llm_text;
 import std::io;
 import std::io::file;

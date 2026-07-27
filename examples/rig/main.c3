@@ -14,7 +14,7 @@
 module rig_cli;
 
 import llm;
-import llm::mesh;
+import skintokens;
 import llm_text;
 import std::io;
 import std::io::file;
@@ -25,14 +25,14 @@ import std::math::vector;
 const String DEFAULT_MODEL = "/Users/tonis/Documents/ai_models/grpo_1400.gguf";
 const uint SEED_ATTEMPTS = 8;
 
-fn mesh::RigClass? parse_class(String text)
+fn skintokens::RigClass? parse_class(String text)
 {
     switch (text)
     {
-        case "none": return mesh::RigClass.NONE;
-        case "rignet": return mesh::RigClass.RIGNET;
-        case "vroid": return mesh::RigClass.VROID;
-        case "articulation": return mesh::RigClass.ARTICULATION;
+        case "none": return skintokens::RigClass.NONE;
+        case "rignet": return skintokens::RigClass.RIGNET;
+        case "vroid": return skintokens::RigClass.VROID;
+        case "articulation": return skintokens::RigClass.ARTICULATION;
         default: return io::UNSUPPORTED_OPERATION~;
     }
 }
@@ -49,7 +49,7 @@ fn int main(String[] args)
     String output = args[2];
     String model_path = DEFAULT_MODEL;
     ulong seed = 0;
-    mesh::RigClass rig_class = mesh::RigClass.ARTICULATION;
+    skintokens::RigClass rig_class = skintokens::RigClass.ARTICULATION;
 
     for (usz i = 3; i < args.len; i++)
     {
@@ -63,7 +63,7 @@ fn int main(String[] args)
                 seed = args[i].to_ulong() ?? 0;
             case "--class":
                 if (++i >= args.len) { io::printn("--class needs a name"); return 1; }
-                rig_class = parse_class(args[i]) ?? mesh::RigClass.ARTICULATION;
+                rig_class = parse_class(args[i]) ?? skintokens::RigClass.ARTICULATION;
             default:
                 io::printfn("unknown option %s", args[i]);
                 return 1;
@@ -84,24 +84,24 @@ fn int main(String[] args)
     llm::WeightNames names = llm::load_weight_names(schema)!!;
     defer names.free();
 
-    mesh::MeshEncoder encoder = mesh::load_mesh_encoder(&ctx, model_path)!!;
+    skintokens::MeshEncoder encoder = skintokens::load_mesh_encoder(&ctx, model_path)!!;
     defer encoder.free();
     llm_text::LlmModel model = llm_text::load_llm_model(&ctx, &gf, &config, &names)!!;
     defer model.free();
 
-    mesh::TriMesh geometry = mesh::load_gltf(mem, input)!!;
+    skintokens::TriMesh geometry = skintokens::load_gltf(mem, input)!!;
     defer geometry.free(mem);
     io::printfn("%s: %d vertices, %d triangles", input, geometry.positions.len, geometry.triangle_count());
 
     // The encoder is the slow half and does not depend on the seed, so it runs
     // once and every attempt re-decodes from the same prefix.
-    mesh::PrepareOptions prepare = mesh::DEFAULT_PREPARE;
-    mesh::ShapeEncoderInput shape = mesh::prepare_shape_input(mem, geometry, prepare)!!;
+    skintokens::PrepareOptions prepare = skintokens::DEFAULT_PREPARE;
+    skintokens::ShapeEncoderInput shape = skintokens::prepare_shape_input(mem, geometry, prepare)!!;
     defer shape.free(mem);
     float[] prefix = encoder.encode(mem, &shape)!!;
     defer mem::free(prefix);
 
-    mesh::RigOptions options = mesh::DEFAULT_RIG;
+    skintokens::RigOptions options = skintokens::DEFAULT_RIG;
     options.prepare = prepare;
     options.rig_class = rig_class;
 
@@ -109,8 +109,8 @@ fn int main(String[] args)
     // sequence runs long -- the reference does the same -- so the first
     // skeleton that parses is not necessarily one worth exporting. A run with
     // every bone on the mesh is taken immediately; otherwise the least bad wins.
-    mesh::Bounds box = geometry.bounds();
-    mesh::RigResult rig;
+    skintokens::Bounds box = geometry.bounds();
+    skintokens::RigResult rig;
     bool rigged = false;
     float best_off = 2.0f;
     ulong best_seed = seed;
@@ -118,7 +118,7 @@ fn int main(String[] args)
     for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++)
     {
         options.seed = seed + attempt;
-        if (try candidate = mesh::generate_rig_from_prefix(
+        if (try candidate = skintokens::generate_rig_from_prefix(
             mem, &ctx, &model, prefix, shape.normalization, options))
         {
             float off = candidate.off_mesh_fraction(box);
@@ -161,7 +161,7 @@ fn int main(String[] args)
     io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh (seed %d, class %s)",
         rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_seed, rig_class);
 
-    mesh::export_rig_glb(mem, output, geometry, &rig)!!;
+    skintokens::export_rig_glb(mem, output, geometry, &rig)!!;
     io::printfn("wrote %s", output);
     return 0;
 }

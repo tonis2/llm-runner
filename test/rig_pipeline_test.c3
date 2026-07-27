@@ -1,6 +1,6 @@
 module llm;
 
-import llm::mesh;
+import skintokens;
 import llm_text;
 import std::io;
 import std::io::file;
@@ -51,17 +51,17 @@ fn void test_mesh_to_bones() @test
     WeightNames names = load_weight_names(schema)!!;
     defer names.free();
 
-    mesh::MeshEncoder encoder = mesh::load_mesh_encoder(&ctx, RIG_GGUF)!!;
+    skintokens::MeshEncoder encoder = skintokens::load_mesh_encoder(&ctx, RIG_GGUF)!!;
     defer encoder.free();
     llm_text::LlmModel model = llm_text::load_llm_model(&ctx, &gf, &config, &names)!!;
     defer model.free();
 
-    mesh::TriMesh cube = {
+    skintokens::TriMesh cube = {
         .positions = rig_cube_positions[..],
         .indices = rig_cube_indices[..],
     };
 
-    mesh::RigOptions options = mesh::DEFAULT_RIG;
+    skintokens::RigOptions options = skintokens::DEFAULT_RIG;
     options.prepare.samples = 16384;
     options.max_new_tokens = 600;
 
@@ -70,12 +70,12 @@ fn void test_mesh_to_bones() @test
     // an input gets. The reference searches ten beams for exactly this reason;
     // retrying a couple of seeds is the poor relation of that, and it is the
     // caller's call to make rather than the library's.
-    mesh::RigResult rig;
+    skintokens::RigResult rig;
     bool generated = false;
     for (ulong seed = 0; seed < 3 && !generated; seed++)
     {
         options.seed = seed;
-        if (try attempt = mesh::generate_rig(mem, &ctx, &encoder, &model, cube, options))
+        if (try attempt = skintokens::generate_rig(mem, &ctx, &encoder, &model, cube, options))
         {
             rig = attempt;
             generated = true;
@@ -91,9 +91,9 @@ fn void test_mesh_to_bones() @test
     // Terminated on its own rather than running out of budget — that is what
     // the grammar buys, and without it decoding runs past any cap.
     assert(rig.tokens.len < 600, "generation used the whole budget");
-    assert(rig.tokens[0] == mesh::TOKEN_BOS);
-    assert(rig.tokens[rig.tokens.len - 1] == mesh::TOKEN_EOS
-        || rig.tokens[rig.tokens.len - 1] == mesh::TOKEN_SEQUENCE_END,
+    assert(rig.tokens[0] == skintokens::TOKEN_BOS);
+    assert(rig.tokens[rig.tokens.len - 1] == skintokens::TOKEN_EOS
+        || rig.tokens[rig.tokens.len - 1] == skintokens::TOKEN_SEQUENCE_END,
         "the sequence did not end on a terminator");
 
     // Nothing outside the skeleton vocabulary can appear: the model is trained
@@ -101,8 +101,8 @@ fn void test_mesh_to_bones() @test
     // two apart.
     foreach (token : rig.tokens)
     {
-        assert(!mesh::is_skin_token(token), "a skin token leaked into the skeleton");
-        assert(token < mesh::RIG_TOTAL_VOCAB);
+        assert(!skintokens::is_skin_token(token), "a skin token leaked into the skeleton");
+        assert(token < skintokens::RIG_TOTAL_VOCAB);
     }
 
     assert(rig.skeleton.len() > 0, "no bones");
@@ -123,7 +123,7 @@ fn void test_mesh_to_bones() @test
     Vec3[] world = rig.joints_in_model_space(mem);
     defer mem::free(world);
 
-    mesh::Bounds box = cube.bounds();
+    skintokens::Bounds box = cube.bounds();
     foreach (i, joint : world)
     {
         for (usz axis = 0; axis < 3; axis++)
@@ -140,44 +140,44 @@ fn void test_mesh_to_bones() @test
 // skeleton vocabulary and offer a way to stop.
 fn void test_grammar_constrains_decoding() @test
 {
-    mesh::RigGrammar grammar;
+    skintokens::RigGrammar grammar;
 
-    bool[] allowed = mem::new_array(bool, (sz)mesh::RIG_TOTAL_VOCAB);
+    bool[] allowed = mem::new_array(bool, (sz)skintokens::RIG_TOTAL_VOCAB);
     defer mem::free(allowed);
 
     // Only bos may open a sequence.
     grammar.allow_next(allowed);
-    assert(allowed[mesh::TOKEN_BOS]);
-    assert(!allowed[0] && !allowed[mesh::TOKEN_EOS]);
+    assert(allowed[skintokens::TOKEN_BOS]);
+    assert(!allowed[0] && !allowed[skintokens::TOKEN_EOS]);
 
-    grammar.accept(mesh::TOKEN_BOS);
+    grammar.accept(skintokens::TOKEN_BOS);
     grammar.allow_next(allowed);
-    assert(allowed[mesh::TOKEN_CLS_VROID] && allowed[0], "a class or a coordinate may follow bos");
-    assert(!allowed[mesh::TOKEN_EOS], "an empty skeleton is not a legal sequence");
+    assert(allowed[skintokens::TOKEN_CLS_VROID] && allowed[0], "a class or a coordinate may follow bos");
+    assert(!allowed[skintokens::TOKEN_EOS], "an empty skeleton is not a legal sequence");
 
-    grammar.accept(mesh::TOKEN_CLS_VROID);
+    grammar.accept(skintokens::TOKEN_CLS_VROID);
 
     // Coordinates come in threes, and nothing else may interrupt them.
     grammar.accept(0);
     grammar.allow_next(allowed);
-    assert(allowed[5] && !allowed[mesh::TOKEN_BRANCH] && !allowed[mesh::TOKEN_EOS],
+    assert(allowed[5] && !allowed[skintokens::TOKEN_BRANCH] && !allowed[skintokens::TOKEN_EOS],
         "the second coordinate of a joint is forced");
     grammar.accept(0);
     grammar.allow_next(allowed);
-    assert(allowed[5] && !allowed[mesh::TOKEN_EOS], "so is the third");
+    assert(allowed[5] && !allowed[skintokens::TOKEN_EOS], "so is the third");
     grammar.accept(0);
 
     // A complete joint: now the sequence may branch, start a part, continue, or end.
     grammar.allow_next(allowed);
-    assert(allowed[mesh::TOKEN_BRANCH] && allowed[mesh::TOKEN_EOS]
-        && allowed[mesh::TOKEN_PART_HAND] && allowed[7]);
+    assert(allowed[skintokens::TOKEN_BRANCH] && allowed[skintokens::TOKEN_EOS]
+        && allowed[skintokens::TOKEN_PART_HAND] && allowed[7]);
 
     // At no point is a skin token or the model's own terminator reachable.
-    assert(!allowed[mesh::SKIN_TOKEN_BASE]);
-    assert(!allowed[mesh::TOKEN_SEQUENCE_END]);
+    assert(!allowed[skintokens::SKIN_TOKEN_BASE]);
+    assert(!allowed[skintokens::TOKEN_SEQUENCE_END]);
 
     // A branch is followed by six coordinates, so the first three are forced too.
-    grammar.accept(mesh::TOKEN_BRANCH);
+    grammar.accept(skintokens::TOKEN_BRANCH);
     grammar.allow_next(allowed);
-    assert(allowed[9] && !allowed[mesh::TOKEN_EOS] && !allowed[mesh::TOKEN_BRANCH]);
+    assert(allowed[9] && !allowed[skintokens::TOKEN_EOS] && !allowed[skintokens::TOKEN_BRANCH]);
 }

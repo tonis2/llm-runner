@@ -12,7 +12,7 @@
  Only TRIANGLES primitives are taken. Strips and fans are rare in exported
  assets and are skipped rather than silently mis-triangulated.
 *>
-module llm::mesh;
+module skintokens;
 
 import gltf;
 import std::core::mem;

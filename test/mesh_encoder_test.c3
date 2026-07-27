@@ -1,6 +1,6 @@
 module llm;
 
-import llm::mesh;
+import skintokens;
 import vk;
 import std::io;
 import std::io::file;
@@ -92,7 +92,7 @@ fn void cpu_rmsnorm(float[] out, float[] input, float[] weight, usz rows, usz di
 
 // Mirrors the strided addressing in mesh_attention.slang, so a mismatch means
 // the shader disagrees with the layout rather than that both are wrong.
-fn void cpu_attention(float[] out, float[] q, float[] kv, mesh::MeshAttentionPC pc, usz head_dim)
+fn void cpu_attention(float[] out, float[] q, float[] kv, skintokens::MeshAttentionPC pc, usz head_dim)
 {
     for (usz head = 0; head < pc.n_heads; head++)
     {
@@ -141,7 +141,7 @@ fn void test_mesh_encoder_kernels() @test
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    mesh::MeshEncoderKernels kernels = mesh::create_encoder_kernels(&ctx)!!;
+    skintokens::MeshEncoderKernels kernels = skintokens::create_encoder_kernels(&ctx)!!;
     defer kernels.free(ctx.device);
 
     random::Sfc64Random rng;
@@ -169,7 +169,7 @@ fn void test_mesh_encoder_kernels() @test
     {
         RenderGraph graph;
         graph.init(&ctx)!!;
-        mesh::MeshLinearPC pc = { .m = (uint)ROWS, .n = (uint)OUT_DIM, .k = (uint)IN_DIM, .has_bias = 1 };
+        skintokens::MeshLinearPC pc = { .m = (uint)ROWS, .n = (uint)OUT_DIM, .k = (uint)IN_DIM, .has_bias = 1 };
         graph.dispatch(&kernels.linear, { &t_input, &t_weight, &t_bias, &t_out }, &pc,
             ceil_div((uint)OUT_DIM, 16), ceil_div((uint)ROWS, 16));
         graph.flush()!!;
@@ -184,7 +184,7 @@ fn void test_mesh_encoder_kernels() @test
     {
         RenderGraph graph;
         graph.init(&ctx)!!;
-        mesh::MeshLinearPC pc = { .m = (uint)ROWS, .n = (uint)OUT_DIM, .k = (uint)IN_DIM, .has_bias = 0 };
+        skintokens::MeshLinearPC pc = { .m = (uint)ROWS, .n = (uint)OUT_DIM, .k = (uint)IN_DIM, .has_bias = 0 };
         graph.dispatch(&kernels.linear, { &t_input, &t_weight, &t_weight, &t_out }, &pc,
             ceil_div((uint)OUT_DIM, 16), ceil_div((uint)ROWS, 16));
         graph.flush()!!;
@@ -209,12 +209,12 @@ fn void test_mesh_encoder_kernels() @test
 
         RenderGraph graph;
         graph.init(&ctx)!!;
-        mesh::MeshLayerNormPC pc = { .dim = (uint)IN_DIM, .n_rows = (uint)ROWS, .eps = 1e-5f, .has_bias = 1 };
+        skintokens::MeshLayerNormPC pc = { .dim = (uint)IN_DIM, .n_rows = (uint)ROWS, .eps = 1e-5f, .has_bias = 1 };
         graph.dispatch(&kernels.layernorm, { &t_input, &t_gamma, &t_beta, &t_normed }, &pc, (uint)ROWS);
 
         // In-place is what the forward pass does to the 54000-row cloud, so it
         // is worth proving rather than assuming.
-        mesh::MeshRmsNormPC rms_pc = { .dim = (uint)IN_DIM, .n_rows = (uint)ROWS, .eps = 1e-6f, .pad = 0 };
+        skintokens::MeshRmsNormPC rms_pc = { .dim = (uint)IN_DIM, .n_rows = (uint)ROWS, .eps = 1e-6f, .pad = 0 };
         graph.dispatch(&kernels.rmsnorm, { &t_input, &t_gamma, &t_input }, &rms_pc, (uint)ROWS);
         graph.flush()!!;
 
@@ -243,9 +243,9 @@ fn void test_mesh_encoder_kernels() @test
 
         RenderGraph graph;
         graph.init(&ctx)!!;
-        mesh::MeshGeluPC gelu_pc = { .n = (uint)N };
+        skintokens::MeshGeluPC gelu_pc = { .n = (uint)N };
         graph.dispatch(&kernels.gelu, { &t_a }, &gelu_pc, ceil_div((uint)N, 256));
-        mesh::MeshAddPC add_pc = { .n = (uint)N };
+        skintokens::MeshAddPC add_pc = { .n = (uint)N };
         graph.dispatch(&kernels.residual_add, { &t_a, &t_b }, &add_pc, ceil_div((uint)N, 256));
         graph.flush()!!;
 
@@ -269,7 +269,7 @@ fn void test_mesh_attention_kernel() @test
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    mesh::MeshEncoderKernels kernels = mesh::create_encoder_kernels(&ctx)!!;
+    skintokens::MeshEncoderKernels kernels = skintokens::create_encoder_kernels(&ctx)!!;
     defer kernels.free(ctx.device);
 
     random::Sfc64Random rng;
@@ -295,7 +295,7 @@ fn void test_mesh_attention_kernel() @test
         Tensor t_out = create_f32_tensor(&ctx, { (ulong)(Q_LEN * HEADS * HEAD_DIM), 0, 0, 0 }, 1)!!;
         defer { t_q.free(); t_kv.free(); t_out.free(); }
 
-        mesh::MeshAttentionPC pc = {
+        skintokens::MeshAttentionPC pc = {
             .n_heads = (uint)HEADS,
             .q_len = (uint)Q_LEN,
             .kv_len = (uint)KV_LEN,
@@ -334,7 +334,7 @@ fn void test_mesh_attention_kernel() @test
         Tensor t_out = create_f32_tensor(&ctx, { (ulong)(LEN * HEADS * HEAD_DIM), 0, 0, 0 }, 1)!!;
         defer { t_qkv.free(); t_out.free(); }
 
-        mesh::MeshAttentionPC pc = {
+        skintokens::MeshAttentionPC pc = {
             .n_heads = (uint)HEADS,
             .q_len = (uint)LEN,
             .kv_len = (uint)LEN,
@@ -381,7 +381,7 @@ fn void test_mesh_encoder_forward() @test
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    mesh::MeshEncoder encoder = mesh::load_mesh_encoder(&ctx, ENCODER_WEIGHTS)!!;
+    skintokens::MeshEncoder encoder = skintokens::load_mesh_encoder(&ctx, ENCODER_WEIGHTS)!!;
     defer encoder.free();
 
     // A cube is a poor thing to rig, but the point here is that the graph runs
@@ -395,12 +395,12 @@ fn void test_mesh_encoder_forward() @test
         0, 4, 7,  0, 7, 3,   1, 2, 6,  1, 6, 5,
         0, 1, 5,  0, 5, 4,   3, 7, 6,  3, 6, 2,
     };
-    mesh::TriMesh cube = { .positions = positions[..], .indices = indices[..] };
+    skintokens::TriMesh cube = { .positions = positions[..], .indices = indices[..] };
 
-    mesh::PrepareOptions options = mesh::DEFAULT_PREPARE;
+    skintokens::PrepareOptions options = skintokens::DEFAULT_PREPARE;
     options.samples = 8192;
 
-    mesh::ShapeEncoderInput input = mesh::prepare_shape_input(mem, cube, options)!!;
+    skintokens::ShapeEncoderInput input = skintokens::prepare_shape_input(mem, cube, options)!!;
     defer input.free(mem);
 
     float[] latents = encoder.encode(mem, &input)!!;

@@ -6,19 +6,23 @@
      prepare_shape_input   mesh -> 54000 sampled points + 512 queries
      MeshEncoder.encode    -> 512 x 896 prefix embeddings
      prefill_embeddings    those, then bos and a class token, into the LLM
-     greedy decode         -> a rig token sequence
+     constrained sampling  -> a rig token sequence, `RigGrammar` masking the
+                              logits so decoding cannot leave the skeleton
+                              vocabulary
      detokenize_skeleton   -> joints and parents
 
  Bone positions come back in the encoder's normalised frame, so the result
  carries the `Normalization` that puts them back on the original mesh.
 
- Two deliberate departures from the reference, both of which cost quality
- rather than correctness. It samples from one sequence where the reference
- searches ten beams, and it applies no grammar, so a sequence can come back
- malformed — that surfaces as a fault from `detokenize_skeleton` rather than
- as a quietly wrong rig.
+ One departure from the reference remains: this samples a single sequence where
+ the reference searches ten beams. `rig_beam.c3` implements a beam search, but
+ a deterministic one — the reference passes `num_beams` alongside
+ `do_sample: true`, which is beam *sampling*, and the two do not produce the
+ same distribution. Sampling several seeds and choosing between them with
+ `RigResult.off_mesh_fraction` is the cheaper substitute, and it is what
+ `examples/rig` does.
 *>
-module llm::mesh;
+module skintokens;
 
 import vk;
 import llm;
