@@ -2,7 +2,7 @@
   "langrev": "1",
   "warnings": [ "no-unused" ],
   "dependency-search-paths": [ "dependencies" ],
-  "dependencies": ["vk", "image", "llm_text", "zimage", "qwen_edit", "flux", "depth_anything"],
+  "dependencies": ["vk", "image", "llm_text", "zimage", "qwen_edit", "flux", "depth_anything", "gltf"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
   "sources": [ "lib/**"],
