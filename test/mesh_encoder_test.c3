@@ -141,7 +141,7 @@ fn void test_mesh_encoder_kernels() @test
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    skintokens::MeshEncoderKernels kernels = skintokens::create_encoder_kernels(&ctx)!!;
+    skintokens::MeshKernels kernels = skintokens::create_mesh_kernels(&ctx)!!;
     defer kernels.free(ctx.device);
 
     random::Sfc64Random rng;
@@ -170,7 +170,7 @@ fn void test_mesh_encoder_kernels() @test
         RenderGraph graph;
         graph.init(&ctx)!!;
         skintokens::MeshLinearPC pc = { .m = (uint)ROWS, .n = (uint)OUT_DIM, .k = (uint)IN_DIM, .has_bias = 1 };
-        graph.dispatch(&kernels.linear, { &t_input, &t_weight, &t_bias, &t_out }, &pc,
+        graph.dispatch(&kernels.mesh_linear, { &t_input, &t_weight, &t_bias, &t_out }, &pc,
             ceil_div((uint)OUT_DIM, 16), ceil_div((uint)ROWS, 16));
         graph.flush()!!;
 
@@ -185,7 +185,7 @@ fn void test_mesh_encoder_kernels() @test
         RenderGraph graph;
         graph.init(&ctx)!!;
         skintokens::MeshLinearPC pc = { .m = (uint)ROWS, .n = (uint)OUT_DIM, .k = (uint)IN_DIM, .has_bias = 0 };
-        graph.dispatch(&kernels.linear, { &t_input, &t_weight, &t_weight, &t_out }, &pc,
+        graph.dispatch(&kernels.mesh_linear, { &t_input, &t_weight, &t_weight, &t_out }, &pc,
             ceil_div((uint)OUT_DIM, 16), ceil_div((uint)ROWS, 16));
         graph.flush()!!;
 
@@ -210,12 +210,12 @@ fn void test_mesh_encoder_kernels() @test
         RenderGraph graph;
         graph.init(&ctx)!!;
         skintokens::MeshLayerNormPC pc = { .dim = (uint)IN_DIM, .n_rows = (uint)ROWS, .eps = 1e-5f, .has_bias = 1 };
-        graph.dispatch(&kernels.layernorm, { &t_input, &t_gamma, &t_beta, &t_normed }, &pc, (uint)ROWS);
+        graph.dispatch(&kernels.mesh_layernorm, { &t_input, &t_gamma, &t_beta, &t_normed }, &pc, (uint)ROWS);
 
         // In-place is what the forward pass does to the 54000-row cloud, so it
         // is worth proving rather than assuming.
         skintokens::MeshRmsNormPC rms_pc = { .dim = (uint)IN_DIM, .n_rows = (uint)ROWS, .eps = 1e-6f, .pad = 0 };
-        graph.dispatch(&kernels.rmsnorm, { &t_input, &t_gamma, &t_input }, &rms_pc, (uint)ROWS);
+        graph.dispatch(&kernels.mesh_rmsnorm, { &t_input, &t_gamma, &t_input }, &rms_pc, (uint)ROWS);
         graph.flush()!!;
 
         cpu_layernorm(normed, input, gamma, beta, ROWS, IN_DIM, 1e-5f);
@@ -244,9 +244,9 @@ fn void test_mesh_encoder_kernels() @test
         RenderGraph graph;
         graph.init(&ctx)!!;
         skintokens::MeshGeluPC gelu_pc = { .n = (uint)N };
-        graph.dispatch(&kernels.gelu, { &t_a }, &gelu_pc, ceil_div((uint)N, 256));
+        graph.dispatch(&kernels.mesh_gelu, { &t_a }, &gelu_pc, ceil_div((uint)N, 256));
         skintokens::MeshAddPC add_pc = { .n = (uint)N };
-        graph.dispatch(&kernels.residual_add, { &t_a, &t_b }, &add_pc, ceil_div((uint)N, 256));
+        graph.dispatch(&kernels.mesh_residual_add, { &t_a, &t_b }, &add_pc, ceil_div((uint)N, 256));
         graph.flush()!!;
 
         // The exact erf GELU, computed a different way than the shader does it:
@@ -269,7 +269,7 @@ fn void test_mesh_attention_kernel() @test
     DeviceContext ctx = createContext()!!;
     defer ctx.free();
 
-    skintokens::MeshEncoderKernels kernels = skintokens::create_encoder_kernels(&ctx)!!;
+    skintokens::MeshKernels kernels = skintokens::create_mesh_kernels(&ctx)!!;
     defer kernels.free(ctx.device);
 
     random::Sfc64Random rng;
@@ -312,7 +312,7 @@ fn void test_mesh_attention_kernel() @test
 
         RenderGraph graph;
         graph.init(&ctx)!!;
-        graph.dispatch(&kernels.attention, { &t_q, &t_kv, &t_out }, &pc,
+        graph.dispatch(&kernels.mesh_attention, { &t_q, &t_kv, &t_out }, &pc,
             ceil_div(pc.q_len, 16), (uint)HEADS);
         graph.flush()!!;
 
@@ -351,7 +351,7 @@ fn void test_mesh_attention_kernel() @test
 
         RenderGraph graph;
         graph.init(&ctx)!!;
-        graph.dispatch(&kernels.attention, { &t_qkv, &t_qkv, &t_out }, &pc,
+        graph.dispatch(&kernels.mesh_attention, { &t_qkv, &t_qkv, &t_out }, &pc,
             ceil_div(pc.q_len, 16), (uint)HEADS);
         graph.flush()!!;
 

@@ -96,13 +96,43 @@ fn void test_mesh_to_bones() @test
         || rig.tokens[rig.tokens.len - 1] == skintokens::TOKEN_SEQUENCE_END,
         "the sequence did not end on a terminator");
 
-    // Nothing outside the skeleton vocabulary can appear: the model is trained
-    // to follow the skeleton with skin codes, and only the grammar keeps the
-    // two apart.
-    foreach (token : rig.tokens)
+    // One sequence, two halves. The skeleton runs to the tokenizer's
+    // terminator; everything after it is the skin block, four codes per bone,
+    // closed by the model's own terminator. Nothing in the logits marks that
+    // boundary — only the grammar keeps the two apart, in both directions.
+    usz eos = 0;
+    bool found_eos = false;
+    foreach (usz i, token : rig.tokens)
+    {
+        if (token == skintokens::TOKEN_EOS) { eos = i; found_eos = true; break; }
+    }
+    assert(found_eos, "the sequence has no skeleton terminator");
+
+    foreach (token : rig.tokens[:eos])
     {
         assert(!skintokens::is_skin_token(token), "a skin token leaked into the skeleton");
         assert(token < skintokens::RIG_TOTAL_VOCAB);
+    }
+
+    if (rig.has_skin())
+    {
+        assert(rig.skin_start == eos + 1, "the skin block should start right after the terminator");
+        assert(rig.skin_count == rig.skeleton.len() * (usz)skintokens::TOKENS_PER_SKIN,
+            "%d codes for %d bones", rig.skin_count, rig.skeleton.len());
+        assert(rig.tokens[rig.tokens.len - 1] == skintokens::TOKEN_SEQUENCE_END,
+            "a complete skin block ends on the model's own terminator");
+
+        foreach (token : rig.tokens[rig.skin_start:rig.skin_count])
+        {
+            assert(skintokens::is_skin_token(token), "a non-code appeared in the skin block");
+        }
+
+        uint[] codes = rig.skin_codes(mem)!!;
+        defer mem::free(codes);
+        foreach (code : codes)
+        {
+            assert(code < skintokens::SKIN_TOKEN_COUNT, "code %d is outside the codebook", code);
+        }
     }
 
     assert(rig.skeleton.len() > 0, "no bones");

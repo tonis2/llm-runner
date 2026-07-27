@@ -17,6 +17,14 @@
  nothing; only a beam descending from a slot someone else claimed needs a copy,
  and then only of the positions generated so far — the prefix is identical
  across beams and is written once.
+
+ Skeletons only. Each beam's `RigGrammar` is left at `tokens_per_skin = 0`, so
+ the skeleton's terminator ends a beam rather than opening the skin block that
+ `rig.c3` decodes into. Ten beams over a sequence that is half skin codes would
+ be searching a part of it that no beam can score usefully — a skin code's
+ likelihood says nothing about whether the skeleton in front of it was a good
+ one. Take the skeleton from here and re-decode it with `generate_rig` if the
+ weights are wanted.
 *>
 module skintokens;
 

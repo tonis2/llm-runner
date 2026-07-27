@@ -73,16 +73,19 @@ struct MeshAttentionPC {
     float scale;
 }
 
-struct MeshEncoderKernels {
-    llm::ComputeKernel layernorm;
-    llm::ComputeKernel rmsnorm;
-    llm::ComputeKernel linear;
-    llm::ComputeKernel gelu;
-    llm::ComputeKernel residual_add;
-    llm::ComputeKernel attention;
+// Fields are named for the SPIR-V entry points they wrap; the methods below
+// are named for the operations. Same six things, and C3 will not let one name
+// serve as both a field and a method.
+struct MeshKernels {
+    llm::ComputeKernel mesh_layernorm;
+    llm::ComputeKernel mesh_rmsnorm;
+    llm::ComputeKernel mesh_linear;
+    llm::ComputeKernel mesh_gelu;
+    llm::ComputeKernel mesh_residual_add;
+    llm::ComputeKernel mesh_attention;
 }
 
-fn MeshEncoderKernels? create_encoder_kernels(llm::DeviceContext* ctx) {
+fn MeshKernels? create_mesh_kernels(llm::DeviceContext* ctx) {
     char[] encoder_spv = &MESH_ENCODER_SPV;
     vk::ShaderModule encoder_shader = vk::shaderModuleCreateInfo()
         .setCodeSize(encoder_spv.len)
@@ -98,22 +101,22 @@ fn MeshEncoderKernels? create_encoder_kernels(llm::DeviceContext* ctx) {
     defer attention_shader.free(ctx.device);
 
     return {
-        .layernorm    = llm::create_kernel(ctx, encoder_shader, 4, MeshLayerNormPC::size, "mesh_layernorm")!!,
-        .rmsnorm      = llm::create_kernel(ctx, encoder_shader, 3, MeshRmsNormPC::size, "mesh_rmsnorm")!!,
-        .linear       = llm::create_kernel(ctx, encoder_shader, 4, MeshLinearPC::size, "mesh_linear")!!,
-        .gelu         = llm::create_kernel(ctx, encoder_shader, 1, MeshGeluPC::size, "mesh_gelu")!!,
-        .residual_add = llm::create_kernel(ctx, encoder_shader, 2, MeshAddPC::size, "mesh_residual_add")!!,
-        .attention    = llm::create_kernel(ctx, attention_shader, 3, MeshAttentionPC::size, "mesh_attention")!!,
+        .mesh_layernorm    = llm::create_kernel(ctx, encoder_shader, 4, MeshLayerNormPC::size, "mesh_layernorm")!!,
+        .mesh_rmsnorm      = llm::create_kernel(ctx, encoder_shader, 3, MeshRmsNormPC::size, "mesh_rmsnorm")!!,
+        .mesh_linear       = llm::create_kernel(ctx, encoder_shader, 4, MeshLinearPC::size, "mesh_linear")!!,
+        .mesh_gelu         = llm::create_kernel(ctx, encoder_shader, 1, MeshGeluPC::size, "mesh_gelu")!!,
+        .mesh_residual_add = llm::create_kernel(ctx, encoder_shader, 2, MeshAddPC::size, "mesh_residual_add")!!,
+        .mesh_attention    = llm::create_kernel(ctx, attention_shader, 3, MeshAttentionPC::size, "mesh_attention")!!,
     };
 }
 
-fn void MeshEncoderKernels.free(&self, vk::Device device) {
-    self.layernorm.free(device);
-    self.rmsnorm.free(device);
-    self.linear.free(device);
-    self.gelu.free(device);
-    self.residual_add.free(device);
-    self.attention.free(device);
+fn void MeshKernels.free(&self, vk::Device device) {
+    self.mesh_layernorm.free(device);
+    self.mesh_rmsnorm.free(device);
+    self.mesh_linear.free(device);
+    self.mesh_gelu.free(device);
+    self.mesh_residual_add.free(device);
+    self.mesh_attention.free(device);
 }
 
 // --- Weights ---
@@ -139,7 +142,7 @@ struct SelfAttnBlock {
 
 // Tolerates a half-built struct: a load that fails partway leaves the rest
 // zeroed, and handing a zeroed vk::Memory to free() is not survivable.
-fn void release_tensor(llm::Tensor* tensor) @local {
+fn void release_tensor(llm::Tensor* tensor) @private {
     if (tensor.size_bytes > 0) tensor.free();
     *tensor = {};
 }
@@ -233,7 +236,7 @@ fn void MeshEncoderActivations.free(&self) {
 
 struct MeshEncoder {
     llm::DeviceContext* ctx;
-    MeshEncoderKernels kernels;
+    MeshKernels kernels;
     MeshEncoderWeights weights;
     MeshEncoderActivations acts;
     bool has_acts;
@@ -241,25 +244,27 @@ struct MeshEncoder {
 
 // --- Loading ---
 
-fn llm::Tensor? load_named(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) @local {
+fn llm::Tensor? load_named(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) @private {
     llm::GGUFTensorInfo* info = gf.find_tensor(name)!;
     return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base);
 }
 
+// Longest name in either network is 54 characters. Formatted onto the stack
+// rather than through `tformat`: a loader runs a few hundred of these and none
+// of them needs to outlive the call.
+const usz TENSOR_NAME_MAX = 128;
+
 fn llm::Tensor? load_one(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) @local {
-    @pool() {
-        return load_named(ctx, gf, string::tformat("mesh_encoder.encoder.%s", name));
-    };
+    char[TENSOR_NAME_MAX] buffer;
+    String full = (String)io::bprintf(buffer[..], "mesh_encoder.encoder.%s", name)!;
+    return load_named(ctx, gf, full);
 }
 
-// One name at a time, each under its own pool. Formatting all eleven up front
-// and loading them in a single struct literal reads better and crashes: the
-// nested pools do not survive being interleaved with the literal's evaluation.
 fn llm::Tensor? load_block_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, uint index, String suffix) @local {
-    @pool() {
-        return load_named(ctx, gf,
-            string::tformat("mesh_encoder.encoder.self_attn.resblocks.%d.%s", index, suffix));
-    };
+    char[TENSOR_NAME_MAX] buffer;
+    String full = (String)io::bprintf(buffer[..],
+        "mesh_encoder.encoder.self_attn.resblocks.%d.%s", index, suffix)!;
+    return load_named(ctx, gf, full);
 }
 
 fn SelfAttnBlock? load_block(llm::DeviceContext* ctx, llm::GGUFFile* gf, uint index) @local {
@@ -297,7 +302,7 @@ fn MeshEncoder? load_mesh_encoder(llm::DeviceContext* ctx, String path) {
     defer gf.free();
 
     MeshEncoder encoder = { .ctx = ctx };
-    encoder.kernels = create_encoder_kernels(ctx)!;
+    encoder.kernels = create_mesh_kernels(ctx)!;
     defer catch encoder.kernels.free(ctx.device);
 
     encoder.weights = {
@@ -343,6 +348,19 @@ fn void MeshEncoder.free(&self) {
     *self = {};
 }
 
+<*
+ Give back the activation buffers, keeping the weights.
+
+ Worth doing between encoding and skinning: the two point-sized buffers here
+ are a third of a gigabyte at 54000 points, and the skin VAE is about to
+ allocate its own pair at a wider dim. The next `encode` reserves them again.
+*>
+fn void MeshEncoder.release_activations(&self) {
+    if (!self.has_acts) return;
+    self.acts.free();
+    self.has_acts = false;
+}
+
 // --- Activation allocation ---
 
 fn llm::Tensor? matrix(llm::DeviceContext* ctx, uint rows, uint cols) @local
@@ -378,24 +396,26 @@ fn void? MeshEncoder.reserve(&self, uint n_points, uint n_latents) {
 // --- Dispatch helpers ---
 //
 // Each wraps one kernel so the forward pass below reads as the network rather
-// than as push-constant bookkeeping.
+// than as push-constant bookkeeping. They hang off `MeshKernels` rather than
+// off the encoder because the skin decoder in `skin_vae.c3` runs on the same
+// six kernels — a different network, the same handful of primitives.
 
-fn void MeshEncoder.layer_norm(
+fn void MeshKernels.layer_norm(
     &self, llm::RenderGraph* graph,
     llm::Tensor* input, llm::Tensor* weight, llm::Tensor* bias, llm::Tensor* output,
     uint rows, uint dim)
 {
     MeshLayerNormPC pc = { .dim = dim, .n_rows = rows, .eps = LN_EPS, .has_bias = 1 };
-    graph.dispatch(&self.kernels.layernorm, { input, weight, bias, output }, &pc, rows);
+    graph.dispatch(&self.mesh_layernorm, { input, weight, bias, output }, &pc, rows);
 }
 
-fn void MeshEncoder.rms_norm(
+fn void MeshKernels.rms_norm(
     &self, llm::RenderGraph* graph,
     llm::Tensor* input, llm::Tensor* weight, llm::Tensor* output,
     uint rows, uint dim)
 {
     MeshRmsNormPC pc = { .dim = dim, .n_rows = rows, .eps = RMS_EPS, .pad = 0 };
-    graph.dispatch(&self.kernels.rmsnorm, { input, weight, output }, &pc, rows);
+    graph.dispatch(&self.mesh_rmsnorm, { input, weight, output }, &pc, rows);
 }
 
 <*
@@ -404,7 +424,7 @@ fn void MeshEncoder.rms_norm(
  `bias` is still bound when unused — a push descriptor has to point somewhere —
  so callers without one pass the weight again and the shader ignores it.
 *>
-fn void MeshEncoder.linear(
+fn void MeshKernels.linear(
     &self, llm::RenderGraph* graph,
     llm::Tensor* input, llm::Tensor* weight, llm::Tensor* bias, llm::Tensor* output,
     uint rows, uint out_dim, uint in_dim, bool has_bias)
@@ -414,35 +434,37 @@ fn void MeshEncoder.linear(
         .has_bias = has_bias ? 1 : 0,
     };
     graph.dispatch(
-        &self.kernels.linear,
+        &self.mesh_linear,
         { input, weight, has_bias ? bias : weight, output },
         &pc,
         llm::ceil_div(out_dim, 16), llm::ceil_div(rows, 16),
     );
 }
 
-fn void MeshEncoder.gelu(&self, llm::RenderGraph* graph, llm::Tensor* data, uint count) {
+fn void MeshKernels.gelu(&self, llm::RenderGraph* graph, llm::Tensor* data, uint count) {
     MeshGeluPC pc = { .n = count };
-    graph.dispatch(&self.kernels.gelu, { data }, &pc, llm::ceil_div(count, 256));
+    graph.dispatch(&self.mesh_gelu, { data }, &pc, llm::ceil_div(count, 256));
 }
 
-fn void MeshEncoder.residual_add(&self, llm::RenderGraph* graph, llm::Tensor* acc, llm::Tensor* delta, uint count) {
+fn void MeshKernels.residual_add(&self, llm::RenderGraph* graph, llm::Tensor* acc, llm::Tensor* delta, uint count) {
     MeshAddPC pc = { .n = count };
-    graph.dispatch(&self.kernels.residual_add, { acc, delta }, &pc, llm::ceil_div(count, 256));
+    graph.dispatch(&self.mesh_residual_add, { acc, delta }, &pc, llm::ceil_div(count, 256));
 }
 
-fn void MeshEncoder.attention(&self, llm::RenderGraph* graph, MeshAttentionPC pc, llm::Tensor* q, llm::Tensor* kv, llm::Tensor* out) {
+fn void MeshKernels.attention(&self, llm::RenderGraph* graph, MeshAttentionPC pc, llm::Tensor* q, llm::Tensor* kv, llm::Tensor* out) {
     graph.dispatch(
-        &self.kernels.attention,
+        &self.mesh_attention,
         { q, kv, out },
         &pc,
-        llm::ceil_div(pc.q_len, ATTN_QUERY_TILE), ENCODER_HEADS,
+        llm::ceil_div(pc.q_len, ATTN_QUERY_TILE), pc.n_heads,
     );
 }
 
 // Michelangelo scales q and k by 1/sqrt(sqrt(head_dim)) each, which is the
-// usual 1/sqrt(head_dim) on the product.
-fn float attention_scale() @local => 1.0f / (float)math::sqrt((double)ENCODER_HEAD_DIM);
+// usual 1/sqrt(head_dim) on the product. The VAE's blocks reach the same scale
+// by a different route — torch's scaled_dot_product_attention applies its own
+// 1/sqrt(head_dim) — and head_dim is 64 on both sides.
+fn float attention_scale() => 1.0f / (float)math::sqrt((double)ENCODER_HEAD_DIM);
 
 // --- Forward pass ---
 
@@ -479,8 +501,8 @@ fn float[]? MeshEncoder.encode(&self, alloc::Allocator allocator, ShapeEncoderIn
     // The cloud and the queries go through one and the same projection; the
     // queries are just rows of the cloud that farthest point sampling picked,
     // and a per-row linear commutes with that gather.
-    self.linear(&graph, &acts.point_features, &w.input_proj_weight, &w.input_proj_bias, &acts.data, n_points, width, feature_dim, true);
-    self.linear(&graph, &acts.query_features, &w.input_proj_weight, &w.input_proj_bias, &acts.latents, n_latents, width, feature_dim, true);
+    self.kernels.linear(&graph, &acts.point_features, &w.input_proj_weight, &w.input_proj_bias, &acts.data, n_points, width, feature_dim, true);
+    self.kernels.linear(&graph, &acts.query_features, &w.input_proj_weight, &w.input_proj_bias, &acts.latents, n_latents, width, feature_dim, true);
 
     // Point-sized work is the expensive part of the whole encoder; give it its
     // own submission so a slow device does not trip a watchdog mid-graph.
@@ -488,16 +510,16 @@ fn float[]? MeshEncoder.encode(&self, alloc::Allocator allocator, ShapeEncoderIn
 
     // --- Cross attention: x = x + attn(ln_1(x), ln_2(data)) ---
 
-    self.layer_norm(&graph, &acts.latents, &w.cross_ln_1_weight, &w.cross_ln_1_bias, &acts.norm, n_latents, width);
+    self.kernels.layer_norm(&graph, &acts.latents, &w.cross_ln_1_weight, &w.cross_ln_1_bias, &acts.norm, n_latents, width);
     // In place: every thread rewrites only the elements it read, and it reads
     // them for the last time in the same statement.
-    self.layer_norm(&graph, &acts.data, &w.cross_ln_2_weight, &w.cross_ln_2_bias, &acts.data, n_points, width);
-    self.linear(&graph, &acts.norm, &w.cross_q_weight, null, &acts.query, n_latents, width, width, false);
-    self.linear(&graph, &acts.data, &w.cross_kv_weight, null, &acts.kv, n_points, 2 * width, width, false);
+    self.kernels.layer_norm(&graph, &acts.data, &w.cross_ln_2_weight, &w.cross_ln_2_bias, &acts.data, n_points, width);
+    self.kernels.linear(&graph, &acts.norm, &w.cross_q_weight, null, &acts.query, n_latents, width, width, false);
+    self.kernels.linear(&graph, &acts.data, &w.cross_kv_weight, null, &acts.kv, n_points, 2 * width, width, false);
 
     graph.checkpoint()!;
 
-    self.attention(&graph, {
+    self.kernels.attention(&graph, {
         .n_heads = ENCODER_HEADS,
         .q_len = n_latents,
         .kv_len = n_points,
@@ -513,8 +535,8 @@ fn float[]? MeshEncoder.encode(&self, alloc::Allocator allocator, ShapeEncoderIn
         .scale = attention_scale(),
     }, &acts.query, &acts.kv, &acts.attn);
 
-    self.linear(&graph, &acts.attn, &w.cross_proj_weight, &w.cross_proj_bias, &acts.delta, n_latents, width, width, true);
-    self.residual_add(&graph, &acts.latents, &acts.delta, latent_elements);
+    self.kernels.linear(&graph, &acts.attn, &w.cross_proj_weight, &w.cross_proj_bias, &acts.delta, n_latents, width, width, true);
+    self.kernels.residual_add(&graph, &acts.latents, &acts.delta, latent_elements);
 
     self.feed_forward(&graph, &w.cross_ln_3_weight, &w.cross_ln_3_bias, &w.cross_fc_weight, &w.cross_fc_bias, &w.cross_out_weight, &w.cross_out_bias, n_latents);
 
@@ -525,10 +547,10 @@ fn float[]? MeshEncoder.encode(&self, alloc::Allocator allocator, ShapeEncoderIn
     for (uint i = 0; i < ENCODER_BLOCKS; i++) {
         SelfAttnBlock* block = &w.blocks[i];
 
-        self.layer_norm(&graph, &acts.latents, &block.ln_1_weight, &block.ln_1_bias, &acts.norm, n_latents, width);
-        self.linear(&graph, &acts.norm, &block.qkv_weight, null, &acts.qkv, n_latents, 3 * width, width, false);
+        self.kernels.layer_norm(&graph, &acts.latents, &block.ln_1_weight, &block.ln_1_bias, &acts.norm, n_latents, width);
+        self.kernels.linear(&graph, &acts.norm, &block.qkv_weight, null, &acts.qkv, n_latents, 3 * width, width, false);
 
-        self.attention(&graph, {
+        self.kernels.attention(&graph, {
             .n_heads = ENCODER_HEADS,
             .q_len = n_latents,
             .kv_len = n_latents,
@@ -545,17 +567,17 @@ fn float[]? MeshEncoder.encode(&self, alloc::Allocator allocator, ShapeEncoderIn
             .scale = attention_scale(),
         }, &acts.qkv, &acts.qkv, &acts.attn);
 
-        self.linear(&graph, &acts.attn, &block.proj_weight, &block.proj_bias, &acts.delta, n_latents, width, width, true);
-        self.residual_add(&graph, &acts.latents, &acts.delta, latent_elements);
+        self.kernels.linear(&graph, &acts.attn, &block.proj_weight, &block.proj_bias, &acts.delta, n_latents, width, width, true);
+        self.kernels.residual_add(&graph, &acts.latents, &acts.delta, latent_elements);
 
         self.feed_forward(&graph, &block.ln_2_weight, &block.ln_2_bias, &block.fc_weight, &block.fc_bias, &block.out_weight, &block.out_bias, n_latents);
     }
 
     // --- Out ---
 
-    self.layer_norm(&graph, &acts.latents, &w.ln_post_weight, &w.ln_post_bias, &acts.latents, n_latents, width);
-    self.linear(&graph, &acts.latents, &w.out_proj_weight, &w.out_proj_bias, &acts.output, n_latents, ENCODER_OUT_DIM, width, true);
-    self.rms_norm(&graph, &acts.output, &w.out_norm_weight, &acts.output, n_latents, ENCODER_OUT_DIM);
+    self.kernels.layer_norm(&graph, &acts.latents, &w.ln_post_weight, &w.ln_post_bias, &acts.latents, n_latents, width);
+    self.kernels.linear(&graph, &acts.latents, &w.out_proj_weight, &w.out_proj_bias, &acts.output, n_latents, ENCODER_OUT_DIM, width, true);
+    self.kernels.rms_norm(&graph, &acts.output, &w.out_norm_weight, &acts.output, n_latents, ENCODER_OUT_DIM);
 
     graph.flush()!;
 
@@ -573,9 +595,9 @@ fn void MeshEncoder.feed_forward(
 {
     MeshEncoderActivations* acts = &self.acts;
 
-    self.layer_norm(graph, &acts.latents, norm_weight, norm_bias, &acts.norm, rows, ENCODER_WIDTH);
-    self.linear(graph, &acts.norm, fc_weight, fc_bias, &acts.hidden, rows, ENCODER_MLP_DIM, ENCODER_WIDTH, true);
-    self.gelu(graph, &acts.hidden, rows * ENCODER_MLP_DIM);
-    self.linear(graph, &acts.hidden, out_weight, out_bias, &acts.delta, rows, ENCODER_WIDTH, ENCODER_MLP_DIM, true);
-    self.residual_add(graph, &acts.latents, &acts.delta, rows * ENCODER_WIDTH);
+    self.kernels.layer_norm(graph, &acts.latents, norm_weight, norm_bias, &acts.norm, rows, ENCODER_WIDTH);
+    self.kernels.linear(graph, &acts.norm, fc_weight, fc_bias, &acts.hidden, rows, ENCODER_MLP_DIM, ENCODER_WIDTH, true);
+    self.kernels.gelu(graph, &acts.hidden, rows * ENCODER_MLP_DIM);
+    self.kernels.linear(graph, &acts.hidden, out_weight, out_bias, &acts.delta, rows, ENCODER_WIDTH, ENCODER_MLP_DIM, true);
+    self.kernels.residual_add(graph, &acts.latents, &acts.delta, rows * ENCODER_WIDTH);
 }

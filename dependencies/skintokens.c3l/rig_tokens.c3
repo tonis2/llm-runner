@@ -339,11 +339,35 @@ enum RigState {
     EXPECT_JOINT_2,
     EXPECT_JOINT_3,
     EXPECT_BRANCH_OR_PART_OR_JOINT,
+    EXPECT_SKIN,
+    EXPECT_SEQUENCE_END,
+    RIG_DONE,
 }
 
 struct RigGrammar {
     RigState state;
+    // Codes the model owes per bone once the skeleton ends. Zero makes the
+    // skeleton's terminator final, which is what a caller wanting bones and
+    // nothing else asks for.
+    uint tokens_per_skin;
+    // Bones closed so far, counted exactly as the reference's
+    // `bones_in_sequence` does — a branch spends six coordinates on two
+    // positions and still names one bone, so the first triple after a branch
+    // marker does not close anything.
+    uint bones;
+    bool branching;
+    uint skin_emitted;
 }
+
+<*
+ How many skin codes the model still owes, given the skeleton it has written.
+*>
+fn uint RigGrammar.skin_remaining(&self) {
+    uint wanted = self.bones * self.tokens_per_skin;
+    return self.skin_emitted >= wanted ? 0 : wanted - self.skin_emitted;
+}
+
+fn bool RigGrammar.finished(&self) => self.state == RIG_DONE;
 
 fn bool is_part_token(uint token) @local
     => token == TOKEN_SPRING || token == TOKEN_PART_BODY || token == TOKEN_PART_HAND;
@@ -356,6 +380,15 @@ fn bool is_class_token(uint token) @local
  Advance the machine over one emitted token.
 *>
 fn void RigGrammar.accept(&self, uint token) {
+    // The skeleton's terminator can arrive from either of the two states that
+    // offer it, and from there the machine either counts out the skin block or
+    // stops.
+    if (token == TOKEN_EOS
+        && (self.state == EXPECT_PART_OR_JOINT || self.state == EXPECT_BRANCH_OR_PART_OR_JOINT)) {
+        self.state = self.tokens_per_skin > 0 && self.bones > 0 ? EXPECT_SKIN : RIG_DONE;
+        return;
+    }
+
     switch (self.state) {
         case EXPECT_BOS:
             self.state = EXPECT_CLS_OR_PART_OR_JOINT;
@@ -374,15 +407,27 @@ fn void RigGrammar.accept(&self, uint token) {
         case EXPECT_JOINT_2:
             self.state = EXPECT_JOINT_3;
         case EXPECT_JOINT_3:
+            // A joint closes here, unless these three coordinates were the
+            // parent position a branch marker asked for.
+            if (!self.branching) self.bones++;
+            self.branching = false;
             self.state = EXPECT_BRANCH_OR_PART_OR_JOINT;
         case EXPECT_BRANCH_OR_PART_OR_JOINT:
             if (token == TOKEN_BRANCH) {
+                self.branching = true;
                 self.state = EXPECT_JOINT;
             } else if (is_coordinate(token)) {
                 self.state = EXPECT_JOINT_2;
             } else {
                 self.state = EXPECT_JOINT;
             }
+        case EXPECT_SKIN:
+            self.skin_emitted++;
+            if (self.skin_remaining() == 0) self.state = EXPECT_SEQUENCE_END;
+        case EXPECT_SEQUENCE_END:
+            self.state = RIG_DONE;
+        case RIG_DONE:
+            break;
     }
 }
 
@@ -417,7 +462,22 @@ fn void RigGrammar.allow_next(&self, bool[] allowed) {
             allow_parts(allowed);
             allowed[TOKEN_BRANCH] = true;
             allowed[TOKEN_EOS] = true;
+        case EXPECT_SKIN:
+            allow_skin(allowed);
+        case EXPECT_SEQUENCE_END:
+            allowed[TOKEN_SEQUENCE_END] = true;
+        case RIG_DONE:
+            break;
     }
+}
+
+// The reference reopens everything from the skeleton's eos upward here -- pad,
+// the part and class markers, the skin codes and the model's own terminator
+// all at once -- and leans on the model not to reach for the strays. Training
+// puts nothing but skin codes in this stretch, so allowing only those is both
+// tighter and what the sequence is supposed to contain.
+fn void allow_skin(bool[] allowed) @local {
+    for (uint i = SKIN_TOKEN_BASE; i < TOKEN_SEQUENCE_END; i++) allowed[i] = true;
 }
 
 fn void allow_coordinates(bool[] allowed) @local {

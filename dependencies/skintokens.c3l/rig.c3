@@ -1,15 +1,21 @@
 <*
- Mesh in, bones out.
+ Mesh in, rig out.
 
- The pipeline SkinTokens describes, minus the skin weights:
+ The pipeline SkinTokens describes:
 
      prepare_shape_input   mesh -> 54000 sampled points + 512 queries
      MeshEncoder.encode    -> 512 x 896 prefix embeddings
      prefill_embeddings    those, then bos and a class token, into the LLM
      constrained sampling  -> a rig token sequence, `RigGrammar` masking the
-                              logits so decoding cannot leave the skeleton
-                              vocabulary
+                              logits so decoding stays in the right vocabulary
      detokenize_skeleton   -> joints and parents
+
+ One sequence carries two things. Up to the tokenizer's terminator it is a
+ skeleton; after it, four codes per bone that `SkinDecoder` turns into weights.
+ Nothing in the logits marks the boundary, so the grammar is what finds it —
+ and `predict_skin` is what decides whether decoding crosses it at all. Stopping
+ at the skeleton is a legitimate answer, and it is what the seed search in
+ `examples/rig` wants.
 
  Bone positions come back in the encoder's normalised frame, so the result
  carries the `Normalization` that puts them back on the original mesh.
@@ -33,7 +39,7 @@ import std::core::mem::allocator;
 import std::math::vector;
 import std::math::random;
 
-faultdef RIG_PREFIX_TOO_LONG, RIG_DECODE_STALLED, RIG_CONTEXT_EXHAUSTED;
+faultdef RIG_PREFIX_TOO_LONG, RIG_DECODE_STALLED, RIG_CONTEXT_EXHAUSTED, RIG_NO_SKIN;
 
 <*
  How many tokens may still be generated after a prefix of `n_prefix`.
@@ -66,6 +72,10 @@ struct RigOptions {
     uint max_new_tokens;
     llm::SamplingParams sampling;
     ulong seed;
+    // Keep decoding past the skeleton's terminator for the four skin codes per
+    // bone the model owes. Costs one extra token per bone-quarter and buys the
+    // difference between a predicted skin and a distance falloff.
+    bool predict_skin;
 }
 
 <*
@@ -88,6 +98,7 @@ const RigOptions DEFAULT_RIG = {
         .repetition_penalty = 2.0f,
     },
     .seed = 0,
+    .predict_skin = true,
 };
 
 <*
@@ -98,6 +109,39 @@ struct RigResult {
     Normalization normalization;
     uint[] tokens;      // the whole sequence, bos first
     usz prefix_tokens;  // how many embeddings preceded it
+    usz skin_start;     // where the skin block begins in `tokens`, 0 if absent
+    usz skin_count;     // how many skin tokens it holds
+}
+
+<*
+ Whether the sequence carries a complete set of skin codes.
+
+ Incomplete is a normal outcome, not an error: the skeleton comes first and a
+ run that fills its token budget partway through the skin block still has a
+ skeleton worth exporting.
+*>
+fn bool RigResult.has_skin(&self) => self.skin_count > 0
+    && self.skin_count == self.skeleton.joints.len * (usz)TOKENS_PER_SKIN;
+
+<*
+ The skin block as codebook indices — four per bone, bone-major.
+
+ The caller owns the returned array.
+
+ @return? RIG_NO_SKIN : `The sequence has no complete skin block.`
+*>
+fn uint[]? RigResult.skin_codes(&self, alloc::Allocator allocator) {
+    if (!self.has_skin()) return RIG_NO_SKIN~;
+
+    uint[] codes = alloc::new_array(allocator, uint, (sz)self.skin_count);
+    defer catch alloc::free(allocator, codes);
+
+    for (usz i = 0; i < self.skin_count; i++) {
+        uint token = self.tokens[self.skin_start + i];
+        if (!is_skin_token(token)) return RIG_NO_SKIN~;
+        codes[i] = token - SKIN_TOKEN_BASE;
+    }
+    return codes;
 }
 
 fn void RigResult.free(&self, alloc::Allocator allocator) {
@@ -250,14 +294,17 @@ fn RigResult? generate_rig_from_prefix(
     // The grammar has already consumed the start tokens; from here it says
     // which tokens may follow, which is what keeps sampling inside the
     // skeleton vocabulary. The model is trained to emit skin codes straight
-    // after the skeleton's eos, and nothing in the logits marks that boundary.
-    RigGrammar grammar;
+    // after the skeleton's eos, and nothing in the logits marks that boundary —
+    // so the grammar also decides whether decoding crosses it.
+    RigGrammar grammar = { .tokens_per_skin = options.predict_skin ? TOKENS_PER_SKIN : 0 };
     foreach (token : start_tokens) grammar.accept(token);
 
     bool[] allowed = alloc::new_array(allocator, bool, (sz)model.config.vocab_size);
     defer alloc::free(allocator, allowed);
 
     bool terminated = false;
+    usz skeleton_end = 0;
+
     for (uint step = 0; step < budget; step++) {
         // The penalty looks only at what has been generated, not at the start
         // tokens: bos is meant to appear once and penalising it changes nothing.
@@ -270,10 +317,11 @@ fn RigResult? generate_rig_from_prefix(
         tokens[produced] = next;
         produced++;
 
-        if (next == TOKEN_EOS || next == TOKEN_SEQUENCE_END) {
+        if (next == TOKEN_EOS && !terminated) {
             terminated = true;
-            break;
+            skeleton_end = produced - 1;
         }
+        if (grammar.finished()) break;
         if (produced == capacity) break;
 
         // Positions continue straight on from the prefix: the KV cache the
@@ -290,6 +338,13 @@ fn RigResult? generate_rig_from_prefix(
         .tokens = tokens[:produced],
         .prefix_tokens = latents,
     };
+    // A skin block counts only when the grammar saw it through to the model's
+    // own terminator. Running out of budget partway leaves the skeleton intact
+    // and the weights to whatever the caller falls back on.
+    if (grammar.finished() && grammar.skin_emitted > 0 && grammar.skin_remaining() == 0) {
+        result.skin_start = skeleton_end + 1;
+        result.skin_count = (usz)grammar.skin_emitted;
+    }
     result.skeleton = detokenize_skeleton(allocator, result.tokens)!;
     return result;
 }

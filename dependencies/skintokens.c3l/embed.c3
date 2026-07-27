@@ -48,13 +48,35 @@ fn usz encoder_input_dim(uint num_freqs = DEFAULT_NUM_FREQS, usz point_feats = P
     => fourier_dim(num_freqs) + point_feats;
 
 <*
+ The phase offset PMPE adds to frequency `index` of `num_freqs`.
+
+ The skin VAE's embedder runs with `use_pmpe`, which adds a second, phase-shifted
+ sinusoid to every term: `sin(x*f_i) + sin(x*pi/2 + phase_i)`. The second term
+ sweeps slowly where the first sweeps fast — `phase_i` runs from ~6.3 down to 2
+ turns as the frequency climbs — so a point keeps a coarse, unambiguous
+ signature alongside the high-frequency detail.
+
+ The mesh encoder does not use it. Two embedders, both 54 wide, and feeding one
+ the other's numbers produces no error anywhere downstream.
+*>
+fn float pmpe_phase(usz index, uint num_freqs) {
+    double n = (double)num_freqs;
+    double t = (double)(index + 1) / n;
+    return (float)((math::pow(n, 1.0 - t) + t) * 2.0 * math::PI);
+}
+
+<*
  Write one point's encoder input into `dst`.
 
  @param dst : `At least encoder_input_dim() long; only that prefix is written.`
- @param include_pi : `Scale the frequencies by pi. False for this checkpoint.`
+ @param include_pi : `Scale the frequencies by pi. False for the mesh encoder, true for the skin VAE.`
+ @param use_pmpe : `Add the phase-shifted second sinusoid. The skin VAE only.`
  @return? BUFFER_TOO_SMALL : `dst cannot hold a full row.`
 *>
-fn void? embed_point(float[] dst, Vec3 position, Vec3 normal, uint num_freqs = DEFAULT_NUM_FREQS, bool include_pi = false) {
+fn void? embed_point(
+    float[] dst, Vec3 position, Vec3 normal,
+    uint num_freqs = DEFAULT_NUM_FREQS, bool include_pi = false, bool use_pmpe = false)
+{
     usz freqs = (usz)num_freqs;
     usz dim = encoder_input_dim(num_freqs, POINT_FEATS);
     if (dst.len < dim) return BUFFER_TOO_SMALL~;
@@ -74,8 +96,17 @@ fn void? embed_point(float[] dst, Vec3 position, Vec3 normal, uint num_freqs = D
 
         for (usz f = 0; f < freqs; f++) {
             float theta = coordinate * frequency;
-            dst[sin_base + axis * freqs + f] = math::sin(theta);
-            dst[cos_base + axis * freqs + f] = math::cos(theta);
+            float sine = math::sin(theta);
+            float cosine = math::cos(theta);
+
+            if (use_pmpe) {
+                float shifted = coordinate * (float)(math::PI * 0.5) + pmpe_phase(f, num_freqs);
+                sine += math::sin(shifted);
+                cosine += math::cos(shifted);
+            }
+
+            dst[sin_base + axis * freqs + f] = sine;
+            dst[cos_base + axis * freqs + f] = cosine;
             frequency *= 2.0f;
         }
     }
@@ -92,7 +123,10 @@ fn void? embed_point(float[] dst, Vec3 position, Vec3 normal, uint num_freqs = D
  @return? NORMAL_COUNT_MISMATCH : `Positions and normals are different lengths.`
  @return? EMPTY_MESH : `The cloud is empty.`
 *>
-fn float[]? embed_points(Allocator allocator, PointCloud cloud, uint num_freqs = DEFAULT_NUM_FREQS, bool include_pi = false) {
+fn float[]? embed_points(
+    Allocator allocator, PointCloud cloud,
+    uint num_freqs = DEFAULT_NUM_FREQS, bool include_pi = false, bool use_pmpe = false)
+{
     if (cloud.positions.len == 0) return EMPTY_MESH~;
     if (cloud.positions.len != cloud.normals.len) return NORMAL_COUNT_MISMATCH~;
 
@@ -101,7 +135,7 @@ fn float[]? embed_points(Allocator allocator, PointCloud cloud, uint num_freqs =
     defer catch alloc::free(allocator, features);
 
     for (usz i = 0; i < cloud.positions.len; i++) {
-        embed_point(features[i * dim : dim], cloud.positions[i], cloud.normals[i], num_freqs, include_pi)!;
+        embed_point(features[i * dim : dim], cloud.positions[i], cloud.normals[i], num_freqs, include_pi, use_pmpe)!;
     }
 
     return features;
@@ -151,11 +185,16 @@ const PrepareOptions DEFAULT_PREPARE = {
  `features` are the cross-attention keys and values; `query` is the gather of
  `features` at `query_indices`, which is what the encoder's single cross
  attention block attends *from*. Both are row-major, `dim` floats per row.
+
+ `cloud` is the sampled surface the features were embedded from, kept because
+ the skin VAE conditions on the same points through a different embedder —
+ re-sampling for it would have to reproduce this seed exactly to stay in step.
 *>
 struct ShapeEncoderInput {
     float[] features;
     float[] query;
     usz[] query_indices;
+    PointCloud cloud;
     usz count;
     usz latents;
     usz dim;
@@ -166,6 +205,7 @@ fn void ShapeEncoderInput.free(&self, Allocator allocator) {
     if (self.features.len > 0) alloc::free(allocator, self.features);
     if (self.query.len > 0) alloc::free(allocator, self.query);
     if (self.query_indices.len > 0) alloc::free(allocator, self.query_indices);
+    self.cloud.free(allocator);
     *self = {};
 }
 
@@ -198,7 +238,6 @@ fn ShapeEncoderInput? prepare_shape_input(Allocator allocator, TriMesh geometry,
         : geometry.unit_cube_transform(options.target);
 
     PointCloud cloud = sample_surface(allocator, geometry, options.samples, options.seed, options.smooth_normals)!;
-    defer cloud.free(allocator);
 
     foreach (&position : cloud.positions) {
         *position = transform.forward(*position);
@@ -207,6 +246,7 @@ fn ShapeEncoderInput? prepare_shape_input(Allocator allocator, TriMesh geometry,
     usz dim = encoder_input_dim(options.num_freqs, POINT_FEATS);
 
     ShapeEncoderInput input = {
+        .cloud = cloud,
         .count = cloud.positions.len,
         .latents = options.latents,
         .dim = dim,

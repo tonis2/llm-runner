@@ -1,14 +1,17 @@
 <*
  Writing a generated rig out as a .glb.
 
- `generate_rig` predicts a skeleton and nothing else. glTF skinning needs a
- weight per bone per vertex as well, and those come from the checkpoint's skin
- VAE, which is not ported — so `bind_geometric` stands in for it with a plain
- distance falloff. That is a placeholder, not a prediction: the skeleton in the
- exported file is the model's, the weights are not.
+ glTF skinning wants a weight per bone per vertex. `SkinDecoder.decode_rig`
+ produces those from the skin codes the transformer emitted after the
+ skeleton, and `export_rig_glb` takes them as they come. When there are none —
+ a sequence that ran out of budget partway through the skin block, or a caller
+ that never asked for one — `bind_geometric` stands in with a plain distance
+ falloff. That fallback is a placeholder, not a prediction: it puts a valid
+ skin in the file and nothing more.
 
-     `RigResult rig = mesh::generate_rig(mem, &ctx, &encoder, &model, geometry)!;`
-     `mesh::export_rig_glb(mem, "cow_rigged.glb", geometry, &rig)!;`
+     `RigResult rig = skintokens::generate_rig(mem, &ctx, &encoder, &model, geometry)!;`
+     `float[] skin = decoder.decode_rig(mem, &shape, &rig, geometry)!;`
+     `skintokens::export_rig_glb(mem, "cow_rigged.glb", geometry, &rig, skin: skin)!;`
 *>
 module skintokens;
 
@@ -87,6 +90,7 @@ fn float[] bind_geometric(
  matching a generated skeleton against one is a separate problem.
 
  @param geometry : `The mesh as it was handed to generate_rig, in its own coordinates.`
+ @param skin : `[vertices, bones] predicted weights, or empty for the distance fallback.`
  @return? gltf::WEIGHT_SIZE_MISMATCH : `The skeleton and the weight matrix disagree.`
  @return? gltf::WRITE_FAILED : `The file could not be opened, written or flushed.`
 *>
@@ -95,7 +99,8 @@ fn void? export_rig_glb(
     String path,
     TriMesh geometry,
     RigResult* rig,
-    String name = "Mesh")
+    String name = "Mesh",
+    float[] skin = {})
 {
     Vec3[] joints = rig.joints_in_model_space(allocator);
     defer alloc::free(allocator, joints);
@@ -113,8 +118,11 @@ fn void? export_rig_glb(
     }
     defer foreach (bone : bones) alloc::free(allocator, bone.name);
 
-    float[] weights = bind_geometric(allocator, geometry.positions, joints, rig.skeleton.parents);
-    defer alloc::free(allocator, weights);
+    bool predicted = skin.len == geometry.positions.len * joints.len && joints.len > 0;
+    float[] fallback = predicted
+        ? (float[]){}
+        : bind_geometric(allocator, geometry.positions, joints, rig.skeleton.parents);
+    defer if (!predicted) alloc::free(allocator, fallback);
 
     gltf::SkinnedMesh skinned = {
         .name = name,
@@ -122,7 +130,7 @@ fn void? export_rig_glb(
         .normals = geometry.normals,
         .indices = geometry.indices,
         .bones = bones,
-        .weights = weights,
+        .weights = predicted ? skin : fallback,
         .max_influences = 4,
     };
 

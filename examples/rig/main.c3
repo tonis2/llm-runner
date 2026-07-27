@@ -1,15 +1,20 @@
 <*
  Mesh in, rigged .glb out.
 
-     rig cow.glb cow_rigged.glb [--model <gguf>] [--seed N] [--class none|rignet|vroid|articulation]
+     rig cow.glb cow_rigged.glb [--model <gguf>] [--seed N] [--class none|rignet|vroid|articulation] [--no-skin]
 
- The skeleton is the model's. The skin weights are not — those come from the
- checkpoint's skin VAE, which is not ported, so `export_rig_glb` falls back to
- a distance bind. See lib/mesh/rig_export.c3.
+ Both halves are the model's: the skeleton comes out of the transformer and so
+ do the skin weights, as four codes per bone that the VAE decoder turns back
+ into a weight per vertex. `--no-skin` skips the second half and falls back to
+ the distance bind in `rig_export.c3`.
 
  Generation samples, so a run that does not terminate within budget is a normal
  outcome rather than a failure; seeds are retried until one lands, which is what
- the reference buys with its ten beams.
+ the reference buys with its ten beams. The search runs skeleton-only — skin
+ codes cost more tokens than the skeleton they follow, and eight seeds' worth
+ of them would be thrown away — and the winner is then decoded once more with
+ skin. Same seed, same sampler, same prefix, so the skeleton comes back
+ identical and decoding simply carries on past its terminator.
 *>
 module rig_cli;
 
@@ -49,6 +54,7 @@ fn int main(String[] args)
     String output = args[2];
     String model_path = DEFAULT_MODEL;
     ulong seed = 0;
+    bool want_skin = true;
     skintokens::RigClass rig_class = skintokens::RigClass.ARTICULATION;
 
     for (usz i = 3; i < args.len; i++)
@@ -64,6 +70,8 @@ fn int main(String[] args)
             case "--class":
                 if (++i >= args.len) { io::printn("--class needs a name"); return 1; }
                 rig_class = parse_class(args[i]) ?? skintokens::RigClass.ARTICULATION;
+            case "--no-skin":
+                want_skin = false;
             default:
                 io::printfn("unknown option %s", args[i]);
                 return 1;
@@ -104,6 +112,7 @@ fn int main(String[] args)
     skintokens::RigOptions options = skintokens::DEFAULT_RIG;
     options.prepare = prepare;
     options.rig_class = rig_class;
+    options.predict_skin = false;
 
     // Sample several seeds and keep the cleanest. The model wanders when a
     // sequence runs long -- the reference does the same -- so the first
@@ -161,7 +170,42 @@ fn int main(String[] args)
     io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh (seed %d, class %s)",
         rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_seed, rig_class);
 
-    skintokens::export_rig_glb(mem, output, geometry, &rig)!!;
+    // The encoder is done with; its activations are the biggest thing on the
+    // device and the skin decoder is about to want the space.
+    encoder.release_activations();
+
+    float[] skin = {};
+    defer if (skin.len > 0) mem::free(skin);
+
+    if (want_skin)
+    {
+        options.seed = best_seed;
+        options.predict_skin = true;
+
+        if (try full = skintokens::generate_rig_from_prefix(
+            mem, &ctx, &model, prefix, shape.normalization, options))
+        {
+            defer full.free(mem);
+            if (full.has_skin() && full.skeleton.len() == rig.skeleton.len())
+            {
+                skintokens::SkinDecoder decoder = skintokens::load_skin_decoder(&ctx, model_path)!!;
+                defer decoder.free();
+                skin = decoder.decode_rig(mem, &shape, &full, geometry)!!;
+                io::printfn("skin: %d codes -> %d x %d weights",
+                    full.skin_count, geometry.positions.len, full.skeleton.len());
+            }
+            else
+            {
+                io::printn("skin: the model did not finish a skin block; falling back to a distance bind");
+            }
+        }
+        else
+        {
+            io::printn("skin: the skin pass did not terminate; falling back to a distance bind");
+        }
+    }
+
+    skintokens::export_rig_glb(mem, output, geometry, &rig, skin: skin)!!;
     io::printfn("wrote %s", output);
     return 0;
 }

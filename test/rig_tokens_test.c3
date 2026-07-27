@@ -196,3 +196,138 @@ fn void test_sequence_end_terminates() @test
     assert(skeleton.len() == 1);
     assert(skeleton.parents[0] == -1);
 }
+
+// --- The skin phase -------------------------------------------------------
+
+fn skintokens::RigGrammar run_grammar(uint[] tokens, uint tokens_per_skin)
+{
+    skintokens::RigGrammar grammar = { .tokens_per_skin = tokens_per_skin };
+    foreach (token : tokens) grammar.accept(token);
+    return grammar;
+}
+
+fn bool allows(skintokens::RigGrammar* grammar, uint token)
+{
+    bool[] allowed = mem::new_array(bool, (sz)skintokens::RIG_TOTAL_VOCAB);
+    defer mem::free(allowed);
+    grammar.allow_next(allowed);
+    return allowed[token];
+}
+
+// The grammar counts bones the way the reference's `bones_in_sequence` does,
+// because that count is what decides how many skin codes the model owes: a
+// branch spends six coordinates naming a parent and then a joint, and still
+// closes only one bone.
+fn void test_grammar_counts_bones_like_the_tokenizer() @test
+{
+    uint[] chain = {
+        skintokens::TOKEN_BOS, skintokens::TOKEN_CLS_ARTICULATION,
+        10, 20, 30,
+        40, 50, 60,
+    };
+    skintokens::RigGrammar g = run_grammar(chain, 0);
+    assert(g.bones == 2, "two joints in a chain are two bones, got %d", g.bones);
+
+    uint[] branched = {
+        skintokens::TOKEN_BOS, skintokens::TOKEN_CLS_ARTICULATION,
+        10, 20, 30,
+        skintokens::TOKEN_BRANCH,
+        10, 20, 30,      // where it hangs from
+        70, 80, 90,      // where it sits
+    };
+    skintokens::RigGrammar b = run_grammar(branched, 0);
+    assert(b.bones == 2, "a branch adds one bone, not two, got %d", b.bones);
+
+    // And the count matches what detokenize_skeleton actually builds.
+    uint[] with_eos = {
+        skintokens::TOKEN_BOS, skintokens::TOKEN_CLS_ARTICULATION,
+        10, 20, 30,
+        skintokens::TOKEN_BRANCH,
+        10, 20, 30,
+        70, 80, 90,
+        skintokens::TOKEN_EOS,
+    };
+    skintokens::Skeleton skeleton = skintokens::detokenize_skeleton(mem, with_eos)!!;
+    defer skeleton.free(mem);
+    assert(skeleton.len() == (usz)b.bones, "grammar and detokenizer disagree on the bone count");
+}
+
+// Zero tokens_per_skin makes the skeleton's terminator final. That is what a
+// caller wanting bones and nothing else asks for, and it is what the seed
+// search in examples/rig runs with.
+fn void test_grammar_stops_at_the_skeleton_when_skin_is_off() @test
+{
+    uint[] ids = {
+        skintokens::TOKEN_BOS, skintokens::TOKEN_CLS_ARTICULATION,
+        10, 20, 30,
+        skintokens::TOKEN_EOS,
+    };
+    skintokens::RigGrammar g = run_grammar(ids, 0);
+    assert(g.finished(), "eos should be terminal with no skin block asked for");
+}
+
+fn void test_grammar_counts_out_the_skin_block() @test
+{
+    uint[] ids = {
+        skintokens::TOKEN_BOS, skintokens::TOKEN_CLS_ARTICULATION,
+        10, 20, 30,
+        40, 50, 60,
+        skintokens::TOKEN_EOS,
+    };
+    skintokens::RigGrammar g = run_grammar(ids, skintokens::TOKENS_PER_SKIN);
+
+    assert(!g.finished(), "the skin block has not started yet");
+    assert(g.bones == 2);
+    assert(g.skin_remaining() == 2 * skintokens::TOKENS_PER_SKIN);
+
+    // Only skin codes are reachable here. The reference reopens everything
+    // from the skeleton's eos upward; training puts nothing but codes in this
+    // stretch, so the tighter mask is the correct one.
+    assert(allows(&g, skintokens::SKIN_TOKEN_BASE));
+    assert(allows(&g, skintokens::TOKEN_SEQUENCE_END - 1));
+    assert(!allows(&g, skintokens::TOKEN_SEQUENCE_END), "not until the block is full");
+    assert(!allows(&g, skintokens::TOKEN_PAD));
+    assert(!allows(&g, 128), "coordinates are done");
+
+    for (uint i = 0; i < 2 * skintokens::TOKENS_PER_SKIN; i++)
+    {
+        assert(!g.finished());
+        g.accept(skintokens::SKIN_TOKEN_BASE + i);
+    }
+
+    assert(g.skin_remaining() == 0);
+    assert(allows(&g, skintokens::TOKEN_SEQUENCE_END), "the block is full, so the terminator is due");
+    assert(!allows(&g, skintokens::SKIN_TOKEN_BASE), "and nothing else is");
+
+    g.accept(skintokens::TOKEN_SEQUENCE_END);
+    assert(g.finished());
+}
+
+// The reference stops one code short: its logits processor compares
+// `length - where` against `J * tokens_per_skin`, and at the step just after
+// the skeleton's eos that difference is already 1. So it forces the model's
+// terminator after J*4-1 codes, and `decode` then slices J*4 values — the last
+// of which is the terminator itself, 33035, which unpacks to codebook entry 0.
+// The last bone's fourth latent is silently wrong there. Training writes the
+// full J*4 followed by the terminator, so counting the whole block is both
+// what the model was taught and what leaves every bone intact.
+fn void test_skin_block_is_a_full_four_per_bone() @test
+{
+    uint[] ids = {
+        skintokens::TOKEN_BOS, skintokens::TOKEN_CLS_ARTICULATION,
+        10, 20, 30,
+        skintokens::TOKEN_EOS,
+    };
+    skintokens::RigGrammar g = run_grammar(ids, skintokens::TOKENS_PER_SKIN);
+    assert(g.bones == 1);
+
+    uint emitted = 0;
+    while (!allows(&g, skintokens::TOKEN_SEQUENCE_END))
+    {
+        g.accept(skintokens::SKIN_TOKEN_BASE + emitted);
+        emitted++;
+        assert(emitted <= 8, "the block should have closed by now");
+    }
+    assert(emitted == skintokens::TOKENS_PER_SKIN,
+        "one bone owes four codes, not %d", emitted);
+}
