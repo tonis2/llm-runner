@@ -30,7 +30,7 @@ import std::math::vector;
  makes the whole limb bend from the middle. The root, having no parent, is a
  point and is measured as one.
 *>
-fn float segment_distance_sq(Vec3 point, Vec3 head, Vec3 tail) @local
+fn float segment_distance_sq(Vec3 point, Vec3 head, Vec3 tail) @private
 {
     Vec3 axis = tail - head;
     float length_sq = axis.dot(axis);
@@ -82,19 +82,18 @@ fn float[] bind_geometric(
 }
 
 <*
- The share of a mesh's vertices a joint has to lead to be worth keeping.
+ The share of a mesh's skin a joint has to hold to be worth keeping.
 
  A count would not travel: two vertices out of a 1300-vertex cow is noise, and
  two out of a 200000-vertex scan is nothing at all. A share means the same thing
  on both.
 
- One in four hundred sits in the middle of a wide gap on the cow — the weakest
- joint worth keeping leads 0.39% of the mesh, the weakest one worth dropping
- leads 0.15% — so the exact value is not doing delicate work. Raising it as far
- as 0.5% starts taking a fork that holds three chains together, which is where
- it stops being a cleanup.
+ One in two hundred sits in a wide gap on both meshes tried. The squirrel's
+ three dead joints hold 0.08%, 0.16% and 0.19% of the skin; the weakest joint
+ worth keeping — the tip of its nose — holds 1.92%. So the exact value is not
+ doing delicate work, and there is an order of magnitude of room either side.
 *>
-const float DEFAULT_PRUNE_SHARE = 0.0025f;
+const float DEFAULT_PRUNE_SHARE = 0.005f;
 
 <*
  Drop the joints the skin decoder barely leans on, and the weight columns that
@@ -102,15 +101,25 @@ const float DEFAULT_PRUNE_SHARE = 0.0025f;
 
  The transformer emits a skeleton and then, separately, four codes per bone that
  the VAE turns into weights. The two halves can disagree, and when they do the
- weights are the half worth believing: a joint almost no vertex prefers does
- nothing in the rig but sit in the outliner and clutter the viewport. On the cow,
- five of thirty-three joints came back the strongest influence on not one vertex
- — three of them outside the mesh entirely — and a sixth led two.
+ weights are the half worth believing: a joint almost no vertex leans on does
+ nothing in the rig but sit in the outliner and clutter the viewport.
 
- Dropping a joint hands its vertices to whatever they lean on next, which can
+ What counts as leaning is the share of the skin a joint holds, not the number
+ of vertices where it happens to be the strongest influence. Those are not the
+ same question, and the second one is the wrong one: on the squirrel the tip of
+ the nose was the strongest influence on not one vertex — the head joint beat it
+ everywhere — while holding 1.92% of the skin, and counting winners threw it
+ away. A joint that is second everywhere still moves the mesh.
+
+ The share is measured over the influences that survive to the file: `sparsify`
+ keeps the strongest `influences` per vertex and renormalises, so weights below
+ that cut are not in the rig no matter how broadly they are spread. Counting
+ them would keep a joint alive on a halo that gets discarded on export.
+
+ Dropping a joint hands its share to whatever the vertex leans on next, which can
  lift another joint over the line — so they go one at a time, weakest first,
- recounting after each. It runs one round per joint removed and converges in the
- safe direction: removing a joint only ever adds to the counts of the ones that
+ remeasuring after each. It runs one round per joint removed and converges in the
+ safe direction: removing a joint only ever adds to the shares of the ones that
  remain. The last joint is never taken, whatever the weights say.
 
  A pruned joint's children re-attach to its nearest surviving ancestor, so the
@@ -121,7 +130,8 @@ const float DEFAULT_PRUNE_SHARE = 0.0025f;
 
  @param skeleton : `Rewritten in place; its old arrays are freed.`
  @param skin : `[vertices, bones] as decode_rig returns it, replaced by the pruned matrix.`
- @param min_share : `Share of vertices a joint must lead. Zero keeps any joint that leads one.`
+ @param min_share : `Share of the skin a joint must hold. Zero keeps anything above nothing.`
+ @param influences : `Weights kept per vertex, matching what the exporter writes.`
  @return `How many joints were removed.`
  @return? SKIN_SHAPE_MISMATCH : `skin is not exactly vertices * bones long.`
  @return? RIG_NO_BONES : `Every joint would go, which means the weights are empty.`
@@ -131,29 +141,27 @@ fn usz? prune_unused_joints(
     Skeleton* skeleton,
     float[]* skin,
     usz vertices,
-    float min_share = DEFAULT_PRUNE_SHARE)
+    float min_share = DEFAULT_PRUNE_SHARE,
+    usz influences = 4)
 {
     usz bones = skeleton.joints.len;
     if (bones == 0 || vertices == 0) return 0;
     if (skin.len != vertices * bones) return SKIN_SHAPE_MISMATCH~;
 
-    // At least one vertex, however coarse the mesh: a share that rounds to
-    // nothing would keep every joint, which is not what asking for a filter
-    // means.
-    //
-    // The nudge before rounding up is not cosmetic. A float share widens to a
-    // double a hair above itself — 0.2f is 0.20000000298 — so a bar that should
-    // land exactly on a whole number of vertices lands a hair past it, and ceil
-    // takes it to the next one. That turns "one vertex in five" into "one in
-    // four" and quietly drops a joint that had cleared the bar.
-    usz threshold = (usz)math::ceil((double)min_share * (double)vertices - 1.0e-6);
-    if (threshold < 1) threshold = 1;
+    // Each vertex contributes one unit of skin once its surviving weights are
+    // renormalised, so the whole mesh is worth `vertices` and a share of it is
+    // a share of that.
+    float floor_mass = min_share * (float)vertices;
 
     bool[] keep = alloc::new_array(allocator, bool, (sz)bones);
-    usz[] leads = alloc::new_array(allocator, usz, (sz)bones);
+    float[] mass = alloc::new_array(allocator, float, (sz)bones);
+    usz[] top_bone = alloc::new_array(allocator, usz, (sz)bones);
+    float[] top_weight = alloc::new_array(allocator, float, (sz)bones);
     defer {
         alloc::free(allocator, keep);
-        alloc::free(allocator, leads);
+        alloc::free(allocator, mass);
+        alloc::free(allocator, top_bone);
+        alloc::free(allocator, top_weight);
     }
     for (usz b = 0; b < bones; b++) keep[b] = true;
 
@@ -161,24 +169,45 @@ fn usz? prune_unused_joints(
     usz kept = bones;
 
     // The weakest joint at a time, never a whole pass at once. Two joints can
-    // each lead one vertex and be under the bar together, and dropping either
-    // one hands its vertex to the other and lifts it clear — taking both would
-    // remove a joint that had earned its place.
+    // both sit under the bar together, and dropping either one hands its share
+    // to the other and lifts it clear — taking both would remove a joint that
+    // had earned its place.
     while (kept > 1)
     {
-        for (usz b = 0; b < bones; b++) leads[b] = 0;
+        usz top = influences == 0 || influences > kept ? kept : influences;
+        for (usz b = 0; b < bones; b++) mass[b] = 0;
 
         for (usz v = 0; v < vertices; v++)
         {
             usz base = v * bones;
-            usz best = bones;
-            float strongest = 0;
+
+            // The strongest `top` survivors, descending. Insertion rather than a
+            // sort: `top` is four in practice, so this is a handful of compares
+            // per bone and no allocation per vertex.
+            for (usz i = 0; i < top; i++) { top_bone[i] = bones; top_weight[i] = 0; }
             for (usz b = 0; b < bones; b++)
             {
                 if (!keep[b]) continue;
-                if (weights[base + b] > strongest) { strongest = weights[base + b]; best = b; }
+                float w = weights[base + b];
+                if (w <= top_weight[top - 1]) continue;
+                usz slot = top - 1;
+                while (slot > 0 && top_weight[slot - 1] < w)
+                {
+                    top_weight[slot] = top_weight[slot - 1];
+                    top_bone[slot] = top_bone[slot - 1];
+                    slot--;
+                }
+                top_weight[slot] = w;
+                top_bone[slot] = b;
             }
-            if (best < bones) leads[best]++;
+
+            float total = 0;
+            for (usz i = 0; i < top; i++) if (top_bone[i] < bones) total += top_weight[i];
+            if (total <= 0) continue;
+            for (usz i = 0; i < top; i++)
+            {
+                if (top_bone[i] < bones) mass[top_bone[i]] += top_weight[i] / total;
+            }
         }
 
         // Ties go to the later joint: the model emitted it further along, so it
@@ -187,9 +216,13 @@ fn usz? prune_unused_joints(
         for (usz b = 0; b < bones; b++)
         {
             if (!keep[b]) continue;
-            if (weakest == bones || leads[b] <= leads[weakest]) weakest = b;
+            if (weakest == bones || mass[b] <= mass[weakest]) weakest = b;
         }
-        if (weakest == bones || leads[weakest] >= threshold) break;
+        if (weakest == bones) break;
+
+        // A joint holding nothing at all goes whatever the bar is, so that a
+        // zero share still means "drop the dead ones" rather than "do nothing".
+        if (mass[weakest] > 0 && mass[weakest] >= floor_mass) break;
 
         keep[weakest] = false;
         kept--;

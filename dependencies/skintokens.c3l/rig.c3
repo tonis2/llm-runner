@@ -201,6 +201,63 @@ fn float RigResult.off_mesh_fraction(&self, Bounds bounds, float tolerance = 0.0
 }
 
 <*
+ The share of the mesh that no bone comes near.
+
+ `off_mesh_fraction` asks whether the joints are inside the mesh, and a skeleton
+ can satisfy that by being far too small: huddle every joint near the centre and
+ not one of them is outside the box. It is blind to the opposite failure, which
+ is a whole limb — or half the body — left with no bone at all. A squirrel whose
+ skeleton stopped at the shoulders scored a perfect zero while 47% of its
+ vertices sat more than a tenth of the mesh away from the nearest bone.
+
+ So this asks the question of the mesh rather than of the skeleton. Distance is
+ to the bone segment, not to the joints: a vertex halfway down a thigh is far
+ from both hip and knee and near the bone between them, and it is the bone that
+ will move it.
+
+ Vertices rather than surface area, which biases towards the dense regions —
+ the right bias, since that is where the detail a rig has to move usually is.
+ Both halves of a seed's score want to be small, and they trade off against
+ each other: reaching further covers more of the mesh and risks overshooting it.
+
+ @param geometry : `The mesh as it was handed to generate_rig, in its own coordinates.`
+ @param tolerance : `How near counts as covered, as a fraction of the box diagonal.`
+*>
+fn float RigResult.uncovered_fraction(&self, TriMesh geometry, float tolerance = 0.10f) {
+    usz bones = self.skeleton.joints.len;
+    if (bones == 0 || geometry.positions.len == 0) return 1.0f;
+
+    Bounds box = geometry.bounds();
+    Vec3 extent = box.extent();
+
+    // Compared in the normalised frame the joints are already in, rather than
+    // mapping every joint back for every candidate. The normalisation is a
+    // translate and a uniform scale, so it multiplies every distance by the same
+    // factor and the threshold can be scaled instead of the skeleton.
+    float reach = extent.length() * tolerance * self.normalization.scale;
+    float reach_sq = reach * reach;
+
+    Vec3[] joints = self.skeleton.joints;
+    usz far = 0;
+
+    foreach (position : geometry.positions) {
+        Vec3 point = self.normalization.forward(position);
+        bool covered = false;
+        foreach (usz b, joint : joints) {
+            int parent = self.skeleton.parents[b];
+            Vec3 head = parent >= 0 ? joints[(usz)parent] : joint;
+            if (segment_distance_sq(point, head, joint) <= reach_sq) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) far++;
+    }
+
+    return (float)far / (float)geometry.positions.len;
+}
+
+<*
  Encode a mesh, generate a skeleton for it, and decode the result.
 
  @param geometry : `The mesh, in its own coordinates; not modified.`

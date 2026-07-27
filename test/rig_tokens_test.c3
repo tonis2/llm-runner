@@ -459,11 +459,11 @@ fn void test_pruning_drops_joints_no_vertex_leans_on() @test
     defer skeleton.free(mem);
 
     // Three vertices, each led by one of 0, 1, 2. Joints 3 and 4 pick up a
-    // little weight everywhere but lead nothing.
+    // trace of weight everywhere and hold a thousandth of the skin between them.
     float[15] dense = {
-        0.8f, 0.1f, 0.0f, 0.05f, 0.05f,
-        0.1f, 0.7f, 0.1f, 0.05f, 0.05f,
-        0.0f, 0.2f, 0.7f, 0.05f, 0.05f,
+        0.8f, 0.1f, 0.0f, 0.001f, 0.001f,
+        0.1f, 0.7f, 0.1f, 0.001f, 0.001f,
+        0.0f, 0.2f, 0.7f, 0.001f, 0.001f,
     };
     // One defer, after the call: prune_unused_joints frees the array it was
     // given and hands back a new one, and a defer reads `skin` at scope exit.
@@ -500,8 +500,8 @@ fn void test_pruning_reattaches_orphans() @test
     defer skeleton.free(mem);
 
     float[8] dense = {
-        0.9f, 0.03f, 0.03f, 0.04f,
-        0.1f, 0.05f, 0.05f, 0.8f,
+        0.9f, 0.001f, 0.001f, 0.04f,
+        0.1f, 0.001f, 0.001f, 0.8f,
     };
     float[] skin = mem::new_array(float, 8);
     foreach (i, w : dense) skin[i] = w;
@@ -537,13 +537,13 @@ fn void test_pruning_a_fully_used_skeleton_changes_nothing() @test
     assert(skin.len == 4);
 }
 
-// A joint that leads a couple of vertices out of a large mesh is noise, so the
-// filter is a share rather than a count — two vertices mean something different
-// on a 1300-vertex cow and on a 200000-vertex scan.
+// A joint holding a trace of a large mesh is noise, so the filter is a share
+// rather than a count — the same absolute weight means something different on a
+// 1300-vertex cow and on a 200000-vertex scan.
 fn void test_pruning_measures_a_share_not_a_count() @test
 {
-    // Four joints, ten vertices. Joint 3 leads exactly one of them, which is
-    // 10% -- above a 5% bar and below a 20% one.
+    // Four joints, ten vertices. Joint 3 leads one and trails the rest, which
+    // comes to 16% of the skin -- above a 5% bar and below a 20% one.
     Vec3[4] joints = { { 0, 0, 0 }, { 0, 1, 0 }, { 0, 2, 0 }, { 1, 1, 0 } };
     int[4] parents = { -1, 0, 1, 1 };
 
@@ -556,7 +556,7 @@ fn void test_pruning_measures_a_share_not_a_count() @test
         for (usz b = 0; b < 4; b++) dense[v * 4 + b] = (b == lead) ? 0.7f : 0.1f;
     }
 
-    // 5%: one vertex in ten clears the bar, so joint 3 stays.
+    // 5%: a sixth of the skin clears the bar, so joint 3 stays.
     {
         skintokens::Skeleton keep = make_skeleton(joints[..], parents[..]);
         defer keep.free(mem);
@@ -564,11 +564,12 @@ fn void test_pruning_measures_a_share_not_a_count() @test
         foreach (i, w : dense) skin[i] = w;
         usz dropped = skintokens::prune_unused_joints(mem, &keep, &skin, 10, 0.05f)!!;
         defer mem::free(skin);
-        assert(dropped == 0, "a joint leading 10%% should clear a 5%% bar");
+        assert(dropped == 0, "a joint holding 16%% of the skin should clear a 5%% bar");
         assert(keep.len() == 4);
     }
 
-    // 20%: it does not, and its one vertex falls to whatever it leans on next.
+    // 20%: it does not, and its share falls to whatever those vertices lean on
+    // next.
     {
         skintokens::Skeleton cut = make_skeleton(joints[..], parents[..]);
         defer cut.free(mem);
@@ -576,15 +577,15 @@ fn void test_pruning_measures_a_share_not_a_count() @test
         foreach (i, w : dense) skin[i] = w;
         usz dropped = skintokens::prune_unused_joints(mem, &cut, &skin, 10, 0.20f)!!;
         defer mem::free(skin);
-        assert(dropped == 1, "a joint leading 10%% should fail a 20%% bar, dropped %d", dropped);
+        assert(dropped == 1, "a joint holding 16%% of the skin should fail a 20%% bar, dropped %d", dropped);
         assert(cut.len() == 3);
         assert(skin.len == 10 * 3);
     }
 }
 
-// Dropping a joint hands its vertices on, which can lift another over the bar,
-// so the filter repeats until a pass finds nothing. A single pass would take
-// both of these.
+// Dropping a joint hands its share on, which can lift another over the bar, so
+// the filter repeats until a pass finds nothing. A single pass would take both
+// of these.
 fn void test_pruning_repeats_until_nothing_falls() @test
 {
     Vec3[3] joints = { { 0, 0, 0 }, { 0, 1, 0 }, { 0, 2, 0 } };
@@ -593,9 +594,9 @@ fn void test_pruning_repeats_until_nothing_falls() @test
     skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
     defer skeleton.free(mem);
 
-    // Ten vertices. Joint 0 leads eight. Joints 1 and 2 lead one each, and both
-    // of joint 2's would go to joint 1 if joint 2 were dropped -- lifting it to
-    // two and over a 20% bar.
+    // Ten vertices. Joint 0 takes two thirds of the skin. Joints 1 and 2 hold
+    // 19% and 15%, and dropping joint 2 lifts joint 1 to 25% -- clear of a 20%
+    // bar it was under a moment earlier.
     float[] skin = mem::new_array(float, 30);
     for (usz v = 0; v < 10; v++)
     {
@@ -611,4 +612,32 @@ fn void test_pruning_repeats_until_nothing_falls() @test
     assert(dropped == 1, "only joint 2 should go; joint 1 inherits its vertex, dropped %d", dropped);
     assert(skeleton.len() == 2);
     assert(skeleton.joints[1] == joints[1], "the joint that was rescued is the one that stayed");
+}
+
+// Being second everywhere is not the same as being useless. The squirrel's nose
+// joint was the strongest influence on not one vertex -- the head beat it the
+// whole way along -- while carrying a fiftieth of the skin, and a filter that
+// counted vertices won rather than weight held threw it away.
+fn void test_pruning_keeps_a_joint_that_is_never_strongest() @test
+{
+    Vec3[3] joints = { { 0, 0, 0 }, { 0, 1, 0 }, { 0, 2, 0 } };
+    int[3] parents = { -1, 0, 1 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+
+    // Joint 1 is runner-up on every vertex and leads none of them, but it holds
+    // 30% of the skin. Joint 2 trails on 10% and is still far clear of the bar.
+    float[] skin = mem::new_array(float, 12);
+    for (usz v = 0; v < 4; v++)
+    {
+        usz base = v * 3;
+        skin[base] = 0.6f; skin[base + 1] = 0.3f; skin[base + 2] = 0.1f;
+    }
+
+    usz dropped = skintokens::prune_unused_joints(mem, &skeleton, &skin, 4)!!;
+    defer mem::free(skin);
+
+    assert(dropped == 0, "a joint holding 30%% of the skin must survive, dropped %d", dropped);
+    assert(skeleton.len() == 3);
 }

@@ -1,12 +1,17 @@
 <*
  Mesh in, rigged .glb out.
 
-     rig cow.glb cow_rigged.glb [--model <gguf>] [--seed N] [--class none|rignet|vroid|articulation] [--no-skin]
+     rig cow.glb cow_rigged.glb [--model <gguf>] [--seed N] [--class none|rignet|vroid|articulation] [--no-skin] [--no-prune|--prune-share F]
 
  Both halves are the model's: the skeleton comes out of the transformer and so
  do the skin weights, as four codes per bone that the VAE decoder turns back
  into a weight per vertex. `--no-skin` skips the second half and falls back to
  the distance bind in `rig_export.c3`.
+
+ Joints the weights barely use are dropped by default; `--no-prune` keeps every
+ joint the model emitted, and `--prune-share` sets the bar as a share of the
+ mesh's vertices. Worth reaching for when a rig comes back missing a limb: it
+ says whether the joints were never generated or generated and then filtered.
 
  Generation samples, so a run that does not terminate within budget is a normal
  outcome rather than a failure; seeds are retried until one lands, which is what
@@ -55,6 +60,8 @@ fn int main(String[] args)
     String model_path = DEFAULT_MODEL;
     ulong seed = 0;
     bool want_skin = true;
+    bool want_prune = true;
+    float prune_share = skintokens::DEFAULT_PRUNE_SHARE;
     skintokens::RigClass rig_class = skintokens::RigClass.ARTICULATION;
 
     for (usz i = 3; i < args.len; i++)
@@ -72,6 +79,11 @@ fn int main(String[] args)
                 rig_class = parse_class(args[i]) ?? skintokens::RigClass.ARTICULATION;
             case "--no-skin":
                 want_skin = false;
+            case "--no-prune":
+                want_prune = false;
+            case "--prune-share":
+                if (++i >= args.len) { io::printn("--prune-share needs a fraction"); return 1; }
+                prune_share = (float)(args[i].to_double() ?? (double)skintokens::DEFAULT_PRUNE_SHARE);
             default:
                 io::printfn("unknown option %s", args[i]);
                 return 1;
@@ -116,12 +128,19 @@ fn int main(String[] args)
 
     // Sample several seeds and keep the cleanest. The model wanders when a
     // sequence runs long -- the reference does the same -- so the first
-    // skeleton that parses is not necessarily one worth exporting. A run with
-    // every bone on the mesh is taken immediately; otherwise the least bad wins.
+    // skeleton that parses is not necessarily one worth exporting.
+    //
+    // Two ways to be wrong, and a seed is scored on both: bones flung out past
+    // the mesh, and mesh no bone reaches. Judging on the first alone rewards a
+    // skeleton for being too small, which is how a squirrel rigged only from
+    // the shoulders down came back with a perfect score. A seed clean on both
+    // is taken immediately; otherwise the least bad wins.
     skintokens::Bounds box = geometry.bounds();
     skintokens::RigResult rig;
     bool rigged = false;
-    float best_off = 2.0f;
+    float best_score = 4.0f;
+    float best_off = 1.0f;
+    float best_bare = 1.0f;
     ulong best_seed = seed;
 
     for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++)
@@ -131,22 +150,26 @@ fn int main(String[] args)
             mem, &ctx, &model, prefix, shape.normalization, options))
         {
             float off = candidate.off_mesh_fraction(box);
-            io::printfn("  seed %d: %d bones, %.0f%% off mesh",
-                options.seed, candidate.skeleton.len(), off * 100.0f);
+            float bare = candidate.uncovered_fraction(geometry);
+            float score = off + bare;
+            io::printfn("  seed %d: %d bones, %.0f%% off mesh, %.0f%% of mesh unreached",
+                options.seed, candidate.skeleton.len(), off * 100.0f, bare * 100.0f);
 
-            if (off < best_off)
+            if (score < best_score)
             {
                 if (rigged) rig.free(mem);
                 rig = candidate;
                 rigged = true;
+                best_score = score;
                 best_off = off;
+                best_bare = bare;
                 best_seed = options.seed;
             }
             else
             {
                 candidate.free(mem);
             }
-            if (best_off == 0.0f) break;
+            if (best_score == 0.0f) break;
         }
         else
         {
@@ -167,8 +190,9 @@ fn int main(String[] args)
     foreach (parent : rig.skeleton.parents) if (parent >= 0) children[(usz)parent]++;
     foreach (count : children) if (count > 1) forks++;
 
-    io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh (seed %d, class %s)",
-        rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_seed, rig_class);
+    io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh, %.0f%% unreached (seed %d, class %s)",
+        rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_bare * 100.0f,
+        best_seed, rig_class);
 
     // The tokenizer can mark where a part starts -- `spring` for the secondary
     // chains a character rig hangs off itself, `body` and `hand` for the two
@@ -216,8 +240,10 @@ fn int main(String[] args)
                 rig.free(mem);
                 rig = full;
 
-                usz dropped = skintokens::prune_unused_joints(
-                    mem, &rig.skeleton, &skin, geometry.positions.len)!!;
+                usz dropped = want_prune
+                    ? skintokens::prune_unused_joints(
+                        mem, &rig.skeleton, &skin, geometry.positions.len, prune_share)!!
+                    : 0;
 
                 io::printfn("skin: %d codes -> %d x %d weights",
                     rig.skin_count, geometry.positions.len, rig.skeleton.len());
@@ -225,6 +251,10 @@ fn int main(String[] args)
                 {
                     io::printfn("  dropped %d joints too few vertices lean on -> %d bones",
                         dropped, rig.skeleton.len());
+                }
+                else if (!want_prune)
+                {
+                    io::printn("  keeping every joint the model emitted (--no-prune)");
                 }
             }
             else
