@@ -170,6 +170,23 @@ fn int main(String[] args)
     io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh (seed %d, class %s)",
         rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_seed, rig_class);
 
+    // The tokenizer can mark where a part starts -- `spring` for the secondary
+    // chains a character rig hangs off itself, `body` and `hand` for the two
+    // halves a naming template is keyed on. We parse them and have never looked
+    // at them, and they are the model's own word for what a run of joints is.
+    foreach (usz i, token : rig.skeleton.part_tokens)
+    {
+        String part = "part";
+        switch (token)
+        {
+            case skintokens::TOKEN_SPRING: part = "spring";
+            case skintokens::TOKEN_PART_BODY: part = "body";
+            case skintokens::TOKEN_PART_HAND: part = "hand";
+            default: break;
+        }
+        io::printfn("  part: %s starts at bone %d", part, rig.skeleton.part_starts[i]);
+    }
+
     // The encoder is done with; its activations are the biggest thing on the
     // device and the skin decoder is about to want the space.
     encoder.release_activations();
@@ -185,17 +202,34 @@ fn int main(String[] args)
         if (try full = skintokens::generate_rig_from_prefix(
             mem, &ctx, &model, prefix, shape.normalization, options))
         {
-            defer full.free(mem);
             if (full.has_skin() && full.skeleton.len() == rig.skeleton.len())
             {
                 skintokens::SkinDecoder decoder = skintokens::load_skin_decoder(&ctx, model_path)!!;
                 defer decoder.free();
                 skin = decoder.decode_rig(mem, &shape, &full, geometry)!!;
+
+                // The skinned run supersedes the search result — same seed, so
+                // the same skeleton, and now the weights that go with it. It
+                // has to replace `rig` rather than sit alongside it, because
+                // pruning rewrites the skeleton and the weight matrix together
+                // and the export needs both halves to agree.
+                rig.free(mem);
+                rig = full;
+
+                usz dropped = skintokens::prune_unused_joints(
+                    mem, &rig.skeleton, &skin, geometry.positions.len)!!;
+
                 io::printfn("skin: %d codes -> %d x %d weights",
-                    full.skin_count, geometry.positions.len, full.skeleton.len());
+                    rig.skin_count, geometry.positions.len, rig.skeleton.len());
+                if (dropped > 0)
+                {
+                    io::printfn("  dropped %d joints too few vertices lean on -> %d bones",
+                        dropped, rig.skeleton.len());
+                }
             }
             else
             {
+                full.free(mem);
                 io::printn("skin: the model did not finish a skin block; falling back to a distance bind");
             }
         }

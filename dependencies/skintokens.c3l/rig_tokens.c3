@@ -133,6 +133,97 @@ struct Skeleton {
 
 fn usz Skeleton.len(self) => self.joints.len;
 
+// How far past a joint a leaf bone is extruded, as a fraction of the bone that
+// led into it. `extrude_scale` in the reference.
+const float TAIL_EXTRUDE = 0.5f;
+
+<*
+ Where each bone ends — its tail, in the same normalised frame as the joints.
+
+ The token stream names joints, not bones: a position and where it hangs from,
+ and nothing about which way the bone between them faces onward. That is fine
+ for a graph and useless for a rig, because every consumer of a skeleton draws
+ and rotates bones along their own length. So the direction has to be
+ reconstructed, and there are two cases:
+
+     has children   the tail is the first child the model emitted
+     a leaf         nothing to reach, so extrude the direction that arrived
+                    here by half its length
+
+ The first child is not an arbitrary tiebreak. The sequence is a depth-first
+ walk: a joint is followed by the joint it continues into, and only a `branch`
+ token starts somewhere else, naming an earlier joint to hang off. So a fork's
+ first child is the limb it was already travelling down, and every later child
+ is a branch that re-attached — which can be anywhere, because the branch names
+ a position rather than a step. Following the first child is following the
+ model's own thread.
+
+ The reference instead aims at a child only where there is exactly one and
+ extrudes a fork the way it extrudes a leaf, which leaves a fork pointing at
+ nothing. On the cow that put the second shoulder's bone straight out through
+ the ribs and stood the joint above the hip up out of the back, and left 8 of
+ the 33 bones ending in mid-air; following the thread leaves none.
+
+ Two rules that sound better are worse. Aiming at the deepest chain sends the
+ bone halfway down one hind leg climbing to the top of the back, because a
+ branch attached there and the branch is longer — 0.391 against 0.153, when no
+ other bone reaches 0.19. Aiming at the nearest child points the spine at a
+ short rib stub instead of continuing along the spine. The emission order gets
+ both right without a threshold to tune.
+
+ None of this touches the deformation. A tail decides which axes a joint turns
+ about, not what it can reach, and it does not move the branch that made a bone
+ look wrong — only how that bone is drawn.
+
+ The caller owns the returned array.
+*>
+fn Vec3[] Skeleton.tails(&self, Allocator allocator) {
+    usz count = self.joints.len;
+    Vec3[] tails = alloc::new_array(allocator, Vec3, (sz)count);
+    if (count == 0) return tails;
+
+    usz[] heir = alloc::new_array(allocator, usz, (sz)count);
+    bool[] has_child = alloc::new_array(allocator, bool, (sz)count);
+    defer {
+        alloc::free(allocator, heir);
+        alloc::free(allocator, has_child);
+    }
+    for (usz i = 0; i < count; i++) { heir[i] = 0; has_child[i] = false; }
+
+    // Ascending, so the first child seen is the earliest emitted.
+    foreach (usz i, parent : self.parents) {
+        if (parent < 0 || (usz)parent >= count) continue;
+        usz p = (usz)parent;
+        if (has_child[p]) continue;
+        heir[p] = i;
+        has_child[p] = true;
+    }
+
+    for (usz i = 0; i < count; i++) {
+        if (has_child[i]) {
+            tails[i] = self.joints[heir[i]];
+            continue;
+        }
+
+        int parent = self.parents[i];
+        if (parent >= 0 && (usz)parent < count) {
+            Vec3 arriving = self.joints[i] - self.joints[(usz)parent];
+            // Coincident joints happen — a shoulder and an upper arm often sit
+            // on the same point — and leave nothing to extrude along.
+            if (arriving.length_sq() > 1.0e-18f) {
+                tails[i] = self.joints[i] + arriving * TAIL_EXTRUDE;
+                continue;
+            }
+        }
+
+        // A lone joint, with nothing above it and nothing below. Up is +Y:
+        // these are glTF coordinates, where the reference's are Blender's.
+        tails[i] = self.joints[i] + (Vec3){ 0, TAIL_EXTRUDE, 0 };
+    }
+
+    return tails;
+}
+
 fn void Skeleton.free(&self, Allocator allocator) {
     if (self.joints.len > 0) alloc::free(allocator, self.joints);
     if (self.parents.len > 0) alloc::free(allocator, self.parents);

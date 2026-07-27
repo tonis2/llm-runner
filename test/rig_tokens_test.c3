@@ -331,3 +331,284 @@ fn void test_skin_block_is_a_full_four_per_bone() @test
     assert(emitted == skintokens::TOKENS_PER_SKIN,
         "one bone owes four codes, not %d", emitted);
 }
+
+// --- Bone directions ------------------------------------------------------
+
+fn skintokens::Skeleton make_skeleton(Vec3[] joints, int[] parents)
+{
+    skintokens::Skeleton s;
+    s.joints = mem::new_array(Vec3, (sz)joints.len);
+    s.parents = mem::new_array(int, (sz)parents.len);
+    foreach (i, j : joints) s.joints[i] = j;
+    foreach (i, p : parents) s.parents[i] = p;
+    return s;
+}
+
+fn Vec3[] tails_of(skintokens::Skeleton* skeleton) => skeleton.tails(mem);
+
+// A fork follows the child the model emitted first — the limb it was already
+// walking down. Every later child arrived through a `branch` token, which names
+// a position to hang off rather than a step to take, so it can be anywhere.
+fn void test_a_fork_follows_the_chain_it_was_walking() @test
+{
+    // 0 -> 1 -> 2 is the walk; joint 3 then branches back onto 0 and runs on to
+    // 6, so it is both deeper and, here, no further away.
+    Vec3[7] joints = {
+        { 0,  0, 0 },
+        { 0, -1, 0 },
+        { 0, -2, 0 },
+        { 1,  0, 0 },
+        { 2,  0, 0 },
+        { 3,  0, 0 },
+        { 4,  0, 0 },
+    };
+    int[7] parents = { -1, 0, 1, 0, 3, 4, 5 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+    Vec3[] tails = tails_of(&skeleton);
+    defer mem::free(tails);
+
+    assert(tails[0] == joints[1], "the fork left the chain it was walking for a branch");
+    assert(tails[1] == joints[2], "a single child is still just followed");
+
+    // Every bone with a child reaches it exactly, which is what keeps a
+    // skeleton from breaking into stubs at each fork.
+    foreach (usz i, tail : tails)
+    {
+        bool has_child = false;
+        foreach (parent : skeleton.parents) if (parent >= 0 && (usz)parent == i) has_child = true;
+        if (!has_child) continue;
+
+        bool lands_on_a_joint = false;
+        foreach (usz j, joint : skeleton.joints) if (j != i && tail == joint) lands_on_a_joint = true;
+        assert(lands_on_a_joint, "bone %d ends nowhere", i);
+    }
+}
+
+// The two rules that sound better both fail on a real rig, so pin what they
+// would have done here. A branch re-attaches to an arbitrary earlier joint, so
+// it can be far away and can still be the longest chain hanging off the fork.
+fn void test_a_fork_ignores_a_deeper_or_nearer_branch() @test
+{
+    // 0 -> 1 -> 2 is the walk. Joint 3 branches onto 0 much further out and
+    // runs four joints, so it is the deepest chain; joint 7 branches onto 0
+    // closer than joint 1, so it is the nearest child.
+    Vec3[8] joints = {
+        { 0,   0, 0 },
+        { 0,  -1, 0 },
+        { 0,  -2, 0 },
+        { 9,   0, 0 },
+        { 10,  0, 0 },
+        { 11,  0, 0 },
+        { 12,  0, 0 },
+        { 0.1, 0, 0 },
+    };
+    int[8] parents = { -1, 0, 1, 0, 3, 4, 5, 0 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+    Vec3[] tails = tails_of(&skeleton);
+    defer mem::free(tails);
+
+    assert(tails[0] != joints[3], "aimed at the deepest chain and crossed the model to do it");
+    assert(tails[0] != joints[7], "aimed at the nearest child instead of the limb");
+    assert(tails[0] == joints[1], "should follow the chain it was walking");
+}
+
+// A leaf has nothing to reach, so it carries on the way it came — half as far
+// again. That much is the reference's rule and stays.
+fn void test_a_leaf_extrudes_the_way_it_came() @test
+{
+    Vec3[3] joints = { { 0, 0, 0 }, { 0, -1, 0 }, { 0, -3, 0 } };
+    int[3] parents = { -1, 0, 1 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+    Vec3[] tails = tails_of(&skeleton);
+    defer mem::free(tails);
+
+    // The last bone arrives along (0, -2, 0), so it ends one further unit on.
+    assert(tails[2] == (Vec3){ 0, -4, 0 }, "leaf extrusion is half the arriving bone");
+
+    // A lone joint has neither a parent nor a child; it goes up rather than
+    // collapsing to zero length, which would leave it undrawable.
+    Vec3[1] alone = { { 5, 5, 5 } };
+    int[1] no_parent = { -1 };
+    skintokens::Skeleton single = make_skeleton(alone[..], no_parent[..]);
+    defer single.free(mem);
+    Vec3[] one = tails_of(&single);
+    defer mem::free(one);
+    assert(one[0].y > alone[0].y, "a lone joint needs some length");
+}
+
+// --- Pruning --------------------------------------------------------------
+
+// The transformer's two halves can disagree, and the weights are the half
+// worth believing: a joint no vertex leans on does nothing but clutter the rig.
+fn void test_pruning_drops_joints_no_vertex_leans_on() @test
+{
+    // 0 -> 1 -> 2 is real; 3 hangs off 1 and 4 hangs off 3, and neither is any
+    // vertex's strongest, so 4 has to survive 3 going by re-attaching to 1.
+    Vec3[5] joints = {
+        { 0, 0, 0 }, { 0, -1, 0 }, { 0, -2, 0 }, { 1, -1, 0 }, { 2, -1, 0 },
+    };
+    int[5] parents = { -1, 0, 1, 1, 3 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+
+    // Three vertices, each led by one of 0, 1, 2. Joints 3 and 4 pick up a
+    // little weight everywhere but lead nothing.
+    float[15] dense = {
+        0.8f, 0.1f, 0.0f, 0.05f, 0.05f,
+        0.1f, 0.7f, 0.1f, 0.05f, 0.05f,
+        0.0f, 0.2f, 0.7f, 0.05f, 0.05f,
+    };
+    // One defer, after the call: prune_unused_joints frees the array it was
+    // given and hands back a new one, and a defer reads `skin` at scope exit.
+    float[] skin = mem::new_array(float, 15);
+    foreach (i, w : dense) skin[i] = w;
+
+    usz dropped = skintokens::prune_unused_joints(mem, &skeleton, &skin, 3)!!;
+    defer mem::free(skin);
+
+    assert(dropped == 2, "expected joints 3 and 4 to go, dropped %d", dropped);
+    assert(skeleton.len() == 3);
+    assert(skin.len == 3 * 3, "the weight matrix should have lost two columns");
+
+    // The survivors keep their order, their positions and their tree.
+    assert(skeleton.joints[0] == joints[0] && skeleton.joints[1] == joints[1]
+        && skeleton.joints[2] == joints[2]);
+    assert(skeleton.parents[0] == -1 && skeleton.parents[1] == 0 && skeleton.parents[2] == 1);
+
+    // And the columns that stayed are the ones that were there before.
+    assert(skin[0] == 0.8f && skin[1] == 0.1f && skin[2] == 0.0f);
+    assert(skin[6] == 0.0f && skin[7] == 0.2f && skin[8] == 0.7f);
+}
+
+// A pruned joint's children re-attach to the nearest surviving ancestor rather
+// than being orphaned, even when several ancestors go at once.
+fn void test_pruning_reattaches_orphans() @test
+{
+    // A chain 0 -> 1 -> 2 -> 3 where only the ends are used, so 3 has to climb
+    // past two dead joints to find 0.
+    Vec3[4] joints = { { 0, 0, 0 }, { 0, 1, 0 }, { 0, 2, 0 }, { 0, 3, 0 } };
+    int[4] parents = { -1, 0, 1, 2 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+
+    float[8] dense = {
+        0.9f, 0.03f, 0.03f, 0.04f,
+        0.1f, 0.05f, 0.05f, 0.8f,
+    };
+    float[] skin = mem::new_array(float, 8);
+    foreach (i, w : dense) skin[i] = w;
+
+    usz dropped = skintokens::prune_unused_joints(mem, &skeleton, &skin, 2)!!;
+    defer mem::free(skin);
+
+    assert(dropped == 2);
+    assert(skeleton.len() == 2);
+    assert(skeleton.parents[0] == -1);
+    assert(skeleton.parents[1] == 0, "the orphan should have climbed to the root");
+    assert(skeleton.joints[1] == joints[3]);
+}
+
+// Nothing to do is not an error, and it must not disturb what is already there.
+fn void test_pruning_a_fully_used_skeleton_changes_nothing() @test
+{
+    Vec3[2] joints = { { 0, 0, 0 }, { 0, 1, 0 } };
+    int[2] parents = { -1, 0 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+
+    float[] skin = mem::new_array(float, 4);
+    skin[0] = 0.9f; skin[1] = 0.1f;
+    skin[2] = 0.2f; skin[3] = 0.8f;
+
+    usz dropped = skintokens::prune_unused_joints(mem, &skeleton, &skin, 2)!!;
+    defer mem::free(skin);
+
+    assert(dropped == 0);
+    assert(skeleton.len() == 2);
+    assert(skin.len == 4);
+}
+
+// A joint that leads a couple of vertices out of a large mesh is noise, so the
+// filter is a share rather than a count — two vertices mean something different
+// on a 1300-vertex cow and on a 200000-vertex scan.
+fn void test_pruning_measures_a_share_not_a_count() @test
+{
+    // Four joints, ten vertices. Joint 3 leads exactly one of them, which is
+    // 10% -- above a 5% bar and below a 20% one.
+    Vec3[4] joints = { { 0, 0, 0 }, { 0, 1, 0 }, { 0, 2, 0 }, { 1, 1, 0 } };
+    int[4] parents = { -1, 0, 1, 1 };
+
+    float[] dense = mem::new_array(float, 40);
+    defer mem::free(dense);
+    for (usz v = 0; v < 10; v++)
+    {
+        usz lead = v < 4 ? 0 : (v < 7 ? 1 : 2);
+        if (v == 9) lead = 3;
+        for (usz b = 0; b < 4; b++) dense[v * 4 + b] = (b == lead) ? 0.7f : 0.1f;
+    }
+
+    // 5%: one vertex in ten clears the bar, so joint 3 stays.
+    {
+        skintokens::Skeleton keep = make_skeleton(joints[..], parents[..]);
+        defer keep.free(mem);
+        float[] skin = mem::new_array(float, 40);
+        foreach (i, w : dense) skin[i] = w;
+        usz dropped = skintokens::prune_unused_joints(mem, &keep, &skin, 10, 0.05f)!!;
+        defer mem::free(skin);
+        assert(dropped == 0, "a joint leading 10%% should clear a 5%% bar");
+        assert(keep.len() == 4);
+    }
+
+    // 20%: it does not, and its one vertex falls to whatever it leans on next.
+    {
+        skintokens::Skeleton cut = make_skeleton(joints[..], parents[..]);
+        defer cut.free(mem);
+        float[] skin = mem::new_array(float, 40);
+        foreach (i, w : dense) skin[i] = w;
+        usz dropped = skintokens::prune_unused_joints(mem, &cut, &skin, 10, 0.20f)!!;
+        defer mem::free(skin);
+        assert(dropped == 1, "a joint leading 10%% should fail a 20%% bar, dropped %d", dropped);
+        assert(cut.len() == 3);
+        assert(skin.len == 10 * 3);
+    }
+}
+
+// Dropping a joint hands its vertices on, which can lift another over the bar,
+// so the filter repeats until a pass finds nothing. A single pass would take
+// both of these.
+fn void test_pruning_repeats_until_nothing_falls() @test
+{
+    Vec3[3] joints = { { 0, 0, 0 }, { 0, 1, 0 }, { 0, 2, 0 } };
+    int[3] parents = { -1, 0, 1 };
+
+    skintokens::Skeleton skeleton = make_skeleton(joints[..], parents[..]);
+    defer skeleton.free(mem);
+
+    // Ten vertices. Joint 0 leads eight. Joints 1 and 2 lead one each, and both
+    // of joint 2's would go to joint 1 if joint 2 were dropped -- lifting it to
+    // two and over a 20% bar.
+    float[] skin = mem::new_array(float, 30);
+    for (usz v = 0; v < 10; v++)
+    {
+        usz base = v * 3;
+        if (v < 8)      { skin[base] = 0.8f; skin[base+1] = 0.1f; skin[base+2] = 0.1f; }
+        else if (v == 8){ skin[base] = 0.1f; skin[base+1] = 0.8f; skin[base+2] = 0.1f; }
+        else            { skin[base] = 0.1f; skin[base+1] = 0.3f; skin[base+2] = 0.6f; }
+    }
+
+    usz dropped = skintokens::prune_unused_joints(mem, &skeleton, &skin, 10, 0.20f)!!;
+    defer mem::free(skin);
+
+    assert(dropped == 1, "only joint 2 should go; joint 1 inherits its vertex, dropped %d", dropped);
+    assert(skeleton.len() == 2);
+    assert(skeleton.joints[1] == joints[1], "the joint that was rescued is the one that stayed");
+}

@@ -31,6 +31,7 @@ skintokens::export_rig_glb(mem, "cow_rigged.glb", cow, &rig, skin: skin)!;
 | `generate_rig` | prefills those as embeddings, then samples under `RigGrammar` |
 | `detokenize_skeleton` | token sequence → joints and parents |
 | `SkinDecoder.decode_rig` | four codes per bone → a weight per vertex per bone |
+| `prune_unused_joints` | drops joints the weights lean on nowhere |
 | `export_rig_glb` | rigged `.glb`, via `gltf.c3l` |
 
 One sequence carries both halves: the skeleton, the tokenizer's terminator,
@@ -82,6 +83,16 @@ deterministic one; the reference passes `num_beams` alongside `do_sample`,
 which is beam *sampling*. Generating a few seeds and choosing between them with
 `RigResult.off_mesh_fraction` is the cheaper substitute, and it is what
 `examples/rig` does.
+
+**Bone directions, and a prune.** The reference reconstructs a tail per bone in
+`make_skeleton`; a fork there points along the way it was reached rather than
+at anything, which leaves it sticking out of the model. `Skeleton.tails()`
+follows the child the model emitted next instead — the sequence is a depth-first
+walk, so that is the limb the chain was already travelling down, and every later
+child arrived through a `branch` token naming a position rather than a step.
+`prune_unused_joints` then drops the joints no vertex leans on: the two halves
+of the model can disagree about a joint, and the weights are the half worth
+believing.
 
 **Joint names.** Joints are named positionally. The checkpoint ships vroid and
 mixamo skeleton templates with real names, but matching a generated skeleton
