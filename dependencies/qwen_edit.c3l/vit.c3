@@ -607,7 +607,9 @@ fn llm::Tensor? encode_multimodal(
     }
 
     llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
+    defer text_config.free();
     llm::WeightNames text_names = llm::load_weight_names(config_json)!!;
+    defer text_names.free();
     llm::Tokenizer tok = llm::load_tokenizer(&text_gf)!!;
 
     // 3. Build token sequence with visual placeholders
@@ -715,7 +717,9 @@ fn llm::Tensor? encode_text_prompt(
     }
 
     llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
+    defer text_config.free();
     llm::WeightNames text_names = llm::load_weight_names(config_json)!!;
+    defer text_names.free();
     llm::Tokenizer tok = llm::load_tokenizer(&text_gf)!!;
 
     // Build token sequence: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n

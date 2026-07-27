@@ -25,7 +25,9 @@ fn void test_stories260k_forward() @test {
 
     String config_json = (String)&llm_text::LLAMA_CONFIG_JSON;
     ModelConfig config = load_arch_config(config_json, &gf)!!;
+    defer config.free();
     WeightNames names = load_weight_names(config_json)!!;
+    defer names.free();
 
     // Verify model dimensions
     test::@check(config.dim > 0, "dim should be > 0");

@@ -37,8 +37,33 @@ struct SafetensorsFile {
     usz n_tensors;
 }
 
+// Parsing copies every tensor name and dtype, and every metadata pair, out of
+// the JSON object before that object is freed — so each is a separate
+// allocation the SafetensorsFile owns. Both cleanups are shared between the
+// error paths in safetensors_open and close().
+fn void free_tensor_infos(SafetensorsTensorInfo[] tensors, usz count) @local {
+    for (usz i = 0; i < count; i++) {
+        mem::free(tensors[i].name);
+        mem::free(tensors[i].dtype);
+    }
+    if (tensors.len > 0) mem::free(tensors);
+}
+
+fn void free_metadata(SafetensorsMetaKV[] metadata) @local {
+    foreach (kv : metadata) {
+        mem::free(kv.key);
+        mem::free(kv.value);
+    }
+    if (metadata.len > 0) mem::free(metadata);
+}
+
 fn SafetensorsFile? safetensors_open(String path) {
     mmap::FileMmap mm = file::mmap_open(path, "rb")!!;
+    // Every failure below returns before the caller has a SafetensorsFile to
+    // close, so the mapping has to be released here — otherwise a rejected file
+    // stays mapped for the life of the process.
+    defer catch (void)mm.destroy();
+
     char[] data = mm.bytes();
 
     if (data.len < 8) {
@@ -56,82 +81,86 @@ fn SafetensorsFile? safetensors_open(String path) {
     // Parse JSON header using std library parser
     String header_str = (String)data[8 .. 8 + (usz)header_len - 1];
     Object* root = json::parse(mem, header_str)!;
+    defer catch root.free();
 
     if (!root.is_map()) {
-        root.free();
         io::printfn("Error: safetensors header is not a JSON object");
         return FILE_NOT_FOUND~;
     }
 
-    // Get keys to count tensors and iterate
-    String[] keys = root.map.keys(mem);
-	defer mem::free(keys);
-
-    // Count actual tensor entries (skip __metadata__)
-    usz tensor_count = 0;
-    foreach (key : keys) {
-        if (key == "__metadata__") continue;
-        tensor_count++;
-    }
+    // Count tensor entries without materialising a key list: keys() would copy
+    // every key just to have them counted and thrown away, and the map already
+    // knows its own size.
+    bool has_metadata = root.map.has_key("__metadata__");
+    usz tensor_count = (usz)root.map.count - (has_metadata ? (usz)1 : (usz)0);
 
     // Parse optional __metadata__ object — Diffusers/Kohya store LoRA alpha here.
     SafetensorsMetaKV[] metadata = {};
-    if (try meta_obj = root.get("__metadata__")) {
+    if (has_metadata) {
+        Object* meta_obj = root.get("__metadata__")!;
         if (meta_obj.is_map()) {
-            String[] meta_keys = meta_obj.map.keys(mem);
-            defer mem::free(meta_keys);
-            metadata = mem::new_array(SafetensorsMetaKV, meta_keys.len);
+            metadata = mem::new_array(SafetensorsMetaKV, (sz)meta_obj.map.count);
             usz mi = 0;
-            foreach (mk : meta_keys) {
-                if (try mv = meta_obj.get_string(mk)) {
+            meta_obj.map.@each(; String mk, Object* mv) {
+                // Skip anything that isn't a plain string — the block is
+                // conventionally flat, but nothing enforces that.
+                if (mv.is_string()) {
                     metadata[mi] = {
                         .key = mk.copy(mem),
-                        .value = mv.copy(mem),
+                        .value = mv.s.copy(mem),
                     };
                     mi++;
                 }
-            }
+            };
             // Trim if some entries weren't strings.
-            if (mi < meta_keys.len) {
+            if (mi < (usz)meta_obj.map.count) {
                 metadata = metadata[0:mi];
             }
         }
     }
 
+    defer catch free_metadata(metadata);
+
     SafetensorsTensorInfo[] tensors = mem::new_array(SafetensorsTensorInfo, (sz)tensor_count);
     usz n_tensors = 0;
 
-    foreach (key : keys) {
-        if (key == "__metadata__") continue;
+    // The header loop below can fail on any malformed entry, after earlier
+    // entries have already had their names copied out of the JSON object.
+    defer catch free_tensor_infos(tensors, n_tensors);
 
-        Object* tensor_obj = root.get(key)!;
+    // @each walks the map's own entries, so there is no key array to allocate
+    // and no second lookup per tensor — the value comes with the key.
+    root.map.@each(; String key, Object* tensor_obj) {
+        // Guarded rather than `continue`d: the body is a macro argument, not a
+        // loop of its own.
+        if (key != "__metadata__") {
+            String dtype = tensor_obj.get_string("dtype")!;
 
-        String dtype = tensor_obj.get_string("dtype")!;
+            // Parse shape array
+            Object* shape_arr = tensor_obj.get("shape")!;
+            uint n_dims = (uint)shape_arr.get_len();
+            ulong[4] shape = { 0, 0, 0, 0 };
+            for (uint i = 0; i < n_dims && i < 4; i++) {
+                shape[i] = shape_arr.get_ulong_at(i)!;
+            }
 
-        // Parse shape array
-        Object* shape_arr = tensor_obj.get("shape")!;
-        uint n_dims = (uint)shape_arr.get_len();
-        ulong[4] shape = { 0, 0, 0, 0 };
-        for (uint i = 0; i < n_dims && i < 4; i++) {
-            shape[i] = shape_arr.get_ulong_at(i)!;
+            // Parse data_offsets [start, end]
+            Object* offsets_arr = tensor_obj.get("data_offsets")!;
+            ulong data_start = offsets_arr.get_ulong_at(0)!;
+            ulong data_end = offsets_arr.get_ulong_at(1)!;
+
+            // Copy strings — JSON Object owns the originals and will be freed below
+            tensors[n_tensors] = {
+                .name = key.copy(mem),
+                .dtype = dtype.copy(mem),
+                .shape = shape,
+                .n_dims = n_dims,
+                .data_start = data_start,
+                .data_end = data_end,
+            };
+            n_tensors++;
         }
-
-        // Parse data_offsets [start, end]
-        Object* offsets_arr = tensor_obj.get("data_offsets")!;
-        ulong data_start = offsets_arr.get_ulong_at(0)!;
-        ulong data_end = offsets_arr.get_ulong_at(1)!;
-
-        // Copy strings — JSON Object owns the originals and will be freed below
-        tensors[n_tensors] = {
-            .name = key.copy(mem),
-            .dtype = dtype.copy(mem),
-            .shape = shape,
-            .n_dims = n_dims,
-            .data_start = data_start,
-            .data_end = data_end,
-        };
-        n_tensors++;
-    }
+    };
 
     root.free();
 
@@ -317,6 +346,14 @@ fn Tensor? upload_safetensor_conv_f32(DeviceContext* ctx, SafetensorsFile* sf, S
 }
 
 fn void SafetensorsFile.close(&self) {
-    mem::free(self.tensors);
-    if (self.metadata.len > 0) mem::free(self.metadata);
+    free_tensor_infos(self.tensors, self.n_tensors);
+    free_metadata(self.metadata);
+
+    // This is the one that matters at scale: these files run to hundreds of
+    // megabytes, and without it every model loaded stays mapped.
+    (void)self.mmap_handle.destroy();
+
+    // Leave the struct empty so a second close is harmless rather than a
+    // double free — callers often pair this with a defer and an early return.
+    *self = {};
 }

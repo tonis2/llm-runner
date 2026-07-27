@@ -15,7 +15,10 @@ if [ ! -f test/models/stories260K.gguf ]; then
     echo "Downloaded stories260K.gguf ($(du -h test/models/stories260K.gguf | cut -f1))"
 fi
 
-# Run tests (--test-noleak: Vulkan/GPU allocations aren't tracked by C3's allocator)
+# Leak detection is on: the suite allocates nothing it does not release, so a
+# leak report here is a real regression rather than pre-existing noise. Vulkan
+# and GPU allocations are invisible to C3's allocator either way, so this only
+# ever polices host-side memory.
 echo ""
 echo "Running c3c test..."
-c3c test --test-noleak "$@"
+c3c test "$@"

@@ -47,6 +47,20 @@ struct WeightNames {
     String ffn_down;
 }
 
+// The parsed JSON tree is released before these loaders return, so any string
+// kept in ModelConfig or WeightNames has to be copied out of it first.
+//
+// An absent entry stays the null slice rather than becoming a copy of "": the
+// fallbacks below are string literals living in rodata, and handing one of
+// those to mem::free would corrupt the heap. Callers already test these with
+// `.len > 0`, which reads the same either way.
+fn String own_string(String s) @local => s.len > 0 ? s.copy(mem) : (String){};
+
+fn void disown_string(String* s) @local {
+    if ((*s).len > 0) mem::free(*s);
+    *s = (String){};
+}
+
 fn String detect_architecture(GGUFFile* gf) {
     return gf.get_string("general.architecture") ?? "llama";
 }
@@ -77,6 +91,7 @@ fn float read_param_f32(Object* params, String param_name, GGUFFile* gf) {
 
 fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
     Object* root = json::parse(mem, json_text)!;
+    defer root.free();
 
     String name = root.get_string("name") ?? "unknown";
 
@@ -116,7 +131,7 @@ fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
     }
 
     ModelConfig config = {
-        .name = name,
+        .name = own_string(name),
         .norm_type = norm_type,
         .ffn_type = ffn_type,
         .dim = dim,
@@ -131,39 +146,62 @@ fn ModelConfig? load_arch_config(String json_text, GGUFFile* gf) {
     };
 
 
-    // Don't free root - strings in ModelConfig reference JSON-allocated memory
     return config;
+}
+
+fn void ModelConfig.free(&self) {
+    disown_string(&self.name);
 }
 
 fn WeightNames? load_weight_names(String json_text) {
     Object* root = json::parse(mem, json_text)!;
+    defer root.free();
 
     Object* w = root.get("weights")!;
 
     WeightNames names = {
-        .embedding = w.get_string("embedding") ?? "token_embd.weight",
-        .output_norm = w.get_string("output_norm") ?? "output_norm.weight",
-        .output_norm_bias = w.get_string("output_norm_bias") ?? "",
-        .output = w.get_string("output") ?? "output.weight",
-        .layer_prefix = w.get_string("layer_prefix") ?? "blk",
-        .attn_norm = w.get_string("attn_norm") ?? "attn_norm.weight",
-        .attn_norm_bias = w.get_string("attn_norm_bias") ?? "",
-        .wq = w.get_string("attn_q") ?? "attn_q.weight",
-        .wk = w.get_string("attn_k") ?? "attn_k.weight",
-        .wv = w.get_string("attn_v") ?? "attn_v.weight",
-        .wo = w.get_string("attn_output") ?? "attn_output.weight",
-        .wq_bias = w.get_string("attn_q_bias") ?? "",
-        .wk_bias = w.get_string("attn_k_bias") ?? "",
-        .wv_bias = w.get_string("attn_v_bias") ?? "",
-        .wq_norm = w.get_string("attn_q_norm") ?? "",
-        .wk_norm = w.get_string("attn_k_norm") ?? "",
-        .ffn_norm = w.get_string("ffn_norm") ?? "ffn_norm.weight",
-        .ffn_norm_bias = w.get_string("ffn_norm_bias") ?? "",
-        .ffn_gate = w.get_string("ffn_gate") ?? "ffn_gate.weight",
-        .ffn_up = w.get_string("ffn_up") ?? "ffn_up.weight",
-        .ffn_down = w.get_string("ffn_down") ?? "ffn_down.weight",
+        .embedding = own_string(w.get_string("embedding") ?? "token_embd.weight"),
+        .output_norm = own_string(w.get_string("output_norm") ?? "output_norm.weight"),
+        .output_norm_bias = own_string(w.get_string("output_norm_bias") ?? ""),
+        .output = own_string(w.get_string("output") ?? "output.weight"),
+        .layer_prefix = own_string(w.get_string("layer_prefix") ?? "blk"),
+        .attn_norm = own_string(w.get_string("attn_norm") ?? "attn_norm.weight"),
+        .attn_norm_bias = own_string(w.get_string("attn_norm_bias") ?? ""),
+        .wq = own_string(w.get_string("attn_q") ?? "attn_q.weight"),
+        .wk = own_string(w.get_string("attn_k") ?? "attn_k.weight"),
+        .wv = own_string(w.get_string("attn_v") ?? "attn_v.weight"),
+        .wo = own_string(w.get_string("attn_output") ?? "attn_output.weight"),
+        .wq_bias = own_string(w.get_string("attn_q_bias") ?? ""),
+        .wk_bias = own_string(w.get_string("attn_k_bias") ?? ""),
+        .wv_bias = own_string(w.get_string("attn_v_bias") ?? ""),
+        .wq_norm = own_string(w.get_string("attn_q_norm") ?? ""),
+        .wk_norm = own_string(w.get_string("attn_k_norm") ?? ""),
+        .ffn_norm = own_string(w.get_string("ffn_norm") ?? "ffn_norm.weight"),
+        .ffn_norm_bias = own_string(w.get_string("ffn_norm_bias") ?? ""),
+        .ffn_gate = own_string(w.get_string("ffn_gate") ?? "ffn_gate.weight"),
+        .ffn_up = own_string(w.get_string("ffn_up") ?? "ffn_up.weight"),
+        .ffn_down = own_string(w.get_string("ffn_down") ?? "ffn_down.weight"),
     };
 
-    // Don't free root - strings in WeightNames reference JSON-allocated memory
     return names;
+}
+
+<*
+ Release the names copied out of the config JSON.
+
+ LlmModel keeps a *pointer* to a WeightNames in encode_only mode, for streaming
+ layer loads — so this must outlive any model built from it. Declaring it before
+ the model and deferring both gives that ordering for free.
+*>
+fn void WeightNames.free(&self) {
+    String*[21] fields = {
+        &self.embedding, &self.output_norm, &self.output_norm_bias, &self.output,
+        &self.layer_prefix, &self.attn_norm, &self.attn_norm_bias,
+        &self.wq, &self.wk, &self.wv, &self.wo,
+        &self.wq_bias, &self.wk_bias, &self.wv_bias,
+        &self.wq_norm, &self.wk_norm,
+        &self.ffn_norm, &self.ffn_norm_bias,
+        &self.ffn_gate, &self.ffn_up, &self.ffn_down,
+    };
+    foreach (field : fields) disown_string(field);
 }

@@ -93,7 +93,9 @@ fn image::Image? ZImageState.generate(ZImageState* self, llm::DeviceContext* ctx
     }
 
     llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
+    defer text_config.free();
     llm::WeightNames text_names = llm::load_weight_names(config_json)!!;
+    defer text_names.free();
 
     llm::Tokenizer tok = llm::load_tokenizer(&text_gf)!!;
 

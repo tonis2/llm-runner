@@ -190,7 +190,9 @@ fn image::Image? flux_generate(FluxServerState* state, FluxGenerateRequest* req)
 	}
 
 	llm::ModelConfig text_config = llm::load_arch_config(config_json, &text_gf)!!;
+	defer text_config.free();
 	llm::WeightNames text_names  = llm::load_weight_names(config_json)!!;
+	defer text_names.free();
 	llm::Tokenizer tok           = llm::load_tokenizer(&text_gf)!!;
 
 	// Flux 2 Klein was trained with the Qwen3 chat-template wrap around the

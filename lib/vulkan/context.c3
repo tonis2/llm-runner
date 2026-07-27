@@ -65,6 +65,7 @@ fn void DeviceContext.vram_status(&self, ulong* used, ulong* budget, ulong* tota
 
 fn DeviceContext? createContext() {
     ZStringList device_extensions;
+    defer device_extensions.free();
     device_extensions.push_all({"VK_KHR_push_descriptor"});
     // Phase 3: cooperative matrix tensor-core path. Both extensions are
     // optional — checked at runtime, falls back to the tiled GEMM path if
@@ -96,7 +97,10 @@ fn DeviceContext? createContext() {
 
     instance = created;
 
+    // Deferred rather than freed after the loop: the "no suitable device" exit
+    // below returns from the middle of this function.
     DeviceList devices = instance.getDevices()!!;
+    defer devices.free();
 
     uint best_score = 0;
     PhysicalDeviceProperties device_props;
@@ -104,6 +108,7 @@ fn DeviceContext? createContext() {
     foreach (usz i, entry: devices) {
         bool supports_extensions = entry.checkExtensionSupport(device_extensions)!!;
         QueuePropertiesList queue_properties = entry.getQueueProperties()!!;
+        defer queue_properties.free();
 
         int queue_index = queue_properties.find(fn (sz index, QueueFamilyProperties props) =>
             ((QueueFlagBits)props.queueFlags & QUEUE_COMPUTE_BIT) != (QueueFlagBits)0
@@ -136,8 +141,6 @@ fn DeviceContext? createContext() {
     PhysicalDeviceLimits limits = device_props.limits;
     io::printfn("  maxComputeWorkGroupCount: (%d, %d, %d)", limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1], limits.maxComputeWorkGroupCount[2]);
     io::printfn("  maxComputeWorkGroupSize: (%d, %d, %d)", limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]);
-
-    devices.free();
 
     // Query the driver ID so we can blacklist drivers with broken cooperative
     // matrix support. Mesa RADV and Mesa ANV both produce wrong results from
@@ -282,7 +285,10 @@ fn DeviceContext? createContext() {
     compute_queue.handle = device.getQueue(compute_queue.index);
 
     CommandPool command_pool = device.createCommandPool(queue: compute_queue.index)!;
+    // Only the handle list is ours; the command buffers themselves belong to
+    // the pool and go when it does.
     CommandBufferList command_buffers = device.createCommandBuffers(command_pool, 1)!;
+    defer command_buffers.free();
 
     Fence compute_fence = vk::fenceCreateInfo()
         .setFlags(FENCE_CREATE_SIGNALED_BIT)
