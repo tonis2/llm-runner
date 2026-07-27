@@ -364,7 +364,7 @@ fn void test_mesh_attention_kernel() @test
 
 // --- End to end, against the real checkpoint ---
 
-const String ENCODER_WEIGHTS = "test/models/skintokens/grpo_1400.mesh_encoder.safetensors";
+const String ENCODER_WEIGHTS = "test/models/skintokens/grpo_1400.gguf";
 
 fn void test_mesh_encoder_forward() @test
 {

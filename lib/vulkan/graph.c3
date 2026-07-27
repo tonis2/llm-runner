@@ -73,6 +73,16 @@ fn void RenderGraph.copy(&self, Tensor* src, Tensor* dst, ulong size) {
     self.needs_barrier = true;
 }
 
+// Copy a region of one tensor into another. Same barrier treatment as copy();
+// the offsets are what a batched activation needs when only one row of it is
+// wanted, e.g. the last position of a prefill.
+fn void RenderGraph.copy_region(&self, Tensor* src, usz src_offset, Tensor* dst, usz dst_offset, ulong size) {
+    if (self.needs_barrier) compute_barrier(self.cmd);
+    vk::cmdCopyBuffer(self.cmd, src.gpu_buffer.buffer, dst.gpu_buffer.buffer, 1,
+        (vk::BufferCopy[]){{ .srcOffset = (ulong)src_offset, .dstOffset = (ulong)dst_offset, .size = size }});
+    self.needs_barrier = true;
+}
+
 // Submit the recorded work, wait for completion, and start a new frame.
 // Use this where the imperative code calls `submit_and_wait + begin_compute`.
 fn void? RenderGraph.checkpoint(&self) {

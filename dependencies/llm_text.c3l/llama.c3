@@ -747,6 +747,115 @@ fn void? LlmModel.forward_layer_prefill(&self, llm::RenderGraph* g, LayerWeights
     g.dispatch(&sk.residual_add, { hidden, &pa.ffn_down_out }, &res_pc, llm::ceil_div(n_tokens * c.dim, 256));
 }
 
+<*
+ Copy positions [from, to) of one KV cache into another.
+
+ What beam search needs: a beam that descends from another has to inherit its
+ attention state, and re-running the prefix per beam is not an option. The
+ cache is laid out head-major — `h * max_seq_len * head_dim + pos * head_dim` —
+ so a position range is contiguous within a head and the whole move is one
+ region per head.
+*>
+fn void? LlmModel.copy_kv_range(&self, KVCache* src, KVCache* dst, uint from_pos, uint to_pos) {
+    if (to_pos <= from_pos) return;
+
+    llm::ModelConfig* c = &self.config;
+    uint heads = c.n_kv_heads;
+    if (heads > 32) return llm::COMPUTE_ERROR~;
+
+    ulong head_stride = (ulong)self.max_seq_len * c.head_dim * 4;
+    ulong offset = (ulong)from_pos * c.head_dim * 4;
+    ulong length = (ulong)(to_pos - from_pos) * c.head_dim * 4;
+
+    BufferCopy[32] regions;
+    for (uint h = 0; h < heads; h++) {
+        regions[h] = {
+            .srcOffset = (ulong)h * head_stride + offset,
+            .dstOffset = (ulong)h * head_stride + offset,
+            .size = length,
+        };
+    }
+
+    self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+        for (uint l = 0; l < c.n_layers; l++) {
+            vk::cmdCopyBuffer(cmd, src.k_cache[l].gpu_buffer.buffer,
+                dst.k_cache[l].gpu_buffer.buffer, heads, regions[:heads]);
+            vk::cmdCopyBuffer(cmd, src.v_cache[l].gpu_buffer.buffer,
+                dst.v_cache[l].gpu_buffer.buffer, heads, regions[:heads]);
+        }
+    }!!;
+}
+
+<*
+ Swap in a different KV cache, returning the one that was in use.
+
+ Beams take turns on the same weights and activations; only their attention
+ state differs, so switching beams is switching caches.
+*>
+fn void KVCache.free(&self) {
+    foreach (&tensor : self.k_cache) tensor.free();
+    foreach (&tensor : self.v_cache) tensor.free();
+    if (self.k_cache.len > 0) mem::free(self.k_cache);
+    if (self.v_cache.len > 0) mem::free(self.v_cache);
+    *self = {};
+}
+
+fn KVCache LlmModel.use_kv_cache(&self, KVCache cache) {
+    KVCache previous = self.kv;
+    self.kv = cache;
+    return previous;
+}
+
+<*
+ Run a batch of pre-computed embeddings through the stack instead of a token
+ lookup, filling the KV cache for positions [0, n_tokens) and leaving the last
+ row's logits in `acts.logits`.
+
+ This is what conditioning on something that is not text needs — SkinTokens
+ prefixes a mesh encoder's 512 latents before any token exists. Decoding then
+ continues through the ordinary `forward(token, position)` from position
+ `n_tokens`, because both paths share the same KV cache.
+
+ `embeddings` is [n_tokens, dim] and doubles as the residual stream, so it is
+ overwritten. Requires prefill_supported(n_tokens).
+*>
+fn void? LlmModel.prefill_embeddings(&self, llm::Tensor* embeddings, uint n_tokens) {
+    if (n_tokens == 0 || !self.prefill_supported(n_tokens)) return llm::COMPUTE_ERROR~;
+    if (self.encode_only) return llm::COMPUTE_ERROR~;
+
+    llm::ModelConfig* c = &self.config;
+    LlmWeights* w = &self.weights;
+    LlmActivations* a = &self.acts;
+    LlmKernels* k = &self.kernels;
+    llm::SharedKernels* sk = &k.shared;
+
+    PrefillActivations pa = allocate_prefill_activations(self.ctx, c, n_tokens)!!;
+    defer pa.free();
+
+    llm::RenderGraph g;
+    g.init(self.ctx)!!;
+
+    for (uint l = 0; l < c.n_layers; l++) {
+        self.forward_layer_prefill(&g, &w.layers[l], l, embeddings, &pa, n_tokens)!!;
+        // A whole stack of batched layers is a long command buffer; break it up
+        // so a slow device is not asked to chew through all of it in one go.
+        if ((l + 1) % 8 == 0 && l + 1 < c.n_layers) g.checkpoint()!!;
+    }
+
+    // Only the final position predicts the next token, so the rest of the
+    // batch is done and just its row goes on to the output head.
+    ulong row_bytes = (ulong)c.dim * 4;
+    g.copy_region(embeddings, (usz)((ulong)(n_tokens - 1) * row_bytes), &a.hidden, 0, row_bytes);
+
+    // prefill_supported() already established RMSNorm, so there is no
+    // layernorm branch to mirror from forward().
+    llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
+    g.dispatch(&sk.rmsnorm, { &a.hidden, &w.output_norm, &a.norm_out }, &final_rms, 1);
+    llm::dispatch_matmul(&g, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
+
+    g.flush()!!;
+}
+
 fn void? LlmModel.forward(&self, uint token, uint position) {
     llm::DeviceContext* ctx = self.ctx;
     llm::ModelConfig* c = &self.config;

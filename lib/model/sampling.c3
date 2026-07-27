@@ -38,6 +38,10 @@ struct SamplingParams {
     float temperature;
     uint top_k;
     float top_p;
+    // Divides the logit of anything already generated, so a model that likes
+    // one token cannot spend the whole sequence on it. 1.0 (and 0.0, which is
+    // what a caller that predates this field leaves behind) means off.
+    float repetition_penalty;
 }
 
 struct TokenCandidate {
@@ -54,7 +58,13 @@ fn int cmp_candidates_desc(TokenCandidate a, TokenCandidate b) {
 
 // --- Main sampling function ---
 
-fn uint? sample_token(DeviceContext* ctx, Tensor* logits, uint vocab_size, SamplingParams* params, random::Sfc64Random* rng) {
+<*
+ Pick the next token.
+
+ @param history : `Tokens already generated, for the repetition penalty; empty to skip it.`
+ @param allowed : `Per-token legality mask; empty to allow everything.`
+*>
+fn uint? sample_token(DeviceContext* ctx, Tensor* logits, uint vocab_size, SamplingParams* params, random::Sfc64Random* rng, uint[] history = {}, bool[] allowed = {}) {
     usz size = (usz)vocab_size * 4;
 
     // Read logits from GPU
@@ -72,6 +82,27 @@ fn uint? sample_token(DeviceContext* ctx, Tensor* logits, uint vocab_size, Sampl
     }!!;
 
     float* data = (float*)staging.data();
+
+    // Repetition penalty, before temperature and before any greedy shortcut:
+    // the point is to change which token wins, so applying it after the
+    // argmax would do nothing at all. Sign matters — dividing a negative
+    // logit would make the token more likely, not less.
+    if (params.repetition_penalty > 1.0f) {
+        foreach (token : history) {
+            if (token >= vocab_size) continue;
+            data[token] = data[token] < 0.0f
+                ? data[token] * params.repetition_penalty
+                : data[token] / params.repetition_penalty;
+        }
+    }
+
+    // Constrained decoding: anything the caller ruled out is pushed below the
+    // range any real logit occupies, so it cannot survive top-k either.
+    if (allowed.len > 0) {
+        for (uint i = 0; i < vocab_size; i++) {
+            if (i >= allowed.len || !allowed[i]) data[i] = -1.0e30f;
+        }
+    }
 
     // Temperature 0 = greedy (argmax)
     if (params.temperature <= 0.0f) {

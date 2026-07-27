@@ -24,6 +24,8 @@ module llm::mesh;
 import vk;
 import llm;
 import std::io;
+import std::io::file;
+import std::io::file::mmap;
 import std::core::mem;
 import std::core::mem::allocator;
 import std::core::string;
@@ -239,37 +241,42 @@ struct MeshEncoder {
 
 // --- Loading ---
 
-fn llm::Tensor? load_one(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, String name) @local {
+fn llm::Tensor? load_named(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) @local {
+    llm::GGUFTensorInfo* info = gf.find_tensor(name)!;
+    return llm::upload_weight_as_f32(ctx, info, gf.tensor_data_base);
+}
+
+fn llm::Tensor? load_one(llm::DeviceContext* ctx, llm::GGUFFile* gf, String name) @local {
     @pool() {
-        return llm::upload_safetensor_f32(ctx, sf, string::tformat("mesh_encoder.encoder.%s", name));
+        return load_named(ctx, gf, string::tformat("mesh_encoder.encoder.%s", name));
     };
 }
 
 // One name at a time, each under its own pool. Formatting all eleven up front
 // and loading them in a single struct literal reads better and crashes: the
 // nested pools do not survive being interleaved with the literal's evaluation.
-fn llm::Tensor? load_block_tensor(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, uint index, String suffix) @local {
+fn llm::Tensor? load_block_tensor(llm::DeviceContext* ctx, llm::GGUFFile* gf, uint index, String suffix) @local {
     @pool() {
-        return llm::upload_safetensor_f32(ctx, sf,
+        return load_named(ctx, gf,
             string::tformat("mesh_encoder.encoder.self_attn.resblocks.%d.%s", index, suffix));
     };
 }
 
-fn SelfAttnBlock? load_block(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, uint index) @local {
+fn SelfAttnBlock? load_block(llm::DeviceContext* ctx, llm::GGUFFile* gf, uint index) @local {
     SelfAttnBlock block;
     defer catch block.free();
 
-    block.ln_1_weight = load_block_tensor(ctx, sf, index, "ln_1.weight")!;
-    block.ln_1_bias   = load_block_tensor(ctx, sf, index, "ln_1.bias")!;
-    block.qkv_weight  = load_block_tensor(ctx, sf, index, "attn.c_qkv.weight")!;
-    block.proj_weight = load_block_tensor(ctx, sf, index, "attn.c_proj.weight")!;
-    block.proj_bias   = load_block_tensor(ctx, sf, index, "attn.c_proj.bias")!;
-    block.ln_2_weight = load_block_tensor(ctx, sf, index, "ln_2.weight")!;
-    block.ln_2_bias   = load_block_tensor(ctx, sf, index, "ln_2.bias")!;
-    block.fc_weight   = load_block_tensor(ctx, sf, index, "mlp.c_fc.weight")!;
-    block.fc_bias     = load_block_tensor(ctx, sf, index, "mlp.c_fc.bias")!;
-    block.out_weight  = load_block_tensor(ctx, sf, index, "mlp.c_proj.weight")!;
-    block.out_bias    = load_block_tensor(ctx, sf, index, "mlp.c_proj.bias")!;
+    block.ln_1_weight = load_block_tensor(ctx, gf, index, "ln_1.weight")!;
+    block.ln_1_bias   = load_block_tensor(ctx, gf, index, "ln_1.bias")!;
+    block.qkv_weight  = load_block_tensor(ctx, gf, index, "attn.c_qkv.weight")!;
+    block.proj_weight = load_block_tensor(ctx, gf, index, "attn.c_proj.weight")!;
+    block.proj_bias   = load_block_tensor(ctx, gf, index, "attn.c_proj.bias")!;
+    block.ln_2_weight = load_block_tensor(ctx, gf, index, "ln_2.weight")!;
+    block.ln_2_bias   = load_block_tensor(ctx, gf, index, "ln_2.bias")!;
+    block.fc_weight   = load_block_tensor(ctx, gf, index, "mlp.c_fc.weight")!;
+    block.fc_bias     = load_block_tensor(ctx, gf, index, "mlp.c_fc.bias")!;
+    block.out_weight  = load_block_tensor(ctx, gf, index, "mlp.c_proj.weight")!;
+    block.out_bias    = load_block_tensor(ctx, gf, index, "mlp.c_proj.bias")!;
 
     return block;
 }
@@ -277,48 +284,53 @@ fn SelfAttnBlock? load_block(llm::DeviceContext* ctx, llm::SafetensorsFile* sf, 
 <*
  Load the encoder from a converted SkinTokens checkpoint.
 
- The file is the `.mesh_encoder.safetensors` split written by
- `tools/convert_ckpt.py`; its weights are BF16 and are widened to F32 on upload.
+ The file is the GGUF written by `tools/convert_ckpt.py --gguf`, which holds
+ all three networks. The encoder's tensors are stored F32 and keep their
+ checkpoint names; only the transformer is renamed and quantised, so that the
+ engine's own Qwen3 loader can read the same file.
 *>
 fn MeshEncoder? load_mesh_encoder(llm::DeviceContext* ctx, String path) {
-    llm::SafetensorsFile sf = llm::safetensors_open(path)!;
-    defer sf.close();
+    mmap::FileMmap weights = file::mmap_open(path, "rb")!;
+    defer (void)weights.destroy();
+
+    llm::GGUFFile gf = llm::gguf_parse(weights.bytes())!;
+    defer gf.free();
 
     MeshEncoder encoder = { .ctx = ctx };
     encoder.kernels = create_encoder_kernels(ctx)!;
     defer catch encoder.kernels.free(ctx.device);
 
     encoder.weights = {
-        .input_proj_weight = load_one(ctx, &sf, "input_proj.weight")!,
-        .input_proj_bias   = load_one(ctx, &sf, "input_proj.bias")!,
+        .input_proj_weight = load_one(ctx, &gf, "input_proj.weight")!,
+        .input_proj_bias   = load_one(ctx, &gf, "input_proj.bias")!,
 
-        .cross_ln_1_weight = load_one(ctx, &sf, "cross_attn.ln_1.weight")!,
-        .cross_ln_1_bias   = load_one(ctx, &sf, "cross_attn.ln_1.bias")!,
-        .cross_ln_2_weight = load_one(ctx, &sf, "cross_attn.ln_2.weight")!,
-        .cross_ln_2_bias   = load_one(ctx, &sf, "cross_attn.ln_2.bias")!,
-        .cross_ln_3_weight = load_one(ctx, &sf, "cross_attn.ln_3.weight")!,
-        .cross_ln_3_bias   = load_one(ctx, &sf, "cross_attn.ln_3.bias")!,
-        .cross_q_weight    = load_one(ctx, &sf, "cross_attn.attn.c_q.weight")!,
-        .cross_kv_weight   = load_one(ctx, &sf, "cross_attn.attn.c_kv.weight")!,
-        .cross_proj_weight = load_one(ctx, &sf, "cross_attn.attn.c_proj.weight")!,
-        .cross_proj_bias   = load_one(ctx, &sf, "cross_attn.attn.c_proj.bias")!,
-        .cross_fc_weight   = load_one(ctx, &sf, "cross_attn.mlp.c_fc.weight")!,
-        .cross_fc_bias     = load_one(ctx, &sf, "cross_attn.mlp.c_fc.bias")!,
-        .cross_out_weight  = load_one(ctx, &sf, "cross_attn.mlp.c_proj.weight")!,
-        .cross_out_bias    = load_one(ctx, &sf, "cross_attn.mlp.c_proj.bias")!,
+        .cross_ln_1_weight = load_one(ctx, &gf, "cross_attn.ln_1.weight")!,
+        .cross_ln_1_bias   = load_one(ctx, &gf, "cross_attn.ln_1.bias")!,
+        .cross_ln_2_weight = load_one(ctx, &gf, "cross_attn.ln_2.weight")!,
+        .cross_ln_2_bias   = load_one(ctx, &gf, "cross_attn.ln_2.bias")!,
+        .cross_ln_3_weight = load_one(ctx, &gf, "cross_attn.ln_3.weight")!,
+        .cross_ln_3_bias   = load_one(ctx, &gf, "cross_attn.ln_3.bias")!,
+        .cross_q_weight    = load_one(ctx, &gf, "cross_attn.attn.c_q.weight")!,
+        .cross_kv_weight   = load_one(ctx, &gf, "cross_attn.attn.c_kv.weight")!,
+        .cross_proj_weight = load_one(ctx, &gf, "cross_attn.attn.c_proj.weight")!,
+        .cross_proj_bias   = load_one(ctx, &gf, "cross_attn.attn.c_proj.bias")!,
+        .cross_fc_weight   = load_one(ctx, &gf, "cross_attn.mlp.c_fc.weight")!,
+        .cross_fc_bias     = load_one(ctx, &gf, "cross_attn.mlp.c_fc.bias")!,
+        .cross_out_weight  = load_one(ctx, &gf, "cross_attn.mlp.c_proj.weight")!,
+        .cross_out_bias    = load_one(ctx, &gf, "cross_attn.mlp.c_proj.bias")!,
 
-        .ln_post_weight = load_one(ctx, &sf, "ln_post.weight")!,
-        .ln_post_bias   = load_one(ctx, &sf, "ln_post.bias")!,
+        .ln_post_weight = load_one(ctx, &gf, "ln_post.weight")!,
+        .ln_post_bias   = load_one(ctx, &gf, "ln_post.bias")!,
 
         // The bridge into the LLM sits outside the encoder namespace.
-        .out_proj_weight = llm::upload_safetensor_f32(ctx, &sf, "output_proj.0.weight")!,
-        .out_proj_bias   = llm::upload_safetensor_f32(ctx, &sf, "output_proj.0.bias")!,
-        .out_norm_weight = llm::upload_safetensor_f32(ctx, &sf, "output_proj.1.weight")!,
+        .out_proj_weight = load_named(ctx, &gf, "output_proj.0.weight")!,
+        .out_proj_bias   = load_named(ctx, &gf, "output_proj.0.bias")!,
+        .out_norm_weight = load_named(ctx, &gf, "output_proj.1.weight")!,
     };
     defer catch encoder.weights.free();
 
     for (uint i = 0; i < ENCODER_BLOCKS; i++) {
-        encoder.weights.blocks[i] = load_block(ctx, &sf, i)!;
+        encoder.weights.blocks[i] = load_block(ctx, &gf, i)!;
     }
 
     return encoder;
