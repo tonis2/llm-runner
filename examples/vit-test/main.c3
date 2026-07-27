@@ -88,7 +88,7 @@ fn int main(String[] args) {
             allocator: &ctx.allocator,
             usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
             properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            data_size: img_size,
+            data_size: (sz)img_size,
         )!!;
         float* sdata = (float*)staging.data();
 
@@ -151,7 +151,7 @@ fn int main(String[] args) {
         allocator: &ctx.allocator,
         usage: BUFFER_USAGE_TRANSFER_DST_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
         properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: latent_bytes,
+        data_size: (sz)latent_bytes,
     )!!;
 
     // Unpatchify on GPU first
@@ -220,13 +220,13 @@ fn int main(String[] args) {
 
     // Download decoded image
     usz total_px = (usz)img_h * img_w * 3;
-    float[] img_data = mem::new_array(float, total_px);
+    float[] img_data = mem::new_array(float, (sz)total_px);
 
     vk::Memory download_staging = vk::new_buffer(
         allocator: &ctx.allocator,
         usage: BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: total_px * 4,
+        data_size: (sz)(total_px * 4),
     )!!;
     ctx.device.@single_time_command(ctx.compute_queue; vk::CommandBuffer cmd) {
         vk::cmdCopyBuffer(cmd, vae_acts.buf_a.gpu_buffer.buffer, download_staging.buffer, 1,
@@ -234,7 +234,7 @@ fn int main(String[] args) {
     }!!;
 
     float* mapped = (float*)download_staging.data();
-    mem::copy(img_data.ptr, mapped, total_px * 4);
+    mem::copy(img_data.ptr, mapped, (sz)(total_px * 4));
     download_staging.free();
     
     // Debug: print first few pixel values

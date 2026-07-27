@@ -158,7 +158,7 @@ fn void? test_q4_0_matmul(llm::DeviceContext* ctx) {
         allocator: &ctx.allocator,
         usage: BUFFER_USAGE_TRANSFER_DST_BIT,
         properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data_size: output_bytes,
+        data_size: (sz)output_bytes,
     )!!;
     defer staging.free();
 

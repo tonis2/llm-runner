@@ -144,7 +144,7 @@ fn AppConfig? parse_args(String[] args) {
 
 fn bool load_config(String config_path, AppConfig* config) {
     char[] config_data = file::load(mem, config_path)!!;
-    Object* cfg = json::parse_string(mem, (String)config_data)!!;
+    Object* cfg = json::parse(mem, (String)config_data)!!;
 
     if (try v = cfg.get_string("model")) config.model_path = v;
     if (try v = cfg.get_string("prompt")) config.prompt = v;

@@ -3,6 +3,8 @@
   "dependencies": ["llm_text", "vk", "image"],
   "sources": ["./**"],
   "targets": {
+    "macos-x64": { "linked-libraries": [] },
+    "macos-aarch64": { "linked-libraries": [] },
     "linux-x64": { "linked-libraries": ["vulkan"] },
     "windows-x64": { "linked-libraries": ["vulkan-1"] }
   }

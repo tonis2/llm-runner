@@ -64,7 +64,6 @@ fn void DeviceContext.vram_status(&self, ulong* used, ulong* budget, ulong* tota
 }
 
 fn DeviceContext? createContext() {
-    ZStringList extensions;
     ZStringList device_extensions;
     device_extensions.push_all({"VK_KHR_push_descriptor"});
     // Phase 3: cooperative matrix tensor-core path. Both extensions are
@@ -77,26 +76,25 @@ fn DeviceContext? createContext() {
     DeviceQueue compute_queue;
     Device device;
 
-    vk::checkInstanceExtensionSupport(extensions)!!;
+    // Nothing links against Vulkan: every command is a function pointer bound at
+    // runtime, so the loader has to be opened before the first call. On macOS
+    // there is no system Vulkan — vk ships the loader and a Metal driver
+    // (KosmicKrisp) in its macos-aarch64/ folder, and both are found next to the
+    // executable, which is what the `macos-libs` prepare target puts them there
+    // for. createDefaultInstance runs vk::init, hands the bundled driver to the
+    // loader via VK_LUNARG_direct_driver_loading when it finds one, and binds
+    // every command off the instance it builds.
+    Instance? created = vk::createDefaultInstance({
+        .app_name = "LLM Runner",
+        .api_version = vk::@makeApiVersion(0,1,3,0),
+    });
 
-    ApplicationInfo info = {
-        .pApplicationName = "LLM Runner",
-        .pEngineName = "LLM Engine",
-        .applicationVersion = vk::@makeApiVersion(0,1,0,0),
-        .engineVersion = vk::@makeApiVersion(0,1,0,0),
-        .apiVersion = vk::@makeApiVersion(0,1,3,0)
-    };
-
-    InstanceCreateInfo instanceInfo = vk::instanceCreateInfo()
-        .setApplicationInfo(&info)
-        .setFlags(env::os_is_darwin() ? INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0);
-
-    if (catch err = vk::createInstance(&instanceInfo, null, &instance)) {
-        io::printfn("Instance creation error");
+    if (catch err = created) {
+        io::printfn("Instance creation error: %s", err);
         return NO_SUITABLE_DEVICE~;
     }
 
-    vk::loadExtensions(instance);
+    instance = created;
 
     DeviceList devices = instance.getDevices()!!;
 

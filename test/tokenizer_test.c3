@@ -24,7 +24,7 @@ fn String[]? parse_vocab_test_input(String data) {
     // Last segment (after final delimiter) may or may not exist
     count++; // segments = delimiters + 1
 
-    String[] cases = mem::new_array(String, count);
+    String[] cases = mem::new_array(String, (sz)count);
     pos = 0;
     usz ci = 0;
     while (pos < data.len && ci < count) {
@@ -42,7 +42,7 @@ fn String[]? parse_vocab_test_input(String data) {
 
     // Trim to actual count (last segment may be empty after final delimiter)
     if (ci < count) {
-        String[] trimmed = mem::new_array(String, ci);
+        String[] trimmed = mem::new_array(String, (sz)ci);
         for (usz i = 0; i < ci; i++) trimmed[i] = cases[i];
         mem::free(cases);
         return trimmed;
@@ -83,7 +83,7 @@ fn TokenLine[]? parse_vocab_test_output(String data) {
     }
     if (data.len > 0 && data[data.len - 1] != '\n') n_lines++;
 
-    TokenLine[] lines = mem::new_array(TokenLine, n_lines);
+    TokenLine[] lines = mem::new_array(TokenLine, (sz)n_lines);
 
     usz pos = 0;
     usz li = 0;
@@ -106,7 +106,7 @@ fn TokenLine[]? parse_vocab_test_output(String data) {
             }
         }
 
-        uint[] ids = mem::new_array(uint, n_toks);
+        uint[] ids = mem::new_array(uint, (sz)n_toks);
         if (n_toks > 0) {
             usz ti = 0;
             usz tpos = 0;

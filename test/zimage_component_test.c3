@@ -55,13 +55,13 @@ fn void? load_reference_tensor(String path, float* out_data, uint expected_float
         for (usz i = 0; i < 16; i++) {
             if (header[i] != expected_header[i]) {
                 io::printfn("Warning: Bad header in %s", path);
-                f.seek(0, io::Seek.SET)!!;
+                f.seek(0, io::SeekOrigin.FROM_START)!!;
             }
         }
         
         // Read data
-        usz bytes_read = f.read(((char*)out_data)[:expected_floats * 4])!!;
-        if (bytes_read != expected_floats * 4) {
+        usz bytes_read = (usz)f.read(((char*)out_data)[:expected_floats * 4])!!;
+        if (bytes_read != (usz)expected_floats * 4) {
             io::printfn("Warning: Expected %d bytes, got %d", expected_floats * 4, bytes_read);
         }
         return;
