@@ -4,3 +4,6 @@
 [submodule "dependencies/image.c3l"]
 	path = dependencies/image.c3l
 	url = git@github.com:tonis2/image.c3.git
+[submodule "dependencies/gltf.c3l"]
+	path = dependencies/gltf.c3l
+	url = git@github.com:tonis2/gltf.c3.git
