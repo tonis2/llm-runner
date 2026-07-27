@@ -87,9 +87,20 @@ fn uint? sample_token(DeviceContext* ctx, Tensor* logits, uint vocab_size, Sampl
     // the point is to change which token wins, so applying it after the
     // argmax would do nothing at all. Sign matters — dividing a negative
     // logit would make the token more likely, not less.
+    // Once per *distinct* token, not once per occurrence. HuggingFace gathers
+    // the original logit for every position, penalises that, and scatters it
+    // back, so a token repeated k times is still only divided once. Applying
+    // it per occurrence compounds to penalty^k, which at 2.0 buries any token
+    // the grammar has to reuse -- the branch marker above all, since one id
+    // serves every fork while coordinates spread over 256.
     if (params.repetition_penalty > 1.0f) {
-        foreach (token : history) {
+        foreach (usz i, token : history) {
             if (token >= vocab_size) continue;
+            bool already = false;
+            for (usz j = 0; j < i; j++) {
+                if (history[j] == token) { already = true; break; }
+            }
+            if (already) continue;
             data[token] = data[token] < 0.0f
                 ? data[token] * params.repetition_penalty
                 : data[token] / params.repetition_penalty;
