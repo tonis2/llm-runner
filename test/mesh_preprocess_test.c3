@@ -100,6 +100,40 @@ fn void test_samples_lie_on_the_surface() @test
     }
 }
 
+fn void test_normals_default_to_the_face() @test
+{
+    // A single triangle in the z = 0 plane, given vertex normals that all lean
+    // away from it. The face normal is +z; any interpolation of the vertex
+    // normals is not.
+    Vec3[3] positions = { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 } };
+    Vec3[3] leaning = { { 1, 0, 0 }, { 0, 1, 0 }, { 0.6, 0.8, 0 } };
+    uint[3] indices = { 0, 1, 2 };
+
+    mesh::TriMesh sloped = {
+        .positions = positions[..],
+        .normals = leaning[..],
+        .indices = indices[..],
+    };
+    assert(sloped.has_normals());
+
+    // SkinTokens pairs every sample with the normal of the face it landed on,
+    // so that is the default here even when vertex normals are available.
+    mesh::PointCloud flat = mesh::sample_surface(mem, sloped, 64)!!;
+    defer flat.free(mem);
+    foreach (normal : flat.normals)
+    {
+        assert(approx(normal[2], 1.0f), "the face normal is +z");
+    }
+
+    mesh::PointCloud smooth = mesh::sample_surface(mem, sloped, 64, 0, true)!!;
+    defer smooth.free(mem);
+    foreach (normal : smooth.normals)
+    {
+        assert(approx(normal[2], 0.0f), "interpolated normals stay in the plane");
+        assert(approx(normal.length(), 1.0f), "and are renormalised");
+    }
+}
+
 fn void test_sampling_is_area_weighted() @test
 {
     // Two disjoint squares in the z = 0 plane, one four times the area of the
@@ -234,7 +268,7 @@ fn void test_prepare_shape_input() @test
 {
     mesh::PrepareOptions options = mesh::DEFAULT_PREPARE;
     options.samples = 2000;
-    options.latents = 32;
+    options.latents = 32;   // draws a pool of 128 and keeps 32
 
     mesh::TriMesh cube = unit_cube();
     mesh::ShapeEncoderInput input = mesh::prepare_shape_input(mem, cube, options)!!;
@@ -271,12 +305,50 @@ fn void test_prepare_shape_input() @test
     assert(approx(extreme, 1.0f, 1e-3f), "and it fills that box");
 }
 
-fn void test_prepare_rejects_more_latents_than_samples() @test
+fn void test_prepare_rejects_a_pool_bigger_than_the_cloud() @test
 {
     mesh::PrepareOptions options = mesh::DEFAULT_PREPARE;
     options.samples = 16;
     options.latents = 32;
     assert(@catch(mesh::prepare_shape_input(mem, unit_cube(), options)) == mesh::TOO_FEW_POINTS);
+
+    // The pool is four times the latents, so this is short even though there
+    // are more samples than queries.
+    options.samples = 100;
+    options.latents = 32;
+    assert(@catch(mesh::prepare_shape_input(mem, unit_cube(), options)) == mesh::TOO_FEW_POINTS);
+}
+
+fn void test_pick_queries_spreads_over_a_uniform_draw() @test
+{
+    // A line of 400 points. Whatever pool is drawn, farthest point sampling
+    // over it still reaches for the ends first.
+    Vec3[400] line;
+    for (usz i = 0; i < 400; i++) line[i] = { (float)i, 0, 0 };
+
+    usz[] picked = mesh::pick_queries(mem, line[..], 8, 4, 1)!!;
+    defer mem::free(picked);
+
+    assert(picked.len == 8);
+
+    // Distinct cloud indices: the pool is drawn without replacement.
+    for (usz a = 0; a < picked.len; a++)
+    {
+        for (usz b = a + 1; b < picked.len; b++) assert(picked[a] != picked[b], "queries repeat");
+    }
+
+    float lowest = 1.0e30f;
+    float highest = -1.0e30f;
+    foreach (index : picked)
+    {
+        assert(index < 400);
+        if (line[index][0] < lowest) lowest = line[index][0];
+        if (line[index][0] > highest) highest = line[index][0];
+    }
+    // 32 points drawn from 400, so the extremes of the pool land near the ends.
+    assert(lowest < 40 && highest > 360, "the picks span the line");
+
+    assert(@catch(mesh::pick_queries(mem, line[..], 200, 4)) == mesh::TOO_FEW_POINTS);
 }
 
 // The glTF adapter is exercised against a fixture that ships with the gltf

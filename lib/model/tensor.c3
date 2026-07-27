@@ -3,6 +3,7 @@ module llm;
 import vk;
 import std::io;
 import std::core::mem;
+import std::core::mem::allocator;
 
 struct Tensor {
     vk::Memory gpu_buffer;
@@ -70,6 +71,52 @@ fn void Tensor.free(&self) {
 
 fn Tensor? create_f32_tensor(DeviceContext* ctx, ulong[4] shape, uint n_dims) {
     return create_tensor(ctx, GGML_F32, shape, n_dims);
+}
+
+// Copy host floats into an existing device tensor through a staging buffer.
+// For feeding inputs that are computed on the CPU rather than loaded from a
+// weights file, which upload_weight already covers.
+fn void? upload_to_tensor(DeviceContext* ctx, Tensor* tensor, float[] data) {
+    usz size = data.len * 4;
+    if (size == 0 || size > tensor.size_bytes) return COMPUTE_ERROR~;
+
+    vk::Memory staging = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: data.ptr,
+        data_size: (sz)size,
+    )!!;
+    defer staging.free();
+
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
+        vk::cmdCopyBuffer(cmd, staging.buffer, tensor.gpu_buffer.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = size }});
+    }!!;
+}
+
+// Read the first `count` floats of a device tensor back into host memory.
+fn float[]? download_tensor(alloc::Allocator allocator, DeviceContext* ctx, Tensor* tensor, usz count) {
+    usz size = count * 4;
+    if (size == 0 || size > tensor.size_bytes) return COMPUTE_ERROR~;
+
+    vk::Memory staging = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null,
+        data_size: (sz)size,
+    )!!;
+    defer staging.free();
+
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
+        vk::cmdCopyBuffer(cmd, tensor.gpu_buffer.buffer, staging.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = size }});
+    }!!;
+
+    float[] out = alloc::new_array(allocator, float, (sz)count);
+    mem::copy(out.ptr, staging.data(), (sz)size);
+    return out;
 }
 
 // CPU-side bf16 to f32 conversion

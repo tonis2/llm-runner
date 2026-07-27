@@ -6,163 +6,161 @@ import std::core::mem;
 
 const MAX_BINDINGS = 8;
 
-struct ComputeKernel {
-    vk::Pipeline pipeline;
-    PipelineLayout pipeline_layout;
-    DescriptorSetLayout desc_layout;
-    uint num_buffers;
-    uint push_constant_size;
+struct ComputeKernel
+{
+	vk::Pipeline pipeline;
+	PipelineLayout pipeline_layout;
+	DescriptorSetLayout desc_layout;
+	uint num_buffers;
+	uint push_constant_size;
 }
 
 fn ComputeKernel? create_kernel(
-    DeviceContext* ctx,
-    ShaderModule shader_module,
-    uint num_storage_buffers,
-    uint push_constant_size = 0,
-    ZString entry_point = "main"
-) {
-    Device device = ctx.device;
+	DeviceContext* ctx,
+	ShaderModule shader_module,
+	uint num_storage_buffers,
+	uint push_constant_size = 0,
+	ZString entry_point = "main"
+)
+{
+	Device device = ctx.device;
 
-    // Create descriptor set layout with push descriptor flag
-    DescriptorSetLayoutBinding[MAX_BINDINGS] bindings;
-    for (uint i = 0; i < num_storage_buffers; i++) {
-        bindings[i] = {
-            .binding = i,
-            .descriptorType = vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = SHADER_STAGE_COMPUTE_BIT,
-        };
-    }
+	// Create descriptor set layout with push descriptor flag
+	DescriptorSetLayoutBinding[MAX_BINDINGS] bindings;
+	for (uint i = 0; i < num_storage_buffers; i++)
+	{
+		bindings[i] = {
+			.binding = i,
+			.descriptorType = vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = SHADER_STAGE_COMPUTE_BIT,
+		};
+	}
 
-    DescriptorSetLayout desc_layout = vk::descriptorSetLayoutCreateInfo()
-        .setFlags(DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT)
-        .setBindings(bindings[0 .. num_storage_buffers - 1])
-        .build(device)!!;
+	DescriptorSetLayout desc_layout = vk::descriptorSetLayoutCreateInfo()
+		.setFlags(DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT)
+		.setBindings(bindings[0..num_storage_buffers - 1])
+		.build(device)!!;
 
-    // Create pipeline layout
-    PipelineLayout pipeline_layout;
-    if (push_constant_size > 0) {
-        PushConstantRange pc_range = {
-            .stageFlags = SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0,
-            .size = push_constant_size,
-        };
-        pipeline_layout = vk::pipelineLayoutCreateInfo()
-            .setSetLayouts({ desc_layout })
-            .setPushConstantRanges({ pc_range })
-            .build(device)!!;
-    } else {
-        pipeline_layout = vk::pipelineLayoutCreateInfo()
-            .setSetLayouts({ desc_layout })
-            .build(device)!!;
-    }
+	// Create pipeline layout
+	PipelineLayout pipeline_layout;
+	if (push_constant_size > 0)
+	{
+		PushConstantRange pc_range = {
+			.stageFlags = SHADER_STAGE_COMPUTE_BIT,
+			.offset = 0,
+			.size = push_constant_size,
+		};
+		pipeline_layout = vk::pipelineLayoutCreateInfo().setSetLayouts({ desc_layout })
+			.setPushConstantRanges({ pc_range })
+			.build(device)!!;
+	}
+	else
+	{
+		pipeline_layout = vk::pipelineLayoutCreateInfo().setSetLayouts({ desc_layout }).build(device)!!;
+	}
 
-    // Create compute pipeline
-    PipelineShaderStageCreateInfo stage = vk::pipelineShaderStageCreateInfo()
-        .setStage(SHADER_STAGE_COMPUTE_BIT)
-        .setMod(shader_module)
-        .setName(entry_point);
+	// Create compute pipeline
+	PipelineShaderStageCreateInfo stage = vk::pipelineShaderStageCreateInfo().setStage(SHADER_STAGE_COMPUTE_BIT)
+		.setMod(shader_module)
+		.setName(entry_point);
 
-    vk::Pipeline pipeline = vk::computePipelineCreateInfo()
-        .setStage(stage)
-        .setLayout(pipeline_layout)
-        .build(device)!!;
+	vk::Pipeline pipeline = vk::computePipelineCreateInfo().setStage(stage).setLayout(pipeline_layout).build(device)!!;
 
-    return {
-        .pipeline = pipeline,
-        .pipeline_layout = pipeline_layout,
-        .desc_layout = desc_layout,
-        .num_buffers = num_storage_buffers,
-        .push_constant_size = push_constant_size,
-    };
+	return {
+		.pipeline = pipeline,
+		.pipeline_layout = pipeline_layout,
+		.desc_layout = desc_layout,
+		.num_buffers = num_storage_buffers,
+		.push_constant_size = push_constant_size,
+	};
 }
 
-fn void ComputeKernel.free(&self, Device device) {
-    self.pipeline.free(device);
-    self.pipeline_layout.free(device);
-    self.desc_layout.free(device);
+fn void ComputeKernel.free(&self, Device device)
+{
+	self.pipeline.free(device);
+	self.pipeline_layout.free(device);
+	self.desc_layout.free(device);
 }
 
 fn void dispatch_kernel(
-    CommandBuffer cmd,
-    ComputeKernel* kernel,
-    vk::Buffer[] buffers,
-    usz[] sizes,
-    void* push_constants,
-    uint groups_x,
-    uint groups_y = 1,
-    uint groups_z = 1
-) {
-    vk::cmdBindPipeline(cmd, vk::PipelineBindPoint.PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+	CommandBuffer cmd,
+	ComputeKernel* kernel,
+	vk::Buffer[] buffers,
+	usz[] sizes,
+	void* push_constants,
+	uint groups_x,
+	uint groups_y = 1,
+	uint groups_z = 1
+)
+{
+	vk::cmdBindPipeline(cmd, vk::PipelineBindPoint.PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
 
-    // Build write descriptor sets for push descriptors
-    DescriptorBufferInfo[MAX_BINDINGS] buffer_infos;
-    WriteDescriptorSet[MAX_BINDINGS] writes;
+	// Build write descriptor sets for push descriptors
+	DescriptorBufferInfo[MAX_BINDINGS] buffer_infos;
+	WriteDescriptorSet[MAX_BINDINGS] writes;
 
-    for (uint i = 0; i < kernel.num_buffers; i++) {
-        buffer_infos[i] = {
-            .buffer = buffers[i],
-            .offset = 0,
-            .range = sizes[i],
-        };
-        writes[i] = vk::writeDescriptorSet()
-            .setDstBinding(i)
-            .setDescriptorType(vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER)
-            .setBufferInfo(buffer_infos[i .. i]);
-    }
+	for (uint i = 0; i < kernel.num_buffers; i++)
+	{
+		buffer_infos[i] = { .buffer = buffers[i], .offset = 0, .range = sizes[i], };
+		writes[i] = vk::writeDescriptorSet().setDstBinding(i)
+			.setDescriptorType(vk::DescriptorType.DESCRIPTOR_TYPE_STORAGE_BUFFER)
+			.setBufferInfo(buffer_infos[i..i]);
+	}
 
-    vk::cmdPushDescriptorSetKHR(
-        cmd,
-        vk::PipelineBindPoint.PIPELINE_BIND_POINT_COMPUTE,
-        kernel.pipeline_layout,
-        0,
-        kernel.num_buffers,
-        &writes[0]
-    );
+	vk::cmdPushDescriptorSetKHR(
+		cmd,
+		vk::PipelineBindPoint.PIPELINE_BIND_POINT_COMPUTE,
+		kernel.pipeline_layout,
+		0,
+		kernel.num_buffers,
+		&writes[0]
+	);
 
-    if (kernel.push_constant_size > 0 && push_constants != null) {
-        vk::cmdPushConstants(
-            cmd,
-            kernel.pipeline_layout,
-            SHADER_STAGE_COMPUTE_BIT,
-            0,
-            kernel.push_constant_size,
-            push_constants
-        );
-    }
+	if (kernel.push_constant_size > 0 && push_constants != null)
+	{
+		vk::cmdPushConstants(
+			cmd,
+			kernel.pipeline_layout,
+			SHADER_STAGE_COMPUTE_BIT,
+			0,
+			kernel.push_constant_size,
+			push_constants
+		);
+	}
 
-    vk::cmdDispatch(cmd, groups_x, groups_y, groups_z);
+	vk::cmdDispatch(cmd, groups_x, groups_y, groups_z);
 }
 
-fn void compute_barrier(CommandBuffer cmd) {
-    MemoryBarrier2 barrier = vk::memoryBarrier2()
-        .setSrcStageMask(PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
-        .setSrcAccessMask(ACCESS_2_SHADER_WRITE_BIT)
-        .setDstStageMask(PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
-        .setDstAccessMask(ACCESS_2_SHADER_READ_BIT | ACCESS_2_SHADER_WRITE_BIT);
+fn void compute_barrier(CommandBuffer cmd)
+{
+	MemoryBarrier2 barrier = vk::memoryBarrier2().setSrcStageMask(PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+		.setSrcAccessMask(ACCESS_2_SHADER_WRITE_BIT)
+		.setDstStageMask(PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+		.setDstAccessMask(ACCESS_2_SHADER_READ_BIT | ACCESS_2_SHADER_WRITE_BIT);
 
-    vk::cmdPipelineBarrier2(cmd, &&vk::dependencyInfo().setMemoryBarriers({ barrier }));
+	vk::cmdPipelineBarrier2(cmd, &&vk::dependencyInfo().setMemoryBarriers({ barrier }));
 }
 
-fn void? begin_compute(CommandBuffer cmd) {
-    vk::resetCommandBuffer(cmd, (vk::CommandBufferResetFlags)0)!!;
-    vk::beginCommandBuffer(cmd, &&vk::commandBufferBeginInfo())!!;
+fn void? begin_compute(CommandBuffer cmd)
+{
+	vk::resetCommandBuffer(cmd, (vk::CommandBufferResetFlags)0)!!;
+	vk::beginCommandBuffer(cmd, &&vk::commandBufferBeginInfo())!!;
 }
 
-fn void? submit_and_wait(DeviceContext* ctx) {
-    CommandBuffer cmd = ctx.command_buffer;
-    vk::endCommandBuffer(cmd)!!;
+fn void? submit_and_wait(DeviceContext* ctx)
+{
+	CommandBuffer cmd = ctx.command_buffer;
+	vk::endCommandBuffer(cmd)!!;
 
-    ctx.compute_fence.wait(ctx.device)!!;
-    ctx.compute_fence.reset(ctx.device)!!;
+	ctx.compute_fence.wait(ctx.device)!!;
+	ctx.compute_fence.reset(ctx.device)!!;
 
-    CommandBufferSubmitInfo cmd_info = vk::commandBufferSubmitInfo()
-        .setCommandBuffer(cmd);
+	CommandBufferSubmitInfo cmd_info = vk::commandBufferSubmitInfo().setCommandBuffer(cmd);
 
-    SubmitInfo2 submit = vk::submitInfo2()
-        .setCommandBufferInfos({ cmd_info });
+	SubmitInfo2 submit = vk::submitInfo2().setCommandBufferInfos({ cmd_info });
 
-    vk::queueSubmit2(ctx.compute_queue.handle, 1, &submit, ctx.compute_fence)!!;
+	vk::queueSubmit2(ctx.compute_queue.handle, 1, &submit, ctx.compute_fence)!!;
 
-    ctx.compute_fence.wait(ctx.device)!!;
+	ctx.compute_fence.wait(ctx.device)!!;
 }

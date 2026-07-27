@@ -66,15 +66,20 @@ fn Vec3 triangle_normal(Vec3 a, Vec3 b, Vec3 c) @local {
  Scatter `count` points over the mesh, area-weighted.
 
  A triangle is drawn with probability proportional to its area, then a point is
- drawn uniformly inside it by folding a unit square onto the triangle. The
- normal is barycentrically interpolated from the vertex normals when the mesh
- has them, and is the face normal otherwise.
+ drawn uniformly inside it by folding a unit square onto the triangle.
+
+ The normal is the face normal by default, even on a mesh that carries vertex
+ normals. That is what SkinTokens trained against — its sampler pairs every
+ barycentric sample with `face_normals[face_index]` — and a smooth normal is
+ not a harmless improvement here, it is a different input than the network
+ learned from. `smooth_normals` asks for the interpolated one instead.
 
  Sampling is fully determined by `seed`: the same mesh and seed give the same
  cloud, which matters because the encoder's latents are gathered from these
  points and a rig that changes run to run is not debuggable.
 
  @param count : `Number of points to draw; SkinTokens sampled 54000.`
+ @param smooth_normals : `Interpolate the vertex normals rather than using the face normal.`
  @return? EMPTY_MESH : `The mesh has no triangles.`
  @return? NOT_TRIANGULATED : `The index count is not a multiple of three.`
  @return? NORMAL_COUNT_MISMATCH : `Some but not all vertices carry a normal.`
@@ -82,7 +87,7 @@ fn Vec3 triangle_normal(Vec3 a, Vec3 b, Vec3 c) @local {
  @return? NO_SURFACE_AREA : `Every triangle is degenerate.`
  @return? TOO_FEW_POINTS : `count is zero.`
 *>
-fn PointCloud? sample_surface(Allocator allocator, TriMesh geometry, usz count, ulong seed = 0) {
+fn PointCloud? sample_surface(Allocator allocator, TriMesh geometry, usz count, ulong seed = 0, bool smooth_normals = false) {
     geometry.validate()!;
     if (count == 0) return TOO_FEW_POINTS~;
 
@@ -109,7 +114,7 @@ fn PointCloud? sample_surface(Allocator allocator, TriMesh geometry, usz count, 
         .normals = alloc::new_array(allocator, Vec3, (sz)count),
     };
 
-    bool interpolate = geometry.has_normals();
+    bool interpolate = smooth_normals && geometry.has_normals();
 
     DefaultRandom rng;
     random::seed(&rng, seed);
@@ -201,5 +206,73 @@ fn usz[]? farthest_point_sample(Allocator allocator, Vec3[] points, usz count, u
         current = next;
     }
 
+    return picked;
+}
+
+<*
+ Pick the encoder's query points the way SkinTokens does: draw `count *
+ pool_ratio` points uniformly out of the cloud, then farthest-point-sample that
+ pool down by `pool_ratio`.
+
+ Not the same as farthest point sampling the whole cloud, and the difference is
+ not an optimisation. Running FPS over a random draw makes the queries a blend
+ of uniform and well-spread coverage, and the model was trained against that
+ blend. It also means the cost does not scale with the cloud: 2048 candidates
+ whether there are 54000 points or a million.
+
+ One departure from the reference, which draws its pool with numpy's PCG64 at a
+ fixed seed: the pool here comes from a different generator, so the exact query
+ set differs even though its distribution does not. Reproducing numpy's
+ `Generator.choice` bit for bit is the only way to close that gap.
+
+ @return? EMPTY_MESH : `No points to pick from.`
+ @return? TOO_FEW_POINTS : `The cloud is smaller than count * pool_ratio.`
+*>
+fn usz[]? pick_queries(Allocator allocator, Vec3[] points, usz count, usz pool_ratio = 4, ulong seed = 0) {
+    if (points.len == 0) return EMPTY_MESH~;
+    if (count == 0 || pool_ratio == 0) return TOO_FEW_POINTS~;
+
+    usz pool_size = count * pool_ratio;
+    if (pool_size > points.len) return TOO_FEW_POINTS~;
+
+    usz[] pool = uniform_indices(allocator, points.len, pool_size, seed)!;
+    defer alloc::free(allocator, pool);
+
+    Vec3[] candidates = alloc::new_array(allocator, Vec3, (sz)pool_size);
+    defer alloc::free(allocator, candidates);
+    foreach (slot, index : pool) candidates[slot] = points[index];
+
+    usz[] picked = farthest_point_sample(allocator, candidates, count)!;
+
+    // Back from pool slots to cloud indices, so the caller can gather rows of
+    // the already-embedded features.
+    foreach (&slot : picked) *slot = pool[*slot];
+    return picked;
+}
+
+// `count` distinct indices below `population`, uniformly, by running a partial
+// Fisher-Yates shuffle rather than rejection sampling -- the pool is a
+// noticeable fraction of small clouds, where retry loops get slow.
+fn usz[]? uniform_indices(Allocator allocator, usz population, usz count, ulong seed) @local {
+    if (count > population) return TOO_FEW_POINTS~;
+
+    usz[] scratch = alloc::new_array(allocator, usz, (sz)population);
+    defer alloc::free(allocator, scratch);
+    foreach (usz i, &slot : scratch) *slot = i;
+
+    DefaultRandom rng;
+    random::seed(&rng, seed);
+
+    usz[] picked = alloc::new_array(allocator, usz, (sz)count);
+    for (usz i = 0; i < count; i++) {
+        usz span = population - i;
+        usz j = i + (usz)(random::next_double(&rng) * (double)span);
+        if (j >= population) j = population - 1;
+
+        usz swap = scratch[i];
+        scratch[i] = scratch[j];
+        scratch[j] = swap;
+        picked[i] = scratch[i];
+    }
     return picked;
 }

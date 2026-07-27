@@ -24,11 +24,15 @@ import std::math;
 import std::math::vector;
 
 // From the checkpoint's hyper-parameters: mesh_encoder_num_freqs,
-// mesh_encoder_point_feats, mesh_encoder_num_latents, sampler_num_samples.
+// mesh_encoder_point_feats, mesh_encoder_token_num, sampler_num_samples.
 const uint DEFAULT_NUM_FREQS = 8;
 const usz POINT_FEATS = 3;
-const usz DEFAULT_LATENTS = 256;
+const usz DEFAULT_LATENTS = 512;
 const usz DEFAULT_SAMPLES = 54000;
+
+// Farthest point sampling runs over a uniform draw of this many points per
+// query it returns, not over the whole cloud.
+const usz QUERY_POOL_RATIO = 4;
 
 <*
  Width of the Fourier part alone: xyz plus a sin and a cos per axis per
@@ -111,25 +115,30 @@ enum FitMode {
 struct PrepareOptions {
     usz samples;
     usz latents;
+    usz pool_ratio;
     uint num_freqs;
     bool include_pi;
+    bool smooth_normals;
     ulong seed;
     FitMode fit;
     float target;
 }
 
 <*
- What the checkpoint's own hyper-parameters imply.
+ What SkinTokens actually runs with.
 
- `samples` is `sampler_num_samples`, the cloud size the model was trained
- against. `fit` is a guess: the checkpoint records no normalisation, and only
- the training repo settles it. Everything else is read straight off the weights.
+ `samples` is `sampler_num_samples` and `latents` is `mesh_encoder_token_num` —
+ 512, not the `mesh_encoder_num_latents` of 256, which only sizes the learned
+ queries this encoder does not have. `fit` matches the training pipeline's
+ `AugmentAffine(normalize_into=[-1, 1])`: bounding box centre, uniform scale.
 *>
 const PrepareOptions DEFAULT_PREPARE = {
     .samples = DEFAULT_SAMPLES,
     .latents = DEFAULT_LATENTS,
+    .pool_ratio = QUERY_POOL_RATIO,
     .num_freqs = DEFAULT_NUM_FREQS,
     .include_pi = false,
+    .smooth_normals = false,
     .seed = 0,
     .fit = UNIT_CUBE,
     .target = 1.0f,
@@ -173,10 +182,11 @@ fn void ShapeEncoderInput.free(&self, Allocator allocator) {
  @return? NORMAL_COUNT_MISMATCH : `Some but not all vertices carry a normal.`
  @return? INDEX_OUT_OF_RANGE : `An index names a vertex that does not exist.`
  @return? NO_SURFACE_AREA : `Every triangle is degenerate.`
- @return? TOO_FEW_POINTS : `Fewer samples requested than latents needed.`
+ @return? TOO_FEW_POINTS : `Fewer samples drawn than the query pool needs.`
 *>
 fn ShapeEncoderInput? prepare_shape_input(Allocator allocator, TriMesh geometry, PrepareOptions options = DEFAULT_PREPARE) {
-    if (options.latents > options.samples) return TOO_FEW_POINTS~;
+    usz pool_size = options.latents * options.pool_ratio;
+    if (options.latents == 0 || pool_size > options.samples) return TOO_FEW_POINTS~;
 
     // Derived from the mesh, applied to the cloud. Taking it from the mesh
     // makes it independent of the sample count and the seed; applying it after
@@ -187,7 +197,7 @@ fn ShapeEncoderInput? prepare_shape_input(Allocator allocator, TriMesh geometry,
         ? geometry.unit_sphere_transform(options.target)
         : geometry.unit_cube_transform(options.target);
 
-    PointCloud cloud = sample_surface(allocator, geometry, options.samples, options.seed)!;
+    PointCloud cloud = sample_surface(allocator, geometry, options.samples, options.seed, options.smooth_normals)!;
     defer cloud.free(allocator);
 
     foreach (&position : cloud.positions) {
@@ -205,7 +215,7 @@ fn ShapeEncoderInput? prepare_shape_input(Allocator allocator, TriMesh geometry,
     defer catch input.free(allocator);
 
     input.features = embed_points(allocator, cloud, options.num_freqs, options.include_pi)!;
-    input.query_indices = farthest_point_sample(allocator, cloud.positions, options.latents)!;
+    input.query_indices = pick_queries(allocator, cloud.positions, options.latents, options.pool_ratio, options.seed)!;
     input.query = alloc::new_array(allocator, float, (sz)(options.latents * dim));
 
     foreach (usz slot, index : input.query_indices) {
