@@ -1,7 +1,7 @@
 <*
  Mesh in, rigged .glb out.
 
-     rig cow.glb cow_rigged.glb [--model <gguf>] [--seed N] [--class none|rignet|vroid|articulation] [--no-skin] [--no-prune|--prune-share F]
+     rig cow.glb cow_rigged.glb [--model <gguf>] [--seed N] [--beam N] [--class none|rignet|vroid|articulation] [--no-skin] [--no-prune|--prune-share F]
 
  Both halves are the model's: the skeleton comes out of the transformer and so
  do the skin weights, as four codes per bone that the VAE decoder turns back
@@ -15,7 +15,11 @@
 
  Generation samples, so a run that does not terminate within budget is a normal
  outcome rather than a failure; seeds are retried until one lands, which is what
- the reference buys with its ten beams. The search runs skeleton-only — skin
+ the reference buys with its ten beams. `--beam N` reaches for those beams
+ directly instead: likelihood-guided search rather than sampling, worth trying
+ when every seed comes back missing a limb. A beam skeleton has no seed that
+ reproduces it, so it exports with the distance bind rather than predicted
+ weights. The search runs skeleton-only — skin
  codes cost more tokens than the skeleton they follow, and eight seeds' worth
  of them would be thrown away — and the winner is then decoded once more with
  skin. Same seed, same sampler, same prefix, so the skeleton comes back
@@ -61,6 +65,8 @@ fn int main(String[] args)
     String output = args[2];
     String model_path = DEFAULT_MODEL;
     ulong seed = 0;
+    usz beams = 0;
+    float beam_length = skintokens::DEFAULT_BEAM.length_penalty;
     bool want_skin = true;
     bool want_prune = true;
     float prune_share = skintokens::DEFAULT_PRUNE_SHARE;
@@ -76,6 +82,17 @@ fn int main(String[] args)
             case "--seed":
                 if (++i >= args.len) { io::printn("--seed needs a number"); return 1; }
                 seed = args[i].to_ulong() ?? 0;
+            case "--beam":
+                if (++i >= args.len) { io::printn("--beam needs a count"); return 1; }
+                beams = (usz)(args[i].to_ulong() ?? 0);
+                if (beams == 0 || beams > skintokens::MAX_BEAMS)
+                {
+                    io::printfn("--beam wants 1..%d", skintokens::MAX_BEAMS);
+                    return 1;
+                }
+            case "--beam-length":
+                if (++i >= args.len) { io::printn("--beam-length needs a penalty"); return 1; }
+                beam_length = (float)(args[i].to_double() ?? (double)skintokens::DEFAULT_BEAM.length_penalty);
             case "--class":
                 if (++i >= args.len) { io::printn("--class needs a name"); return 1; }
                 rig_class = parse_class(args[i]) ?? skintokens::RigClass.ARTICULATION;
@@ -157,53 +174,77 @@ fn int main(String[] args)
     float best_bare = 1.0f;
     ulong best_seed = seed;
 
-    // All the attempts decode together — a lockstep step costs what a single
-    // sequence's step does — and the selection walks them in seed order, so
-    // the winner is the one the sequential loop would have kept.
-    ulong[SEED_ATTEMPTS] seeds;
-    for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++) seeds[attempt] = seed + attempt;
-    skintokens::RigResult[SEED_ATTEMPTS] candidates;
-    bool[SEED_ATTEMPTS] ok;
-    skintokens::decode_rig_attempts(mem, &ctx, &model, &rig_prefill, shape.normalization, options,
-        seeds[..], candidates[..], ok[..])!!;
-
-    for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++)
+    if (beams > 0)
     {
-        options.seed = seeds[attempt];
-        if (ok[attempt])
-        {
-            skintokens::RigResult candidate = candidates[attempt];
-            float off = candidate.off_mesh_fraction(box);
-            float bare = candidate.uncovered_fraction(geometry);
-            float score = off + bare;
-            io::printfn("  seed %d: %d bones, %.0f%% off mesh, %.0f%% of mesh unreached",
-                options.seed, candidate.skeleton.len(), off * 100.0f, bare * 100.0f);
+        skintokens::BeamOptions beam_options = skintokens::DEFAULT_BEAM;
+        beam_options.beams = beams;
+        beam_options.length_penalty = beam_length;
+        beam_options.rig_class = rig_class;
 
-            if (score < best_score)
-            {
-                if (rigged) rig.free(mem);
-                rig = candidate;
-                rigged = true;
-                best_score = score;
-                best_off = off;
-                best_bare = bare;
-                best_seed = options.seed;
-            }
-            else
-            {
-                candidate.free(mem);
-            }
+        if (try result = skintokens::generate_rig_beam(
+            mem, &ctx, &model, prefix, shape.normalization, beam_options))
+        {
+            rig = result;
+            rigged = true;
+            best_off = rig.off_mesh_fraction(box);
+            best_bare = rig.uncovered_fraction(geometry);
         }
         else
         {
-            io::printfn("  seed %d did not produce a complete skeleton", options.seed);
+            io::printfn("no beam finished a skeleton with %d beams", beams);
+            return 1;
         }
     }
-
-    if (!rigged)
+    else
     {
-        io::printfn("no seed produced a skeleton in %d attempts", SEED_ATTEMPTS);
-        return 1;
+        // All the attempts decode together — a lockstep step costs what a single
+        // sequence's step does — and the selection walks them in seed order, so
+        // the winner is the one the sequential loop would have kept.
+        ulong[SEED_ATTEMPTS] seeds;
+        for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++) seeds[attempt] = seed + attempt;
+        skintokens::RigResult[SEED_ATTEMPTS] candidates;
+        bool[SEED_ATTEMPTS] ok;
+        skintokens::decode_rig_attempts(mem, &ctx, &model, &rig_prefill, shape.normalization, options,
+            seeds[..], candidates[..], ok[..])!!;
+
+        for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++)
+        {
+            options.seed = seeds[attempt];
+            if (ok[attempt])
+            {
+                skintokens::RigResult candidate = candidates[attempt];
+                float off = candidate.off_mesh_fraction(box);
+                float bare = candidate.uncovered_fraction(geometry);
+                float score = off + bare;
+                io::printfn("  seed %d: %d bones, %.0f%% off mesh, %.0f%% of mesh unreached",
+                    options.seed, candidate.skeleton.len(), off * 100.0f, bare * 100.0f);
+
+                if (score < best_score)
+                {
+                    if (rigged) rig.free(mem);
+                    rig = candidate;
+                    rigged = true;
+                    best_score = score;
+                    best_off = off;
+                    best_bare = bare;
+                    best_seed = options.seed;
+                }
+                else
+                {
+                    candidate.free(mem);
+                }
+            }
+            else
+            {
+                io::printfn("  seed %d did not produce a complete skeleton", options.seed);
+            }
+        }
+
+        if (!rigged)
+        {
+            io::printfn("no seed produced a skeleton in %d attempts", SEED_ATTEMPTS);
+            return 1;
+        }
     }
     defer rig.free(mem);
 
@@ -213,9 +254,18 @@ fn int main(String[] args)
     foreach (parent : rig.skeleton.parents) if (parent >= 0) children[(usz)parent]++;
     foreach (count : children) if (count > 1) forks++;
 
-    io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh, %.0f%% unreached (seed %d, class %s)",
-        rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_bare * 100.0f,
-        best_seed, rig_class);
+    if (beams > 0)
+    {
+        io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh, %.0f%% unreached (%d beams, class %s)",
+            rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_bare * 100.0f,
+            beams, rig_class);
+    }
+    else
+    {
+        io::printfn("rig: %d tokens -> %d bones, %d branch points, %.0f%% off mesh, %.0f%% unreached (seed %d, class %s)",
+            rig.tokens.len, rig.skeleton.len(), forks, best_off * 100.0f, best_bare * 100.0f,
+            best_seed, rig_class);
+    }
 
     // The tokenizer can mark where a part starts -- `spring` for the secondary
     // chains a character rig hangs off itself, `body` and `hand` for the two
@@ -241,7 +291,11 @@ fn int main(String[] args)
     float[] skin = {};
     defer if (skin.len > 0) mem::free(skin);
 
-    if (want_skin)
+    if (want_skin && beams > 0)
+    {
+        io::printn("skin: no seed reproduces a beam skeleton; using the distance bind");
+    }
+    if (want_skin && beams == 0)
     {
         options.seed = best_seed;
         options.predict_skin = true;

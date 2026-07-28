@@ -239,7 +239,7 @@ struct JointBuffer @local {
     usz count;
 }
 
-fn void JointBuffer.push(&self, Vec3 joint, Vec3 parent_joint) @local {
+fn void JointBuffer.push(&self, Vec3 joint, Vec3 parent_joint) {
     self.joints[self.count] = joint;
     self.parent_joints[self.count] = parent_joint;
     self.count++;
