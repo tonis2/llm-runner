@@ -2704,6 +2704,7 @@ struct KVStoreParams {
     uint kv_dim;
     uint head_dim;
     uint max_seq_len;
+    uint pos_offset;   // first cache position written; 0 for a prefill
 };
 
 [vk_push_constant] const KVStoreParams kv_store_pc;
@@ -2717,7 +2718,7 @@ struct KVStoreParams {
 [numthreads(256, 1, 1)]
 void kv_cache_store(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= kv_store_pc.n_tokens * kv_store_pc.kv_dim) return;
-    uint pos = tid.x / kv_store_pc.kv_dim;
+    uint pos = kv_store_pc.pos_offset + tid.x / kv_store_pc.kv_dim;
     uint rem = tid.x % kv_store_pc.kv_dim;
     uint h   = rem / kv_store_pc.head_dim;
     uint d   = rem % kv_store_pc.head_dim;
@@ -2809,5 +2810,584 @@ void attention_prefill(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
             acc += apf_scores[pos] * apf_v_cache[kv_base + pos * hd + d];
         }
         apf_output[q_base + d] = acc * inv_sum;
+    }
+}
+
+// ============================================================
+// Fused decode-path kernels. Each replaces a chain of the small
+// per-token dispatches above; the decode loop is bound on dispatch
+// and barrier overhead, not arithmetic, so every removed hop counts.
+// The arithmetic and its order are copied exactly from the kernels
+// they replace, so a fused step is bit-identical to the chain.
+// ============================================================
+
+// SwiGLU tail: gate = silu(gate) * up, in place on gate.
+struct SiluMulParams {
+    uint n;
+};
+
+[vk_push_constant] const SiluMulParams silu_mul_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> silu_mul_gate;
+[vk_binding(1, 0)] RWStructuredBuffer<float> silu_mul_up;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void silu_mul(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= silu_mul_pc.n) return;
+    float x = silu_mul_gate[tid.x];
+    silu_mul_gate[tid.x] = (x / (1.0 + exp(-x))) * silu_mul_up[tid.x];
+}
+
+// Residual add + RMSNorm: hidden += delta, out = rmsnorm(hidden) * weight.
+// One workgroup per row. `out` may alias `delta`: every element of the row's
+// delta is consumed in the accumulate pass, and the group barrier orders that
+// pass before the write-back.
+struct ResidualRMSNormParams {
+    uint dim;
+    float eps;
+    uint n_rows;
+};
+
+[vk_push_constant] const ResidualRMSNormParams resid_rms_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> resid_rms_hidden;
+[vk_binding(1, 0)] RWStructuredBuffer<float> resid_rms_delta;
+[vk_binding(2, 0)] RWStructuredBuffer<float> resid_rms_weight;
+[vk_binding(3, 0)] RWStructuredBuffer<float> resid_rms_output;
+
+groupshared float resid_rms_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void residual_rmsnorm(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint row = gid.x;
+    if (row >= resid_rms_pc.n_rows) return;
+    uint dim = resid_rms_pc.dim;
+    uint base = row * dim;
+
+    float sum_sq = 0.0;
+    for (uint i = gi; i < dim; i += 256) {
+        float val = resid_rms_hidden[base + i] + resid_rms_delta[base + i];
+        resid_rms_hidden[base + i] = val;
+        sum_sq += val * val;
+    }
+    resid_rms_shared[gi] = sum_sq;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) resid_rms_shared[gi] += resid_rms_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float rms = 1.0 / sqrt(resid_rms_shared[0] / float(dim) + resid_rms_pc.eps);
+
+    for (uint i = gi; i < dim; i += 256) {
+        resid_rms_output[base + i] = resid_rms_hidden[base + i] * rms * resid_rms_weight[i];
+    }
+}
+
+// Per-head RMSNorm + RoPE over a [n_rows, n_heads * head_dim] tensor, in
+// place. One thread per (row, head); row r sits at position `position + r`.
+struct HeadNormRopeParams {
+    uint head_dim;
+    uint n_heads;
+    uint n_rows;
+    float eps;
+    uint position;
+    float theta;
+    uint pos_stride;   // row r sits at position + r * pos_stride; 0 = same position (a batch of streams)
+};
+
+[vk_push_constant] const HeadNormRopeParams hnr_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> hnr_data;
+[vk_binding(1, 0)] RWStructuredBuffer<float> hnr_weight;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void head_norm_rope(uint3 tid: SV_DispatchThreadID) {
+    uint total = hnr_pc.n_rows * hnr_pc.n_heads;
+    if (tid.x >= total) return;
+    uint hd = hnr_pc.head_dim;
+    uint base = tid.x * hd;
+    uint row = tid.x / hnr_pc.n_heads;
+
+    float sum_sq = 0.0;
+    for (uint d = 0; d < hd; d++) {
+        float val = hnr_data[base + d];
+        sum_sq += val * val;
+    }
+    float rms = 1.0 / sqrt(sum_sq / float(hd) + hnr_pc.eps);
+    for (uint d = 0; d < hd; d++) {
+        hnr_data[base + d] = hnr_data[base + d] * rms * hnr_weight[d];
+    }
+
+    uint position = hnr_pc.position + row * hnr_pc.pos_stride;
+    for (uint pair = 0; pair < hd / 2; pair++) {
+        float freq = 1.0 / pow(hnr_pc.theta, float(2 * pair) / float(hd));
+        float angle = float(position) * freq;
+        float cos_val = cos(angle);
+        float sin_val = sin(angle);
+
+        uint at = base + pair * 2;
+        float x0 = hnr_data[at];
+        float x1 = hnr_data[at + 1];
+        hnr_data[at]     = x0 * cos_val - x1 * sin_val;
+        hnr_data[at + 1] = x0 * sin_val + x1 * cos_val;
+    }
+}
+
+// ============================================================
+// Flash-decode attention: the single-query attention above run as one
+// workgroup per (q_head, 256-position chunk of the sequence) instead of one
+// per head. A head's chunks each produce an unnormalised partial weighted-V
+// sum plus their local softmax max and expsum; attention_combine folds them.
+// What this buys on a decode: n_heads workgroups leave most of the GPU idle
+// and walk the whole sequence serially per thread; chunking multiplies the
+// workgroup count by seq/256 and bounds every serial loop at 256.
+// ============================================================
+
+#define ATTN_CHUNK 256
+
+struct AttentionSplitParams {
+    uint head_dim;
+    uint n_kv_heads;
+    uint n_q_heads;
+    uint seq_len;
+    float scale;
+    uint max_seq_len;
+    uint n_chunks;
+};
+
+[vk_push_constant] const AttentionSplitParams asp_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> asp_q;        // [n_q_heads * head_dim]
+[vk_binding(1, 0)] RWStructuredBuffer<float> asp_k_cache;  // [n_kv_heads, max_seq_len, head_dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> asp_v_cache;
+[vk_binding(3, 0)] RWStructuredBuffer<float> asp_partial;  // [n_q_heads, n_chunks, head_dim]
+[vk_binding(4, 0)] RWStructuredBuffer<float> asp_meta;     // [n_q_heads, n_chunks, 2]
+
+groupshared float asp_scores[ATTN_CHUNK];
+groupshared float asp_red[256];
+groupshared float asp_qtile[256];
+// K staged 32 positions at a time: the load is coalesced (consecutive
+// threads, consecutive addresses), where reading K straight from global in
+// the dot loop makes every thread walk its own 512-byte-strided row.
+#define ATTN_KTILE 32
+groupshared float asp_ktile[ATTN_KTILE * 128];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void attention_split(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint q_head = gid.x;
+    uint chunk = gid.y;
+    // gid.z is the stream for a batched decode: stream b's query sits b
+    // batches into asp_q, its cache b slabs into the caches, its partials b
+    // head-groups into the partial buffers. A single-stream dispatch launches
+    // with one z-group and lands on offsets of zero.
+    uint b = gid.z;
+    uint hd = asp_pc.head_dim;
+    uint start = chunk * ATTN_CHUNK;
+    uint slot = (b * asp_pc.n_q_heads + q_head) * asp_pc.n_chunks + chunk;
+    if (q_head >= asp_pc.n_q_heads || start >= asp_pc.seq_len) return;
+
+    uint end = min(asp_pc.seq_len, start + ATTN_CHUNK);
+    uint count = end - start;
+    uint kv_head = q_head / (asp_pc.n_q_heads / asp_pc.n_kv_heads);
+    uint kv_base = (b * asp_pc.n_kv_heads + kv_head) * asp_pc.max_seq_len * hd;
+    uint q_base = (b * asp_pc.n_q_heads + q_head) * hd;
+
+    // The query is read hd times per chunk; stage it once.
+    for (uint d = gi; d < hd; d += 256) asp_qtile[d] = asp_q[q_base + d];
+    GroupMemoryBarrierWithGroupSync();
+
+    // Scores for this chunk's positions. The dot itself stays a serial
+    // ascending walk over d — the same arithmetic order as the sequential
+    // attention — only the K reads go through the staged tile.
+    if (hd <= 128) {
+        uint tiles = (ATTN_CHUNK + ATTN_KTILE - 1) / ATTN_KTILE;
+        for (uint t = 0; t < tiles; t++) {
+            uint tile_base = t * ATTN_KTILE;
+            uint tile_count = tile_base < count ? min(count - tile_base, ATTN_KTILE) : 0;
+            for (uint idx = gi; idx < tile_count * hd; idx += 256) {
+                asp_ktile[idx] = asp_k_cache[kv_base + (start + tile_base) * hd + idx];
+            }
+            GroupMemoryBarrierWithGroupSync();
+            if (gi < tile_count) {
+                float dot_val = 0.0;
+                for (uint d = 0; d < hd; d++) {
+                    dot_val += asp_qtile[d] * asp_ktile[gi * hd + d];
+                }
+                asp_scores[tile_base + gi] = dot_val * asp_pc.scale;
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    } else {
+        for (uint i = gi; i < count; i += 256) {
+            uint pos = start + i;
+            float dot_val = 0.0;
+            for (uint d = 0; d < hd; d++) {
+                dot_val += asp_qtile[d] * asp_k_cache[kv_base + pos * hd + d];
+            }
+            asp_scores[i] = dot_val * asp_pc.scale;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Local softmax: chunk max, then exp and expsum.
+    float m = -1.0e30;
+    for (uint i = gi; i < count; i += 256) m = max(m, asp_scores[i]);
+    asp_red[gi] = m;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) asp_red[gi] = max(asp_red[gi], asp_red[gi + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float cmax = asp_red[0];
+    GroupMemoryBarrierWithGroupSync();
+
+    float sum = 0.0;
+    for (uint i = gi; i < count; i += 256) {
+        float e = exp(asp_scores[i] - cmax);
+        asp_scores[i] = e;
+        sum += e;
+    }
+    asp_red[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (gi < s) asp_red[gi] += asp_red[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) {
+        asp_meta[slot * 2 + 0] = cmax;
+        asp_meta[slot * 2 + 1] = asp_red[0];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Partial weighted V, unnormalised. Threads with the same d % hd cover
+    // interleaved positions, so consecutive threads touch consecutive V
+    // addresses; the position-groups then fold in LDS.
+    uint n_groups = 256 / hd;
+    uint g_idx = gi / hd;
+    uint d = gi % hd;
+    float acc = 0.0;
+    if (g_idx < n_groups) {
+        for (uint i = g_idx; i < count; i += n_groups) {
+            acc += asp_scores[i] * asp_v_cache[kv_base + (start + i) * hd + d];
+        }
+    }
+    asp_red[gi] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    if (g_idx == 0) {
+        float total = acc;
+        for (uint g = 1; g < n_groups; g++) total += asp_red[g * hd + d];
+        asp_partial[slot * hd + d] = total;
+    }
+}
+
+struct AttentionCombineParams {
+    uint head_dim;
+    uint n_q_heads;
+    uint n_chunks;
+};
+
+[vk_push_constant] const AttentionCombineParams acb_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> acb_partial;
+[vk_binding(1, 0)] RWStructuredBuffer<float> acb_meta;
+[vk_binding(2, 0)] RWStructuredBuffer<float> acb_output;   // [n_q_heads * head_dim]
+
+groupshared float acb_shared[2];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void attention_combine(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint q_head = gid.x;
+    uint b = gid.y;   // stream, for a batched decode; 0 otherwise
+    uint hd = acb_pc.head_dim;
+    uint base = (b * acb_pc.n_q_heads + q_head) * acb_pc.n_chunks;
+
+    // The chunk count is seq/256 — a handful — so one thread folds the metas.
+    if (gi == 0) {
+        float m = -1.0e30;
+        for (uint c = 0; c < acb_pc.n_chunks; c++) {
+            m = max(m, acb_meta[(base + c) * 2 + 0]);
+        }
+        float l = 0.0;
+        for (uint c = 0; c < acb_pc.n_chunks; c++) {
+            l += acb_meta[(base + c) * 2 + 1] * exp(acb_meta[(base + c) * 2 + 0] - m);
+        }
+        acb_shared[0] = m;
+        acb_shared[1] = l;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    float m = acb_shared[0];
+    float inv_l = 1.0 / acb_shared[1];
+
+    for (uint d = gi; d < hd; d += 256) {
+        float acc = 0.0;
+        for (uint c = 0; c < acb_pc.n_chunks; c++) {
+            acc += acb_partial[(base + c) * hd + d] * exp(acb_meta[(base + c) * 2 + 0] - m);
+        }
+        acb_output[(b * acb_pc.n_q_heads + q_head) * hd + d] = acc * inv_l;
+    }
+}
+
+// ============================================================
+// Q8_0 GEMV, eight rows per workgroup. The one-workgroup-per-row matmul_q8
+// above leaves in_dim/32 of its 256 threads active — 28 for an 896-wide
+// layer — and pays an eight-level LDS tree per row. Here a row belongs to a
+// 32-thread team: lanes take whole blocks, the tree is five levels over the
+// team, and a workgroup retires eight rows. The decode GEMVs are this
+// kernel's whole workload; the batched prefill keeps its tiled path.
+// ============================================================
+
+[vk_push_constant] const MatMulParams matmul_q8_gemv_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> q8g_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> q8g_input;
+[vk_binding(2, 0)] RWStructuredBuffer<float> q8g_output;
+
+groupshared float q8g_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void matmul_q8_gemv(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint team = gi / 32;
+    uint lane = gi % 32;
+    uint row = gid.x * 8 + team;
+    // gid.y is the batch row for a lockstep multi-stream decode; a plain
+    // decode dispatches one y-group and the offsets vanish.
+    uint in_base = gid.y * matmul_q8_gemv_pc.in_dim;
+    uint out_base = gid.y * matmul_q8_gemv_pc.out_dim;
+
+    uint blocks_per_row = matmul_q8_gemv_pc.in_dim / 32;
+    float sum = 0.0;
+
+    if (row < matmul_q8_gemv_pc.out_dim) {
+        uint bytes_per_row = blocks_per_row * 34;
+        uint row_byte_offset = row * bytes_per_row;
+
+        for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+            uint block_byte = row_byte_offset + block_idx * 34;
+
+            uint scale_uint_idx = block_byte / 4;
+            uint scale_byte_offset = block_byte % 4;
+            uint scale_word = q8g_weight[scale_uint_idx];
+            uint scale_bits;
+            if (scale_byte_offset == 0) {
+                scale_bits = scale_word & 0xFFFFu;
+            } else if (scale_byte_offset == 2) {
+                scale_bits = (scale_word >> 16) & 0xFFFFu;
+            } else {
+                uint next_word = q8g_weight[scale_uint_idx + 1];
+                scale_bits = ((scale_word >> (scale_byte_offset * 8)) | (next_word << (32 - scale_byte_offset * 8))) & 0xFFFFu;
+            }
+            float scale = unpack_f16(scale_bits);
+
+            uint qs_byte = block_byte + 2;
+            uint input_offset = block_idx * 32;
+
+            float block_sum = 0.0;
+            for (uint j = 0; j < 32; j += 4) {
+                uint byte_pos = qs_byte + j;
+                uint uint_idx = byte_pos / 4;
+                uint byte_off = byte_pos % 4;
+
+                uint word = q8g_weight[uint_idx];
+                if (byte_off != 0) {
+                    uint next_word = q8g_weight[uint_idx + 1];
+                    word = (word >> (byte_off * 8)) | (next_word << (32 - byte_off * 8));
+                }
+
+                int q0 = sign_extend_i8(word & 0xFFu);
+                int q1 = sign_extend_i8((word >> 8) & 0xFFu);
+                int q2 = sign_extend_i8((word >> 16) & 0xFFu);
+                int q3 = sign_extend_i8((word >> 24) & 0xFFu);
+
+                block_sum += float(q0) * q8g_input[in_base + input_offset + j];
+                block_sum += float(q1) * q8g_input[in_base + input_offset + j + 1];
+                block_sum += float(q2) * q8g_input[in_base + input_offset + j + 2];
+                block_sum += float(q3) * q8g_input[in_base + input_offset + j + 3];
+            }
+            sum += scale * block_sum;
+        }
+    }
+
+    q8g_shared[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (lane < s) q8g_shared[gi] += q8g_shared[gi + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0 && row < matmul_q8_gemv_pc.out_dim) {
+        q8g_output[out_base + row] = q8g_shared[gi];
+    }
+}
+
+// ============================================================
+// Batched-decode support: several independent streams at the same position,
+// contiguous in [n_rows, ...] tensors, one dispatch per stage.
+// ============================================================
+
+// Embedding gather for up to 16 tokens, ids carried in the push constants.
+struct EmbeddingBatchParams {
+    uint dim;
+    uint n_rows;
+    uint4 tokens[4];
+};
+
+[vk_push_constant] const EmbeddingBatchParams emb_batch_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> emb_batch_table;
+[vk_binding(1, 0)] RWStructuredBuffer<float> emb_batch_output;   // [n_rows, dim]
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void embedding_batch(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= emb_batch_pc.n_rows * emb_batch_pc.dim) return;
+    uint row = tid.x / emb_batch_pc.dim;
+    uint d = tid.x % emb_batch_pc.dim;
+    uint token = emb_batch_pc.tokens[row / 4][row % 4];
+    emb_batch_output[tid.x] = emb_batch_table[token * emb_batch_pc.dim + d];
+}
+
+// K/V scatter for a batch of streams: row r of the [n_rows, kv_dim] inputs
+// goes to stream r's slab of the shared caches, all at the same position.
+struct KVStoreMultiParams {
+    uint n_rows;
+    uint kv_dim;
+    uint head_dim;
+    uint max_seq_len;
+    uint position;
+};
+
+[vk_push_constant] const KVStoreMultiParams kvm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<float> kvm_k_in;
+[vk_binding(1, 0)] RWStructuredBuffer<float> kvm_v_in;
+[vk_binding(2, 0)] RWStructuredBuffer<float> kvm_k_cache;   // [n_rows, n_kv_heads, max_seq_len, head_dim]
+[vk_binding(3, 0)] RWStructuredBuffer<float> kvm_v_cache;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void kv_cache_store_multi(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= kvm_pc.n_rows * kvm_pc.kv_dim) return;
+    uint row = tid.x / kvm_pc.kv_dim;
+    uint rem = tid.x % kvm_pc.kv_dim;
+    uint h   = rem / kvm_pc.head_dim;
+    uint d   = rem % kvm_pc.head_dim;
+    uint n_kv_heads = kvm_pc.kv_dim / kvm_pc.head_dim;
+    uint dst = ((row * n_kv_heads + h) * kvm_pc.max_seq_len + kvm_pc.position) * kvm_pc.head_dim + d;
+    kvm_k_cache[dst] = kvm_k_in[tid.x];
+    kvm_v_cache[dst] = kvm_v_in[tid.x];
+}
+
+// ============================================================
+// Q8_0 GEMV against a whole batch of inputs: same row/team layout as
+// matmul_q8_gemv, but each weight block is loaded once and dotted against
+// every input row before moving on. gid.y re-reads the full weight matrix
+// per stream; for an eight-stream decode that is 8x the traffic of the
+// weights themselves, and the weights are the bulk of all bytes moved.
+// Per (row, input) the block order and the team tree are exactly the
+// single-input kernel's, so the outputs are bit-identical to running it
+// once per stream.
+// ============================================================
+
+struct MatMulMultiParams {
+    uint out_dim;
+    uint in_dim;
+    uint n_rows;
+};
+
+[vk_push_constant] const MatMulMultiParams q8gm_pc;
+
+[vk_binding(0, 0)] RWStructuredBuffer<uint> q8gm_weight;
+[vk_binding(1, 0)] RWStructuredBuffer<float> q8gm_input;    // [n_rows, in_dim]
+[vk_binding(2, 0)] RWStructuredBuffer<float> q8gm_output;   // [n_rows, out_dim]
+
+#define GEMV_MAX_BATCH 16
+
+groupshared float q8gm_shared[256];
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void matmul_q8_gemv_multi(uint3 gid: SV_GroupID, uint gi: SV_GroupIndex) {
+    uint team = gi / 32;
+    uint lane = gi % 32;
+    uint row = gid.x * 8 + team;
+    uint n = q8gm_pc.n_rows;
+
+    uint blocks_per_row = q8gm_pc.in_dim / 32;
+    float sums[GEMV_MAX_BATCH];
+    for (uint b = 0; b < n; b++) sums[b] = 0.0;
+
+    if (row < q8gm_pc.out_dim) {
+        uint bytes_per_row = blocks_per_row * 34;
+        uint row_byte_offset = row * bytes_per_row;
+
+        for (uint block_idx = lane; block_idx < blocks_per_row; block_idx += 32) {
+            uint block_byte = row_byte_offset + block_idx * 34;
+
+            uint scale_uint_idx = block_byte / 4;
+            uint scale_byte_offset = block_byte % 4;
+            uint scale_word = q8gm_weight[scale_uint_idx];
+            uint scale_bits;
+            if (scale_byte_offset == 0) {
+                scale_bits = scale_word & 0xFFFFu;
+            } else if (scale_byte_offset == 2) {
+                scale_bits = (scale_word >> 16) & 0xFFFFu;
+            } else {
+                uint next_word = q8gm_weight[scale_uint_idx + 1];
+                scale_bits = ((scale_word >> (scale_byte_offset * 8)) | (next_word << (32 - scale_byte_offset * 8))) & 0xFFFFu;
+            }
+            float scale = unpack_f16(scale_bits);
+
+            uint qs_byte = block_byte + 2;
+            uint input_offset = block_idx * 32;
+
+            float block_sums[GEMV_MAX_BATCH];
+            for (uint b = 0; b < n; b++) block_sums[b] = 0.0;
+
+            for (uint j = 0; j < 32; j += 4) {
+                uint byte_pos = qs_byte + j;
+                uint uint_idx = byte_pos / 4;
+                uint byte_off = byte_pos % 4;
+
+                uint word = q8gm_weight[uint_idx];
+                if (byte_off != 0) {
+                    uint next_word = q8gm_weight[uint_idx + 1];
+                    word = (word >> (byte_off * 8)) | (next_word << (32 - byte_off * 8));
+                }
+
+                float q0 = float(sign_extend_i8(word & 0xFFu));
+                float q1 = float(sign_extend_i8((word >> 8) & 0xFFu));
+                float q2 = float(sign_extend_i8((word >> 16) & 0xFFu));
+                float q3 = float(sign_extend_i8((word >> 24) & 0xFFu));
+
+                for (uint b = 0; b < n; b++) {
+                    uint in_base = b * q8gm_pc.in_dim + input_offset;
+                    block_sums[b] += q0 * q8gm_input[in_base + j];
+                    block_sums[b] += q1 * q8gm_input[in_base + j + 1];
+                    block_sums[b] += q2 * q8gm_input[in_base + j + 2];
+                    block_sums[b] += q3 * q8gm_input[in_base + j + 3];
+                }
+            }
+            for (uint b = 0; b < n; b++) sums[b] += scale * block_sums[b];
+        }
+    }
+
+    // One team tree per input row; the barrier pattern is uniform across the
+    // workgroup, so idle teams just ride along.
+    for (uint b = 0; b < n; b++) {
+        q8gm_shared[gi] = sums[b];
+        GroupMemoryBarrierWithGroupSync();
+        for (uint s = 16; s > 0; s >>= 1) {
+            if (lane < s) q8gm_shared[gi] += q8gm_shared[gi + s];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (lane == 0 && row < q8gm_pc.out_dim) {
+            q8gm_output[b * q8gm_pc.out_dim + row] = q8gm_shared[gi];
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
 }

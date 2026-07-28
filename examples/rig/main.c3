@@ -31,8 +31,10 @@ import std::io::file;
 import std::io::file::mmap;
 import std::core::mem;
 import std::math::vector;
+import std::os::env;
+import std::time::clock;
 
-const String DEFAULT_MODEL = "/Users/tonis/Documents/ai_models/grpo_1400.gguf";
+const String DEFAULT_MODEL = "/home/tonis/Documents/AI/models/grpo_1400.gguf";
 const uint SEED_ATTEMPTS = 8;
 
 fn skintokens::RigClass? parse_class(String text)
@@ -90,6 +92,10 @@ fn int main(String[] args)
         }
     }
 
+    bool profile = false;
+    if (try String flag = env::tget_var("RIG_PROFILE")) profile = flag == "1";
+    Clock phase_clock = clock::now();
+
     llm::DeviceContext ctx = llm::createContext()!!;
     defer ctx.free();
 
@@ -108,6 +114,7 @@ fn int main(String[] args)
     defer encoder.free();
     llm_text::LlmModel model = llm_text::load_llm_model(&ctx, &gf, &config, &names)!!;
     defer model.free();
+    if (profile) io::printfn("  [profile] context + weights in %.2fs", phase_clock.to_now().to_sec());
 
     skintokens::TriMesh geometry = skintokens::load_gltf(mem, input)!!;
     defer geometry.free(mem);
@@ -115,16 +122,23 @@ fn int main(String[] args)
 
     // The encoder is the slow half and does not depend on the seed, so it runs
     // once and every attempt re-decodes from the same prefix.
+    phase_clock = clock::now();
     skintokens::PrepareOptions prepare = skintokens::DEFAULT_PREPARE;
     skintokens::ShapeEncoderInput shape = skintokens::prepare_shape_input(mem, geometry, prepare)!!;
     defer shape.free(mem);
     float[] prefix = encoder.encode(mem, &shape)!!;
     defer mem::free(prefix);
+    if (profile) io::printfn("  [profile] mesh encode in %.2fs", phase_clock.to_now().to_sec());
 
     skintokens::RigOptions options = skintokens::DEFAULT_RIG;
     options.prepare = prepare;
     options.rig_class = rig_class;
     options.predict_skin = false;
+
+    // The prefix goes through the model once; every attempt — and the skin
+    // pass at the end — decodes against the same KV cache.
+    skintokens::RigPrefill rig_prefill = skintokens::prepare_rig_prefill(&ctx, &model, prefix, options)!!;
+    defer rig_prefill.free();
 
     // Sample several seeds and keep the cleanest. The model wanders when a
     // sequence runs long -- the reference does the same -- so the first
@@ -143,12 +157,22 @@ fn int main(String[] args)
     float best_bare = 1.0f;
     ulong best_seed = seed;
 
+    // All the attempts decode together — a lockstep step costs what a single
+    // sequence's step does — and the selection walks them in seed order, so
+    // the winner is the one the sequential loop would have kept.
+    ulong[SEED_ATTEMPTS] seeds;
+    for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++) seeds[attempt] = seed + attempt;
+    skintokens::RigResult[SEED_ATTEMPTS] candidates;
+    bool[SEED_ATTEMPTS] ok;
+    skintokens::decode_rig_attempts(mem, &ctx, &model, &rig_prefill, shape.normalization, options,
+        seeds[..], candidates[..], ok[..])!!;
+
     for (uint attempt = 0; attempt < SEED_ATTEMPTS; attempt++)
     {
-        options.seed = seed + attempt;
-        if (try candidate = skintokens::generate_rig_from_prefix(
-            mem, &ctx, &model, prefix, shape.normalization, options))
+        options.seed = seeds[attempt];
+        if (ok[attempt])
         {
+            skintokens::RigResult candidate = candidates[attempt];
             float off = candidate.off_mesh_fraction(box);
             float bare = candidate.uncovered_fraction(geometry);
             float score = off + bare;
@@ -169,7 +193,6 @@ fn int main(String[] args)
             {
                 candidate.free(mem);
             }
-            if (best_score == 0.0f) break;
         }
         else
         {
@@ -223,8 +246,8 @@ fn int main(String[] args)
         options.seed = best_seed;
         options.predict_skin = true;
 
-        if (try full = skintokens::generate_rig_from_prefix(
-            mem, &ctx, &model, prefix, shape.normalization, options))
+        if (try full = skintokens::decode_rig_attempt(
+            mem, &ctx, &model, &rig_prefill, shape.normalization, options))
         {
             if (full.has_skin() && full.skeleton.len() == rig.skeleton.len())
             {

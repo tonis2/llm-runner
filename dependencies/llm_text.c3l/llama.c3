@@ -6,6 +6,7 @@ import std::io;
 import std::math;
 import std::core::mem;
 
+
 const MAX_SEQ_LEN = 2048;
 
 // Embedded SPIR-V shader (single module with all entry points)
@@ -59,6 +60,10 @@ struct LlmActivations {
     llm::Tensor ffn_down_out;
     llm::Tensor logits;
     llm::Tensor attn_scores;
+    // Flash-decode partials: per (head, chunk) an unnormalised weighted-V sum
+    // and its chunk's softmax max + expsum.
+    llm::Tensor attn_partial;
+    llm::Tensor attn_meta;
 }
 
 struct KVCache {
@@ -71,6 +76,16 @@ struct LlmKernels {
     llm::ComputeKernel embedding;
     llm::ComputeKernel rope;
     llm::ComputeKernel attention;
+    // Fused decode path (forward_layer_fused)
+    llm::ComputeKernel silu_mul;
+    llm::ComputeKernel residual_rmsnorm;
+    llm::ComputeKernel head_norm_rope;
+    llm::ComputeKernel attention_split;
+    llm::ComputeKernel attention_combine;
+    llm::ComputeKernel matmul_q8_gemv;
+    llm::ComputeKernel embedding_batch;
+    llm::ComputeKernel kv_cache_store_multi;
+    llm::ComputeKernel matmul_q8_gemv_multi;
     // Batched prefill path (encode_text_multilayer)
     llm::ComputeKernel rmsnorm_batch;
     llm::ComputeKernel head_rmsnorm_batch;
@@ -108,8 +123,21 @@ struct AttentionPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_le
 // Batched prefill push constants (must match llm.slang prefill kernels)
 struct RMSNormBatchPC { uint dim; float eps; uint n_rows; }
 struct HeadRMSNormBatchPC { uint head_dim; uint n_heads; uint n_rows; float eps; }
+struct SiluMulPC { uint n; }
+struct ResidualRMSNormPC { uint dim; float eps; uint n_rows; }
+struct HeadNormRopePC { uint head_dim; uint n_heads; uint n_rows; float eps; uint position; float theta; uint pos_stride; }
+// The shader-side `uint4 tokens[4]` sits on a 16-byte boundary (std430), so
+// the two pads are load-bearing.
+struct EmbeddingBatchPC { uint dim; uint n_rows; uint pad0; uint pad1; uint[16] tokens; }
+struct KVStoreMultiPC { uint n_rows; uint kv_dim; uint head_dim; uint max_seq_len; uint position; }
+struct MatMulMultiPC { uint out_dim; uint in_dim; uint n_rows; }
+struct AttentionSplitPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint seq_len; float scale; uint max_seq_len; uint n_chunks; }
+struct AttentionCombinePC { uint head_dim; uint n_q_heads; uint n_chunks; }
+
+// Positions per attention_split workgroup; mirrors ATTN_CHUNK in llm.slang.
+const uint ATTN_SPLIT_CHUNK = 256;
 struct RoPEBatchPC { uint dim; uint n_heads; uint n_tokens; float theta; }
-struct KVStorePC { uint n_tokens; uint kv_dim; uint head_dim; uint max_seq_len; }
+struct KVStorePC { uint n_tokens; uint kv_dim; uint head_dim; uint max_seq_len; uint pos_offset; }
 struct AttentionPrefillPC { uint head_dim; uint n_kv_heads; uint n_q_heads; uint n_tokens; float scale; uint max_seq_len; }
 struct BatchMatMulPC { uint out_dim; uint in_dim; uint seq_len; uint row_offset; }
 
@@ -344,6 +372,10 @@ fn LlmActivations? allocate_llm_activations(llm::DeviceContext* ctx, llm::ModelC
         .ffn_down_out = llm::create_f32_tensor(ctx, dim_shape, 1)!!,
         .logits = logits,
         .attn_scores = llm::create_f32_tensor(ctx, scores_shape, 1)!!,
+        .attn_partial = llm::create_f32_tensor(ctx,
+            { n_heads * llm::ceil_div(max_seq_len, ATTN_SPLIT_CHUNK) * config.head_dim, 0, 0, 0 }, 1)!!,
+        .attn_meta = llm::create_f32_tensor(ctx,
+            { n_heads * llm::ceil_div(max_seq_len, ATTN_SPLIT_CHUNK) * 2, 0, 0, 0 }, 1)!!,
     };
 }
 
@@ -377,6 +409,15 @@ fn LlmKernels? create_llm_kernels(llm::DeviceContext* ctx) {
         .embedding    = llm::create_kernel(ctx, shader, 2, EmbeddingPC::size, "embedding")!!,
         .rope         = llm::create_kernel(ctx, shader, 1, RoPEPC::size, "rope")!!,
         .attention    = llm::create_kernel(ctx, shader, 5, AttentionPC::size, "attention")!!,
+        .silu_mul         = llm::create_kernel(ctx, shader, 2, SiluMulPC::size, "silu_mul")!!,
+        .residual_rmsnorm = llm::create_kernel(ctx, shader, 4, ResidualRMSNormPC::size, "residual_rmsnorm")!!,
+        .head_norm_rope   = llm::create_kernel(ctx, shader, 2, HeadNormRopePC::size, "head_norm_rope")!!,
+        .attention_split  = llm::create_kernel(ctx, shader, 5, AttentionSplitPC::size, "attention_split")!!,
+        .attention_combine = llm::create_kernel(ctx, shader, 3, AttentionCombinePC::size, "attention_combine")!!,
+        .matmul_q8_gemv   = llm::create_kernel(ctx, shader, 3, llm::MatMulPC::size, "matmul_q8_gemv")!!,
+        .embedding_batch  = llm::create_kernel(ctx, shader, 2, EmbeddingBatchPC::size, "embedding_batch")!!,
+        .kv_cache_store_multi = llm::create_kernel(ctx, shader, 4, KVStoreMultiPC::size, "kv_cache_store_multi")!!,
+        .matmul_q8_gemv_multi = llm::create_kernel(ctx, shader, 3, MatMulMultiPC::size, "matmul_q8_gemv_multi")!!,
         .rmsnorm_batch      = llm::create_kernel(ctx, shader, 3, RMSNormBatchPC::size, "rmsnorm_batch")!!,
         .head_rmsnorm_batch = llm::create_kernel(ctx, shader, 2, HeadRMSNormBatchPC::size, "head_rmsnorm_batch")!!,
         .rope_batch         = llm::create_kernel(ctx, shader, 1, RoPEBatchPC::size, "rope_batch")!!,
@@ -453,9 +494,11 @@ fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, ui
     // Q output = n_heads * head_dim (may differ from dim, e.g. Qwen3: dim=2560 but Q=32*128=4096)
     uint q_dim = c.n_heads * c.head_dim;
     uint kv_dim = c.n_kv_heads * c.head_dim;
+    // All three read the same norm and write elsewhere, so they need one
+    // barrier between them and the norm, not three between each other.
     llm::dispatch_matmul(g, sk, &lw.wq, &a.norm_out, &a.q, q_dim, c.dim);
-    llm::dispatch_matmul(g, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim);
-    llm::dispatch_matmul(g, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim);
+    llm::dispatch_matmul(g, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim, independent: true);
+    llm::dispatch_matmul(g, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim, independent: true);
 
     // Q/K/V bias addition (e.g. Qwen2.5-VL)
     if (lw.wq_bias.size_bytes > 0) {
@@ -467,63 +510,42 @@ fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, ui
         g.dispatch(&sk.residual_add, { &a.v, &lw.wv_bias }, &v_bias_pc, llm::ceil_div(kv_dim, 256));
     }
 
-    // Q/K norm (per-head RMSNorm, e.g. Qwen3)
+    // Q/K norm (per-head RMSNorm, e.g. Qwen3). The same in-place kernel the
+    // prefill path uses, with one row: a head is a row whether the batch is
+    // 512 positions or the single token being decoded. The staged version
+    // this replaces cost 3 commands and 3 full pipeline barriers per head —
+    // (n_heads + n_kv_heads) * 3 per layer, on 128-element norms, which on a
+    // 0.6B model is most of the decode's command stream.
     if (lw.wq_norm.size_bytes > 0) {
-        for (uint h = 0; h < c.n_heads; h++) {
-            usz h_off = (usz)h * c.head_dim * 4;
-            // Per-head copy reads from a non-zero offset, so call cmdCopyBuffer directly.
-            if (g.needs_barrier) llm::compute_barrier(g.cmd);
-            vk::cmdCopyBuffer(g.cmd, a.q.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
-            g.needs_barrier = true;
-            llm::RMSNormPC qn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
-            g.dispatch(&sk.rmsnorm,
-                { &a.norm_out, &lw.wq_norm, &a.ffn_down_out },
-                &qn_pc, 1);
-            if (g.needs_barrier) llm::compute_barrier(g.cmd);
-            vk::cmdCopyBuffer(g.cmd, a.ffn_down_out.gpu_buffer.buffer, a.q.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
-            g.needs_barrier = true;
-        }
-        for (uint h = 0; h < c.n_kv_heads; h++) {
-            usz h_off = (usz)h * c.head_dim * 4;
-            if (g.needs_barrier) llm::compute_barrier(g.cmd);
-            vk::cmdCopyBuffer(g.cmd, a.k.gpu_buffer.buffer, a.norm_out.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = h_off, .dstOffset = 0, .size = (ulong)c.head_dim * 4 }});
-            g.needs_barrier = true;
-            llm::RMSNormPC kn_pc = { .dim = c.head_dim, .eps = c.rms_eps };
-            g.dispatch(&sk.rmsnorm,
-                { &a.norm_out, &lw.wk_norm, &a.ffn_down_out },
-                &kn_pc, 1);
-            if (g.needs_barrier) llm::compute_barrier(g.cmd);
-            vk::cmdCopyBuffer(g.cmd, a.ffn_down_out.gpu_buffer.buffer, a.k.gpu_buffer.buffer, 1,
-                (BufferCopy[]){{ .srcOffset = 0, .dstOffset = h_off, .size = (ulong)c.head_dim * 4 }});
-            g.needs_barrier = true;
-        }
+        HeadRMSNormBatchPC qn_pc = { .head_dim = c.head_dim, .n_heads = c.n_heads, .n_rows = 1, .eps = c.rms_eps };
+        g.dispatch(&k.head_rmsnorm_batch, { &a.q, &lw.wq_norm }, &qn_pc, llm::ceil_div(c.n_heads, 256));
+        HeadRMSNormBatchPC kn_pc = { .head_dim = c.head_dim, .n_heads = c.n_kv_heads, .n_rows = 1, .eps = c.rms_eps };
+        g.dispatch(&k.head_rmsnorm_batch, { &a.k, &lw.wk_norm }, &kn_pc, llm::ceil_div(c.n_kv_heads, 256), independent: true);
     }
 
-    // RoPE on Q and K (independent — no inter-dispatch barrier required)
+    // RoPE on Q and K — one touches Q, the other K, so the barrier belongs in
+    // front of the pair rather than between them.
     RoPEPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .position = position, .theta = c.rope_theta };
     g.dispatch(&k.rope, { &a.q }, &rope_q_pc,
         llm::ceil_div(c.n_heads * (c.head_dim / 2), 128));
 
     RoPEPC rope_k_pc = { .dim = c.head_dim, .n_heads = c.n_kv_heads, .position = position, .theta = c.rope_theta };
     g.dispatch(&k.rope, { &a.k }, &rope_k_pc,
-        llm::ceil_div(c.n_kv_heads * (c.head_dim / 2), 128));
+        llm::ceil_div(c.n_kv_heads * (c.head_dim / 2), 128), independent: true);
 
-    // Copy K, V into KV cache at position
-    if (g.needs_barrier) llm::compute_barrier(g.cmd);
-    usz kv_head_bytes = (usz)c.head_dim * 4;
-    for (uint h = 0; h < c.n_kv_heads; h++) {
-        usz src_offset = h * kv_head_bytes;
-        usz dst_offset = (usz)h * self.max_seq_len * kv_head_bytes + (usz)position * kv_head_bytes;
-
-        vk::cmdCopyBuffer(g.cmd, a.k.gpu_buffer.buffer, kv.k_cache[layer].gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = kv_head_bytes }});
-        vk::cmdCopyBuffer(g.cmd, a.v.gpu_buffer.buffer, kv.v_cache[layer].gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = src_offset, .dstOffset = dst_offset, .size = kv_head_bytes }});
-    }
-    g.needs_barrier = true;
+    // Scatter K, V into the cache at `position` — the prefill's kernel with a
+    // one-row batch, so the 2 * n_kv_heads little region copies this used to
+    // record become a single dispatch.
+    KVStorePC kvs_pc = {
+        .n_tokens = 1,
+        .kv_dim = kv_dim,
+        .head_dim = c.head_dim,
+        .max_seq_len = self.max_seq_len,
+        .pos_offset = position,
+    };
+    g.dispatch(&k.kv_cache_store,
+        { &a.k, &a.v, &kv.k_cache[layer], &kv.v_cache[layer] },
+        &kvs_pc, llm::ceil_div(kv_dim, 256));
 
     // Attention
     uint seq_len = position + 1;
@@ -560,7 +582,7 @@ fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, ui
     // FFN
     if (c.ffn_type == SWIGLU) {
         llm::dispatch_matmul(g, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
-        llm::dispatch_matmul(g, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim);
+        llm::dispatch_matmul(g, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim, independent: true);
 
         llm::SiluPC silu_pc = { .n = c.ffn_dim };
         g.dispatch(&sk.silu, { &a.ffn_gate_out }, &silu_pc, llm::ceil_div(c.ffn_dim, 256));
@@ -581,6 +603,367 @@ fn void? LlmModel.forward_layer(&self, llm::RenderGraph* g, LayerWeights* lw, ui
 
     // Residual add: hidden += ffn_down_out
     g.dispatch(&sk.residual_add, { &a.hidden, &a.ffn_down_out }, &res_pc, llm::ceil_div(c.dim, 256));
+}
+
+// Decode GEMV router: Q8_0 goes to the eight-rows-per-workgroup kernel, other
+// dtypes to the shared one-row-per-workgroup matmuls. Decode path only — the
+// prefill's tiled batch kernels are a different regime.
+fn void dispatch_gemv(
+    llm::RenderGraph* g,
+    LlmKernels* k,
+    llm::SharedKernels* sk,
+    llm::Tensor* weight,
+    llm::Tensor* input,
+    llm::Tensor* output,
+    uint out_dim,
+    uint in_dim,
+    bool independent = false
+) @local {
+    if (weight.dtype == llm::GGML_Q8_0) {
+        llm::MatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim };
+        g.dispatch(&k.matmul_q8_gemv, { weight, input, output }, &pc,
+            llm::ceil_div(out_dim, 8), independent: independent);
+        return;
+    }
+    llm::dispatch_matmul(g, sk, weight, input, output, out_dim, in_dim, independent: independent);
+}
+
+<*
+ One decode layer with the elementwise chains fused.
+
+ The decode loop is bound on dispatch and barrier overhead — the model's whole
+ weight traffic would take about a tenth of what a token actually costs — so
+ the win here is structural, not arithmetic: 19 dispatches and 13 barriers per
+ layer become 14 and 9. The layer expects `norm_out` to already hold the
+ attn-normed hidden (the previous layer's fused tail leaves it there; forward()
+ seeds it for layer 0), and its own tail norms `hidden` with `next_norm` —
+ the next layer's attn norm, or the model's output norm after the last layer.
+
+ Requires RMSNorm + SwiGLU without QKV bias, same gate as the prefill path;
+ forward() checks and falls back to forward_layer otherwise.
+*>
+fn void? LlmModel.forward_layer_fused(&self, llm::RenderGraph* g, LayerWeights* lw, uint layer, uint position, llm::Tensor* next_norm) {
+    llm::ModelConfig* c = &self.config;
+    LlmActivations* a = &self.acts;
+    KVCache* kv = &self.kv;
+    LlmKernels* k = &self.kernels;
+    llm::SharedKernels* sk = &k.shared;
+    uint q_dim = c.n_heads * c.head_dim;
+    uint kv_dim = c.n_kv_heads * c.head_dim;
+
+    // Q/K/V off the pre-normed input; siblings, one barrier for the group.
+    dispatch_gemv(g, k, sk, &lw.wq, &a.norm_out, &a.q, q_dim, c.dim);
+    dispatch_gemv(g, k, sk, &lw.wk, &a.norm_out, &a.k, kv_dim, c.dim, independent: true);
+    dispatch_gemv(g, k, sk, &lw.wv, &a.norm_out, &a.v, kv_dim, c.dim, independent: true);
+
+    if (lw.wq_norm.size_bytes > 0) {
+        // Per-head norm and rotation in one pass per tensor.
+        HeadNormRopePC qh = { .head_dim = c.head_dim, .n_heads = c.n_heads, .n_rows = 1,
+            .eps = c.rms_eps, .position = position, .theta = c.rope_theta, .pos_stride = 0 };
+        g.dispatch(&k.head_norm_rope, { &a.q, &lw.wq_norm }, &qh, llm::ceil_div(c.n_heads, 256));
+        HeadNormRopePC kh = { .head_dim = c.head_dim, .n_heads = c.n_kv_heads, .n_rows = 1,
+            .eps = c.rms_eps, .position = position, .theta = c.rope_theta, .pos_stride = 0 };
+        g.dispatch(&k.head_norm_rope, { &a.k, &lw.wk_norm }, &kh, llm::ceil_div(c.n_kv_heads, 256), independent: true);
+    } else {
+        RoPEPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .position = position, .theta = c.rope_theta };
+        g.dispatch(&k.rope, { &a.q }, &rope_q_pc, llm::ceil_div(c.n_heads * (c.head_dim / 2), 128));
+        RoPEPC rope_k_pc = { .dim = c.head_dim, .n_heads = c.n_kv_heads, .position = position, .theta = c.rope_theta };
+        g.dispatch(&k.rope, { &a.k }, &rope_k_pc, llm::ceil_div(c.n_kv_heads * (c.head_dim / 2), 128), independent: true);
+    }
+
+    KVStorePC kvs_pc = {
+        .n_tokens = 1,
+        .kv_dim = kv_dim,
+        .head_dim = c.head_dim,
+        .max_seq_len = self.max_seq_len,
+        .pos_offset = position,
+    };
+    g.dispatch(&k.kv_cache_store,
+        { &a.k, &a.v, &kv.k_cache[layer], &kv.v_cache[layer] },
+        &kvs_pc, llm::ceil_div(kv_dim, 256));
+
+    // Flash-decode: (head, chunk) workgroups over the sequence, then a fold.
+    // Not the sequential kernel forward_layer uses — with one query there is
+    // nothing else to parallelise over, and the sequence is the long axis.
+    uint n_chunks = llm::ceil_div(position + 1, ATTN_SPLIT_CHUNK);
+    AttentionSplitPC as_pc = {
+        .head_dim = c.head_dim,
+        .n_kv_heads = c.n_kv_heads,
+        .n_q_heads = c.n_heads,
+        .seq_len = position + 1,
+        .scale = 1.0f / std::math::sqrt((float)c.head_dim),
+        .max_seq_len = self.max_seq_len,
+        .n_chunks = n_chunks,
+    };
+    g.dispatch(&k.attention_split,
+        { &a.q, &kv.k_cache[layer], &kv.v_cache[layer], &a.attn_partial, &a.attn_meta },
+        &as_pc, c.n_heads, n_chunks);
+    AttentionCombinePC ac_pc = { .head_dim = c.head_dim, .n_q_heads = c.n_heads, .n_chunks = n_chunks };
+    g.dispatch(&k.attention_combine,
+        { &a.attn_partial, &a.attn_meta, &a.attn_out },
+        &ac_pc, c.n_heads);
+
+    dispatch_gemv(g, k, sk, &lw.wo, &a.attn_out, &a.norm_out, c.dim, q_dim);
+
+    // hidden += attn projection, then norm for the FFN — one dispatch. The
+    // delta and the output are the same buffer; the kernel is written for it.
+    ResidualRMSNormPC rr_pc = { .dim = c.dim, .eps = c.rms_eps, .n_rows = 1 };
+    g.dispatch(&k.residual_rmsnorm, { &a.hidden, &a.norm_out, &lw.ffn_norm, &a.norm_out }, &rr_pc, 1);
+
+    dispatch_gemv(g, k, sk, &lw.ffn_gate, &a.norm_out, &a.ffn_gate_out, c.ffn_dim, c.dim);
+    dispatch_gemv(g, k, sk, &lw.ffn_up, &a.norm_out, &a.ffn_up_out, c.ffn_dim, c.dim, independent: true);
+
+    SiluMulPC sm_pc = { .n = c.ffn_dim };
+    g.dispatch(&k.silu_mul, { &a.ffn_gate_out, &a.ffn_up_out }, &sm_pc, llm::ceil_div(c.ffn_dim, 256));
+
+    dispatch_gemv(g, k, sk, &lw.ffn_down, &a.ffn_gate_out, &a.ffn_down_out, c.dim, c.ffn_dim);
+
+    // hidden += FFN, then the next layer's attn norm (or the output norm).
+    g.dispatch(&k.residual_rmsnorm, { &a.hidden, &a.ffn_down_out, next_norm, &a.norm_out }, &rr_pc, 1);
+}
+
+// --- Batched lockstep decode ---
+//
+// A decode step is a chain of small dispatches whose wall clock is close to
+// the dispatch count times ~10 us, not the work inside them: an empty submit
+// is ~0.1 ms, the full step ~5 ms across ~450 dispatches. Independent
+// sequences at the same position can therefore share the chain — but only if
+// they share the dispatches too: recording the stages once per stream was
+// measured at ~7 us per extra dispatch, five times slower per step than one
+// stream. So the streams live batch-major in one set of [n, ...] tensors and
+// every stage is a single dispatch. This is what a seed search is: one
+// prefix decoded under different rngs, in lockstep.
+
+struct BatchDecode {
+    uint n;
+    llm::Tensor hidden;         // [n, dim]
+    llm::Tensor norm_out;
+    llm::Tensor q;              // [n, q_dim]
+    llm::Tensor k;              // [n, kv_dim]
+    llm::Tensor v;
+    llm::Tensor attn_out;       // [n, q_dim]
+    llm::Tensor ffn_gate_out;   // [n, ffn_dim]
+    llm::Tensor ffn_up_out;
+    llm::Tensor ffn_down_out;   // [n, dim]
+    llm::Tensor logits;         // [n, vocab]
+    llm::Tensor attn_partial;   // [n, heads, chunks, head_dim]
+    llm::Tensor attn_meta;      // [n, heads, chunks, 2]
+    llm::Tensor[] k_cache;      // per layer: [n, kv_heads, max_seq, head_dim]
+    llm::Tensor[] v_cache;
+}
+
+const uint MAX_BATCH_DECODE = 16;   // embedding_batch carries the ids in push constants
+
+fn BatchDecode? LlmModel.create_batch_decode(&self, uint n) {
+    llm::ModelConfig* c = &self.config;
+    llm::DeviceContext* ctx = self.ctx;
+    if (n == 0 || n > MAX_BATCH_DECODE) return llm::COMPUTE_ERROR~;
+    if (self.encode_only || c.norm_type != RMSNORM || c.ffn_type != SWIGLU
+        || c.n_layers == 0 || self.weights.layers[0].wq_bias.size_bytes > 0) return llm::COMPUTE_ERROR~;
+
+    ulong nn = n;
+    ulong q_dim = (ulong)c.n_heads * c.head_dim;
+    ulong kv_dim = (ulong)c.n_kv_heads * c.head_dim;
+    ulong chunks = llm::ceil_div(self.max_seq_len, ATTN_SPLIT_CHUNK);
+
+    BatchDecode bd = { .n = n };
+    bd.hidden = llm::create_f32_tensor(ctx, { nn * c.dim, 0, 0, 0 }, 1)!;
+    bd.norm_out = llm::create_f32_tensor(ctx, { nn * c.dim, 0, 0, 0 }, 1)!;
+    bd.q = llm::create_f32_tensor(ctx, { nn * q_dim, 0, 0, 0 }, 1)!;
+    bd.k = llm::create_f32_tensor(ctx, { nn * kv_dim, 0, 0, 0 }, 1)!;
+    bd.v = llm::create_f32_tensor(ctx, { nn * kv_dim, 0, 0, 0 }, 1)!;
+    bd.attn_out = llm::create_f32_tensor(ctx, { nn * q_dim, 0, 0, 0 }, 1)!;
+    bd.ffn_gate_out = llm::create_f32_tensor(ctx, { nn * c.ffn_dim, 0, 0, 0 }, 1)!;
+    bd.ffn_up_out = llm::create_f32_tensor(ctx, { nn * c.ffn_dim, 0, 0, 0 }, 1)!;
+    bd.ffn_down_out = llm::create_f32_tensor(ctx, { nn * c.dim, 0, 0, 0 }, 1)!;
+    bd.logits = llm::create_f32_tensor(ctx, { nn * c.vocab_size, 0, 0, 0 }, 1)!;
+    bd.attn_partial = llm::create_f32_tensor(ctx, { nn * c.n_heads * chunks * c.head_dim, 0, 0, 0 }, 1)!;
+    bd.attn_meta = llm::create_f32_tensor(ctx, { nn * c.n_heads * chunks * 2, 0, 0, 0 }, 1)!;
+
+    bd.k_cache = mem::new_array(llm::Tensor, c.n_layers);
+    bd.v_cache = mem::new_array(llm::Tensor, c.n_layers);
+    ulong slab = nn * kv_dim * self.max_seq_len;
+    for (uint l = 0; l < c.n_layers; l++) {
+        bd.k_cache[l] = llm::create_f32_tensor(ctx, { slab, 0, 0, 0 }, 1)!;
+        bd.v_cache[l] = llm::create_f32_tensor(ctx, { slab, 0, 0, 0 }, 1)!;
+    }
+    return bd;
+}
+
+fn void BatchDecode.free(&self) {
+    self.hidden.free();
+    self.norm_out.free();
+    self.q.free();
+    self.k.free();
+    self.v.free();
+    self.attn_out.free();
+    self.ffn_gate_out.free();
+    self.ffn_up_out.free();
+    self.ffn_down_out.free();
+    self.logits.free();
+    self.attn_partial.free();
+    self.attn_meta.free();
+    foreach (&tensor : self.k_cache) tensor.free();
+    foreach (&tensor : self.v_cache) tensor.free();
+    if (self.k_cache.len > 0) mem::free(self.k_cache);
+    if (self.v_cache.len > 0) mem::free(self.v_cache);
+    *self = {};
+}
+
+// Batched decode GEMV: the fp32 eight-rows-per-workgroup kernel with gid.y
+// as the stream, so each row's arithmetic — and therefore each stream's
+// tokens — is exactly the single-stream kernel's. The tiled batch_matmul
+// path is wrong twice over here: its fp16 LDS tiles drift against the
+// sequential decode, and its 64-row tiles do eight times the work for an
+// eight-row batch.
+fn void? dispatch_gemv_batch(
+    llm::RenderGraph* g,
+    LlmKernels* k,
+    llm::Tensor* weight,
+    llm::Tensor* input,
+    llm::Tensor* output,
+    uint out_dim,
+    uint in_dim,
+    uint n_rows,
+    bool independent = false
+) @local {
+    if (weight.dtype != llm::GGML_Q8_0) return llm::COMPUTE_ERROR~;
+    MatMulMultiPC pc = { .out_dim = out_dim, .in_dim = in_dim, .n_rows = n_rows };
+    g.dispatch(&k.matmul_q8_gemv_multi, { weight, input, output }, &pc,
+        llm::ceil_div(out_dim, 8), independent: independent);
+}
+
+<*
+ Seed every stream's cache slab with positions [0, n_prefix) of the model's
+ own KV cache — the state a prefill just left there.
+*>
+fn void? LlmModel.batch_load_prefix(&self, BatchDecode* bd, uint n_prefix) {
+    llm::ModelConfig* c = &self.config;
+    uint heads = c.n_kv_heads;
+    if (heads > 32) return llm::COMPUTE_ERROR~;
+
+    ulong head_stride = (ulong)self.max_seq_len * c.head_dim * 4;
+    ulong length = (ulong)n_prefix * c.head_dim * 4;
+
+    self.ctx.device.@single_time_command(self.ctx.compute_queue; CommandBuffer cmd) {
+        for (uint l = 0; l < c.n_layers; l++) {
+            for (uint row = 0; row < bd.n; row++) {
+                BufferCopy[32] regions;
+                for (uint h = 0; h < heads; h++) {
+                    regions[h] = {
+                        .srcOffset = (ulong)h * head_stride,
+                        .dstOffset = ((ulong)row * heads + h) * head_stride,
+                        .size = length,
+                    };
+                }
+                vk::cmdCopyBuffer(cmd, self.kv.k_cache[l].gpu_buffer.buffer,
+                    bd.k_cache[l].gpu_buffer.buffer, heads, regions[:heads]);
+                vk::cmdCopyBuffer(cmd, self.kv.v_cache[l].gpu_buffer.buffer,
+                    bd.v_cache[l].gpu_buffer.buffer, heads, regions[:heads]);
+            }
+        }
+    }!!;
+}
+
+<*
+ One lockstep decode step for the whole batch: every stage is a single
+ dispatch over [n, ...] tensors. The step's logits land in `logits_staging`
+ — stream s at byte offset s * vocab_size * 4 — inside the same submission,
+ ready to sample from when this returns.
+*>
+fn void? LlmModel.forward_batch(&self, BatchDecode* bd, uint[] tokens, uint position, vk::Memory* logits_staging) {
+    llm::ModelConfig* c = &self.config;
+    LlmWeights* w = &self.weights;
+    LlmKernels* k = &self.kernels;
+    llm::SharedKernels* sk = &k.shared;
+    uint n = bd.n;
+    uint q_dim = c.n_heads * c.head_dim;
+    uint kv_dim = c.n_kv_heads * c.head_dim;
+
+    llm::RenderGraph g;
+    g.init(self.ctx)!!;
+
+    EmbeddingBatchPC emb_pc = { .dim = c.dim, .n_rows = n };
+    foreach (usz s, token : tokens) emb_pc.tokens[s] = token;
+    g.dispatch(&k.embedding_batch, { &w.token_embedding, &bd.hidden }, &emb_pc,
+        llm::ceil_div(n * c.dim, 256));
+
+    RMSNormBatchPC first_rms = { .dim = c.dim, .eps = c.rms_eps, .n_rows = n };
+    g.dispatch(&k.rmsnorm_batch, { &bd.hidden, &w.layers[0].attn_norm, &bd.norm_out }, &first_rms, n);
+
+    ResidualRMSNormPC rr_pc = { .dim = c.dim, .eps = c.rms_eps, .n_rows = n };
+    uint n_chunks = llm::ceil_div(position + 1, ATTN_SPLIT_CHUNK);
+
+    for (uint l = 0; l < c.n_layers; l++) {
+        LayerWeights* lw = &w.layers[l];
+        llm::Tensor* next_norm = l + 1 < c.n_layers ? &w.layers[l + 1].attn_norm : &w.output_norm;
+
+        dispatch_gemv_batch(&g, k, &lw.wq, &bd.norm_out, &bd.q, q_dim, c.dim, n)!;
+        dispatch_gemv_batch(&g, k, &lw.wk, &bd.norm_out, &bd.k, kv_dim, c.dim, n, independent: true)!;
+        dispatch_gemv_batch(&g, k, &lw.wv, &bd.norm_out, &bd.v, kv_dim, c.dim, n, independent: true)!;
+
+        if (lw.wq_norm.size_bytes > 0) {
+            HeadNormRopePC qh = { .head_dim = c.head_dim, .n_heads = c.n_heads, .n_rows = n,
+                .eps = c.rms_eps, .position = position, .theta = c.rope_theta, .pos_stride = 0 };
+            g.dispatch(&k.head_norm_rope, { &bd.q, &lw.wq_norm }, &qh,
+                llm::ceil_div(n * c.n_heads, 256));
+            HeadNormRopePC kh = { .head_dim = c.head_dim, .n_heads = c.n_kv_heads, .n_rows = n,
+                .eps = c.rms_eps, .position = position, .theta = c.rope_theta, .pos_stride = 0 };
+            g.dispatch(&k.head_norm_rope, { &bd.k, &lw.wk_norm }, &kh,
+                llm::ceil_div(n * c.n_kv_heads, 256), independent: true);
+        } else {
+            return llm::COMPUTE_ERROR~;   // no arch without Q/K norm reaches this path today
+        }
+
+        KVStoreMultiPC kvm_pc = { .n_rows = n, .kv_dim = kv_dim, .head_dim = c.head_dim,
+            .max_seq_len = self.max_seq_len, .position = position };
+        g.dispatch(&k.kv_cache_store_multi,
+            { &bd.k, &bd.v, &bd.k_cache[l], &bd.v_cache[l] },
+            &kvm_pc, llm::ceil_div(n * kv_dim, 256));
+
+        AttentionSplitPC as_pc = {
+            .head_dim = c.head_dim,
+            .n_kv_heads = c.n_kv_heads,
+            .n_q_heads = c.n_heads,
+            .seq_len = position + 1,
+            .scale = 1.0f / std::math::sqrt((float)c.head_dim),
+            .max_seq_len = self.max_seq_len,
+            .n_chunks = n_chunks,
+        };
+        g.dispatch(&k.attention_split,
+            { &bd.q, &bd.k_cache[l], &bd.v_cache[l], &bd.attn_partial, &bd.attn_meta },
+            &as_pc, c.n_heads, n_chunks, n);
+        AttentionCombinePC ac_pc = { .head_dim = c.head_dim, .n_q_heads = c.n_heads, .n_chunks = n_chunks };
+        g.dispatch(&k.attention_combine,
+            { &bd.attn_partial, &bd.attn_meta, &bd.attn_out },
+            &ac_pc, c.n_heads, n);
+
+        dispatch_gemv_batch(&g, k, &lw.wo, &bd.attn_out, &bd.norm_out, c.dim, q_dim, n)!;
+
+        g.dispatch(&k.residual_rmsnorm,
+            { &bd.hidden, &bd.norm_out, &lw.ffn_norm, &bd.norm_out }, &rr_pc, n);
+
+        dispatch_gemv_batch(&g, k, &lw.ffn_gate, &bd.norm_out, &bd.ffn_gate_out, c.ffn_dim, c.dim, n)!;
+        dispatch_gemv_batch(&g, k, &lw.ffn_up, &bd.norm_out, &bd.ffn_up_out, c.ffn_dim, c.dim, n, independent: true)!;
+        SiluMulPC sm_pc = { .n = n * c.ffn_dim };
+        g.dispatch(&k.silu_mul, { &bd.ffn_gate_out, &bd.ffn_up_out }, &sm_pc,
+            llm::ceil_div(n * c.ffn_dim, 256));
+        dispatch_gemv_batch(&g, k, &lw.ffn_down, &bd.ffn_gate_out, &bd.ffn_down_out, c.dim, c.ffn_dim, n)!;
+
+        g.dispatch(&k.residual_rmsnorm,
+            { &bd.hidden, &bd.ffn_down_out, next_norm, &bd.norm_out }, &rr_pc, n);
+    }
+
+    dispatch_gemv_batch(&g, k, &w.output, &bd.norm_out, &bd.logits, c.vocab_size, c.dim, n)!;
+
+    // The logits ride home in the same submission.
+    ulong logits_bytes = (ulong)c.vocab_size * 4;
+    if (g.needs_barrier) llm::compute_barrier(g.cmd);
+    vk::cmdCopyBuffer(g.cmd, bd.logits.gpu_buffer.buffer, logits_staging.buffer, 1,
+        (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = (ulong)n * logits_bytes }});
+    g.needs_barrier = true;
+
+    g.flush()!!;
 }
 
 // --- Batched prefill path ---
@@ -645,7 +1028,8 @@ fn void dispatch_matmul_batch(
     llm::Tensor* output,
     uint out_dim,
     uint in_dim,
-    uint n_tokens
+    uint n_tokens,
+    bool independent = false
 ) {
     BatchMatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim, .seq_len = n_tokens, .row_offset = 0 };
     llm::ComputeKernel* kernel;
@@ -666,13 +1050,13 @@ fn void dispatch_matmul_batch(
         kernel = &k.batch_matmul_q4_0;
     } else {
         // F32/F16-as-F32 weights: 2D dispatch (seq_len, out_dim)
-        g.dispatch(&k.batch_matmul_simple, { weight, input, output }, &pc, n_tokens, out_dim);
+        g.dispatch(&k.batch_matmul_simple, { weight, input, output }, &pc, n_tokens, out_dim, independent: independent);
         return;
     }
     uint groups = tiled_2d
         ? llm::ceil_div(n_tokens, 64) * llm::ceil_div(out_dim, 64)
         : n_tokens * out_dim;
-    g.dispatch(kernel, { weight, input, output }, &pc, groups);
+    g.dispatch(kernel, { weight, input, output }, &pc, groups, independent: independent);
 }
 
 // Batched layer forward over `hidden` [n_tokens, dim]. Requires RMSNorm +
@@ -691,8 +1075,8 @@ fn void? LlmModel.forward_layer_prefill(&self, llm::RenderGraph* g, LayerWeights
 
     // Q/K/V projections (batched GEMM)
     dispatch_matmul_batch(g, k, &lw.wq, &pa.norm_out, &pa.q, q_dim, c.dim, n_tokens);
-    dispatch_matmul_batch(g, k, &lw.wk, &pa.norm_out, &pa.k, kv_dim, c.dim, n_tokens);
-    dispatch_matmul_batch(g, k, &lw.wv, &pa.norm_out, &pa.v, kv_dim, c.dim, n_tokens);
+    dispatch_matmul_batch(g, k, &lw.wk, &pa.norm_out, &pa.k, kv_dim, c.dim, n_tokens, independent: true);
+    dispatch_matmul_batch(g, k, &lw.wv, &pa.norm_out, &pa.v, kv_dim, c.dim, n_tokens, independent: true);
 
     // Q/K per-head RMSNorm (e.g. Qwen3) — two dispatches instead of
     // 3 commands x heads per position
@@ -700,14 +1084,14 @@ fn void? LlmModel.forward_layer_prefill(&self, llm::RenderGraph* g, LayerWeights
         HeadRMSNormBatchPC qn_pc = { .head_dim = c.head_dim, .n_heads = c.n_heads, .n_rows = n_tokens, .eps = c.rms_eps };
         g.dispatch(&k.head_rmsnorm_batch, { &pa.q, &lw.wq_norm }, &qn_pc, llm::ceil_div(n_tokens * c.n_heads, 256));
         HeadRMSNormBatchPC kn_pc = { .head_dim = c.head_dim, .n_heads = c.n_kv_heads, .n_rows = n_tokens, .eps = c.rms_eps };
-        g.dispatch(&k.head_rmsnorm_batch, { &pa.k, &lw.wk_norm }, &kn_pc, llm::ceil_div(n_tokens * c.n_kv_heads, 256));
+        g.dispatch(&k.head_rmsnorm_batch, { &pa.k, &lw.wk_norm }, &kn_pc, llm::ceil_div(n_tokens * c.n_kv_heads, 256), independent: true);
     }
 
     // RoPE (position = row index)
     RoPEBatchPC rope_q_pc = { .dim = c.head_dim, .n_heads = c.n_heads, .n_tokens = n_tokens, .theta = c.rope_theta };
     g.dispatch(&k.rope_batch, { &pa.q }, &rope_q_pc, llm::ceil_div(n_tokens * c.n_heads * (c.head_dim / 2), 128));
     RoPEBatchPC rope_k_pc = { .dim = c.head_dim, .n_heads = c.n_kv_heads, .n_tokens = n_tokens, .theta = c.rope_theta };
-    g.dispatch(&k.rope_batch, { &pa.k }, &rope_k_pc, llm::ceil_div(n_tokens * c.n_kv_heads * (c.head_dim / 2), 128));
+    g.dispatch(&k.rope_batch, { &pa.k }, &rope_k_pc, llm::ceil_div(n_tokens * c.n_kv_heads * (c.head_dim / 2), 128), independent: true);
 
     // KV cache fill (one dispatch instead of 2 copies x kv_heads x positions)
     KVStorePC kvs_pc = { .n_tokens = n_tokens, .kv_dim = kv_dim, .head_dim = c.head_dim, .max_seq_len = self.max_seq_len };
@@ -738,7 +1122,7 @@ fn void? LlmModel.forward_layer_prefill(&self, llm::RenderGraph* g, LayerWeights
 
     // FFN (SwiGLU)
     dispatch_matmul_batch(g, k, &lw.ffn_gate, &pa.norm_out, &pa.ffn_gate_out, c.ffn_dim, c.dim, n_tokens);
-    dispatch_matmul_batch(g, k, &lw.ffn_up, &pa.norm_out, &pa.ffn_up_out, c.ffn_dim, c.dim, n_tokens);
+    dispatch_matmul_batch(g, k, &lw.ffn_up, &pa.norm_out, &pa.ffn_up_out, c.ffn_dim, c.dim, n_tokens, independent: true);
     llm::SiluPC silu_pc = { .n = n_tokens * c.ffn_dim };
     g.dispatch(&sk.silu, { &pa.ffn_gate_out }, &silu_pc, llm::ceil_div(n_tokens * c.ffn_dim, 256));
     llm::ElemwisePC emul_pc = { .n = n_tokens * c.ffn_dim };
@@ -886,25 +1270,41 @@ fn void? LlmModel.forward(&self, uint token, uint position) {
             llm::ceil_div(c.dim, 256));
     }
 
-    // 2. For each transformer layer
-    for (uint l = 0; l < c.n_layers; l++) {
-        self.forward_layer(&g, &w.layers[l], l, position)!!;
-    }
+    // 2. The transformer stack. The fused path carries the arch gate of the
+    // batched prefill: RMSNorm + SwiGLU, no QKV bias. Its layers chain through
+    // norm_out — each one's tail norms the hidden for the next — so the first
+    // norm is seeded here and the last layer's tail is already the final norm.
+    bool fused = !self.encode_only
+        && c.norm_type == RMSNORM && c.ffn_type == SWIGLU
+        && c.n_layers > 0 && w.layers[0].wq_bias.size_bytes == 0;
 
-    // 3. Final norm
-    if (c.norm_type == RMSNORM) {
-        llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
-        g.dispatch(&sk.rmsnorm, { &a.hidden, &w.output_norm, &a.norm_out }, &final_rms, 1);
+    if (fused) {
+        llm::RMSNormPC first_rms = { .dim = c.dim, .eps = c.rms_eps };
+        g.dispatch(&sk.rmsnorm, { &a.hidden, &w.layers[0].attn_norm, &a.norm_out }, &first_rms, 1);
+        for (uint l = 0; l < c.n_layers; l++) {
+            llm::Tensor* next_norm = l + 1 < c.n_layers ? &w.layers[l + 1].attn_norm : &w.output_norm;
+            self.forward_layer_fused(&g, &w.layers[l], l, position, next_norm)!!;
+        }
     } else {
-        llm::LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
-        g.dispatch(&sk.layernorm,
-            { &a.hidden, &w.output_norm, &w.output_norm_bias, &a.norm_out },
-            &final_ln, 1);
+        for (uint l = 0; l < c.n_layers; l++) {
+            self.forward_layer(&g, &w.layers[l], l, position)!!;
+        }
+
+        // 3. Final norm
+        if (c.norm_type == RMSNORM) {
+            llm::RMSNormPC final_rms = { .dim = c.dim, .eps = c.rms_eps };
+            g.dispatch(&sk.rmsnorm, { &a.hidden, &w.output_norm, &a.norm_out }, &final_rms, 1);
+        } else {
+            llm::LayerNormPC final_ln = { .dim = c.dim, .eps = c.rms_eps };
+            g.dispatch(&sk.layernorm,
+                { &a.hidden, &w.output_norm, &w.output_norm_bias, &a.norm_out },
+                &final_ln, 1);
+        }
     }
 
     // 4. Output projection -> logits (skip in encode_only mode)
     if (!self.encode_only) {
-        llm::dispatch_matmul(&g, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
+        dispatch_gemv(&g, k, sk, &w.output, &a.norm_out, &a.logits, c.vocab_size, c.dim);
     }
 
     // 5. Submit and wait
@@ -1110,6 +1510,15 @@ fn void LlmModel.free(&self) {
     self.kernels.embedding.free(self.ctx.device);
     self.kernels.rope.free(self.ctx.device);
     self.kernels.attention.free(self.ctx.device);
+    self.kernels.silu_mul.free(self.ctx.device);
+    self.kernels.residual_rmsnorm.free(self.ctx.device);
+    self.kernels.head_norm_rope.free(self.ctx.device);
+    self.kernels.attention_split.free(self.ctx.device);
+    self.kernels.attention_combine.free(self.ctx.device);
+    self.kernels.matmul_q8_gemv.free(self.ctx.device);
+    self.kernels.embedding_batch.free(self.ctx.device);
+    self.kernels.kv_cache_store_multi.free(self.ctx.device);
+    self.kernels.matmul_q8_gemv_multi.free(self.ctx.device);
     self.kernels.rmsnorm_batch.free(self.ctx.device);
     self.kernels.head_rmsnorm_batch.free(self.ctx.device);
     self.kernels.rope_batch.free(self.ctx.device);
@@ -1141,6 +1550,8 @@ fn void LlmModel.free(&self) {
     self.acts.ffn_down_out.free();
     if (!self.encode_only) self.acts.logits.free();
     self.acts.attn_scores.free();
+    self.acts.attn_partial.free();
+    self.acts.attn_meta.free();
 
     // Free KV cache
     for (uint l = 0; l < self.config.n_layers; l++) {

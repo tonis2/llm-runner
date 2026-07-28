@@ -38,6 +38,8 @@ import std::core::mem;
 import std::core::mem::allocator;
 import std::math::vector;
 import std::math::random;
+import std::os::env;
+import std::time::clock;
 
 faultdef RIG_PREFIX_TOO_LONG, RIG_DECODE_STALLED, RIG_CONTEXT_EXHAUSTED, RIG_NO_SKIN;
 
@@ -284,17 +286,40 @@ fn RigResult? generate_rig(
 }
 
 <*
- The generation half on its own, for a prefix that is already encoded.
+ The prefill half of a generation, run once and decoded from many times.
 
- Split out because the encoder is the slow part and worth reusing across
- sampling attempts on the same mesh.
+ What makes the reuse sound: a decode writes the KV cache only at positions
+ past the prefix, so however many attempts have run, the prefix rows still
+ hold exactly what the prefill left in them. The one prefill product an
+ attempt does destroy is the logits — the first token of every attempt is
+ sampled from them, and the attempt's own forwards then write over them — so
+ they are snapshotted here and put back at the top of each decode.
+
+ The class token is part of the prefix, so the class is fixed at prepare time;
+ `decode_rig_attempt` takes its tokens from here, not from its options.
 *>
-fn RigResult? generate_rig_from_prefix(
-    alloc::Allocator allocator,
+struct RigPrefill {
+    llm::Tensor saved_logits;
+    uint n_tokens;
+    uint[2] start_tokens;
+}
+
+fn void RigPrefill.free(&self) {
+    self.saved_logits.free();
+    *self = {};
+}
+
+<*
+ Feed the encoded prefix and the start tokens through the model once.
+
+ @return? ENCODER_SHAPE_MISMATCH : `The prefix is not a whole number of rows.`
+ @return? RIG_PREFIX_TOO_LONG : `The prefix does not fit the prefill path.`
+ @return? RIG_CONTEXT_EXHAUSTED : `The prefix alone fills the model's KV cache.`
+*>
+fn RigPrefill? prepare_rig_prefill(
     llm::DeviceContext* ctx,
     llm_text::LlmModel* model,
     float[] prefix,
-    Normalization normalization,
     RigOptions options = DEFAULT_RIG)
 {
     uint dim = model.config.dim;
@@ -307,9 +332,9 @@ fn RigResult? generate_rig_from_prefix(
     uint[2] start_tokens = { TOKEN_BOS, options.rig_class.token() };
     usz n_tokens = latents + start_tokens.len;
     if (!model.prefill_supported((uint)n_tokens)) return RIG_PREFIX_TOO_LONG~;
-    uint budget = decode_budget(model, n_tokens, options.max_new_tokens);
-    if (budget == 0) return RIG_CONTEXT_EXHAUSTED~;
+    if (decode_budget(model, n_tokens, options.max_new_tokens) == 0) return RIG_CONTEXT_EXHAUSTED~;
 
+    Clock prefill_clock = clock::now();
     llm::Tensor hidden = llm::create_f32_tensor(ctx, { (ulong)(n_tokens * dim), 0, 0, 0 }, 1)!;
     defer hidden.free();
 
@@ -332,6 +357,50 @@ fn RigResult? generate_rig_from_prefix(
     gather.flush()!;
 
     model.prefill_embeddings(&hidden, (uint)n_tokens)!;
+
+    ulong logits_bytes = (ulong)model.config.vocab_size * 4;
+    llm::Tensor saved = llm::create_f32_tensor(ctx, { (ulong)model.config.vocab_size, 0, 0, 0 }, 1)!;
+    defer catch saved.free();
+    llm::RenderGraph snap;
+    snap.init(ctx)!;
+    snap.copy(&model.acts.logits, &saved, logits_bytes);
+    snap.flush()!;
+
+    if (try String flag = env::tget_var("RIG_PROFILE")) {
+        if (flag == "1") io::printfn("  [profile] prefill %d tokens in %.2fs",
+            n_tokens, prefill_clock.to_now().to_sec());
+    }
+
+    return { .saved_logits = saved, .n_tokens = (uint)n_tokens, .start_tokens = start_tokens };
+}
+
+<*
+ One sampling attempt against a prefix someone already prefilled.
+
+ Only the seed, the sampler, and `predict_skin` are read from `options`; the
+ tokens ahead of the generation belong to the prefill.
+
+ @return? RIG_DECODE_STALLED : `Generation hit max_new_tokens without terminating.`
+ @return? RIG_CONTEXT_EXHAUSTED : `The prefix alone fills the model's KV cache.`
+*>
+fn RigResult? decode_rig_attempt(
+    alloc::Allocator allocator,
+    llm::DeviceContext* ctx,
+    llm_text::LlmModel* model,
+    RigPrefill* prefill,
+    Normalization normalization,
+    RigOptions options = DEFAULT_RIG)
+{
+    uint[2] start_tokens = prefill.start_tokens;
+    usz n_tokens = prefill.n_tokens;
+    uint budget = decode_budget(model, n_tokens, options.max_new_tokens);
+    if (budget == 0) return RIG_CONTEXT_EXHAUSTED~;
+
+    // Put the prefill's logits back; the previous attempt decoded over them.
+    llm::RenderGraph restore;
+    restore.init(ctx)!;
+    restore.copy(&prefill.saved_logits, &model.acts.logits, (ulong)model.config.vocab_size * 4);
+    restore.flush()!;
 
     // Decode. The prefix already produced logits for the position after the
     // last start token, so the first pick comes before any forward() call.
@@ -362,14 +431,28 @@ fn RigResult? generate_rig_from_prefix(
     bool terminated = false;
     usz skeleton_end = 0;
 
+    // RIG_PROFILE=1 splits the decode wall clock into the two things it is
+    // made of: the forward pass and the sampler. They are optimised
+    // separately and the ratio is what says which one to touch.
+    bool profile = false;
+    if (try String flag = env::tget_var("RIG_PROFILE")) profile = flag == "1";
+    double forward_s = 0.0;
+    double sample_s = 0.0;
+    double grammar_s = 0.0;
+    Clock decode_clock = clock::now();
+
     for (uint step = 0; step < budget; step++) {
         // The penalty looks only at what has been generated, not at the start
         // tokens: bos is meant to appear once and penalising it changes nothing.
         uint[] history = tokens[start_tokens.len:produced - start_tokens.len];
+        Clock op_clock = clock::now();
         grammar.allow_next(allowed);
+        if (profile) grammar_s += op_clock.to_now().to_sec();
 
+        if (profile) op_clock = clock::now();
         uint next = llm::sample_token(
             ctx, &model.acts.logits, model.config.vocab_size, &sampling, &rng, history, allowed)!;
+        if (profile) sample_s += op_clock.to_now().to_sec();
         grammar.accept(next);
         tokens[produced] = next;
         produced++;
@@ -383,7 +466,20 @@ fn RigResult? generate_rig_from_prefix(
 
         // Positions continue straight on from the prefix: the KV cache the
         // prefill filled and the one forward() appends to are the same.
+        if (profile) op_clock = clock::now();
         model.forward(next, (uint)(n_tokens + (usz)step))!;
+        if (profile) forward_s += op_clock.to_now().to_sec();
+    }
+
+    if (profile) {
+        double total = decode_clock.to_now().to_sec();
+        io::printfn(
+            "  [profile] %d tokens in %.2fs (%.1f tok/s): forward %.2fs (%.1f ms/tok), sample %.2fs (%.1f ms/tok), grammar %.2fs",
+            produced - start_tokens.len, total,
+            (double)(produced - start_tokens.len) / total,
+            forward_s, forward_s * 1000.0 / (double)(produced - start_tokens.len),
+            sample_s, sample_s * 1000.0 / (double)(produced - start_tokens.len),
+            grammar_s);
     }
 
     // No explicit free here: the `defer catch` above already runs on an error
@@ -393,7 +489,7 @@ fn RigResult? generate_rig_from_prefix(
     RigResult result = {
         .normalization = normalization,
         .tokens = tokens[:produced],
-        .prefix_tokens = latents,
+        .prefix_tokens = n_tokens - start_tokens.len,
     };
     // A skin block counts only when the grammar saw it through to the model's
     // own terminator. Running out of budget partway leaves the skeleton intact
@@ -404,6 +500,206 @@ fn RigResult? generate_rig_from_prefix(
     }
     result.skeleton = detokenize_skeleton(allocator, result.tokens)!;
     return result;
+}
+
+<*
+ One decode attempt per seed, all in lockstep.
+
+ A decode step's cost is its dispatch chain, not the work riding on it, so
+ eight seeds decoded together cost about what one does. Every sequence starts
+ from the same prefill, at the same position, and stays position-aligned for
+ its whole life; a sequence whose grammar finishes simply drops out of the
+ later steps. Per-sequence sampling, grammar state, and rng are untouched —
+ each seed's token stream is the one the sequential loop would have produced.
+
+ @param results : `One slot per seed, filled where the matching ok flag is set.`
+ @param ok : `Whether that seed terminated in a complete skeleton.`
+*>
+fn void? decode_rig_attempts(
+    alloc::Allocator allocator,
+    llm::DeviceContext* ctx,
+    llm_text::LlmModel* model,
+    RigPrefill* prefill,
+    Normalization normalization,
+    RigOptions options,
+    ulong[] seeds,
+    RigResult[] results,
+    bool[] ok)
+{
+    usz n = seeds.len;
+    uint[2] start_tokens = prefill.start_tokens;
+    usz n_tokens = prefill.n_tokens;
+    uint budget = decode_budget(model, n_tokens, options.max_new_tokens);
+    if (budget == 0) return RIG_CONTEXT_EXHAUSTED~;
+    uint vocab = model.config.vocab_size;
+    ulong logits_bytes = (ulong)vocab * 4;
+
+    bool profile = false;
+    if (try String flag = env::tget_var("RIG_PROFILE")) profile = flag == "1";
+    Clock decode_clock = clock::now();
+
+    // One batch, one row per seed, every row opening on the prefix's
+    // attention state.
+    llm_text::BatchDecode batch = model.create_batch_decode((uint)n)!;
+    defer batch.free();
+    model.batch_load_prefix(&batch, (uint)n_tokens)!;
+
+    // Slotted staging the sampler reads from: forward_multi lands stream s's
+    // logits at slot s. Step zero reads the prefill's logits instead — shared
+    // by every sequence, and safe to share because the penalty has no history
+    // to rewrite yet.
+    vk::Memory staging = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null,
+        data_size: (sz)(logits_bytes * n),
+    )!;
+    defer staging.free();
+    vk::Memory prefill_staging = vk::new_buffer(
+        allocator: &ctx.allocator,
+        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
+        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        data: null,
+        data_size: (sz)logits_bytes,
+    )!;
+    defer prefill_staging.free();
+    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
+        vk::cmdCopyBuffer(cmd, prefill.saved_logits.gpu_buffer.buffer, prefill_staging.buffer, 1,
+            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = logits_bytes }});
+    }!!;
+
+    // Per-sequence decode state, exactly the single attempt's, arrayed.
+    usz capacity = start_tokens.len + (usz)budget;
+    uint[][] seq_tokens = alloc::new_array(allocator, uint[], (sz)n);
+    RigGrammar[] grammars = alloc::new_array(allocator, RigGrammar, (sz)n);
+    random::Sfc64Random[] rngs = alloc::new_array(allocator, random::Sfc64Random, (sz)n);
+    usz[] produced = alloc::new_array(allocator, usz, (sz)n);
+    usz[] skeleton_end = alloc::new_array(allocator, usz, (sz)n);
+    bool[] terminated = alloc::new_array(allocator, bool, (sz)n);
+    bool[] done = alloc::new_array(allocator, bool, (sz)n);
+    uint[] step_tokens = alloc::new_array(allocator, uint, (sz)n);
+    bool[] allowed = alloc::new_array(allocator, bool, (sz)vocab);
+    defer {
+        alloc::free(allocator, grammars);
+        alloc::free(allocator, rngs);
+        alloc::free(allocator, produced);
+        alloc::free(allocator, skeleton_end);
+        alloc::free(allocator, terminated);
+        alloc::free(allocator, done);
+        alloc::free(allocator, step_tokens);
+        alloc::free(allocator, allowed);
+        alloc::free(allocator, seq_tokens);
+    }
+    defer catch {
+        for (usz i = 0; i < n; i++) {
+            if (seq_tokens[i].len > 0) alloc::free(allocator, seq_tokens[i]);
+        }
+    }
+
+    for (usz i = 0; i < n; i++) {
+        seq_tokens[i] = alloc::new_array(allocator, uint, (sz)capacity);
+        grammars[i] = { .tokens_per_skin = options.predict_skin ? TOKENS_PER_SKIN : 0 };
+        random::seed(&rngs[i], seeds[i]);
+        foreach (token : start_tokens) {
+            grammars[i].accept(token);
+            seq_tokens[i][produced[i]] = token;
+            produced[i]++;
+        }
+    }
+
+    llm::SamplingParams sampling = options.sampling;
+    usz steps = 0;
+
+    for (uint step = 0; step < budget; step++) {
+        // Sample each running sequence from its slot; a finished one keeps
+        // repeating its last token, which its row decodes into results nobody
+        // reads — with the stages batched, a shorter batch would not make the
+        // step any cheaper.
+        usz n_running = 0;
+        for (usz i = 0; i < n; i++) {
+            if (done[i]) {
+                step_tokens[i] = seq_tokens[i][produced[i] - 1];
+                continue;
+            }
+            uint[] history = seq_tokens[i][start_tokens.len:produced[i] - start_tokens.len];
+            grammars[i].allow_next(allowed);
+            float* data = step == 0
+                ? (float*)prefill_staging.data()
+                : (float*)staging.data() + i * (usz)vocab;
+            uint next = llm::sample_token_data(data, vocab, &sampling, &rngs[i], history, allowed)!;
+            grammars[i].accept(next);
+            seq_tokens[i][produced[i]] = next;
+            produced[i]++;
+            step_tokens[i] = next;
+
+            if (next == TOKEN_EOS && !terminated[i]) {
+                terminated[i] = true;
+                skeleton_end[i] = produced[i] - 1;
+            }
+            if (grammars[i].finished() || produced[i] == capacity) {
+                done[i] = true;
+                continue;
+            }
+            n_running++;
+        }
+        if (n_running == 0) break;
+
+        model.forward_batch(&batch, step_tokens, (uint)(n_tokens + (usz)step), &staging)!;
+        steps++;
+    }
+
+    if (profile) {
+        io::printfn("  [profile] %d seeds in %d lockstep steps, %.2fs",
+            n, steps, decode_clock.to_now().to_sec());
+    }
+
+    for (usz i = 0; i < n; i++) {
+        ok[i] = false;
+        if (terminated[i]) {
+            RigResult result = {
+                .normalization = normalization,
+                .tokens = seq_tokens[i][:produced[i]],
+                .prefix_tokens = n_tokens - start_tokens.len,
+            };
+            if (grammars[i].finished() && grammars[i].skin_emitted > 0 && grammars[i].skin_remaining() == 0) {
+                result.skin_start = skeleton_end[i] + 1;
+                result.skin_count = (usz)grammars[i].skin_emitted;
+            }
+            if (try skeleton = detokenize_skeleton(allocator, result.tokens)) {
+                result.skeleton = skeleton;
+                results[i] = result;
+                ok[i] = true;
+            }
+        }
+        // A stalled or unparseable sequence keeps nothing.
+        if (!ok[i] && seq_tokens[i].len > 0) {
+            alloc::free(allocator, seq_tokens[i]);
+            seq_tokens[i] = {};
+        }
+    }
+}
+
+<*
+ The generation half on its own, for a prefix that is already encoded.
+
+ Prefill and one decode, bundled. A caller that decodes the same prefix more
+ than once — a seed search, or a skin pass re-decoding the winner — should
+ hold a `RigPrefill` and call `decode_rig_attempt` instead: the prefill is
+ 514 tokens through every layer and the decode does not disturb it, so paying
+ for it per attempt buys nothing.
+*>
+fn RigResult? generate_rig_from_prefix(
+    alloc::Allocator allocator,
+    llm::DeviceContext* ctx,
+    llm_text::LlmModel* model,
+    float[] prefix,
+    Normalization normalization,
+    RigOptions options = DEFAULT_RIG)
+{
+    RigPrefill prefill = prepare_rig_prefill(ctx, model, prefix, options)!;
+    defer prefill.free();
+    return decode_rig_attempt(allocator, ctx, model, &prefill, normalization, options);
 }
 
 

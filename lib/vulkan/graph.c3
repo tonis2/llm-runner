@@ -37,6 +37,13 @@ fn void? RenderGraph.init(&self, DeviceContext* ctx) {
 // Append a single compute dispatch. Inserts a compute_barrier first if any
 // prior op has been recorded in the current frame, then builds the
 // buffer/size arrays from the tensor pointers and forwards to dispatch_kernel.
+//
+// `independent` says this dispatch reads nothing the ops recorded since the
+// last barrier wrote, so the barrier before it can be dropped and the two run
+// concurrently. Q/K/V off one norm, the two RoPEs, gate and up off one input —
+// siblings, not a chain. The caller is asserting the aliasing, so it is opt-in
+// per dispatch rather than inferred: getting it wrong reads a stale buffer and
+// shows up as a wrong answer, not a validation error.
 fn void RenderGraph.dispatch(
     &self,
     ComputeKernel* kernel,
@@ -45,8 +52,9 @@ fn void RenderGraph.dispatch(
     uint groups_x,
     uint groups_y = 1,
     uint groups_z = 1,
+    bool independent = false,
 ) {
-    if (self.needs_barrier) compute_barrier(self.cmd);
+    if (self.needs_barrier && !independent) compute_barrier(self.cmd);
 
     vk::Buffer[MAX_BINDINGS] buffers;
     usz[MAX_BINDINGS] sizes;

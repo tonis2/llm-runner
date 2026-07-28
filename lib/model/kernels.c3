@@ -75,7 +75,8 @@ fn void dispatch_matmul(
     Tensor* input,
     Tensor* output,
     uint out_dim,
-    uint in_dim
+    uint in_dim,
+    bool independent = false
 ) {
     MatMulPC pc = { .out_dim = out_dim, .in_dim = in_dim };
     ComputeKernel* kernel;
@@ -92,5 +93,5 @@ fn void dispatch_matmul(
     } else {
         kernel = &k.matmul;
     }
-    g.dispatch(kernel, { weight, input, output }, &pc, out_dim);
+    g.dispatch(kernel, { weight, input, output }, &pc, out_dim, independent: independent);
 }
