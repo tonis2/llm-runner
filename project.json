@@ -1,11 +1,18 @@
 {
   "langrev": "1",
   "warnings": [ "no-unused" ],
-  "dependency-search-paths": [ "dependencies" ],
-  "dependencies": ["vk", "image", "llm_text", "zimage", "qwen_edit", "flux", "depth_anything", "gltf", "skintokens"],
+  "dependency-search-paths": ["lib/three.c3l/lib", "dependencies"],
+  "dependencies": ["vk", "image", "llm_text", "zimage", "qwen_edit", "flux", "depth_anything", "gltf", "skintokens", "shady", "quickjs", "mcp", "c3w", "collision", "ktx", "font", "cui"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
-  "sources": [ "lib/**"],
+  "sources": [
+    "lib/configs/**",
+    "lib/gguf/**",
+    "lib/model/**",
+    "lib/pipelines/**",
+    "lib/shaders/**",
+    "lib/vulkan/**"
+  ],
   "test-sources": [ "test/**" ],
   "build-dir": "build",
   "script-dir": "./",
@@ -44,6 +51,20 @@
     "rig": {
 			"type": "executable",
       "sources": ["examples/rig/**"]
+		},
+    "compute": {
+			"type": "executable",
+      "sources": ["examples/compute/**",
+				"lib/three.c3l/src/app/**",
+				"lib/three.c3l/src/gpu/**",
+				"lib/three.c3l/src/js/**",
+				"lib/three.c3l/src/mcp/**",
+				"lib/three.c3l/src/render/**",
+				"lib/three.c3l/src/scene/**",
+				"lib/three.c3l/src/shader/**",
+				"lib/three.c3l/src/advice.c3",
+				"lib/three.c3l/src/paths.c3",
+				"lib/three.c3l/src/reload.c3"]
 		}
   },
   "cpu": "generic",
