@@ -571,6 +571,25 @@ const FluxLoraScheme[*] FLUX_LORA_SCHEMES = {
         .single_v       = "attn.to_v",
         .single_linear2 = "proj_out",
     },
+    // 4. Kohya-ss / sd-scripts ("networks.lora_flux_2"): flat "lora_unet_"
+    //    prefix with every '.' in the original module path replaced by '_',
+    //    so the layer index is delimited by underscores too
+    //    (lora_unet_double_blocks_1_img_mlp_2.lora_down.weight).
+    {
+        .dual_prefix    = "lora_unet_double_blocks_",
+        .single_prefix  = "lora_unet_single_blocks_",
+        .layer_suffix   = "_",
+        .img_qkv        = "img_attn_qkv",
+        .img_proj       = "img_attn_proj",
+        .img_mlp_up     = "img_mlp_0",
+        .img_mlp_down   = "img_mlp_2",
+        .txt_qkv        = "txt_attn_qkv",
+        .txt_proj       = "txt_attn_proj",
+        .txt_mlp_up     = "txt_mlp_0",
+        .txt_mlp_down   = "txt_mlp_2",
+        .single_linear1 = "linear1",
+        .single_linear2 = "linear2",
+    },
 };
 
 // Build "{prefix}{layer}{suffix}{module}" using the same buffer scheme as
