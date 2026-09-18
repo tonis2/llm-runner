@@ -2,7 +2,8 @@
   "langrev": "1",
   "warnings": [ "no-unused" ],
   "dependency-search-paths": ["lib/three.c3l/lib", "dependencies"],
-  "dependencies": ["vk", "image", "llm_text", "zimage", "qwen_edit", "flux", "depth_anything", "gltf", "skintokens", "shady", "quickjs", "mcp", "c3w", "collision", "ktx", "font", "cui"],
+  "dependencies": ["llm_text", "zimage", "qwen_edit", "flux", "depth_anything", "skintokens",
+                   "shady", "quickjs", "mcp", "c3w", "collision", "ktx", "font", "cui", "vk", "image", "gltf"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
   "sources": [
