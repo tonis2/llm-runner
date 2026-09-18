@@ -42,31 +42,72 @@ const uint BLOCK_BYTES = 34;
 // reduction matters is the one with a workgroup per row, and that is a
 // different kernel with a different check.
 const String KERNEL = `
-// Probe: a @storage struct instead of a bare array, same read.
-struct In @storage { float data[]; }
-In input;
-uint weights[];
+// Q8_0 weights times an f32 vector: one output element per invocation, the
+// blocks walked as bytes.
+//
+// The layout is the one the pipelines ship - 34 bytes per block of 32 weights,
+// an f16 scale followed by 32 signed bytes - and the scale is read as the two
+// bytes it is rather than widened on the way in, so the load the GPU does is
+// the one the layout asks for.
+uint8 weights[];
+float input[];
+float output[];
 
 struct Push @pushconstant
 {
-    float scale;
+    uint rows;
+    uint cols;
 }
 Push push;
 
 struct ComputeIn { uint3 thread @builtin(global_invocation_id); }
 
-fn uint byte_at(uint at)
+const uint BLOCK_WEIGHTS = 32u;
+const uint BLOCK_BYTES = 34u;
+
+// An f16 read as float, by the exponent arithmetic the host does on the same
+// bits: both sides must interpret the stored scale identically, and the only
+// way to be sure is to spell it out on both.
+fn float scale_at(uint at)
 {
-    return (weights[at / 4u] >> ((at % 4u) * 8u)) & 0xFFu;
+    uint bits = uint(weights[at]) | (uint(weights[at + 1u]) << 8u);
+    uint sign = (bits >> 15u) & 0x1u;
+    uint exponent = (bits >> 10u) & 0x1Fu;
+    uint mantissa = bits & 0x3FFu;
+
+    float value;
+    if (exponent == 0u)
+    {
+        value = float(mantissa) * (1.0 / 16384.0) * (1.0 / 1024.0);
+    }
+    else
+    {
+        value = (1.0 + float(mantissa) / 1024.0) * exp2(float(exponent) - 15.0);
+    }
+    return sign != 0u ? -value : value;
 }
 
-fn void main(ComputeIn input2) @compute @threads(64, 1, 1)
+fn void main(ComputeIn at) @compute @threads(64, 1, 1)
 {
-    uint i = input2.thread.x;
-    if (i >= 64u) return;
-    float v = input.data[i];
-    uint b = byte_at(i);
-    _ = v + float(b);
+    uint index = at.thread.x;
+    uint rows = push.rows;
+    uint cols = push.cols;
+    if (index >= rows * cols) return;
+
+    uint row = index / cols;
+
+    float sum = 0.0;
+    for (uint k = 0; k < cols; k++)
+    {
+        uint flat = row * cols + k;
+        uint at_byte = (flat / BLOCK_WEIGHTS) * BLOCK_BYTES;
+        uint within = flat % BLOCK_WEIGHTS;
+
+        float scale = scale_at(at_byte);
+        float quantized = float(int8(weights[at_byte + 2u + within]));
+        sum += scale * quantized * input[k];
+    }
+    output[index] = sum;
 }
 `;
 
@@ -206,7 +247,7 @@ const output = three.compute.f32(rows * cols);
 const kernel = three.compute.kernel(SHADER_SLOT, { name: 'q8_matvec' });
 kernel.run({ weights, input, output }, {
 	threads: rows * cols,
-	push: { rows: rows | 0, cols: cols | 0 },
+	push: { rows: three.compute.uint(rows), cols: three.compute.uint(cols) },
 });
 output.read();
 weights.read();
@@ -250,7 +291,7 @@ fn String js_string(String text)
 }
 
 // A JSON array of numbers, which is all the script returns.
-fn bool parse_floats(String text, float[] out)
+fn uint parse_floats(String text, float[] out)
 {
 	usz at = 0;
 	uint count = 0;
@@ -261,11 +302,13 @@ fn bool parse_floats(String text, float[] out)
 		usz start = at;
 		while (at < text.len && text[at] != ',' && text[at] != ']') at++;
 		if (at == start) break;
-		scanned = text[start..at - start].to_float();
+		// A length, not an end index: `[start..n]` would run from the start
+		// of the number to `n`, which is a shorter slice every iteration.
+		scanned = text[start:at - start].to_float();
 		if (catch scanned) break;
 		out[count++] = scanned;
 	}
-	return count == out.len;
+	return count;
 }
 
 // The renderer the run uses, out of `main`'s frame: the engine it holds is
@@ -335,11 +378,17 @@ fn int main(String[] args)
 		return 1;
 	}
 
+	// The script's own log first: it is the only view of what the device and
+	// the script saw, and a failure below is easier to read next to it.
+	if (result.log.len > 0) io::printfn("script log:\n%s", result.log);
+
 	float* got = (float*)libc::calloc((usz)n, 4);
 	defer libc::free(got);
-	if (!parse_floats((String)result.value, got[:n]))
+	uint parsed = parse_floats((String)result.value, got[:n]);
+	if (parsed != n)
 	{
-		io::printfn("the answer did not parse: %s", (String)result.value);
+		io::printfn("the answer did not parse: %d of %d values, first 200 characters:\n%s",
+			parsed, n, ((String)result.value)[:200]);
 		return 1;
 	}
 
@@ -363,6 +412,5 @@ fn int main(String[] args)
 	io::printfn(worst < 1e-5
 		? "the shader reads the format the host writes"
 		: "THE SHADER AND THE HOST DISAGREE");
-	if (result.log.len > 0) io::printfn("script log:\n%s", result.log);
 	return worst < 1e-5 ? 0 : 1;
 }
