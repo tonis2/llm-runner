@@ -1,7 +1,7 @@
 {
   "langrev": "1",
   "warnings": [ "no-unused" ],
-  "dependency-search-paths": ["lib/three.c3l/lib", "dependencies"],
+  "dependency-search-paths": ["lib/three.c3l/lib"],
   "dependencies": [
                    "shady", "quickjs", "mcp", "c3w", "collision", "ktx", "font", "cui", "vk", "image", "gltf"],
   "authors": [ "John Doe <john.doe@example.com>" ],
