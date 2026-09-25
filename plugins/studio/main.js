@@ -7,7 +7,8 @@
 // `llm-runner run` takes, so a graph built here runs headless too.
 //
 // Keys: delete removes the selected node, ctrl+d duplicates it, ctrl+s saves,
-// ctrl+r runs, f frames the graph, escape cancels a run.
+// ctrl+r runs, f frames the graph, escape cancels a run. Images dragged in from
+// a file manager become Load image nodes.
 
 import { llm } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
@@ -109,6 +110,10 @@ async function boot() {
 	app.widgets.canvas.frame();
 
 	three.systems.frame('studio.layout', () => chrome.resize(...uiSize()));
+	three.systems.frame('studio.drops', () => {
+		const paths = three.window.takeDrops();
+		if (paths.length) safe(() => app.widgets.canvas.dropFiles(paths))();
+	});
 
 	const ctrl = () => three.input.isDown('ctrl') || three.input.isDown('control');
 	three.onKeyDown('delete', safe(removeSelected));
@@ -128,6 +133,7 @@ async function boot() {
 	if (config.shot) {
 		(async () => {
 			for (let i = 0; i < 3; i++) await three.nextFrame();
+			if (config.drop) app.widgets.canvas.dropFiles(String(config.drop).split(','));
 			if (config.run) await run();
 			if (config.select) app.select(config.select);
 			for (let i = 0; i < 3; i++) await three.nextFrame();

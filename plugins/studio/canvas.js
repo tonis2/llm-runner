@@ -67,6 +67,8 @@ function outPort(n, name, L = layout(n)) {
 	return y === undefined ? null : [n.pos[0] + L.w, n.pos[1] + y];
 }
 
+const IMAGE_FILE = /\.(png|jpe?g)$/i;
+
 export class GraphCanvas extends three.Widget {
 	constructor() {
 		super();
@@ -329,6 +331,7 @@ export class GraphCanvas extends three.Widget {
 	pointer(e) {
 		const p = [e.x, e.y];
 		this.pointerAt = p;
+		this.pointerTime = Date.now();
 		switch (e.phase) {
 			case 'wheel': return this.zoomAt(p, e.wheel);
 			case 'down': return this.press(p, e);
@@ -411,6 +414,37 @@ export class GraphCanvas extends three.Widget {
 			this.hoverPort = port && this.fits(d, port) ? { ...port, key: `${port.node}.${port.input ?? port.output}` } : null;
 			this.version++;
 		}
+	}
+
+	// Files dropped on the window. An image dropped on a Load image node
+	// becomes its path; any other image gets a new Load image node where it
+	// landed, the next one below it. Anything else is named in the status bar.
+	dropFiles(paths) {
+		// A drag moves the pointer over the canvas like a hover does, so a
+		// recent event here says the drop landed on it rather than on a panel.
+		const onCanvas = Date.now() - (this.pointerTime ?? 0) < 500;
+		const target = onCanvas ? this.nodeAt(this.pointerAt) : null;
+		let at = onCanvas ? this.toGraph(this.pointerAt) : this.center();
+		const images = paths.filter((p) => IMAGE_FILE.test(p));
+		const skipped = paths.filter((p) => !IMAGE_FILE.test(p));
+		let added = null;
+		for (const path of images) {
+			if (target?.type === 'core.load_image' && path === images[0]) {
+				app.doc.setParam(target.id, 'path', path);
+				added = target;
+				continue;
+			}
+			added = app.doc.add('core.load_image', at);
+			app.doc.setParam(added.id, 'path', path);
+			at = [at[0], at[1] + nodeBox(added).h + 20];
+		}
+		if (added) {
+			app.select(added.id);
+			app.changed();
+		}
+		const name = (p) => p.slice(p.lastIndexOf('/') + 1);
+		if (skipped.length) app.say(`not an image (png or jpeg): ${skipped.map(name).join(', ')}`, true);
+		else if (images.length) app.say(`dropped ${images.map(name).join(', ')}`);
 	}
 
 	// Whether a wire being dragged may end on `port`.
