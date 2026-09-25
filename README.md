@@ -49,10 +49,10 @@ clear it after changing shady itself.
 
 Nothing extra to do — `c3c build llm-runner` is the whole story.
 
-macOS has no system Vulkan, so `vk` ships its own loader and a Metal driver
-(KosmicKrisp) under `lib/three.c3l/lib/vulkan.c3l/macos-aarch64/`. It locates them
-relative to its own source path, so they are found whether or not a LunarG SDK
-is installed. A system SDK in `/usr/local/lib`, if present, is preferred.
+macOS has no system Vulkan, so on arm64 `vk` uses the Khronos loader and the
+KosmicKrisp Metal driver that `lib/three.c3l/lib/vulkan.c3l` fetches
+(`fetch-dylibs.sh`; see that library's README). A system SDK in
+`/usr/local/lib`, if present, is preferred.
 
 Apple GPUs expose no `VK_KHR_cooperative_matrix`, so the engine falls back to
 the tiled GEMM path automatically.
