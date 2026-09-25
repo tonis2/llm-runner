@@ -93,7 +93,7 @@ export class TextEncoder {
 			op.matmul(w.gate, norm, gate, c.ffnDim, dim, n, 0, true);
 			op.matmul(w.up, norm, up, c.ffnDim, dim, n);
 			op.siluMul(gate, up, n * c.ffnDim);
-			op.matmul(w.down, gate, down, dim, c.ffnDim, n);
+			op.matmul(w.down, gate, down, dim, c.ffnDim, n, 0, false, true); // SwiGLU output: can pass 65504
 			op.add(hidden, down, n * dim);
 
 			const slot = layers.indexOf(l);

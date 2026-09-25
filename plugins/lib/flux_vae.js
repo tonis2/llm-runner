@@ -6,7 +6,7 @@
 // (`decoder.up_blocks.N.resnets.M`) and the original checkpoint's
 // (`decoder.up.N.block.M`, numbered from the output end).
 //
-// Ported from `dependencies/zimage.c3l/flux_vae.c3`.
+// Ported from the C3 Z-Image pipeline (`flux_vae.c3`, since deleted).
 
 import { llm, f32 } from './llm.js';
 import * as op from './ops.js';
@@ -196,25 +196,30 @@ function attentionScratch(spatial) {
 //
 // conv_in -> four down stages of two resnets, the first three ending in a
 // stride-2 conv -> mid (resnet, attention, resnet) -> GroupNorm, SiLU,
-// conv_out. Ported from `flux_vae_encoder.c3`; diffusers naming only, which is
-// the only kind of Flux 2 VAE there is.
+// conv_out. Ported from `flux_vae_encoder.c3`. Both namings are read, as for
+// the decoder; the original checkpoint's stages count from the image end too.
 export class FluxVAEEncoder {
 	constructor(model) {
 		const m = model;
 		const t0 = llm.now();
 		if (!m.has('encoder.conv_in.weight')) throw new Error(`${m.path} has no VAE encoder`);
+		const diffusers = m.has('encoder.mid_block.resnets.0.conv1.weight');
 		this.convIn = conv(m, 'encoder.conv_in.');
 		this.stages = [];
 		for (let s = 0; s < 4; s++) {
-			const blocks = [0, 1].map((i) => resnet(m, `encoder.down_blocks.${s}.resnets.${i}.`));
-			const down = s < 3 ? conv(m, `encoder.down_blocks.${s}.downsamplers.0.conv.`) : null;
+			const blocks = [0, 1].map((i) => resnet(m, diffusers ? `encoder.down_blocks.${s}.resnets.${i}.` : `encoder.down.${s}.block.${i}.`));
+			const down = s < 3 ? conv(m, diffusers ? `encoder.down_blocks.${s}.downsamplers.0.conv.` : `encoder.down.${s}.downsample.conv.`) : null;
 			this.stages.push({ blocks, down });
 		}
-		this.mid1 = resnet(m, 'encoder.mid_block.resnets.0.');
-		this.midAttn = attention(m, 'encoder.mid_block.attentions.0.');
-		this.mid2 = resnet(m, 'encoder.mid_block.resnets.1.');
-		this.normOutW = m.upload('encoder.conv_norm_out.weight', 'f32');
-		this.normOutB = m.upload('encoder.conv_norm_out.bias', 'f32');
+		const mid = diffusers
+			? ['encoder.mid_block.resnets.0.', 'encoder.mid_block.attentions.0.', 'encoder.mid_block.resnets.1.']
+			: ['encoder.mid.block_1.', 'encoder.mid.attn_1.', 'encoder.mid.block_2.'];
+		this.mid1 = resnet(m, mid[0]);
+		this.midAttn = attention(m, mid[1]);
+		this.mid2 = resnet(m, mid[2]);
+		const norm = diffusers ? 'encoder.conv_norm_out.' : 'encoder.norm_out.';
+		this.normOutW = m.upload(`${norm}weight`, 'f32');
+		this.normOutB = m.upload(`${norm}bias`, 'f32');
 		this.convOut = conv(m, 'encoder.conv_out.');
 		llm.print(`  VAE encoder: loaded in ${llm.since(t0)}`);
 	}

@@ -14,40 +14,36 @@ images. A new model is a new plugin directory, with no rebuild.
 ```sh
 c3c build llm-runner
 ./build/llm-runner flux --config flux-t2i.json
-./build/llm-runner flux --config flux-kontext-lora.json
+./build/llm-runner flux --config flux-kontext.json
 ./build/llm-runner flux --config flux-t2i.json keep_dit=true --server --port 7860
 ./build/llm-runner zimage --config zimage-t2i.json
+./build/llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6
 ./build/llm-runner depth model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg
 ```
 
-Ported so far: Flux 2 Klein (txt2img, img2img, kontext, LoRA/LoKr, the
-A1111-style server), Z-Image Turbo, and Depth Anything V2. See
-[plugins/README.md](plugins/README.md) for the plugin API and for how each port
-was checked against the C3 pipeline it replaces.
+Ported: Flux 2 Klein (txt2img, img2img, kontext, LoRA/LoKr, the A1111-style
+server), Z-Image Turbo (txt2img, img2img, LoRA, TAESD), and Depth Anything V2.
+The C3 pipelines they replaced, and their Slang shaders, are gone; SkinTokens
+was dropped. See [plugins/README.md](plugins/README.md) for the plugin API and
+for how each port was checked.
 
-## The C3 pipelines
-
-Targets: `zimage`, `rig`. SkinTokens (`rig`) exists only here so far. The C3
-Z-Image pipeline stays as a reference until the plugin has run with its real text
-encoder (Qwen3-4B). The C3 Flux and Depth Anything pipelines were deleted once
-their plugins matched them, and the old Qwen-Image-Edit experiment (`vit-test`)
-was dropped; Qwen-Image 2.1 is planned as a plugin.
+On a GPU with `VK_KHR_cooperative_matrix` and 64-wide subgroups (RDNA3), the
+Q8_0 matmuls, head-128 attention and the VAE's convolutions run on the matrix
+cores in float16 with float32 accumulation. `matrix_cores=false` keeps
+everything in float32.
 
 ## Building
 
-Requires [c3c](https://github.com/c3lang/c3c) 0.8.2+ and, to rebuild shaders,
-[slangc](https://github.com/shader-slang/slang).
+Requires [c3c](https://github.com/c3lang/c3c) 0.8.2+.
 
 ```sh
-git submodule update --init            # dependencies/vulkan.c3l, dependencies/image.c3l
-c3c build llm-runner                   # or zimage / rig
+git submodule update --init --recursive
+c3c build llm-runner
 ```
 
-Shaders are checked in as `.spv`; recompile them only after editing a `.slang`:
-
-```sh
-c3c build shaders --trust=full
-```
+Kernels are compiled from `plugins/lib/kernels/*.shady` when first used and
+cached in `build/shader-cache`. The cache key is the source, not the compiler, so
+clear it after changing shady itself.
 
 ### macOS
 
@@ -68,8 +64,8 @@ is checked first.
 ## Tests
 
 ```sh
-c3c test --trust=full
+c3c test --trust=full                  # host code; tokenizer_test needs test/data/, not checked in
+./build/llm-runner tests/matmul_coop.js  # matrix-core kernels against the float32 ones
+./build/llm-runner tests/bench_attention.js
+./build/llm-runner tests/conv_coop.js
 ```
-
-`inference_test` and `tokenizer_test` need fixtures under `test/models/` and
-`test/data/`, which are not checked in.

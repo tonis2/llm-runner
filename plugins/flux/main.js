@@ -10,11 +10,13 @@
 import { llm, image } from '../lib/llm.js';
 import { precompile, submit } from '../lib/gpu.js';
 import { eulerStep } from '../lib/ops.js';
+import * as op from '../lib/ops.js';
 import { TextEncoder } from '../lib/qwen3.js';
 import { FluxVAEDecoder } from '../lib/flux_vae.js';
 import { FluxDiT } from './dit.js';
 import { sigmas, noise, decodeLatent, encodeReference } from './latent.js';
 import { mergeLoras } from './lora.js';
+import { loraList } from '../lib/lora.js';
 
 const KERNELS = [
 	'matmul_q8', 'matmul_f32', 'matmul_f32_rows', 'rmsnorm_batch', 'head_rmsnorm_batch', 'rope_batch',
@@ -58,13 +60,6 @@ function encodePrompt(config, prompt) {
 	enc.close();
 	llm.print(`  [phase] text_encode: ${llm.since(t0)}`);
 	return { text, nTxt: padded, textDim: 3 * enc.config.dim };
-}
-
-function loraList(config) {
-	const l = config.lora ?? config.loras;
-	if (!l) return [];
-	const list = Array.isArray(l) ? l : [l];
-	return list.map((e) => (typeof e === 'string' ? { path: e, strength: 1 } : { path: e.path, strength: e.strength ?? 1 }));
 }
 
 async function generate(request) {
@@ -154,8 +149,10 @@ llm.plugin({
 	load(config) {
 		state.config = config;
 		const t0 = llm.now();
-		precompile(KERNELS);
-		llm.print(`flux: ${KERNELS.length} kernels ready in ${llm.since(t0)}`);
+		op.useMatrixCores(config.matrix_cores ?? true);
+		const kernels = op.matrixCoresOn() ? [...KERNELS, 'matmul_q8_coop', 'flash_attention_coop', 'conv2d_coop'] : KERNELS;
+		precompile(kernels);
+		llm.print(`flux: ${kernels.length} kernels ready in ${llm.since(t0)}${op.matrixCoresOn() ? ', matmuls on the matrix cores' : ''}`);
 		if (config.keep_dit) {
 			state.ditModel = llm.open(config.model);
 			state.dit = new FluxDiT(state.ditModel);

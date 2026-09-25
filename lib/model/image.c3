@@ -6,7 +6,6 @@ import std::core::mem;
 import image;
 import image::png;
 import image::jpeg;
-import vk;
 
 
 
@@ -307,78 +306,28 @@ fn float[]? image_to_float_nchw(image::Image* img) {
     return data;
 }
 
-// --- Upload image::Image to GPU ---
-fn Tensor? upload_image_to_gpu(DeviceContext* ctx, image::Image* img) {
-    uint channels;
-    switch (img.format) {
-        case PixelFormat.GRAYSCALE: channels = 1;
-        case PixelFormat.RGB: channels = 3;
-        case PixelFormat.RGBA: channels = 4;
-        default: channels = 3;
-    }
-    
-    usz total = (usz)channels * img.width * img.height;
-    ulong[4] shape = { (ulong)total, 0, 0, 0 };
-
-    vk::Memory gpu_buffer = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: img.pixels.ptr,
-        data_size: (sz)total,  // 1 byte per pixel component
-    )!!;
-
-    return {
-        .gpu_buffer = gpu_buffer,
-        .dtype = GGML_F32,
-        .n_dims = 1,
-        .shape = shape,
-        .size_bytes = total,
-    };
-}
-
-// --- Download float tensor from GPU and create image::Image ---
-// Creates a grayscale image::Image from float data
-fn image::Image? download_tensor_as_image(DeviceContext* ctx, Tensor* tensor, uint width, uint height, uint channels) {
-    usz total = (usz)channels * width * height;
-    float[] data = mem::new_array(float, (sz)total);
-
-    // Create staging buffer
-    vk::Memory staging = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null,
-        data_size: (sz)(total * 4),
-    )!!;
-
-    // Copy from device to staging
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
-        vk::cmdCopyBuffer(cmd, tensor.gpu_buffer.buffer, staging.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = total * 4 }});
-    }!!;
-
-    // Read from staging buffer
-    float* mapped = (float*)staging.data();
-    mem::copy(data.ptr, mapped, (sz)(total * 4));
-    staging.free();
-
-    // Convert float [0,1] to bytes
-    char[] pixels = mem::new_array(char, (sz)total);
-    for (usz i = 0; i < total; i++) {
-        float val = data[i];
-        if (val < 0.0f) val = 0.0f;
-        if (val > 1.0f) val = 1.0f;
-        pixels[i] = (char)(val * 255.0f + 0.5f);
-    }
-    mem::free(data);
-
+// [channels, h, w] floats in [0, 1] to an 8-bit image, clamped and rounded.
+fn image::Image? float_tensor_to_image(float[] data, uint width, uint height, uint channels) {
     PixelFormat format;
     switch (channels) {
         case 1: format = PixelFormat.GRAYSCALE;
         case 3: format = PixelFormat.RGB;
         case 4: format = PixelFormat.RGBA;
-        default: format = PixelFormat.RGB;
+        default: return IMAGE_INVALID_CHANNELS~;
+    }
+
+    char[] pixels = mem::new_array(char, (usz)width * height * channels);
+
+    for (uint y = 0; y < height; y++) {
+        for (uint x = 0; x < width; x++) {
+            uint pixel_idx = y * width + x;
+            for (uint c = 0; c < channels; c++) {
+                float val = data[c * width * height + pixel_idx];
+                if (val < 0.0f) val = 0.0f;
+                if (val > 1.0f) val = 1.0f;
+                pixels[(usz)pixel_idx * channels + c] = (char)(val * 255.0f + 0.5f);
+            }
+        }
     }
 
     return {

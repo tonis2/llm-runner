@@ -10,8 +10,9 @@ llm-runner flux   --config flux-t2i.json
 llm-runner flux   --config flux-kontext.json prompt="make it night" seed=7
 llm-runner flux   --config flux-t2i.json keep_dit=true --server --port 7860
 llm-runner zimage --config zimage-t2i.json
+llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6 taesd=taef1.safetensors
 llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg output=depth.png
-llm-runner tests/kernels.js          # a script: run once as a module
+llm-runner tests/matmul_coop.js     # a script: run once as a module
 ```
 
 `--config file.json` is read first, then each `key=value` is applied on top of
@@ -28,11 +29,13 @@ plugins/
     ops.js             the operations models are written in (matmul, norms, attention, conv ...)
     qwen3.js           Qwen-family text encoder (layer-streamed)
     flux_vae.js        Flux VAE encoder and decoder (Flux 1 and Flux 2 namings)
+    taesd.js           TAESD decoder for 16-channel latents (taef1)
+    lora.js            LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
     kernels/*.shady    one kernel per file; common.shady is put in front of each
   flux/                Flux 2 Klein: txt2img, img2img, kontext, LoRA/LoKr, server
-  zimage/              Z-Image Turbo
+  zimage/              Z-Image Turbo: txt2img, img2img, LoRA, TAESD
   depth/               Depth Anything V2
-  tests/               kernel parity, benchmarks, probes
+  tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
 
 ## A plugin
@@ -90,16 +93,26 @@ A kernel can be sized from JS. It spells a size `$NAME`, and
 `kernel(name, { NAME: value })` compiles one pipeline per set of values. This is
 how `flash_attention` serves head widths of 64 and 128.
 
-Shady has no `half` and no integer dot product yet. So f16 and bf16 are decoded
-by hand (`common.shady`), and the matmuls accumulate in f32 from f32 tiles.
+### The matrix cores
+
+With `VK_KHR_cooperative_matrix` and 64-wide subgroups, `ops.js` sends the heavy
+work to kernels built on 16x16x16 float16 products with float32 accumulators:
+
+| | kernel | against the float32 kernel, RX 7800 XT |
+|---|---|---|
+| Q8_0 matmul | `matmul_q8_coop` | 7-8 -> 28-36 TFLOPS |
+| attention, head 128 | `flash_attention_coop` | 42 -> 6.8 ms (32 heads x 2176) |
+| 3x3 / 1x1 conv | `conv2d_coop` | 5x / 40x |
+
+Their operands are float16, so an input past 65504 overflows. `ops.matmul`
+takes an `exact` flag for inputs that can: the SwiGLU down-projections of
+Qwen3 and Z-Image use it. A plugin reads `matrix_cores` (default true) and
+calls `useMatrixCores()`; `matrix_cores=false` runs everything in float32.
 
 ## Checking a port
 
-`tests/kernels.js` runs each shady kernel next to the Slang kernel it replaced,
-on the same random inputs: `llm-runner tests/kernels.js [only=name]`. Most agree
-bit for bit. The Q8_0 matmul and flash attention agree to fp16 precision, because
-Slang kept those tiles in fp16. The whole pipelines were compared image to image
-against the C3 builds:
+Each pipeline was compared image to image against the C3 build it replaced,
+with the same seed, before that build was deleted:
 
 | | against the C3 pipeline |
 |---|---|
@@ -110,7 +123,28 @@ against the C3 builds:
 | Depth Anything, depth / height map | 92.3 / 91.5 dB |
 | Z-Image DiT, first step | velocity correlation 0.999998 |
 
-Z-Image goes further apart from the second step on. The C3 build's Q8_0 matmul
-converts activations to fp16, and some of Z-Image's FFN activations exceed
-65,504, so the C3 build overflows (to inf, then its 1e10 clamp). The f32 tiles
-here don't. See `tests/bench_matmul.js` for the matmul speed comparison.
+Z-Image had no clean reference: the C3 build's Q8_0 matmul converted
+activations to fp16, some of Z-Image's FFN activations exceed 65,504, and from
+the second step on it overflowed into a washed-out image. The plugin keeps
+those matmuls in float32 and produces a clean one.
+
+The matrix-core kernels were checked against the float32 plugin itself:
+`tests/matmul_coop.js`, `tests/bench_attention.js` and `tests/conv_coop.js`
+per kernel (relative error ~3e-4), and whole images with `matrix_cores=false`:
+
+| | float16 matrix cores against float32 |
+|---|---|
+| Flux kontext + LoKr + LoRA | 67.8 dB |
+| Flux txt2img | 51.2 dB |
+| Z-Image txt2img | 56.7 dB |
+| Depth / height map | 67.6 / 66.4 dB |
+
+Timings, 512², 4 steps, RX 7800 XT:
+
+| | C3 build | plugin, float32 | plugin, matrix cores |
+|---|---|---|---|
+| Flux kontext + LoRA, per step | 3.6 s | 4.66 s | 1.23 s |
+| Flux kontext + LoRA, whole run | | 32.4 s | 13.5 s |
+| Flux txt2img, whole run | 39.7 s (spilled VRAM) | 13.7 s | 6.9 s |
+| Z-Image, per step | 2.4 s | 1.8 s | 0.86 s |
+| Z-Image, whole run | 17.1 s | 21.1 s | 12.8 s |

@@ -1,17 +1,8 @@
 module llm;
 
-import vk;
 import std::io;
 import std::core::mem;
 import std::core::mem::allocator;
-
-struct Tensor {
-    vk::Memory gpu_buffer;
-    GGMLType dtype;
-    uint n_dims;
-    ulong[4] shape;
-    usz size_bytes;
-}
 
 fn usz compute_tensor_bytes(GGMLType dtype, ulong[4] shape, uint n_dims) {
     usz n_elements = 1;
@@ -22,101 +13,6 @@ fn usz compute_tensor_bytes(GGMLType dtype, ulong[4] shape, uint n_dims) {
     usz type_size = dtype.type_size();
     usz n_blocks = (n_elements + block_size - 1) / block_size;
     return n_blocks * type_size;
-}
-
-fn Tensor? create_tensor(DeviceContext* ctx, GGMLType dtype, ulong[4] shape, uint n_dims) {
-    usz size_bytes = compute_tensor_bytes(dtype, shape, n_dims);
-    if (size_bytes == 0) return COMPUTE_ERROR~;
-
-    vk::Memory gpu_buffer = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_DST_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: null,
-        data_size: (sz)size_bytes
-    )!!;
-
-    return {
-        .gpu_buffer = gpu_buffer,
-        .dtype = dtype,
-        .n_dims = n_dims,
-        .shape = shape,
-        .size_bytes = size_bytes,
-    };
-}
-
-fn Tensor? upload_weight(DeviceContext* ctx, GGUFTensorInfo* info, char* tensor_data_base) {
-    char* data_ptr = tensor_data_base + (usz)info.offset;
-
-    vk::Memory gpu_buffer = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: data_ptr,
-        data_size: (sz)info.data_size,
-    )!!;
-
-    return {
-        .gpu_buffer = gpu_buffer,
-        .dtype = info.type,
-        .n_dims = info.n_dims,
-        .shape = info.shape,
-        .size_bytes = info.data_size,
-    };
-}
-
-fn void Tensor.free(&self) {
-    self.gpu_buffer.free();
-}
-
-fn Tensor? create_f32_tensor(DeviceContext* ctx, ulong[4] shape, uint n_dims) {
-    return create_tensor(ctx, GGML_F32, shape, n_dims);
-}
-
-// Copy host floats into an existing device tensor through a staging buffer.
-// For feeding inputs that are computed on the CPU rather than loaded from a
-// weights file, which upload_weight already covers.
-fn void? upload_to_tensor(DeviceContext* ctx, Tensor* tensor, float[] data) {
-    usz size = data.len * 4;
-    if (size == 0 || size > tensor.size_bytes) return COMPUTE_ERROR~;
-
-    vk::Memory staging = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: data.ptr,
-        data_size: (sz)size,
-    )!!;
-    defer staging.free();
-
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
-        vk::cmdCopyBuffer(cmd, staging.buffer, tensor.gpu_buffer.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = size }});
-    }!!;
-}
-
-// Read the first `count` floats of a device tensor back into host memory.
-fn float[]? download_tensor(alloc::Allocator allocator, DeviceContext* ctx, Tensor* tensor, usz count) {
-    usz size = count * 4;
-    if (size == 0 || size > tensor.size_bytes) return COMPUTE_ERROR~;
-
-    vk::Memory staging = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_TRANSFER_DST_BIT,
-        properties: MEMORY_PROPERTY_HOST_VISIBLE_BIT | MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        data: null,
-        data_size: (sz)size,
-    )!!;
-    defer staging.free();
-
-    ctx.device.@single_time_command(ctx.compute_queue; CommandBuffer cmd) {
-        vk::cmdCopyBuffer(cmd, tensor.gpu_buffer.buffer, staging.buffer, 1,
-            (BufferCopy[]){{ .srcOffset = 0, .dstOffset = 0, .size = size }});
-    }!!;
-
-    float[] out = alloc::new_array(allocator, float, (sz)count);
-    mem::copy(out.ptr, staging.data(), (sz)size);
-    return out;
 }
 
 // CPU-side bf16 to f32 conversion
@@ -435,60 +331,6 @@ fn void dequant_embedding_row(char* tensor_data, GGUFTensorInfo* info, uint row,
     }
 }
 
-// Upload a quantized tensor as F32 (dequantizes on CPU, uploads F32)
-fn Tensor? upload_weight_as_f32(DeviceContext* ctx, GGUFTensorInfo* info, char* tensor_data_base) {
-    CpuTensorData cpu = dequant_to_cpu(info, tensor_data_base)!!;
-    defer cpu.free();
-    return upload_cpu_data(ctx, &cpu);
-}
-
-// Upload F32 weights as Q8_0 quantized format
-// This is useful for weights that need to use the working Q8 shader path
-fn Tensor? upload_weight_as_q8(DeviceContext* ctx, float* f32_data, uint n_elements, ulong[4] shape, uint n_dims) {
-    // Q8_0: 34 bytes per 32 elements
-    usz n_blocks = n_elements / 32;
-    if (n_elements % 32 != 0) {
-        n_blocks++;  // Handle partial block
-    }
-    usz q8_size = n_blocks * 34;
-    char* q8_data = (char*)mem::calloc((sz)q8_size);
-
-    // Quantize each block
-    for (usz b = 0; b < n_blocks; b++) {
-        usz offset = b * 32;
-        usz remaining = n_elements - offset;
-        if (remaining > 32) remaining = 32;
-        
-        float[32] block_data;
-        for (usz i = 0; i < 32; i++) {
-            if (i < remaining) {
-                block_data[i] = f32_data[offset + i];
-            } else {
-                block_data[i] = 0.0;  // Pad partial block
-            }
-        }
-        quant_q8_0_block(&block_data[0], &q8_data[b * 34]);
-    }
-
-    vk::Memory gpu_buffer = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: q8_data,
-        data_size: (sz)q8_size,
-    )!!;
-
-    mem::free(q8_data);
-
-    return {
-        .gpu_buffer = gpu_buffer,
-        .dtype = GGML_Q8_0,
-        .n_dims = n_dims,
-        .shape = shape,
-        .size_bytes = q8_size,
-    };
-}
-
 // --- CPU-cached tensor data (for GPU offloading / streaming) ---
 
 struct CpuTensorData {
@@ -555,44 +397,6 @@ fn CpuTensorData? dequant_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) {
     };
 }
 
-// Upload pre-dequantized F32 CPU data to GPU device-local buffer.
-fn Tensor? upload_cpu_data(DeviceContext* ctx, CpuTensorData* cpu) {
-    vk::Memory gpu_buffer = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: cpu.data,
-        data_size: (sz)cpu.size_bytes,
-    )!!;
-
-    return {
-        .gpu_buffer = gpu_buffer,
-        .dtype = GGML_F32,
-        .n_dims = cpu.n_dims,
-        .shape = cpu.shape,
-        .size_bytes = cpu.size_bytes,
-    };
-}
-
-// Upload raw quantized CPU data to GPU (no dequantization).
-fn Tensor? upload_cpu_data_raw(DeviceContext* ctx, CpuTensorData* cpu, GGMLType dtype) {
-    vk::Memory gpu_buffer = vk::new_buffer(
-        allocator: &ctx.allocator,
-        usage: BUFFER_USAGE_STORAGE_BUFFER_BIT | BUFFER_USAGE_TRANSFER_SRC_BIT,
-        properties: MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        data: cpu.data,
-        data_size: (sz)cpu.size_bytes,
-    )!!;
-
-    return {
-        .gpu_buffer = gpu_buffer,
-        .dtype = dtype,
-        .n_dims = cpu.n_dims,
-        .shape = cpu.shape,
-        .size_bytes = cpu.size_bytes,
-    };
-}
-
 // Copy raw (possibly quantized) tensor data to CPU without dequantization.
 fn CpuTensorData? copy_raw_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) {
     char* data_ptr = tensor_data_base + (usz)info.offset;
@@ -610,16 +414,4 @@ fn CpuTensorData? copy_raw_to_cpu(GGUFTensorInfo* info, char* tensor_data_base) 
 
 fn void CpuTensorData.free(&self) {
     if (self.data != null) mem::free(self.data);
-}
-
-// Convenience: load a tensor by name from a GGUF file
-fn Tensor? load_tensor_by_name(DeviceContext* ctx, GGUFFile* gf, String name) {
-    GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return upload_weight(ctx, info, gf.tensor_data_base);
-}
-
-// Convenience: load a tensor by name, dequantizing to F32
-fn Tensor? load_tensor_as_f32(DeviceContext* ctx, GGUFFile* gf, String name) {
-    GGUFTensorInfo* info = gf.find_tensor(name)!!;
-    return upload_weight_as_f32(ctx, info, gf.tensor_data_base);
 }

@@ -3,6 +3,8 @@ module llm;
 import std::io;
 import std::core::mem;
 
+faultdef FILE_NOT_FOUND, COMPUTE_ERROR, IMAGE_INVALID_CHANNELS;
+
 const uint GGUF_MAGIC = 0x46554747;
 
 const usz GGUF_ALIGNMENT = 32;

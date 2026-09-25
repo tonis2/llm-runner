@@ -1,0 +1,222 @@
+// y[seq, out_dim] = x[seq, in_dim] @ W[row_offset .. row_offset + out_dim, :]^T, W in Q8_0,
+// on the matrix cores: 16x16x16 float16 products into float32 accumulators.
+//
+// A 128x128 output tile per workgroup: four subgroups of 64, each computing a
+// 64x64 quarter as 4x4 accumulator tiles. K goes one Q8_0 block (32) at a
+// time. x is rounded to half on its way into shared memory and the weight is
+// dequantised to half with its block's scale; the next block of both is read
+// into registers while this block's products run, so the loads wait on
+// nothing. The weight is read as 32-bit words, a block's 32 bytes sitting two
+// bytes off a word half of the time. Results leave through a 16x16 float
+// staging tile per subgroup, so y's edges are bounds-checked.
+//
+// Half operands: x must stay inside +-65504, which a model whose activations
+// grow past that (Z-Image's FFN) cannot promise. Dispatch: ceil(seq/128) * ceil(out_dim/128).
+uint w[];
+float4 x[];
+float y[];
+struct Push @pushconstant { uint out_dim; uint in_dim; uint seq_len; uint row_offset; }
+Push pc;
+shared half As[5120];     // [128 m][40]: 32 k + 8 of padding
+shared half Bs[4352];      // [32 k][136]: 128 n + 8 of padding
+shared float Cs[1024];          // [4 subgroups][16][16]
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+
+// The 32-bit word at an even byte address, whichever half of a word it starts in.
+fn uint word_at(uint byte)
+{
+    uint i = byte / 4u;
+    uint lo = w[i];
+    if ((byte & 2u) == 0u) return lo;
+    return (lo >> 16u) | (w[i + 1u] << 16u);
+}
+
+fn void store_b(uint n, uint k, float s, uint word)
+{
+    Bs[k * 136u + n] = half(s * float(sign_extend8(word & 255u)));
+    Bs[(k + 1u) * 136u + n] = half(s * float(sign_extend8((word >> 8u) & 255u)));
+    Bs[(k + 2u) * 136u + n] = half(s * float(sign_extend8((word >> 16u) & 255u)));
+    Bs[(k + 3u) * 136u + n] = half(s * float(sign_extend8(word >> 24u)));
+}
+
+fn void store_a(uint m, uint k4, float4 v)
+{
+    uint at = m * 40u + k4 * 4u;
+    As[at] = half(v.x);
+    As[at + 1u] = half(v.y);
+    As[at + 2u] = half(v.z);
+    As[at + 3u] = half(v.w);
+}
+
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint sg = gi / 64u;
+    uint lane = gi % 64u;
+    uint tiles_n = (pc.out_dim + 127u) / 128u;
+    uint tile_m = input.gid.x / tiles_n;
+    uint tile_n = input.gid.x % tiles_n;
+    uint pos_base = tile_m * 128u;
+    uint row_base = pc.row_offset + tile_n * 128u;
+    uint row_upper = pc.row_offset + pc.out_dim;
+    uint sm = (sg / 2u) * 64u;     // the subgroup's quarter, in the tile
+    uint sn = (sg % 2u) * 64u;
+    uint in4 = pc.in_dim / 4u;
+    uint blocks = pc.in_dim / 32u;
+    uint row_bytes = blocks * 34u;
+
+    // A: 128 rows of 8 float4s, four a thread, rows gi/8 + 32i. B: 128 rows
+    // of two 16-byte halves, one a thread: row gi % 128, half gi / 128.
+    uint a_m = gi / 8u;
+    uint a_k4 = gi % 8u;
+    uint b_n = gi % 128u;
+    uint b_k0 = (gi / 128u) * 16u;
+    uint gn = row_base + b_n;
+    bool b_live = gn < row_upper;
+    uint b_row = gn * row_bytes;
+    float4 ra0 = float4(0.0);
+    float4 ra1 = float4(0.0);
+    float4 ra2 = float4(0.0);
+    float4 ra3 = float4(0.0);
+    float rs = 0.0;
+    uint rw0 = 0u;
+    uint rw1 = 0u;
+    uint rw2 = 0u;
+    uint rw3 = 0u;
+    if (pos_base + a_m + 0u < pc.seq_len) ra0 = x[(pos_base + a_m + 0u) * in4 + 0u * 8u + a_k4];
+    if (pos_base + a_m + 32u < pc.seq_len) ra1 = x[(pos_base + a_m + 32u) * in4 + 0u * 8u + a_k4];
+    if (pos_base + a_m + 64u < pc.seq_len) ra2 = x[(pos_base + a_m + 64u) * in4 + 0u * 8u + a_k4];
+    if (pos_base + a_m + 96u < pc.seq_len) ra3 = x[(pos_base + a_m + 96u) * in4 + 0u * 8u + a_k4];
+    if (b_live) {
+        uint bb = b_row + 0u * 34u;
+        rs = unpack_f16(word_at(bb) & 65535u);
+        rw0 = word_at(bb + 2u + b_k0 + 0u);
+        rw1 = word_at(bb + 2u + b_k0 + 4u);
+        rw2 = word_at(bb + 2u + b_k0 + 8u);
+        rw3 = word_at(bb + 2u + b_k0 + 12u);
+    }
+    coopmat<float, 16, 16, subgroup, accumulator> c00;
+    coopmat<float, 16, 16, subgroup, accumulator> c01;
+    coopmat<float, 16, 16, subgroup, accumulator> c02;
+    coopmat<float, 16, 16, subgroup, accumulator> c03;
+    coopmat<float, 16, 16, subgroup, accumulator> c10;
+    coopmat<float, 16, 16, subgroup, accumulator> c11;
+    coopmat<float, 16, 16, subgroup, accumulator> c12;
+    coopmat<float, 16, 16, subgroup, accumulator> c13;
+    coopmat<float, 16, 16, subgroup, accumulator> c20;
+    coopmat<float, 16, 16, subgroup, accumulator> c21;
+    coopmat<float, 16, 16, subgroup, accumulator> c22;
+    coopmat<float, 16, 16, subgroup, accumulator> c23;
+    coopmat<float, 16, 16, subgroup, accumulator> c30;
+    coopmat<float, 16, 16, subgroup, accumulator> c31;
+    coopmat<float, 16, 16, subgroup, accumulator> c32;
+    coopmat<float, 16, 16, subgroup, accumulator> c33;
+    coopmat<half, 16, 16, subgroup, a> a0;
+    coopmat<half, 16, 16, subgroup, a> a1;
+    coopmat<half, 16, 16, subgroup, a> a2;
+    coopmat<half, 16, 16, subgroup, a> a3;
+    coopmat<half, 16, 16, subgroup, b> b0;
+    coopmat<half, 16, 16, subgroup, b> b1;
+    coopmat<half, 16, 16, subgroup, b> b2;
+    coopmat<half, 16, 16, subgroup, b> b3;
+
+    // Zeroed through the staging tile: there is no spelling for a filled tile.
+    for (uint i = lane; i < 256u; i += 64u) { Cs[sg * 256u + i] = 0.0; }
+    barrier;
+    coop_load(c00, &Cs[sg * 256u], 16u);
+    coop_load(c01, &Cs[sg * 256u], 16u);
+    coop_load(c02, &Cs[sg * 256u], 16u);
+    coop_load(c03, &Cs[sg * 256u], 16u);
+    coop_load(c10, &Cs[sg * 256u], 16u);
+    coop_load(c11, &Cs[sg * 256u], 16u);
+    coop_load(c12, &Cs[sg * 256u], 16u);
+    coop_load(c13, &Cs[sg * 256u], 16u);
+    coop_load(c20, &Cs[sg * 256u], 16u);
+    coop_load(c21, &Cs[sg * 256u], 16u);
+    coop_load(c22, &Cs[sg * 256u], 16u);
+    coop_load(c23, &Cs[sg * 256u], 16u);
+    coop_load(c30, &Cs[sg * 256u], 16u);
+    coop_load(c31, &Cs[sg * 256u], 16u);
+    coop_load(c32, &Cs[sg * 256u], 16u);
+    coop_load(c33, &Cs[sg * 256u], 16u);
+
+    for (uint t = 0u; t < blocks; t++) {
+        if (pos_base + a_m + 0u < pc.seq_len) ra0 = x[(pos_base + a_m + 0u) * in4 + t * 8u + a_k4];
+        if (pos_base + a_m + 32u < pc.seq_len) ra1 = x[(pos_base + a_m + 32u) * in4 + t * 8u + a_k4];
+        if (pos_base + a_m + 64u < pc.seq_len) ra2 = x[(pos_base + a_m + 64u) * in4 + t * 8u + a_k4];
+        if (pos_base + a_m + 96u < pc.seq_len) ra3 = x[(pos_base + a_m + 96u) * in4 + t * 8u + a_k4];
+        if (b_live) {
+            uint bb = b_row + t * 34u;
+            rs = unpack_f16(word_at(bb) & 65535u);
+            rw0 = word_at(bb + 2u + b_k0 + 0u);
+            rw1 = word_at(bb + 2u + b_k0 + 4u);
+            rw2 = word_at(bb + 2u + b_k0 + 8u);
+            rw3 = word_at(bb + 2u + b_k0 + 12u);
+        }
+        store_a(a_m + 0u, a_k4, ra0);
+        store_a(a_m + 32u, a_k4, ra1);
+        store_a(a_m + 64u, a_k4, ra2);
+        store_a(a_m + 96u, a_k4, ra3);
+        store_b(b_n, b_k0 + 0u, rs, rw0);
+        store_b(b_n, b_k0 + 4u, rs, rw1);
+        store_b(b_n, b_k0 + 8u, rs, rw2);
+        store_b(b_n, b_k0 + 12u, rs, rw3);
+        barrier;
+        for (uint kk = 0u; kk < 32u; kk += 16u) {
+            coop_load(a0, &As[(sm + 0u) * 40u + kk], 40u);
+            coop_load(a1, &As[(sm + 16u) * 40u + kk], 40u);
+            coop_load(a2, &As[(sm + 32u) * 40u + kk], 40u);
+            coop_load(a3, &As[(sm + 48u) * 40u + kk], 40u);
+            coop_load(b0, &Bs[kk * 136u + sn + 0u], 136u);
+            coop_load(b1, &Bs[kk * 136u + sn + 16u], 136u);
+            coop_load(b2, &Bs[kk * 136u + sn + 32u], 136u);
+            coop_load(b3, &Bs[kk * 136u + sn + 48u], 136u);
+            coop_muladd(a0, b0, c00, c00);
+            coop_muladd(a0, b1, c01, c01);
+            coop_muladd(a0, b2, c02, c02);
+            coop_muladd(a0, b3, c03, c03);
+            coop_muladd(a1, b0, c10, c10);
+            coop_muladd(a1, b1, c11, c11);
+            coop_muladd(a1, b2, c12, c12);
+            coop_muladd(a1, b3, c13, c13);
+            coop_muladd(a2, b0, c20, c20);
+            coop_muladd(a2, b1, c21, c21);
+            coop_muladd(a2, b2, c22, c22);
+            coop_muladd(a2, b3, c23, c23);
+            coop_muladd(a3, b0, c30, c30);
+            coop_muladd(a3, b1, c31, c31);
+            coop_muladd(a3, b2, c32, c32);
+            coop_muladd(a3, b3, c33, c33);
+        }
+        barrier;
+    }
+
+    uint m0 = pos_base + sm;
+    uint n0 = tile_n * 128u + sn;
+    coop_store(&Cs[sg * 256u], c00, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 0u); barrier;
+    coop_store(&Cs[sg * 256u], c01, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 16u); barrier;
+    coop_store(&Cs[sg * 256u], c02, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 32u); barrier;
+    coop_store(&Cs[sg * 256u], c03, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 48u); barrier;
+    coop_store(&Cs[sg * 256u], c10, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 0u); barrier;
+    coop_store(&Cs[sg * 256u], c11, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 16u); barrier;
+    coop_store(&Cs[sg * 256u], c12, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 32u); barrier;
+    coop_store(&Cs[sg * 256u], c13, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 48u); barrier;
+    coop_store(&Cs[sg * 256u], c20, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 0u); barrier;
+    coop_store(&Cs[sg * 256u], c21, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 16u); barrier;
+    coop_store(&Cs[sg * 256u], c22, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 32u); barrier;
+    coop_store(&Cs[sg * 256u], c23, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 48u); barrier;
+    coop_store(&Cs[sg * 256u], c30, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 0u); barrier;
+    coop_store(&Cs[sg * 256u], c31, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 16u); barrier;
+    coop_store(&Cs[sg * 256u], c32, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 32u); barrier;
+    coop_store(&Cs[sg * 256u], c33, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 48u);
+}
+
+// One subgroup's staged 16x16 tile to y at (m0, n0), inside the bounds.
+fn void flush(uint sg, uint lane, uint m0, uint n0)
+{
+    for (uint i = lane; i < 256u; i += 64u) {
+        uint gm = m0 + i / 16u;
+        uint gn = n0 + i % 16u;
+        if (gm < pc.seq_len && gn < pc.out_dim) y[gm * pc.out_dim + gn] = Cs[sg * 256u + i];
+    }
+}

@@ -1,0 +1,317 @@
+// Flash attention on the matrix cores, head_dim 128: FA2 tiles with float16
+// operands and float32 accumulators. Non-causal. Q, K, V: [heads, seq, 128].
+// Output: [seq, heads * 128] - the transpose back is fused into the write.
+//
+// A workgroup is 64 query rows of one head, four subgroups of 16 rows each.
+// A subgroup keeps its Q tile (eight 16x16 half tiles) and its output (eight
+// float accumulators) in registers the whole way. Keys go 32 at a time: the K
+// tile is stored d-major so it is Q.K^T's right side as it stands, the scores
+// leave through shared memory for the softmax, and P comes back as half for
+// P.V.
+//
+// The softmax is online, with lazy rescaling: a row keeps its running maximum
+// until a tile's maximum passes it by more than 8, so P stays below e^8 (inside
+// half) and the output tiles - which have no per-row multiply of their own -
+// only take the trip through shared memory to be rescaled when some row's
+// maximum really moved. That is the first tile, and rarely any after it.
+// Q, K and V must be inside +-65504. Dispatch: (ceil(seq/64), heads).
+float4 q[];
+float4 k[];
+float4 v[];
+float output[];
+struct Push @pushconstant { uint head_dim; uint n_heads; uint seq_len; float scale; }
+Push pc;
+shared half kv[9472];       // Kt [128 d][40] at 0, V [32 keys][136] at 5120; Q [64][136] before the loop
+shared float sw[2048];      // per subgroup [16][32]: scores, then output staging
+shared half pw[2560];       // per subgroup [16][40]: P
+shared float zeros[256];
+shared float red[256];
+shared float row_m[64];
+shared float row_l[64];
+shared float row_a[64];
+shared uint flag[1];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint sg = gi / 64u;
+    uint lane = gi % 64u;
+    uint head = input.gid.y;
+    uint q0 = input.gid.x * 64u;
+    uint S = pc.seq_len;
+    uint base4 = head * S * 32u;     // the head's first float4
+    uint r = lane / 4u;              // the row a lane works on in the softmax
+    uint c0 = (lane % 4u) * 8u;      // and its eight columns
+    uint row = sg * 16u + r;
+
+    // Q to half, [64][136], sixteen float4s a thread.
+    for (uint i = 0u; i < 8u; i++) {
+        uint flat = gi + i * 256u;
+        uint m = flat / 32u;
+        uint d4 = flat % 32u;
+        float4 val = float4(0.0);
+        if (q0 + m < S) val = q[base4 + (q0 + m) * 32u + d4];
+        uint at = m * 136u + d4 * 4u;
+        kv[at] = half(val.x);
+        kv[at + 1u] = half(val.y);
+        kv[at + 2u] = half(val.z);
+        kv[at + 3u] = half(val.w);
+    }
+    zeros[gi] = 0.0;
+    if (gi < 64u) {
+        row_m[gi] = -1.0e30;
+        row_l[gi] = 0.0;
+    }
+    barrier;
+    coopmat<half, 16, 16, subgroup, a> qa0;
+    coopmat<half, 16, 16, subgroup, a> qa1;
+    coopmat<half, 16, 16, subgroup, a> qa2;
+    coopmat<half, 16, 16, subgroup, a> qa3;
+    coopmat<half, 16, 16, subgroup, a> qa4;
+    coopmat<half, 16, 16, subgroup, a> qa5;
+    coopmat<half, 16, 16, subgroup, a> qa6;
+    coopmat<half, 16, 16, subgroup, a> qa7;
+    coop_load(qa0, &kv[sg * 16u * 136u + 0u], 136u);
+    coop_load(qa1, &kv[sg * 16u * 136u + 16u], 136u);
+    coop_load(qa2, &kv[sg * 16u * 136u + 32u], 136u);
+    coop_load(qa3, &kv[sg * 16u * 136u + 48u], 136u);
+    coop_load(qa4, &kv[sg * 16u * 136u + 64u], 136u);
+    coop_load(qa5, &kv[sg * 16u * 136u + 80u], 136u);
+    coop_load(qa6, &kv[sg * 16u * 136u + 96u], 136u);
+    coop_load(qa7, &kv[sg * 16u * 136u + 112u], 136u);
+    coopmat<float, 16, 16, subgroup, accumulator> o0;
+    coop_load(o0, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o1;
+    coop_load(o1, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o2;
+    coop_load(o2, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o3;
+    coop_load(o3, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o4;
+    coop_load(o4, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o5;
+    coop_load(o5, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o6;
+    coop_load(o6, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> o7;
+    coop_load(o7, &zeros[0], 16u);
+    coopmat<float, 16, 16, subgroup, accumulator> s0;
+    coopmat<float, 16, 16, subgroup, accumulator> s1;
+    coopmat<half, 16, 16, subgroup, b> kb0;
+    coopmat<half, 16, 16, subgroup, b> kb1;
+    coopmat<half, 16, 16, subgroup, a> pa0;
+    coopmat<half, 16, 16, subgroup, a> pa1;
+    coopmat<half, 16, 16, subgroup, b> vb;
+    barrier;
+
+    uint tiles = (S + 31u) / 32u;
+    for (uint t = 0u; t < tiles; t++) {
+        uint key0 = t * 32u;
+        // K, d-major, and V, key-major: 32 keys of 32 float4s each, four of each a thread.
+        for (uint i = 0u; i < 4u; i++) {
+            uint flat = gi + i * 256u;
+            uint key = flat / 32u;
+            uint d4 = flat % 32u;
+            float4 kk = float4(0.0);
+            float4 vv = float4(0.0);
+            if (key0 + key < S) {
+                kk = k[base4 + (key0 + key) * 32u + d4];
+                vv = v[base4 + (key0 + key) * 32u + d4];
+            }
+            uint d = d4 * 4u;
+            kv[d * 40u + key] = half(kk.x);
+            kv[(d + 1u) * 40u + key] = half(kk.y);
+            kv[(d + 2u) * 40u + key] = half(kk.z);
+            kv[(d + 3u) * 40u + key] = half(kk.w);
+            uint at = 5120u + key * 136u + d;
+            kv[at] = half(vv.x);
+            kv[at + 1u] = half(vv.y);
+            kv[at + 2u] = half(vv.z);
+            kv[at + 3u] = half(vv.w);
+        }
+        if (gi == 0u) flag[0] = 0u;
+        barrier;
+
+        // S = Q.K^T, [16 rows][32 keys] a subgroup.
+        coop_load(s0, &zeros[0], 16u);
+        coop_load(s1, &zeros[0], 16u);
+        coop_load(kb0, &kv[0u], 40u);
+        coop_load(kb1, &kv[16u], 40u);
+        coop_muladd(qa0, kb0, s0, s0);
+        coop_muladd(qa0, kb1, s1, s1);
+        coop_load(kb0, &kv[640u], 40u);
+        coop_load(kb1, &kv[656u], 40u);
+        coop_muladd(qa1, kb0, s0, s0);
+        coop_muladd(qa1, kb1, s1, s1);
+        coop_load(kb0, &kv[1280u], 40u);
+        coop_load(kb1, &kv[1296u], 40u);
+        coop_muladd(qa2, kb0, s0, s0);
+        coop_muladd(qa2, kb1, s1, s1);
+        coop_load(kb0, &kv[1920u], 40u);
+        coop_load(kb1, &kv[1936u], 40u);
+        coop_muladd(qa3, kb0, s0, s0);
+        coop_muladd(qa3, kb1, s1, s1);
+        coop_load(kb0, &kv[2560u], 40u);
+        coop_load(kb1, &kv[2576u], 40u);
+        coop_muladd(qa4, kb0, s0, s0);
+        coop_muladd(qa4, kb1, s1, s1);
+        coop_load(kb0, &kv[3200u], 40u);
+        coop_load(kb1, &kv[3216u], 40u);
+        coop_muladd(qa5, kb0, s0, s0);
+        coop_muladd(qa5, kb1, s1, s1);
+        coop_load(kb0, &kv[3840u], 40u);
+        coop_load(kb1, &kv[3856u], 40u);
+        coop_muladd(qa6, kb0, s0, s0);
+        coop_muladd(qa6, kb1, s1, s1);
+        coop_load(kb0, &kv[4480u], 40u);
+        coop_load(kb1, &kv[4496u], 40u);
+        coop_muladd(qa7, kb0, s0, s0);
+        coop_muladd(qa7, kb1, s1, s1);
+        coop_store(&sw[sg * 512u], s0, 32u);
+        coop_store(&sw[sg * 512u + 16u], s1, 32u);
+        barrier;
+
+        // Each row's maximum over this tile, four lanes a row.
+        float tmax = -1.0e30;
+        for (uint c = 0u; c < 8u; c++) {
+            if (key0 + c0 + c < S) tmax = max(tmax, sw[sg * 512u + r * 32u + c0 + c] * pc.scale);
+        }
+        red[gi] = tmax;
+        barrier;
+        if (lane % 4u == 0u) {
+            float mt = max(max(red[gi], red[gi + 1u]), max(red[gi + 2u], red[gi + 3u]));
+            float mo = row_m[row];
+            float alpha = 1.0;
+            if (mt > mo + 8.0) {
+                alpha = exp(mo - mt);
+                row_m[row] = mt;
+                flag[0] = 1u;
+            }
+            row_a[row] = alpha;
+        }
+        barrier;
+
+        // P = exp(s - m) as half, and each row's sum.
+        float m = row_m[row];
+        float psum = 0.0;
+        for (uint c = 0u; c < 8u; c++) {
+            float p = 0.0;
+            if (key0 + c0 + c < S) p = exp(sw[sg * 512u + r * 32u + c0 + c] * pc.scale - m);
+            pw[sg * 640u + r * 40u + c0 + c] = half(p);
+            psum += p;
+        }
+        red[gi] = psum;
+        barrier;
+        if (lane % 4u == 0u) {
+            row_l[row] = row_l[row] * row_a[row] + red[gi] + red[gi + 1u] + red[gi + 2u] + red[gi + 3u];
+        }
+
+        // The rare trip: the output tiles through shared memory, each row times its alpha.
+        if (flag[0] != 0u) {
+            coop_store(&sw[sg * 512u], o0, 32u);
+            coop_store(&sw[sg * 512u + 16u], o1, 32u);
+            barrier;
+            for (uint c = 0u; c < 8u; c++) { sw[sg * 512u + r * 32u + c0 + c] *= row_a[row]; }
+            barrier;
+            coop_load(o0, &sw[sg * 512u], 32u);
+            coop_load(o1, &sw[sg * 512u + 16u], 32u);
+            barrier;
+            coop_store(&sw[sg * 512u], o2, 32u);
+            coop_store(&sw[sg * 512u + 16u], o3, 32u);
+            barrier;
+            for (uint c = 0u; c < 8u; c++) { sw[sg * 512u + r * 32u + c0 + c] *= row_a[row]; }
+            barrier;
+            coop_load(o2, &sw[sg * 512u], 32u);
+            coop_load(o3, &sw[sg * 512u + 16u], 32u);
+            barrier;
+            coop_store(&sw[sg * 512u], o4, 32u);
+            coop_store(&sw[sg * 512u + 16u], o5, 32u);
+            barrier;
+            for (uint c = 0u; c < 8u; c++) { sw[sg * 512u + r * 32u + c0 + c] *= row_a[row]; }
+            barrier;
+            coop_load(o4, &sw[sg * 512u], 32u);
+            coop_load(o5, &sw[sg * 512u + 16u], 32u);
+            barrier;
+            coop_store(&sw[sg * 512u], o6, 32u);
+            coop_store(&sw[sg * 512u + 16u], o7, 32u);
+            barrier;
+            for (uint c = 0u; c < 8u; c++) { sw[sg * 512u + r * 32u + c0 + c] *= row_a[row]; }
+            barrier;
+            coop_load(o6, &sw[sg * 512u], 32u);
+            coop_load(o7, &sw[sg * 512u + 16u], 32u);
+            barrier;
+        }
+        barrier;
+
+        // O += P.V
+        coop_load(pa0, &pw[sg * 640u], 40u);
+        coop_load(pa1, &pw[sg * 640u + 16u], 40u);
+        coop_load(vb, &kv[5120u + 0u], 136u);
+        coop_muladd(pa0, vb, o0, o0);
+        coop_load(vb, &kv[5120u + 16u * 136u + 0u], 136u);
+        coop_muladd(pa1, vb, o0, o0);
+        coop_load(vb, &kv[5120u + 16u], 136u);
+        coop_muladd(pa0, vb, o1, o1);
+        coop_load(vb, &kv[5120u + 16u * 136u + 16u], 136u);
+        coop_muladd(pa1, vb, o1, o1);
+        coop_load(vb, &kv[5120u + 32u], 136u);
+        coop_muladd(pa0, vb, o2, o2);
+        coop_load(vb, &kv[5120u + 16u * 136u + 32u], 136u);
+        coop_muladd(pa1, vb, o2, o2);
+        coop_load(vb, &kv[5120u + 48u], 136u);
+        coop_muladd(pa0, vb, o3, o3);
+        coop_load(vb, &kv[5120u + 16u * 136u + 48u], 136u);
+        coop_muladd(pa1, vb, o3, o3);
+        coop_load(vb, &kv[5120u + 64u], 136u);
+        coop_muladd(pa0, vb, o4, o4);
+        coop_load(vb, &kv[5120u + 16u * 136u + 64u], 136u);
+        coop_muladd(pa1, vb, o4, o4);
+        coop_load(vb, &kv[5120u + 80u], 136u);
+        coop_muladd(pa0, vb, o5, o5);
+        coop_load(vb, &kv[5120u + 16u * 136u + 80u], 136u);
+        coop_muladd(pa1, vb, o5, o5);
+        coop_load(vb, &kv[5120u + 96u], 136u);
+        coop_muladd(pa0, vb, o6, o6);
+        coop_load(vb, &kv[5120u + 16u * 136u + 96u], 136u);
+        coop_muladd(pa1, vb, o6, o6);
+        coop_load(vb, &kv[5120u + 112u], 136u);
+        coop_muladd(pa0, vb, o7, o7);
+        coop_load(vb, &kv[5120u + 16u * 136u + 112u], 136u);
+        coop_muladd(pa1, vb, o7, o7);
+        barrier;
+    }
+
+    // Out: each row over its sum, transposed back to [seq, heads * 128].
+    uint qrow = q0 + row;
+    float inv = row_l[row] > 0.0 ? 1.0 / row_l[row] : 0.0;
+    uint out_base = qrow * pc.n_heads * 128u + head * 128u;
+    coop_store(&sw[sg * 512u], o0, 32u);
+    coop_store(&sw[sg * 512u + 16u], o1, 32u);
+    barrier;
+    if (qrow < S) {
+        for (uint c = 0u; c < 8u; c++) { output[out_base + 0u + c0 + c] = sw[sg * 512u + r * 32u + c0 + c] * inv; }
+    }
+    barrier;
+    coop_store(&sw[sg * 512u], o2, 32u);
+    coop_store(&sw[sg * 512u + 16u], o3, 32u);
+    barrier;
+    if (qrow < S) {
+        for (uint c = 0u; c < 8u; c++) { output[out_base + 32u + c0 + c] = sw[sg * 512u + r * 32u + c0 + c] * inv; }
+    }
+    barrier;
+    coop_store(&sw[sg * 512u], o4, 32u);
+    coop_store(&sw[sg * 512u + 16u], o5, 32u);
+    barrier;
+    if (qrow < S) {
+        for (uint c = 0u; c < 8u; c++) { output[out_base + 64u + c0 + c] = sw[sg * 512u + r * 32u + c0 + c] * inv; }
+    }
+    barrier;
+    coop_store(&sw[sg * 512u], o6, 32u);
+    coop_store(&sw[sg * 512u + 16u], o7, 32u);
+    barrier;
+    if (qrow < S) {
+        for (uint c = 0u; c < 8u; c++) { output[out_base + 96u + c0 + c] = sw[sg * 512u + r * 32u + c0 + c] * inv; }
+    }
+    barrier;
+}

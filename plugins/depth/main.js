@@ -280,6 +280,7 @@ llm.plugin({
 	name: 'depth',
 	generate(config) {
 		const start = llm.now();
+		op.useMatrixCores(config.matrix_cores ?? true);
 		const heightMode = config.height === true || config.height === 'true';
 		const res = config.res ?? (heightMode ? 1036 : 518);
 		const grid = Math.max(1, Math.floor((res + PATCH / 2) / PATCH));

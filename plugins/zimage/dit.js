@@ -2,7 +2,7 @@
 // refiner over the image patches, then 30 joint layers over [image | text],
 // each with scale-only AdaLN, post-norms and tanh-gated residuals.
 //
-// The graph is `dependencies/zimage.c3l/dit.c3`'s.
+// The graph is the deleted C3 pipeline's (`zimage.c3l/dit.c3`).
 
 import { llm, f32, GGML } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
@@ -254,7 +254,8 @@ export class ZImageDiT {
 		op.matmul(lw.w1, a.bufA, a.gate, this.ffn, dim, seq, 0, true);
 		op.matmul(lw.w3, a.bufA, a.up, this.ffn, dim, seq);
 		op.siluMul(a.gate, a.up, seq * this.ffn);
-		op.matmul(lw.w2, a.gate, a.down, dim, this.ffn, seq);
+		// Exact: Z-Image's SwiGLU outputs pass 65504, which a float16 operand cannot hold.
+		op.matmul(lw.w2, a.gate, a.down, dim, this.ffn, seq, 0, false, true);
 		this.residual(lw.ffnNorm2, a.down, hidden, seq, adaln, 3 * dim);
 	}
 

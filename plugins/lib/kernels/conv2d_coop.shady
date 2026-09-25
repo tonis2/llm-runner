@@ -1,0 +1,188 @@
+// Stride-1 convolution that keeps the size (3x3 with pad 1, 1x1 with pad 0),
+// on the matrix cores: an implicit GEMM of pixels [M] by output channels [N]
+// over taps x input channels [K], in 16x16x16 float16 products with float32
+// accumulators.
+//
+// A workgroup is 128 pixels (flattened, so a tile may wrap a row) by 128
+// output channels: four subgroups of 64 each computing a 64x64 quarter as 4x4
+// accumulator tiles. K goes one tap and 32 input channels at a time. The input
+// is gathered into shared memory as half (im2col on the way in, zeros outside
+// the image); the weight is already [ky, kx, in, out] - K by N as it stands -
+// and goes in as half too. Results leave through a 16x16 staging tile per
+// subgroup, the bias added and the layout turned back to [out_c, h, w].
+//
+// in_c must be a multiple of 32 and out_c of 4. Half operands: inputs must be
+// inside +-65504. Same bindings and push block as conv2d.
+// Dispatch: ceil(h*w/128) * ceil(out_c/128).
+float4 weight[];
+float bias[];
+float input_[];
+float output[];
+struct Push @pushconstant {
+    uint in_c; uint out_c; uint in_h; uint in_w; uint kh; uint kw;
+    uint stride; uint pad; uint groups; uint out_h; uint out_w; uint has_bias;
+}
+Push pc;
+shared half As[5120];     // [128 pixels][40]: 32 channels + 8 of padding
+shared half Bs[4352];      // [32 channels][136]: 128 outputs + 8 of padding
+shared float Cs[1024];          // [4 subgroups][16][16]
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint sg = gi / 64u;
+    uint lane = gi % 64u;
+    uint H = pc.in_h;
+    uint W = pc.in_w;
+    uint hw = H * W;
+    uint tiles_n = (pc.out_c + 127u) / 128u;
+    uint p_base = (input.gid.x / tiles_n) * 128u;
+    uint oc_base = (input.gid.x % tiles_n) * 128u;
+    uint sm = (sg / 2u) * 64u;
+    uint sn = (sg % 2u) * 64u;
+    uint out4 = pc.out_c / 4u;
+
+    // A: pixel gi % 128, sixteen channels from (gi / 128) * 16.
+    uint a_m = gi % 128u;
+    uint a_c0 = (gi / 128u) * 16u;
+    uint p = p_base + a_m;
+    int py = int(p / W);
+    int px = int(p % W);
+    bool p_live = p < hw;
+    coopmat<float, 16, 16, subgroup, accumulator> c00;
+    coopmat<float, 16, 16, subgroup, accumulator> c01;
+    coopmat<float, 16, 16, subgroup, accumulator> c02;
+    coopmat<float, 16, 16, subgroup, accumulator> c03;
+    coopmat<float, 16, 16, subgroup, accumulator> c10;
+    coopmat<float, 16, 16, subgroup, accumulator> c11;
+    coopmat<float, 16, 16, subgroup, accumulator> c12;
+    coopmat<float, 16, 16, subgroup, accumulator> c13;
+    coopmat<float, 16, 16, subgroup, accumulator> c20;
+    coopmat<float, 16, 16, subgroup, accumulator> c21;
+    coopmat<float, 16, 16, subgroup, accumulator> c22;
+    coopmat<float, 16, 16, subgroup, accumulator> c23;
+    coopmat<float, 16, 16, subgroup, accumulator> c30;
+    coopmat<float, 16, 16, subgroup, accumulator> c31;
+    coopmat<float, 16, 16, subgroup, accumulator> c32;
+    coopmat<float, 16, 16, subgroup, accumulator> c33;
+    coopmat<half, 16, 16, subgroup, a> a0;
+    coopmat<half, 16, 16, subgroup, a> a1;
+    coopmat<half, 16, 16, subgroup, a> a2;
+    coopmat<half, 16, 16, subgroup, a> a3;
+    coopmat<half, 16, 16, subgroup, b> b0;
+    coopmat<half, 16, 16, subgroup, b> b1;
+    coopmat<half, 16, 16, subgroup, b> b2;
+    coopmat<half, 16, 16, subgroup, b> b3;
+
+    for (uint i = lane; i < 256u; i += 64u) { Cs[sg * 256u + i] = 0.0; }
+    barrier;
+    coop_load(c00, &Cs[sg * 256u], 16u);
+    coop_load(c01, &Cs[sg * 256u], 16u);
+    coop_load(c02, &Cs[sg * 256u], 16u);
+    coop_load(c03, &Cs[sg * 256u], 16u);
+    coop_load(c10, &Cs[sg * 256u], 16u);
+    coop_load(c11, &Cs[sg * 256u], 16u);
+    coop_load(c12, &Cs[sg * 256u], 16u);
+    coop_load(c13, &Cs[sg * 256u], 16u);
+    coop_load(c20, &Cs[sg * 256u], 16u);
+    coop_load(c21, &Cs[sg * 256u], 16u);
+    coop_load(c22, &Cs[sg * 256u], 16u);
+    coop_load(c23, &Cs[sg * 256u], 16u);
+    coop_load(c30, &Cs[sg * 256u], 16u);
+    coop_load(c31, &Cs[sg * 256u], 16u);
+    coop_load(c32, &Cs[sg * 256u], 16u);
+    coop_load(c33, &Cs[sg * 256u], 16u);
+
+    uint taps = pc.kh * pc.kw;
+    for (uint tap = 0u; tap < taps; tap++) {
+        int sy = py + int(tap / pc.kw) - int(pc.pad);
+        int sx = px + int(tap % pc.kw) - int(pc.pad);
+        bool inside = p_live && sy >= 0 && sy < int(H) && sx >= 0 && sx < int(W);
+        uint src = inside ? uint(sy) * W + uint(sx) : 0u;
+        for (uint ic0 = 0u; ic0 < pc.in_c; ic0 += 32u) {
+            for (uint c = 0u; c < 16u; c++) {
+                float v = 0.0;
+                if (inside) v = input_[(ic0 + a_c0 + c) * hw + src];
+                As[a_m * 40u + a_c0 + c] = half(v);
+            }
+            // B: 32 rows of K (this tap, these channels) by 128 outputs, four float4s a thread.
+            for (uint i = 0u; i < 4u; i++) {
+                uint flat = gi + i * 256u;
+                uint kk = flat / 32u;
+                uint n4 = flat % 32u;
+                uint n = oc_base + n4 * 4u;
+                float4 wv = float4(0.0);
+                if (n < pc.out_c) wv = weight[(tap * pc.in_c + ic0 + kk) * out4 + n / 4u];
+                uint at = kk * 136u + n4 * 4u;
+                Bs[at] = half(wv.x);
+                Bs[at + 1u] = half(wv.y);
+                Bs[at + 2u] = half(wv.z);
+                Bs[at + 3u] = half(wv.w);
+            }
+            barrier;
+            for (uint kk = 0u; kk < 32u; kk += 16u) {
+                coop_load(a0, &As[(sm + 0u) * 40u + kk], 40u);
+                coop_load(a1, &As[(sm + 16u) * 40u + kk], 40u);
+                coop_load(a2, &As[(sm + 32u) * 40u + kk], 40u);
+                coop_load(a3, &As[(sm + 48u) * 40u + kk], 40u);
+                coop_load(b0, &Bs[kk * 136u + sn + 0u], 136u);
+                coop_load(b1, &Bs[kk * 136u + sn + 16u], 136u);
+                coop_load(b2, &Bs[kk * 136u + sn + 32u], 136u);
+                coop_load(b3, &Bs[kk * 136u + sn + 48u], 136u);
+                coop_muladd(a0, b0, c00, c00);
+                coop_muladd(a0, b1, c01, c01);
+                coop_muladd(a0, b2, c02, c02);
+                coop_muladd(a0, b3, c03, c03);
+                coop_muladd(a1, b0, c10, c10);
+                coop_muladd(a1, b1, c11, c11);
+                coop_muladd(a1, b2, c12, c12);
+                coop_muladd(a1, b3, c13, c13);
+                coop_muladd(a2, b0, c20, c20);
+                coop_muladd(a2, b1, c21, c21);
+                coop_muladd(a2, b2, c22, c22);
+                coop_muladd(a2, b3, c23, c23);
+                coop_muladd(a3, b0, c30, c30);
+                coop_muladd(a3, b1, c31, c31);
+                coop_muladd(a3, b2, c32, c32);
+                coop_muladd(a3, b3, c33, c33);
+            }
+            barrier;
+        }
+    }
+
+    uint m0 = p_base + sm;
+    uint n0 = oc_base + sn;
+    coop_store(&Cs[sg * 256u], c00, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 0u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c01, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 16u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c02, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 32u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c03, 16u); barrier; flush(sg, lane, m0 + 0u, n0 + 48u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c10, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 0u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c11, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 16u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c12, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 32u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c13, 16u); barrier; flush(sg, lane, m0 + 16u, n0 + 48u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c20, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 0u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c21, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 16u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c22, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 32u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c23, 16u); barrier; flush(sg, lane, m0 + 32u, n0 + 48u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c30, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 0u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c31, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 16u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c32, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 32u, hw); barrier;
+    coop_store(&Cs[sg * 256u], c33, 16u); barrier; flush(sg, lane, m0 + 48u, n0 + 48u, hw);
+}
+
+// One subgroup's staged 16x16 tile (pixels by channels) to output [out_c, h, w],
+// with the bias, inside the bounds. Consecutive lanes take consecutive pixels.
+fn void flush(uint sg, uint lane, uint m0, uint n0, uint hw)
+{
+    for (uint i = lane; i < 256u; i += 64u) {
+        uint m = i % 16u;
+        uint n = i / 16u;
+        uint gm = m0 + m;
+        uint gn = n0 + n;
+        if (gm < hw && gn < pc.out_c) {
+            float b = pc.has_bias != 0u ? bias[gn] : 0.0;
+            output[gn * hw + gm] = Cs[sg * 256u + m * 16u + n] + b;
+        }
+    }
+}

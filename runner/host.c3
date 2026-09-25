@@ -21,7 +21,6 @@ module runner;
 
 import three;
 import llm;
-import llm::pipelines;
 import qjs;
 import image;
 import image::png;
@@ -799,7 +798,7 @@ fn void js_random_normal(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qj
 	uint seed = (uint)(ulong)three::arg_number(&js, argc, args, 1);
 	float[] noise = mem::new_array(float, (sz)count);
 	defer mem::free(noise);
-	pipelines::generate_random_latent(noise, seed);
+	llm::generate_random_latent(noise, seed);
 	*out = float_array(&js, noise.ptr, count);
 }
 
@@ -1030,7 +1029,7 @@ fn void js_tensor_to_image(qjs::ContextRef ctx, qjs::Value* this_val, int argc, 
 		return;
 	}
 	float[] data = ((float*)bytes.ptr)[:(usz)width * height * channels];
-	image::Image? img = pipelines::float_tensor_to_image(data, width, height, channels);
+	image::Image? img = llm::float_tensor_to_image(data, width, height, channels);
 	if (catch err = img)
 	{
 		*out = js.raise(string::tformat("could not convert to an image (%s)", err));

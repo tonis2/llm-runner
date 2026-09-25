@@ -12,12 +12,28 @@
 import { GGML } from './llm.js';
 import { dispatch, pc, groups, flashDefines } from './gpu.js';
 
+// Whether Q8_0 matmuls may run on the matrix cores, in float16. They do when
+// the device has cooperative matrices and 64-wide subgroups (the kernel's
+// layout), unless a plugin turns it off with `useMatrixCores(false)`.
+const L = three.compute.limits;
+let matrixCores = L.cooperativeMatrix && L.subgroupSize === 64;
+export function useMatrixCores(on) { matrixCores = on && L.cooperativeMatrix && L.subgroupSize === 64; }
+export function matrixCoresOn() { return matrixCores; }
+
 // y[seq, out] = x[seq, in] @ W[rowOffset .. rowOffset + out, :]^T
-export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = false) {
+//
+// `exact` keeps a Q8_0 matmul in float32 when the matrix cores are on: their
+// operands are float16, so an x that can pass 65504 (the input of a SwiGLU
+// down-projection in a model with large activations) has to take the slow path.
+export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = false, exact = false) {
 	const push = pc('uuuu', out, inDim, seq, rowOffset);
 	switch (w.type) {
 		case GGML.Q8_0:
-			dispatch('matmul_q8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
+			if (matrixCores && !exact && seq >= 16) {
+				dispatch('matmul_q8_coop', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
+			} else {
+				dispatch('matmul_q8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
+			}
 			return;
 		case GGML.F32:
 			if (seq <= 4) dispatch('matmul_f32_rows', [w, x, y], [seq, out], push, independent);
@@ -82,6 +98,10 @@ export function transposeChannelSpatial(x, y, channels, spatial, direction) {
 
 // Q, K, V [heads, seq, hd] -> out [seq, heads * hd], non-causal.
 export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
+	if (matrixCores && hd === 128) {
+		dispatch('flash_attention_coop', [q, k, v, out], [groups(seq, 64), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)));
+		return;
+	}
 	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)), false, flashDefines(hd));
 }
 // Causal GQA, Q [n, qHeads * hd], K/V [n, kvHeads * hd].
@@ -129,7 +149,10 @@ export function conv2d(conv, x, y, h, w, stride = 1, pad = null, out = null) {
 	const ow = out ? out.w : Math.floor((w + 2 * p - k) / stride) + 1;
 	const bias = conv.bias ?? conv.weight;
 	const push = pc('uuuuuuuuuuuu', conv.inC, conv.outC, h, w, k, k, stride, p, 1, oh, ow, conv.bias ? 1 : 0);
-	if (k === 3 && stride === 1 && p === 1) {
+	if (stride === 1 && 2 * p === k - 1 && matrixCores && conv.inC % 32 === 0 && conv.outC % 4 === 0) {
+		// A size-keeping conv (3x3 or 1x1) as an implicit GEMM on the matrix cores.
+		dispatch('conv2d_coop', [conv.weight, bias, x, y], [groups(oh * ow, 128) * groups(conv.outC, 128)], push);
+	} else if (k === 3 && stride === 1 && p === 1) {
 		dispatch('conv2d_3x3', [conv.weight, bias, x, y], [groups(ow, 16), groups(oh, 16), groups(conv.outC, 4)], push);
 	} else {
 		dispatch('conv2d', [conv.weight, bias, x, y], [groups(oh * ow, 256), conv.outC], push);
@@ -156,6 +179,8 @@ export function layerNormAffine(x, weight, bias, y, dim, rows, eps = 1e-6) {
 }
 export function gelu(x, n) { dispatch('gelu', [x], [groups(n, 256)], pc('u', n)); }
 export function relu(x, n) { dispatch('relu', [x], [groups(n, 256)], pc('u', n)); }
+// tanh(x / 3) * 3 in place.
+export function tanhClamp(x, n) { dispatch('tanh_clamp', [x], [groups(n, 256)], pc('u', n)); }
 // Bilinear resize with align_corners = True.
 export function bilinear(x, y, channels, inH, inW, outH, outW) {
 	dispatch('bilinear_resize', [x, y], [groups(outH * outW, 256), channels], pc('uuuuu', channels, inH, inW, outH, outW));
