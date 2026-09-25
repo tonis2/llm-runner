@@ -58,3 +58,6 @@ export const FIELD_GAP = 6;
 // Below this zoom the editors are too small to use, and a node shows its values
 // as text instead.
 export const EDIT_ZOOM = 0.5;
+
+// How much one wheel notch zooms the canvas.
+export const ZOOM_STEP = 1.1;

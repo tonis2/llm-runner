@@ -231,14 +231,16 @@ export class FluxDiT {
 		op.matmul(this.g.modSingle, a.siluT, a.modSingle, 3 * dim, dim, 1, 0, true);
 		op.matmul(this.g.finalAdaLN, a.siluT, a.modFinal, 2 * dim, dim, 1);
 
+		// A submission per block: with a reference image the sequence doubles, and
+		// a whole stack of blocks in one submission outlasts the driver's GPU
+		// watchdog, which resets the device.
 		for (const b of this.dual) {
 			this.dualBlock(b, txtH, imgH);
-			await breathe();
+			await breathe(true);
 		}
-		submit();
 		for (const b of this.single) {
 			this.singleBlock(b);
-			await breathe();
+			await breathe(true);
 		}
 
 		// Final layer over the image rows: LayerNorm, AdaLN (shift first, then

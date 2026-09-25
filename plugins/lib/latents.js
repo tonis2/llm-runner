@@ -66,24 +66,8 @@ export function pixelUnshuffle(input, channels, h, w, r) {
 	return out;
 }
 
-// out[oc, s] = bias[oc] + sum_ic W[oc, ic] * in[ic, s]
-export function conv1x1(input, weight, bias, inC, outC, spatial) {
-	const out = new Float32Array(outC * spatial);
-	for (let oc = 0; oc < outC; oc++) {
-		const row = oc * inC;
-		const base = oc * spatial;
-		for (let s = 0; s < spatial; s++) out[base + s] = bias[oc];
-		for (let ic = 0; ic < inC; ic++) {
-			const wv = weight[row + ic];
-			const src = ic * spatial;
-			for (let s = 0; s < spatial; s++) out[base + s] += wv * input[src + s];
-		}
-	}
-	return out;
-}
-
-// Flux 2: undo the batch norm, pixel-shuffle to the VAE's 32 channels,
-// post_quant_conv, decode. [128, h, w] -> [3, 16h, 16w].
+// Flux 2: undo the batch norm, pixel-shuffle to the VAE's 32 channels, then
+// the decoder (which runs post_quant_conv on the GPU first). [128, h, w] -> [3, 16h, 16w].
 async function decodeFlux2(vae, data, latentH, latentW) {
 	const latent = data.slice();
 	const mean = vae.floats('bn.running_mean');
@@ -94,13 +78,9 @@ async function decodeFlux2(vae, data, latentH, latentW) {
 		const std = Math.sqrt(variance[c] + 1e-5);
 		for (let j = 0; j < spatial; j++) latent[c * spatial + j] = latent[c * spatial + j] * std + mean[c];
 	}
-	const vaeCh = channels / 4;
 	const h = latentH * 2, w = latentW * 2;
-	let x = pixelShuffle(latent, channels, latentH, latentW, 2);
-	if (vae.has('post_quant_conv.weight')) {
-		x = conv1x1(x, vae.floats('post_quant_conv.weight'), vae.floats('post_quant_conv.bias'), vaeCh, vaeCh, h * w);
-	}
-	const decoder = new FluxVAEDecoder(vae);
+	const x = pixelShuffle(latent, channels, latentH, latentW, 2);
+	const decoder = new FluxVAEDecoder(vae, { quantConv: true });
 	try {
 		return await decoder.decode(x, h, w);
 	} finally {
@@ -114,10 +94,7 @@ async function encodeFlux2(vae, encoder, img) {
 	const H = img.height, W = img.width;
 	const enc = await encoder.encode(image.toTensor(img), H, W);
 	const spatial = enc.h * enc.w;
-	let x = enc.data;
-	if (vae.has('quant_conv.weight')) {
-		x = conv1x1(x, vae.floats('quant_conv.weight'), vae.floats('quant_conv.bias'), enc.channels, enc.channels, spatial);
-	}
+	const x = enc.data;
 	const half = enc.channels / 2;
 	const latent = pixelUnshuffle(x.subarray(0, half * spatial), half, enc.h, enc.w, 2);
 	const mean = vae.floats('bn.running_mean');
@@ -148,7 +125,7 @@ export async function encodeImage(vaePath, img) {
 		vae.close();
 		throw new Error(`${vaePath} is a TAESD decoder; it has no encoder`);
 	}
-	const encoder = new FluxVAEEncoder(vae);
+	const encoder = new FluxVAEEncoder(vae, { quantConv: kind === 'flux2' });
 	try {
 		return await (kind === 'flux2' ? encodeFlux2(vae, encoder, img) : encodeFlux1(encoder, img));
 	} finally {

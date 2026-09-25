@@ -66,11 +66,13 @@ function disposeAll(value) {
 }
 
 export class FluxVAEDecoder {
-	// `model` is an open safetensors (or GGUF) file holding `decoder.*`.
-	constructor(model) {
+	// `model` is an open safetensors (or GGUF) file holding `decoder.*`. With
+	// `quantConv`, the file's post_quant_conv (a 1x1 conv) runs ahead of conv_in.
+	constructor(model, { quantConv = false } = {}) {
 		const m = model;
 		const t0 = llm.now();
 		const diffusers = m.has('decoder.mid_block.resnets.0.conv1.weight');
+		this.postQuant = quantConv && m.has('post_quant_conv.weight') ? conv(m, 'post_quant_conv.', 1) : null;
 		this.convIn = conv(m, 'decoder.conv_in.');
 		if (diffusers) {
 			this.mid1 = resnet(m, 'decoder.mid_block.resnets.0.');
@@ -101,7 +103,7 @@ export class FluxVAEDecoder {
 	}
 
 	dispose() {
-		disposeAll([this.convIn, this.mid1, this.midAttn, this.mid2, this.stages, this.normOutW, this.normOutB, this.convOut]);
+		disposeAll([this.postQuant, this.convIn, this.mid1, this.midAttn, this.mid2, this.stages, this.normOutW, this.normOutB, this.convOut]);
 	}
 
 	// Decode `latent` (Float32Array [C, h, w]) and return [3, 8h, 8w] floats in [0, 1].
@@ -112,6 +114,10 @@ export class FluxVAEDecoder {
 		const a = { x: f32(size), t: f32(size), s: f32(size) };
 		const attn = attentionScratch(h * w);
 		a.x.buffer.write(latent);
+		if (this.postQuant) {
+			op.conv2d(this.postQuant, a.x, a.t, h, w);
+			copy(a.t, a.x, this.postQuant.outC * h * w * 4);
+		}
 
 		let r = op.conv2d(this.convIn, a.x, a.t, h, w);
 		copy(a.t, a.x, this.convIn.outC * h * w * 4);
@@ -206,7 +212,8 @@ function attentionScratch(spatial) {
 // conv_out. Ported from `flux_vae_encoder.c3`. Both namings are read, as for
 // the decoder; the original checkpoint's stages count from the image end too.
 export class FluxVAEEncoder {
-	constructor(model) {
+	// With `quantConv`, the file's quant_conv (a 1x1 conv) runs after conv_out.
+	constructor(model, { quantConv = false } = {}) {
 		const m = model;
 		const t0 = llm.now();
 		if (!m.has('encoder.conv_in.weight')) throw new Error(`${m.path} has no VAE encoder`);
@@ -228,11 +235,12 @@ export class FluxVAEEncoder {
 		this.normOutW = m.upload(`${norm}weight`, 'f32');
 		this.normOutB = m.upload(`${norm}bias`, 'f32');
 		this.convOut = conv(m, 'encoder.conv_out.');
+		this.quant = quantConv && m.has('quant_conv.weight') ? conv(m, 'quant_conv.', 1) : null;
 		llm.print(`  VAE encoder: loaded in ${llm.since(t0)}`);
 	}
 
 	dispose() {
-		disposeAll([this.convIn, this.stages, this.mid1, this.midAttn, this.mid2, this.normOutW, this.normOutB, this.convOut]);
+		disposeAll([this.convIn, this.stages, this.mid1, this.midAttn, this.mid2, this.normOutW, this.normOutB, this.convOut, this.quant]);
 	}
 
 	// `pixels` is [3, H, W] floats in [-1, 1]; returns [outC, H/8, W/8].
@@ -263,6 +271,10 @@ export class FluxVAEEncoder {
 		op.groupNorm(a.x, this.normOutW, this.normOutB, a.t, 512, h * w);
 		op.silu(a.t, 512 * h * w);
 		op.conv2d(this.convOut, a.t, a.x, h, w);
+		if (this.quant) {
+			op.conv2d(this.quant, a.x, a.t, h, w);
+			copy(a.t, a.x, this.quant.outC * h * w * 4);
+		}
 		submit();
 		const outC = this.convOut.outC;
 		const out = new Float32Array(a.x.buffer.readBytes(0, outC * h * w * 4).buffer);

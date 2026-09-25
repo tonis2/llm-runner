@@ -14,7 +14,7 @@ import { layoutOf } from './layout.js';
 import { editor } from './fields.js';
 import { accepts } from '../lib/graph/types.js';
 import {
-	THEME, typeColor, NODE_W, NODE_HEAD, PORT_R, LABEL_H, EDIT_ZOOM,
+	THEME, typeColor, NODE_W, NODE_HEAD, PORT_R, LABEL_H, EDIT_ZOOM, ZOOM_STEP,
 } from './theme.js';
 
 const { Drawing, Clip, Stack, Anchored } = three.ui;
@@ -341,7 +341,11 @@ export class GraphCanvas extends three.Widget {
 		if (!wheel) return;
 		this.autoFrame = false;
 		const before = this.toGraph(p);
-		const zoom = Math.min(2.5, Math.max(0.2, this.view.zoom * Math.exp(wheel * 0.12)));
+		// One wheel notch is 1 on X11 but about 15 points on Wayland, so a notch
+		// counts as one step whatever its size; a trackpad's small deltas still
+		// zoom smoothly in proportion.
+		const step = Math.max(-1, Math.min(1, wheel));
+		const zoom = Math.min(2.5, Math.max(0.2, this.view.zoom * Math.pow(ZOOM_STEP, step)));
 		this.view = { zoom, x: before[0] - p[0] / zoom, y: before[1] - p[1] / zoom };
 	}
 
