@@ -1,0 +1,51 @@
+// W[dst_row_offset + i, j] += scale * W1[i / w2_rows, j / w2_cols] * W2[i % w2_rows, j % w2_cols]
+// - a LyCORIS LoKr delta, folded into Q8_0 weights in place and requantised.
+// Dispatch (in_dim / 256, b_rows).
+uint8 base[];
+float w1[];
+float w2[];
+struct Push @pushconstant { uint in_dim; uint b_rows; uint dst_row_offset; uint w1_rows; uint w1_cols; uint w2_rows; uint w2_cols; float scale; }
+Push pc;
+shared float w1s[256];
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint row = input.gid.y;
+    if (row >= pc.b_rows) return;
+    uint k_start = input.gid.x * 256u;
+    uint row_bytes = (pc.in_dim / 32u) * 34u;
+    uint blk = gi / 32u;
+    uint e = gi % 32u;
+    uint k = k_start + gi;
+    uint bb = (pc.dst_row_offset + row) * row_bytes + (k_start / 32u + blk) * 34u;
+
+    if (gi < pc.w1_rows * pc.w1_cols) w1s[gi] = w1[gi];
+    barrier;
+
+    float old_d = unpack_f16(uint(base[bb]) | (uint(base[bb + 1u]) << 8u));
+    float value = old_d * float(sign_extend8(uint(base[bb + 2u + e])));
+    uint i1 = row / pc.w2_rows;
+    uint i2 = row - i1 * pc.w2_rows;
+    uint j1 = k / pc.w2_cols;
+    uint j2 = k - j1 * pc.w2_cols;
+    float updated = value + pc.scale * w1s[i1 * pc.w1_cols + j1] * w2[i2 * pc.w2_cols + j2];
+
+    red[gi] = abs(updated);
+    barrier;
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (e < s) red[blk * 32u + e] = max(red[blk * 32u + e], red[blk * 32u + e + s]);
+        barrier;
+    }
+    float d = max(red[blk * 32u] / 127.0, 1e-8);
+    float qf = updated / d;
+    int q = qf >= 0.0 ? int(qf + 0.5) : int(qf - 0.5);
+    q = clamp(q, -127, 127);
+    base[bb + 2u + e] = uint8(uint(q) & 255u);
+    if (e == 0u) {
+        uint h = pack_f16(d);
+        base[bb] = uint8(h & 255u);
+        base[bb + 1u] = uint8(h >> 8u);
+    }
+}

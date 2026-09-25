@@ -1,0 +1,30 @@
+// Transposed convolution with stride == kernel and no padding (each input pixel
+// becomes a k x k block): input [Cin, h, w], weight [Cin, Cout, k, k] as PyTorch
+// stores it, output [Cout, h k, w k]. Dispatch (ceil(h k * w k / 256), Cout).
+float weight[];
+float bias[];
+float input_[];
+float output[];
+struct Push @pushconstant { uint in_c; uint out_c; uint in_h; uint in_w; uint k; uint has_bias; }
+Push pc;
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint oc = input.gid.y;
+    uint out_h = pc.in_h * pc.k;
+    uint out_w = pc.in_w * pc.k;
+    uint s = input.gid.x * 256u + input.lid.x;
+    uint oh = s / out_w;
+    uint ow = s % out_w;
+    if (oc >= pc.out_c || oh >= out_h) return;
+    uint ih = oh / pc.k;
+    uint iw = ow / pc.k;
+    uint kk = pc.k * pc.k;
+    uint wo = oc * kk + (oh % pc.k) * pc.k + ow % pc.k;
+    float sum = 0.0;
+    for (uint ic = 0u; ic < pc.in_c; ic++) {
+        sum += input_[ic * pc.in_h * pc.in_w + ih * pc.in_w + iw] * weight[ic * pc.out_c * kk + wo];
+    }
+    if (pc.has_bias != 0u) sum += bias[oc];
+    output[oc * out_h * out_w + oh * out_w + ow] = sum;
+}

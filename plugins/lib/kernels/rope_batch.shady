@@ -1,0 +1,25 @@
+// Standard RoPE on [n_tokens, n_heads * dim] in place, position = row index.
+float data[];
+struct Push @pushconstant { uint dim; uint n_heads; uint n_tokens; float theta; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(128, 1, 1)
+{
+    uint half_dim = pc.dim / 2u;
+    uint pairs_per_tok = pc.n_heads * half_dim;
+    uint i = input.id.x;
+    if (i >= pc.n_tokens * pairs_per_tok) return;
+    uint pos = i / pairs_per_tok;
+    uint rem = i % pairs_per_tok;
+    uint head = rem / half_dim;
+    uint pair = rem % half_dim;
+    float freq = 1.0 / pow(pc.theta, float(2u * pair) / float(pc.dim));
+    float angle = float(pos) * freq;
+    float c = cos(angle);
+    float s = sin(angle);
+    uint base = pos * pc.n_heads * pc.dim + head * pc.dim + pair * 2u;
+    float x0 = data[base];
+    float x1 = data[base + 1u];
+    data[base] = x0 * c - x1 * s;
+    data[base + 1u] = x0 * s + x1 * c;
+}

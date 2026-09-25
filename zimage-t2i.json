@@ -1,0 +1,11 @@
+{
+	"model": "/run/media/tonis/extra/AI models/z-image-turbo-Q8_0.gguf",
+	"prompt": "a photo of a cat",
+	"text_model": "/run/media/tonis/extra/AI models/Qwen3-4B-Q8_0.gguf",
+	"vae": "/run/media/tonis/extra/AI models/ae.safetensors",
+	"steps": 4,
+	"cfg_scale": 0.0,
+	"seed": 42,
+	"size": 512,
+	"output": "zimage_output.png"
+}

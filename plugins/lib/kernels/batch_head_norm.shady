@@ -1,0 +1,33 @@
+// Per-head RMSNorm on [seq, heads * head_dim] in place, one workgroup per (pos, head).
+float data[];
+float weight[];
+struct Push @pushconstant { uint n_heads; uint head_dim; uint seq_len; float eps; }
+Push pc;
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint H = pc.n_heads;
+    uint D = pc.head_dim;
+    uint flat = input.gid.x;
+    uint gi = input.lid.x;
+    uint pos = flat / H;
+    uint h = flat % H;
+    if (pos >= pc.seq_len) return;
+    uint base = (pos * H + h) * D;
+    float sum_sq = 0.0;
+    for (uint i = gi; i < D; i += 256u) {
+        float v = data[base + i];
+        sum_sq += v * v;
+    }
+    red[gi] = sum_sq;
+    barrier;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gi < s) red[gi] += red[gi + s];
+        barrier;
+    }
+    float rms = 1.0 / sqrt(red[0] / float(D) + pc.eps);
+    for (uint i = gi; i < D; i += 256u) {
+        data[base + i] = data[base + i] * rms * weight[i];
+    }
+}

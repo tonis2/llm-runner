@@ -1,0 +1,24 @@
+// [C, H, W] latent -> [n_patches, C * ps * ps], channel innermost within a patch pixel.
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint height; uint width; uint patch_size; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint ps = pc.patch_size;
+    uint patch_dim = pc.channels * ps * ps;
+    uint patches_w = pc.width / ps;
+    uint patches_h = pc.height / ps;
+    uint total = patches_h * patches_w * patch_dim;
+    uint i = input.id.x;
+    if (i >= total) return;
+    uint patch_idx = i / patch_dim;
+    uint elem = i % patch_dim;
+    uint py = elem / (ps * pc.channels);
+    uint px = (elem % (ps * pc.channels)) / pc.channels;
+    uint c = elem % pc.channels;
+    uint ih = (patch_idx / patches_w) * ps + py;
+    uint iw = (patch_idx % patches_w) * ps + px;
+    output[i] = input_[c * pc.height * pc.width + ih * pc.width + iw];
+}

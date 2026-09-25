@@ -1,0 +1,12 @@
+// output = clamp(input * scale + shift, 0, 1)
+float input_[];
+float output[];
+struct Push @pushconstant { uint n; float scale; float shift; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    output[i] = clamp(input_[i] * pc.scale + pc.shift, 0.0, 1.0);
+}

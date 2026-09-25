@@ -1,0 +1,18 @@
+// direction 0: [C, S] -> [S, C]; 1: [S, C] -> [C, S].
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint spatial; uint direction; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint C = pc.channels;
+    uint S = pc.spatial;
+    uint i = input.id.x;
+    if (i >= C * S) return;
+    if (pc.direction == 0u) {
+        output[(i % S) * C + i / S] = input_[i];
+    } else {
+        output[(i % C) * S + i / C] = input_[i];
+    }
+}

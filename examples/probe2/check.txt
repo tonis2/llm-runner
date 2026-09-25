@@ -1,0 +1,1 @@
+probe2 confirmed: libc::calloc for host buffers works where mem::calloc corrupts.

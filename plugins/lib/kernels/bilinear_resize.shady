@@ -1,0 +1,31 @@
+// [C, in_h, in_w] -> [C, out_h, out_w], bilinear with align_corners = True.
+// Dispatch (ceil(out_h * out_w / 256), channels).
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint in_h; uint in_w; uint out_h; uint out_w; }
+Push pc;
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint c = input.gid.y;
+    uint s = input.gid.x * 256u + input.lid.x;
+    if (c >= pc.channels) return;
+    uint oh = s / pc.out_w;
+    uint ow = s % pc.out_w;
+    if (oh >= pc.out_h) return;
+    float sy = pc.out_h > 1u ? float(oh) * float(pc.in_h - 1u) / float(pc.out_h - 1u) : 0.0;
+    float sx = pc.out_w > 1u ? float(ow) * float(pc.in_w - 1u) / float(pc.out_w - 1u) : 0.0;
+    uint y0 = uint(floor(sy));
+    uint x0 = uint(floor(sx));
+    uint y1 = min(y0 + 1u, pc.in_h - 1u);
+    uint x1 = min(x0 + 1u, pc.in_w - 1u);
+    float dy = sy - float(y0);
+    float dx = sx - float(x0);
+    uint plane = c * pc.in_h * pc.in_w;
+    float v00 = input_[plane + y0 * pc.in_w + x0];
+    float v01 = input_[plane + y0 * pc.in_w + x1];
+    float v10 = input_[plane + y1 * pc.in_w + x0];
+    float v11 = input_[plane + y1 * pc.in_w + x1];
+    output[c * pc.out_h * pc.out_w + oh * pc.out_w + ow] =
+        v00 * (1.0 - dy) * (1.0 - dx) + v01 * (1.0 - dy) * dx + v10 * dy * (1.0 - dx) + v11 * dy * dx;
+}

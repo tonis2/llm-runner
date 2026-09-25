@@ -1,0 +1,22 @@
+// Per-head RMSNorm on [n_rows, n_heads * head_dim] in place, one thread per (row, head).
+float data[];
+float weight[];
+struct Push @pushconstant { uint head_dim; uint n_heads; uint n_rows; float eps; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n_rows * pc.n_heads) return;
+    uint hd = pc.head_dim;
+    uint base = i * hd;
+    float sum_sq = 0.0;
+    for (uint d = 0u; d < hd; d++) {
+        float v = data[base + d];
+        sum_sq += v * v;
+    }
+    float rms = 1.0 / sqrt(sum_sq / float(hd) + pc.eps);
+    for (uint d = 0u; d < hd; d++) {
+        data[base + d] = data[base + d] * rms * weight[d];
+    }
+}

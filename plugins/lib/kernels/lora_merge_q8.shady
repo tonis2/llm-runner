@@ -1,0 +1,49 @@
+// W[dst_row_offset + r, :] += scale * B[r, :] @ A, folded into Q8_0 weights in
+// place and requantised. One workgroup per (256 inputs = 8 blocks, B row):
+// dispatch (in_dim / 256, b_rows).
+uint8 base[];
+float a[];      // [rank, in_dim]
+float b[];      // [b_rows, rank]
+struct Push @pushconstant { uint in_dim; uint b_rows; uint dst_row_offset; uint rank; float scale; uint p0; uint p1; uint p2; }
+Push pc;
+shared float brow[256];
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint row = input.gid.y;
+    if (row >= pc.b_rows) return;
+    uint k_start = input.gid.x * 256u;
+    uint row_bytes = (pc.in_dim / 32u) * 34u;
+    uint blk = gi / 32u;
+    uint e = gi % 32u;
+    uint k = k_start + gi;
+    uint bb = (pc.dst_row_offset + row) * row_bytes + (k_start / 32u + blk) * 34u;
+
+    if (gi < pc.rank) brow[gi] = b[row * pc.rank + gi];
+    barrier;
+
+    float old_d = unpack_f16(uint(base[bb]) | (uint(base[bb + 1u]) << 8u));
+    float value = old_d * float(sign_extend8(uint(base[bb + 2u + e])));
+    float delta = 0.0;
+    for (uint r = 0u; r < pc.rank; r++) delta += brow[r] * a[r * pc.in_dim + k];
+    float updated = value + pc.scale * delta;
+
+    red[gi] = abs(updated);
+    barrier;
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (e < s) red[blk * 32u + e] = max(red[blk * 32u + e], red[blk * 32u + e + s]);
+        barrier;
+    }
+    float d = max(red[blk * 32u] / 127.0, 1e-8);
+    float qf = updated / d;
+    int q = qf >= 0.0 ? int(qf + 0.5) : int(qf - 0.5);
+    q = clamp(q, -127, 127);
+    base[bb + 2u + e] = uint8(uint(q) & 255u);
+    if (e == 0u) {
+        uint h = pack_f16(d);
+        base[bb] = uint8(h & 255u);
+        base[bb + 1u] = uint8(h >> 8u);
+    }
+}

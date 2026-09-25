@@ -1,0 +1,15 @@
+// output = input * (1 + scale[d]) + shift[d], scale and shift broadcast over rows.
+float input_[];
+float scale[];
+float shift[];
+float output[];
+struct Push @pushconstant { uint n_elements; uint dim; uint scale_offset; uint shift_offset; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n_elements) return;
+    uint d = i % pc.dim;
+    output[i] = input_[i] * (1.0 + scale[pc.scale_offset + d]) + shift[pc.shift_offset + d];
+}

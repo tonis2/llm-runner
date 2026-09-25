@@ -1,0 +1,12 @@
+// x[i] += bias[i % dim]
+float x[];
+float bias[];
+struct Push @pushconstant { uint n; uint dim; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    x[i] = x[i] + bias[i % pc.dim];
+}

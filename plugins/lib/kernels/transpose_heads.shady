@@ -1,0 +1,25 @@
+// direction 0: [seq, heads, head_dim] -> [heads, seq, head_dim]; 1: the reverse.
+float input_[];
+float output[];
+struct Push @pushconstant { uint seq_len; uint n_heads; uint head_dim; uint direction; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint S = pc.seq_len;
+    uint H = pc.n_heads;
+    uint D = pc.head_dim;
+    uint i = input.id.x;
+    if (i >= S * H * D) return;
+    uint d = i % D;
+    uint rem = i / D;
+    if (pc.direction == 0u) {
+        uint seq = rem / H;
+        uint h = rem % H;
+        output[h * S * D + seq * D + d] = input_[i];
+    } else {
+        uint h = rem / S;
+        uint seq = rem % S;
+        output[seq * H * D + h * D + d] = input_[i];
+    }
+}

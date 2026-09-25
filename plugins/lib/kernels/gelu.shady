@@ -1,0 +1,13 @@
+// GELU, tanh approximation, in place.
+float data[];
+struct Push @pushconstant { uint n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    float x = data[i];
+    float t = 0.7978845608 * (x + 0.044715 * x * x * x);
+    data[i] = 0.5 * x * (2.0 - 2.0 / (exp(2.0 * t) + 1.0));
+}

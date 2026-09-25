@@ -1,0 +1,18 @@
+// residual += tanh(mod[gate_offset + d]) * input (Lumina2's gating).
+float residual[];
+float mod[];
+float input_[];
+struct Push @pushconstant { uint n_elements; uint dim; uint gate_offset; uint pad; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn float tanh_of(float x)
+{
+    // tanh from exp, stable at both ends: 1 - 2 / (exp(2x) + 1).
+    return 1.0 - 2.0 / (exp(2.0 * x) + 1.0);
+}
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n_elements) return;
+    residual[i] = residual[i] + tanh_of(mod[pc.gate_offset + i % pc.dim]) * input_[i];
+}

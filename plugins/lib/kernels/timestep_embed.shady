@@ -1,0 +1,18 @@
+// Sinusoidal timestep embedding: [cos(t * f_i) ..., sin(t * f_i) ...], f_i = 10000^(-i / half).
+float output[];
+struct Push @pushconstant { uint dim; float timestep; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint half_dim = pc.dim / 2u;
+    uint i = input.id.x;
+    if (i >= pc.dim) return;
+    if (i < half_dim) {
+        float freq = exp(-log(10000.0) * float(i) / float(half_dim));
+        output[i] = cos(pc.timestep * freq);
+    } else {
+        float freq = exp(-log(10000.0) * float(i - half_dim) / float(half_dim));
+        output[i] = sin(pc.timestep * freq);
+    }
+}

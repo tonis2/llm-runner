@@ -1,0 +1,14 @@
+// residual += gate[d] * input, the gate broadcast over rows (Flux's linear gating).
+float residual[];
+float gate[];
+float input_[];
+struct Push @pushconstant { uint n_elements; uint dim; uint gate_offset; uint pad; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n_elements) return;
+    uint d = i % pc.dim;
+    residual[i] = residual[i] + gate[pc.gate_offset + d] * input_[i];
+}

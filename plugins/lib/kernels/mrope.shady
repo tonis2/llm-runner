@@ -1,0 +1,26 @@
+// Rotary embedding from precomputed tables on [heads, seq, 128] in place.
+// Pair j rotates (x[2j], x[2j+1]) by the angle whose cos/sin sit at [pos, j].
+// Dispatched 3D: x = pair (one group of 64), y = position, z = head.
+float data[];
+float cos_table[];
+float sin_table[];
+struct Push @pushconstant { uint seq_len; uint n_heads; uint pad0; uint pad1; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(64, 1, 1)
+{
+    uint pair = input.id.x;
+    uint pos = input.id.y;
+    uint head = input.id.z;
+    if (pair >= 64u) return;
+    if (pos >= pc.seq_len) return;
+    if (head >= pc.n_heads) return;
+    uint cs = pos * 64u + pair;
+    float cv = cos_table[cs];
+    float sv = sin_table[cs];
+    uint base = head * pc.seq_len * 128u + pos * 128u + 2u * pair;
+    float x0 = data[base];
+    float x1 = data[base + 1u];
+    data[base] = x0 * cv - x1 * sv;
+    data[base + 1u] = x0 * sv + x1 * cv;
+}

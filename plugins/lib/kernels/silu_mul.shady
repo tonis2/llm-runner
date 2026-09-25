@@ -1,0 +1,12 @@
+// gate = silu(gate) * up — the SwiGLU tail in one pass.
+float gate[];
+float up[];
+struct Push @pushconstant { uint n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    gate[i] = silu_of(gate[i]) * up[i];
+}

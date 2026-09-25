@@ -1,88 +1,45 @@
 ## Flux server
 
-The flux example can run as an HTTP server on `/sdapi/v1/img2img`. The DiT
-GGUF, VAE safetensors, and text-encoder GGUF are opened and parsed once at
-startup; subsequent requests skip Vulkan setup, kernel compilation, and GGUF
-parsing.
-
-### Build
-
-```sh
-c3c build flux
-```
+The Flux plugin can run as an HTTP server. Kernels are compiled once at
+startup. With `keep_dit=true`, the 9 GB DiT is loaded once and stays in VRAM,
+so a request pays only for text encoding, denoising and the VAE.
 
 ### Run
 
 ```sh
-./build/flux --server --config flux.json
+c3c build llm-runner
+./build/llm-runner flux --config flux.json keep_dit=true --server --port 7860
 ```
 
-The same `flux.json` you use for one-shot generation is reused — the server
-takes its model paths from there. `--prompt` in the config is ignored in
-server mode (the prompt arrives per request).
+The `flux.json` you use for one-shot generation is reused: model paths, LoRAs
+and defaults come from it, and each request's fields override them.
 
-Server-only flags:
-
-| Flag         | Default       | Notes                                                                                          |
-|--------------|---------------|------------------------------------------------------------------------------------------------|
-| `--server`   | (off)         | Switches the binary into HTTP server mode.                                                     |
-| `--bind`     | `127.0.0.1`   | Bind address. Use `0.0.0.0` to expose on the network.                                          |
-| `--port`     | `7860`        | TCP port.                                                                                      |
-| `--keep-dit` | (off)         | Keep DiT weights (~9 GB) resident across requests. Faster, but borderline OOM on 16 GB at 1024².|
+| Option               | Default       | Notes |
+|----------------------|---------------|-------|
+| `--server`           | (off)         | Serve instead of generating once. |
+| `--bind`             | `127.0.0.1`   | Bind address. `0.0.0.0` exposes it on the network. |
+| `--port`             | `7860`        | TCP port. |
+| `keep_dit=true`      | (off)         | Keep the DiT resident across requests. The LoRA set it was merged with is remembered, and a request with a different set reloads it. |
 
 ### Endpoint
 
-`POST /sdapi/v1/img2img` with a JSON body. Any other method or path returns
-`404`.
+`POST /sdapi/v1/img2img` or `POST /sdapi/v1/txt2img` with a JSON body:
 
-Supported fields:
+| Field         | Type     | Notes |
+|---------------|----------|-------|
+| `prompt`      | string   | |
+| `init_images` | string[] | Base64 PNG or JPEG (a `data:` URL prefix is accepted). Present: kontext edit with up to 4 references. |
+| `edit_mode`   | string   | `kontext` (default with images) or `img2img`. |
+| `steps`, `seed`, `width`, `height`, `strength` | numbers | As in the config. |
+| `loras` / `lora` | array or string | Replaces the configured adapters for this request. |
 
-| Field         | Type           | Default | Notes                                                              |
-|---------------|----------------|---------|--------------------------------------------------------------------|
-| `prompt`      | string         | —       | Required.                                                          |
-| `init_images` | string[]       | `[]`    | Optional. If non-empty, only `[0]` is used and mode becomes kontext. |
-| `steps`       | uint           | `4`     | Klein is distilled to 4 steps.                                     |
-| `seed`        | uint           | `42`    |                                                                    |
-| `width`       | uint           | `1024`  | Rounded up to a multiple of 16.                                    |
-| `height`      | uint           | `1024`  | Rounded up to a multiple of 16.                                    |
-
-`init_images[0]` is a standard base64-encoded PNG or JPEG (no `data:` URL
-prefix needed; both PNG `89 50 4E 47` and JPEG `FF D8` magic bytes are
-auto-detected).
-
-### Response
-
-```json
-{ "data": "<base64-encoded PNG of the generated image>" }
-```
-
-On error (bad JSON, missing prompt, generation failure, etc.) the server
-returns a non-2xx status with `{"error": "..."}` and stays alive for the
-next request.
-
-### Examples
-
-**txt2img:**
+The response is `{"data": "<base64 PNG>", "images": ["<same>"]}`. Errors are a
+non-2xx status with `{"error": "..."}`, and the server stays up.
 
 ```sh
-curl -X POST http://127.0.0.1:7860/sdapi/v1/img2img \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"a red cat","steps":4,"seed":42,"width":1024,"height":1024}' \
+curl -X POST http://127.0.0.1:7860/sdapi/v1/txt2img \
+  -d '{"prompt":"a red cat","seed":42,"width":1024,"height":1024}' \
   | jq -r .data | base64 -d > out.png
 ```
 
-**kontext (image-conditioned edit):**
-
-```sh
-IMG=$(base64 -w0 input.png)
-curl -X POST http://127.0.0.1:7860/sdapi/v1/img2img \
-  -H 'Content-Type: application/json' \
-  -d "{\"prompt\":\"make it orange\",\"init_images\":[\"$IMG\"],\"steps\":4,\"seed\":42,\"width\":1024,\"height\":1024}" \
-  | jq -r .data | base64 -d > edited.png
-```
-
-### Concurrency
-
-The server is single-threaded and processes one request at a time. There's
-only one GPU; queueing diffusion requests inside the process gives the same
-throughput as parallel handlers and avoids VRAM contention.
+One request is handled at a time; there is one GPU.

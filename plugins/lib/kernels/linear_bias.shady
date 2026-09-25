@@ -1,0 +1,27 @@
+// y[seq, out_dim] = x @ W^T + b, W f32 [out_dim, in_dim], one workgroup per output element.
+// Dispatch 1D: seq * out_dim.
+float w[];
+float b[];
+float x[];
+float y[];
+struct Push @pushconstant { uint out_dim; uint in_dim; uint seq_len; }
+Push pc;
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint flat = input.gid.x;
+    uint gi = input.lid.x;
+    uint pos = flat / pc.out_dim;
+    uint o = flat % pc.out_dim;
+    if (pos >= pc.seq_len) return;
+    float partial = 0.0;
+    for (uint k = gi; k < pc.in_dim; k += 256u) partial += x[pos * pc.in_dim + k] * w[o * pc.in_dim + k];
+    red[gi] = partial;
+    barrier;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gi < s) red[gi] += red[gi + s];
+        barrier;
+    }
+    if (gi == 0u) y[pos * pc.out_dim + o] = red[0] + b[o];
+}

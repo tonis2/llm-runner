@@ -1,0 +1,58 @@
+// Put in front of every kernel by gpu.js.
+
+// An IEEE half, from its 16 bits. Exact: a normal half's exponent is rebiased
+// into a float's and its mantissa widened, and a subnormal is its mantissa times
+// 2^-24.
+fn float unpack_f16(uint bits)
+{
+    uint sign = (bits >> 15u) & 1u;
+    uint e = (bits >> 10u) & 31u;
+    uint m = bits & 1023u;
+    float v;
+    if (e == 0u) {
+        v = float(m) * 5.9604645e-8;
+    } else if (e == 31u) {
+        v = asfloat(0x7F800000u);
+    } else {
+        v = asfloat(((e + 112u) << 23u) | (m << 13u));
+    }
+    return sign != 0u ? -v : v;
+}
+
+// A byte as the signed value it holds.
+fn int sign_extend8(uint v)
+{
+    return (v & 128u) != 0u ? int(v) - 256 : int(v);
+}
+
+fn float silu_of(float x)
+{
+    return x / (1.0 + exp(-x));
+}
+
+// A float as the 16 bits of the nearest IEEE half (round to nearest even),
+// subnormals included - what HLSL's f32tof16 answers.
+fn uint pack_f16(float x)
+{
+    uint bits = asuint(x);
+    uint sign = (bits >> 16u) & 32768u;
+    uint e32 = (bits >> 23u) & 255u;
+    uint mant = bits & 8388607u;
+    if (e32 == 255u) return sign | 31744u | (mant != 0u ? 512u : 0u);
+    int e = int(e32) - 112;
+    if (e >= 31) return sign | 31744u;
+    if (e <= 0) {
+        if (e < -10) return sign;
+        uint m = mant | 8388608u;
+        uint shift = uint(14 - e);
+        uint h = m >> shift;
+        uint rem = m & ((1u << shift) - 1u);
+        uint halfway = 1u << (shift - 1u);
+        if (rem > halfway || (rem == halfway && (h & 1u) != 0u)) h = h + 1u;
+        return sign | h;
+    }
+    uint h = (uint(e) << 10u) | (mant >> 13u);
+    uint rem = mant & 8191u;
+    if (rem > 4096u || (rem == 4096u && (h & 1u) != 0u)) h = h + 1u;
+    return sign | h;
+}

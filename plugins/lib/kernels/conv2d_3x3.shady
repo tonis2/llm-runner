@@ -1,0 +1,86 @@
+// 3x3 convolution, stride 1, pad 1, groups 1 - the VAE's everyday conv.
+// A 16x16 output tile and 4 output channels per workgroup; input channels in
+// chunks of 4 through a shared tile with a one-pixel halo, so every staged input
+// is reused 9 x 4 times. Same bindings and push block as conv2d.
+// Dispatch: (ceil(out_w/16), ceil(out_h/16), ceil(out_c/4)).
+float weight[];
+float bias[];
+float input_[];
+float output[];
+struct Push @pushconstant {
+    uint in_c; uint out_c; uint in_h; uint in_w; uint kh; uint kw;
+    uint stride; uint pad; uint groups; uint out_h; uint out_w; uint has_bias;
+}
+Push pc;
+shared float tile[1368];    // [4][18][19]
+shared float wt[144];       // [9][4][4]
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint tx = gi % 16u;
+    uint ty = gi / 16u;
+    uint ow = input.gid.x * 16u + tx;
+    uint oh = input.gid.y * 16u + ty;
+    uint oc0 = input.gid.z * 4u;
+    float acc[4];
+    for (uint i = 0u; i < 4u; i++) acc[i] = 0.0;
+    int x0 = int(input.gid.x * 16u) - 1;
+    int y0 = int(input.gid.y * 16u) - 1;
+    uint hw = pc.in_h * pc.in_w;
+
+    for (uint ic0 = 0u; ic0 < pc.in_c; ic0 += 4u) {
+        for (uint i = 0u; i < 6u; i++) {
+            uint flat = gi + i * 256u;
+            if (flat < 1296u) {
+                uint c = flat / 324u;
+                uint rem = flat % 324u;
+                uint r = rem / 18u;
+                uint col = rem % 18u;
+                int ih = y0 + int(r);
+                int iw = x0 + int(col);
+                uint ic = ic0 + c;
+                float v = 0.0;
+                if (ic < pc.in_c && ih >= 0 && ih < int(pc.in_h) && iw >= 0 && iw < int(pc.in_w)) {
+                    v = input_[ic * hw + uint(ih) * pc.in_w + uint(iw)];
+                }
+                tile[c * 342u + r * 19u + col] = v;
+            }
+        }
+        if (gi < 144u) {
+            uint kk = gi / 16u;
+            uint rem = gi % 16u;
+            uint icl = rem / 4u;
+            uint ocl = rem % 4u;
+            uint ic = ic0 + icl;
+            uint oc = oc0 + ocl;
+            float v = 0.0;
+            if (ic < pc.in_c && oc < pc.out_c) v = weight[kk * pc.in_c * pc.out_c + ic * pc.out_c + oc];
+            wt[gi] = v;
+        }
+        barrier;
+        for (uint icl = 0u; icl < 4u; icl++) {
+            uint in_base = icl * 342u + ty * 19u + tx;
+            for (uint kk = 0u; kk < 9u; kk++) {
+                float iv = tile[in_base + (kk / 3u) * 19u + kk % 3u];
+                uint wb = (kk * 4u + icl) * 4u;
+                acc[0] += iv * wt[wb];
+                acc[1] += iv * wt[wb + 1u];
+                acc[2] += iv * wt[wb + 2u];
+                acc[3] += iv * wt[wb + 3u];
+            }
+        }
+        barrier;
+    }
+
+    if (oh < pc.out_h && ow < pc.out_w) {
+        for (uint ocl = 0u; ocl < 4u; ocl++) {
+            uint oc = oc0 + ocl;
+            if (oc < pc.out_c) {
+                float v = acc[ocl];
+                if (pc.has_bias != 0u) v += bias[oc];
+                output[oc * pc.out_h * pc.out_w + oh * pc.out_w + ow] = v;
+            }
+        }
+    }
+}

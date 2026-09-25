@@ -1,0 +1,150 @@
+// Flash attention (FA2-style tiles, online softmax), non-causal, head_dim $HD
+// (a multiple of 16 up to 128; gpu.js fills $HD and the sizes derived from it).
+// Q, K, V: [heads, seq, $HD]. Output: [seq, heads * $HD] - the transpose back
+// is fused into the write.
+// One workgroup per (16 query rows, head): dispatch (ceil(seq/16), heads).
+float q[];
+float k[];
+float v[];
+float output[];
+struct Push @pushconstant { uint head_dim; uint n_heads; uint seq_len; float scale; }
+Push pc;
+shared float kv[$KV];       // [32][HD + 1]: a K tile, then the V tile over it
+shared float qt[$QT];       // [16][HD]
+shared float st[512];       // scores [16][32]
+shared float red[512];
+shared float row_m[16];
+shared float row_l[16];
+shared float row_r[16];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint head = input.gid.y;
+    uint q_start = input.gid.x * 16u;
+    uint S = pc.seq_len;
+    if (head >= pc.n_heads) return;
+    uint head_offset = head * S * $HDu;
+
+    for (uint i = 0u; i < $QPTu; i++) {
+        uint flat = gi + i * 256u;
+        uint qr = flat / $HDu;
+        uint d = flat % $HDu;
+        uint aq = q_start + qr;
+        qt[flat] = aq < S ? q[head_offset + aq * $HDu + d] : 0.0;
+    }
+    float acc[$QPT];
+    for (uint i = 0u; i < $QPTu; i++) acc[i] = 0.0;
+    if (gi < 16u) {
+        row_m[gi] = -1.0e30;
+        row_l[gi] = 0.0;
+    }
+    barrier;
+
+    uint n_blocks = (S + 31u) / 32u;
+    for (uint blk = 0u; blk < n_blocks; blk++) {
+        uint kv_start = blk * 32u;
+
+        for (uint i = 0u; i < $KPTu; i++) {
+            uint flat = gi + i * 256u;
+            uint r = flat / $HDu;
+            uint d = flat % $HDu;
+            uint ak = kv_start + r;
+            kv[r * $HD1u + d] = ak < S ? k[head_offset + ak * $HDu + d] : 0.0;
+        }
+        barrier;
+
+        for (uint i = 0u; i < 2u; i++) {
+            uint flat = gi + i * 256u;
+            uint qr = flat / 32u;
+            uint kc = flat % 32u;
+            float dot = 0.0;
+            for (uint d = 0u; d < $HDu; d++) dot += qt[qr * $HDu + d] * kv[kc * $HD1u + d];
+            bool valid = (kv_start + kc < S) && (q_start + qr < S);
+            st[flat] = valid ? dot * pc.scale : -1.0e30;
+        }
+        barrier;
+
+        for (uint i = 0u; i < 2u; i++) {
+            uint flat = gi + i * 256u;
+            red[flat] = st[flat];
+        }
+        barrier;
+        for (uint s = 16u; s > 0u; s >>= 1u) {
+            for (uint i = 0u; i < 2u; i++) {
+                uint flat = gi + i * 256u;
+                if ((flat % 32u) < s) red[flat] = max(red[flat], red[flat + s]);
+            }
+            barrier;
+        }
+
+        float m_new0 = 0.0;
+        float m_new1 = 0.0;
+        float e0 = 0.0;
+        float e1 = 0.0;
+        for (uint i = 0u; i < 2u; i++) {
+            uint flat = gi + i * 256u;
+            uint qr = flat / 32u;
+            uint kc = flat % 32u;
+            float m_new = max(row_m[qr], red[qr * 32u]);
+            bool valid = (kv_start + kc < S) && (q_start + qr < S);
+            float e = valid ? exp(st[flat] - m_new) : 0.0;
+            if (i == 0u) { m_new0 = m_new; e0 = e; } else { m_new1 = m_new; e1 = e; }
+        }
+        barrier;
+
+        st[gi] = e0;
+        red[gi] = e0;
+        st[gi + 256u] = e1;
+        red[gi + 256u] = e1;
+        barrier;
+        for (uint s = 16u; s > 0u; s >>= 1u) {
+            for (uint i = 0u; i < 2u; i++) {
+                uint flat = gi + i * 256u;
+                if ((flat % 32u) < s) red[flat] += red[flat + s];
+            }
+            barrier;
+        }
+
+        for (uint i = 0u; i < 2u; i++) {
+            uint flat = gi + i * 256u;
+            if ((flat % 32u) == 0u) {
+                uint qr = flat / 32u;
+                float m_new = i == 0u ? m_new0 : m_new1;
+                float rescale = exp(row_m[qr] - m_new);
+                row_m[qr] = m_new;
+                row_l[qr] = rescale * row_l[qr] + red[flat];
+                row_r[qr] = rescale;
+            }
+        }
+        barrier;
+
+        for (uint i = 0u; i < $KPTu; i++) {
+            uint flat = gi + i * 256u;
+            uint r = flat / $HDu;
+            uint d = flat % $HDu;
+            uint av = kv_start + r;
+            kv[r * $HD1u + d] = av < S ? v[head_offset + av * $HDu + d] : 0.0;
+        }
+        barrier;
+
+        for (uint i = 0u; i < $QPTu; i++) {
+            uint flat = gi + i * 256u;
+            uint qr = flat / $HDu;
+            uint d = flat % $HDu;
+            float sum = 0.0;
+            for (uint c = 0u; c < 32u; c++) sum += st[qr * 32u + c] * kv[c * $HD1u + d];
+            acc[i] = acc[i] * row_r[qr] + sum;
+        }
+        barrier;
+    }
+
+    uint dim = pc.n_heads * $HDu;
+    for (uint i = 0u; i < $QPTu; i++) {
+        uint flat = gi + i * 256u;
+        uint qr = flat / $HDu;
+        uint d = flat % $HDu;
+        uint aq = q_start + qr;
+        if (aq < S) output[aq * dim + head * $HDu + d] = acc[i] / row_l[qr];
+    }
+}

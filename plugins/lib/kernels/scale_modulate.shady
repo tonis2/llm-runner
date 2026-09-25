@@ -1,0 +1,13 @@
+// output = input * (1 + mod[scale_offset + d]), scale broadcast over rows.
+float input_[];
+float mod[];
+float output[];
+struct Push @pushconstant { uint n_elements; uint dim; uint scale_offset; uint pad; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n_elements) return;
+    output[i] = input_[i] * (1.0 + mod[pc.scale_offset + i % pc.dim]);
+}

@@ -1,0 +1,12 @@
+// dst[(first + r) * dim + c] = row[c] for r < rows: one row repeated, a pad token.
+float row[];
+float dst[];
+struct Push @pushconstant { uint first; uint rows; uint dim; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.rows * pc.dim) return;
+    dst[pc.first * pc.dim + i] = row[i % pc.dim];
+}

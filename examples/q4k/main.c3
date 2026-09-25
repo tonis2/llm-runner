@@ -280,7 +280,7 @@ for (let i = 0; i < inDim; i++) x.bytes[i] = INPUT[i];
 x.write(x.bytes);
 
 const kernel = three.compute.kernel(KERNEL, { name: 'q4k_matvec', pushFields: ['out_dim', 'in_dim'] });
-kernel.run({ w, x, y }, { workgroups: rows, push: { out_dim: rows, in_dim: inDim } });
+kernel.run({ w, x, y }, { workgroups: rows, push: { out_dim: three.compute.uint(rows), in_dim: three.compute.uint(inDim) } });
 y.read();
 
 let worst = 0, worstRow = 0;

@@ -1,0 +1,40 @@
+// Direct 2D convolution, NCHW, weight [kH, kW, C_in/groups, C_out].
+// Dispatch: (ceil(out_h * out_w / 256), out_c).
+float weight[];
+float bias[];
+float input_[];
+float output[];
+struct Push @pushconstant {
+    uint in_c; uint out_c; uint in_h; uint in_w; uint kh; uint kw;
+    uint stride; uint pad; uint groups; uint out_h; uint out_w; uint has_bias;
+}
+Push pc;
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint oc = input.gid.y;
+    uint sp = input.gid.x * 256u + input.lid.x;
+    uint oh = sp / pc.out_w;
+    uint ow = sp % pc.out_w;
+    if (oc >= pc.out_c || oh >= pc.out_h) return;
+    uint gin = pc.in_c / pc.groups;
+    uint gout = pc.out_c / pc.groups;
+    uint ic0 = (oc / gout) * gin;
+    float sum = 0.0;
+    for (uint icl = 0u; icl < gin; icl++) {
+        uint ic = ic0 + icl;
+        for (uint y = 0u; y < pc.kh; y++) {
+            int ih = int(oh * pc.stride + y) - int(pc.pad);
+            if (ih < 0 || ih >= int(pc.in_h)) continue;
+            for (uint x = 0u; x < pc.kw; x++) {
+                int iw = int(ow * pc.stride + x) - int(pc.pad);
+                if (iw < 0 || iw >= int(pc.in_w)) continue;
+                float iv = input_[ic * pc.in_h * pc.in_w + uint(ih) * pc.in_w + uint(iw)];
+                uint wi = y * pc.kw * gin * pc.out_c + x * gin * pc.out_c + icl * pc.out_c + oc;
+                sum += iv * weight[wi];
+            }
+        }
+    }
+    if (pc.has_bias != 0u) sum += bias[oc];
+    output[oc * pc.out_h * pc.out_w + oh * pc.out_w + ow] = sum;
+}

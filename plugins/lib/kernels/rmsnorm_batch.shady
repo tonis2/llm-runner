@@ -1,0 +1,30 @@
+// RMSNorm with a weight over [n_rows, dim], one workgroup per row.
+float input_[];
+float weight[];
+float output[];
+struct Push @pushconstant { uint dim; float eps; uint n_rows; }
+Push pc;
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint row = input.gid.x;
+    uint gi = input.lid.x;
+    if (row >= pc.n_rows) return;
+    uint base = row * pc.dim;
+    float sum_sq = 0.0;
+    for (uint i = gi; i < pc.dim; i += 256u) {
+        float v = input_[base + i];
+        sum_sq += v * v;
+    }
+    red[gi] = sum_sq;
+    barrier;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gi < s) red[gi] += red[gi + s];
+        barrier;
+    }
+    float rms = 1.0 / sqrt(red[0] / float(pc.dim) + pc.eps);
+    for (uint i = gi; i < pc.dim; i += 256u) {
+        output[base + i] = input_[base + i] * rms * weight[i];
+    }
+}

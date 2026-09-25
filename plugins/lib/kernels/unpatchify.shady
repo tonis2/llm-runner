@@ -1,0 +1,22 @@
+// [n_patches, C * ps * ps] -> [C, H, W], the inverse of patchify.
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint height; uint width; uint patch_size; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint total = pc.channels * pc.height * pc.width;
+    uint i = input.id.x;
+    if (i >= total) return;
+    uint ps = pc.patch_size;
+    uint c = i / (pc.height * pc.width);
+    uint rem = i % (pc.height * pc.width);
+    uint h = rem / pc.width;
+    uint w = rem % pc.width;
+    uint patches_w = pc.width / ps;
+    uint patch_idx = (h / ps) * patches_w + w / ps;
+    uint patch_dim = pc.channels * ps * ps;
+    uint elem = (h % ps) * ps * pc.channels + (w % ps) * pc.channels + c;
+    output[i] = input_[patch_idx * patch_dim + elem];
+}

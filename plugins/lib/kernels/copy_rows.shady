@@ -1,0 +1,16 @@
+// dst[r * dst_stride + dst_col + c] = src[r * src_stride + c]: a column range of
+// rows moved between buffers of different widths - a hidden state into its slot
+// of a concatenation, a third of a fused QKV out of it.
+float src[];
+float dst[];
+struct Push @pushconstant { uint rows; uint cols; uint dst_stride; uint dst_col; uint src_stride; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.rows * pc.cols) return;
+    uint r = i / pc.cols;
+    uint c = i % pc.cols;
+    dst[r * pc.dst_stride + pc.dst_col + c] = src[r * pc.src_stride + c];
+}

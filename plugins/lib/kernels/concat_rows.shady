@@ -1,0 +1,16 @@
+// out[r, 0:a_cols] = a[r, :]; out[r, a_cols:a_cols+b_cols] = b[r, :]
+float a[];
+float b[];
+float output[];
+struct Push @pushconstant { uint rows; uint a_cols; uint b_cols; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint total_cols = pc.a_cols + pc.b_cols;
+    uint i = input.id.x;
+    if (i >= pc.rows * total_cols) return;
+    uint r = i / total_cols;
+    uint c = i % total_cols;
+    output[i] = c < pc.a_cols ? a[r * pc.a_cols + c] : b[r * pc.b_cols + (c - pc.a_cols)];
+}

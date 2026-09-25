@@ -1,0 +1,11 @@
+// x *= s
+float x[];
+struct Push @pushconstant { uint n; float s; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    x[i] = x[i] * pc.s;
+}

@@ -1,0 +1,19 @@
+// [C, H, W] -> [C, 2H, 2W], nearest neighbour.
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint in_h; uint in_w; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint out_h = pc.in_h * 2u;
+    uint out_w = pc.in_w * 2u;
+    uint total = pc.channels * out_h * out_w;
+    uint i = input.id.x;
+    if (i >= total) return;
+    uint c = i / (out_h * out_w);
+    uint rem = i % (out_h * out_w);
+    uint oh = rem / out_w;
+    uint ow = rem % out_w;
+    output[i] = input_[c * pc.in_h * pc.in_w + (oh / 2u) * pc.in_w + ow / 2u];
+}

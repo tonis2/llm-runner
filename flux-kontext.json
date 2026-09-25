@@ -1,0 +1,13 @@
+{
+	"model": "/run/media/tonis/extra/AI models/flux-2-klein-9b-Q8_0.gguf",
+	"text_model": "/run/media/tonis/extra/AI models/Qwen3-8B-Q8_0.gguf",
+	"vae": "/run/media/tonis/extra/AI models/flux_vae.safetensors",
+	"input": "./flux_t2i_output.png",
+	"edit_mode": "kontext",
+	"prompt": "turn the fox into a snow white arctic fox, keep the pose and the forest",
+	"steps": 4,
+	"seed": 42,
+	"width": 512,
+	"height": 512,
+	"output": "./flux_kontext_output.png"
+}

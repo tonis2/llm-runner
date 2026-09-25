@@ -1,7 +1,7 @@
 {
-	"model": "/home/tonis/Documents/AI/models/flux-2-klein-9b-Q8_0.gguf",
-	"text_model": "/home/tonis/Documents/AI/models/Qwen3-8B.gguf",
-	"vae": "/home/tonis/Documents/AI/models/flux_vae.safetensors",
+	"model": "/run/media/tonis/extra/AI models/flux-2-klein-9b-Q8_0.gguf",
+	"text_model": "/run/media/tonis/extra/AI models/Qwen3-8B-Q8_0.gguf",
+	"vae": "/run/media/tonis/extra/AI models/flux_vae.safetensors",
 	"input": "./test.jpg",
 	"edit_mode": "kontext",
 	"prompt": "in the style of mad-mdrnmnmlsm, green and black,woman wearing a black dress standing in front of white background made of brush strokes and colored panels, casual poses, turn slightly one hand on her waist",
@@ -9,6 +9,6 @@
 	"seed": 42,
 	"height": 512,
 	"width": 512,
-	"lora": [{"path": "/home/tonis/Documents/AI/models/loras/flux2_klein_9b_refcontrol_depth.safetensors", "strength": 0.8 }],
+	"lora": [ {"path": "/run/media/tonis/extra/AI models/klein_snofs_v1_4.safetensors", "strength": 1.5 }, {"path": "/run/media/tonis/extra/AI models/flux2_klein_9b_refcontrol_depth.safetensors", "strength": 1.0 }],
 	"output": "./flux_output.png"
 }

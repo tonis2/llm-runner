@@ -1,0 +1,11 @@
+// max(x, 0), in place.
+float data[];
+struct Push @pushconstant { uint n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    data[i] = max(data[i], 0.0);
+}
