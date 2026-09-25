@@ -1,0 +1,7 @@
+{
+	"name": "depth",
+	"version": "1.0",
+	"description": "Depth Anything V2: depth maps and tiling height maps.",
+	"nodes": "nodes.js",
+	"main": "main.js"
+}

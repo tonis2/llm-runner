@@ -27,6 +27,8 @@ import image::png;
 import std::io;
 import std::io::file;
 import std::io::file::mmap;
+import std::io::path;
+import std::sort;
 import std::core::mem;
 import std::collections::list;
 import std::time::clock;
@@ -69,6 +71,9 @@ fn void install(three::JsRuntime* runtime)
 	runtime.bind(host, "readBytes", &js_read_bytes, 1);
 	runtime.bind(host, "writeBytes", &js_write_bytes, 2);
 	runtime.bind(host, "exists", &js_exists, 1);
+	runtime.bind(host, "listDir", &js_list_dir, 1);
+	runtime.bind(host, "makeDir", &js_make_dir, 1);
+	runtime.bind(host, "homeDir", &js_home_dir, 0);
 	runtime.bind(host, "base64Encode", &js_base64_encode, 1);
 	runtime.bind(host, "base64Decode", &js_base64_decode, 1);
 
@@ -224,6 +229,61 @@ fn void js_exists(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Valu
 {
 	qjs::Context js = qjs::wrap(ctx);
 	*out = qjs::bool_value(file::exists(@text(&js, argc, args, 0)));
+}
+
+<*
+ `listDir(path)` - the entries of a directory as [{ name, dir }], sorted by
+ name, without `.` and `..`. A missing directory is an empty list, so a plugin
+ or model folder that has not been made yet reads as holding nothing.
+*>
+fn void js_list_dir(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	String dir = @text(&js, argc, args, 0);
+	qjs::Value list = js.array();
+	*out = list;
+	if (!file::is_dir(dir)) return;
+	path::PathList? entries = path::ls(tmem, (path::Path)dir);
+	if (catch entries) return;
+	String[] names = mem::talloc_array(String, entries.len());
+	foreach (i, p : entries) names[i] = (String)p;
+	sort::quicksort(names, fn int(String a, String b) => a.compare_to(b));
+	uint at = 0;
+	foreach (name : names)
+	{
+		if (name == "." || name == "..") continue;
+		qjs::Value entry = js.object();
+		js.set_property(entry, "name", js.string(name));
+		js.set_property(entry, "dir", qjs::bool_value(file::is_dir(string::tformat("%s/%s", dir, name))));
+		js.set_index(list, at++, entry);
+	}
+}
+
+<*
+ `makeDir(path)` - make a directory and any missing parents; true when it
+ exists afterwards.
+*>
+fn void js_make_dir(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	String dir = @text(&js, argc, args, 0);
+	if (!file::is_dir(dir)) (void)path::mkdir(dir, recursive: true);
+	*out = qjs::bool_value(file::is_dir(dir));
+}
+
+<*
+ `homeDir()` - the user's home directory, or "" when there is none.
+*>
+fn void js_home_dir(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	path::Path? home = path::home_directory(tmem);
+	if (catch home)
+	{
+		*out = js.string("");
+		return;
+	}
+	*out = js.string((String)home);
 }
 
 fn void js_base64_encode(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local

@@ -12,6 +12,8 @@ llm-runner flux   --config flux-t2i.json keep_dit=true --server --port 7860
 llm-runner zimage --config zimage-t2i.json
 llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6 taesd=taef1.safetensors
 llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg output=depth.png
+llm-runner run graph/templates/flux-t2i.json sample.seed=7   # a node graph
+llm-runner graph list=true                                     # the node types there are
 llm-runner tests/matmul_coop.js     # a script: run once as a module
 ```
 
@@ -31,12 +33,21 @@ plugins/
     flux_vae.js        Flux VAE encoder and decoder (Flux 1 and Flux 2 namings)
     taesd.js           TAESD decoder for 16-channel latents (taef1)
     lora.js            LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
+    latents.js         latent formats ('flux2', 'flux1') and the VAE encode/decode for each
+    graph/             node registry, port types, the executor, plugin discovery
     kernels/*.shady    one kernel per file; common.shady is put in front of each
+  core/                nodes every graph uses: image load/save/preview, loaders, VAE
   flux/                Flux 2 Klein: txt2img, img2img, kontext, LoRA/LoKr, server
   zimage/              Z-Image Turbo: txt2img, img2img, LoRA, TAESD
   depth/               Depth Anything V2
+  graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
+
+Each plugin directory has a `plugin.json` (`name`, `version`, `description`,
+`nodes`, `main`). `nodes` registers the plugin's node types; `main` is its
+command-line and server entry, which builds a fixed graph from the config keys
+and runs it.
 
 ## A plugin
 
@@ -62,6 +73,68 @@ between requests, so weights a plugin keeps are loaded once.
 `console.log` output is collected and printed when a call finishes. Use
 `llm.print` for progress you want to see while it runs.
 
+## Nodes and graphs
+
+A model's work is split into **nodes** with typed inputs and outputs, the way
+ComfyUI splits it: a loader, a prompt encoder, a sampler, a VAE decode. A graph
+wires them together, so a VAE, a LoRA or a text encoder can be swapped without
+touching the model's code.
+
+```js
+import { defineNodes } from '../lib/graph/registry.js';
+
+defineNodes('mine', {
+	'mine.sample': {
+		title: 'My sampler',
+		inputs: { cond: 'CONDITIONING', model: 'MODEL', steps: 'INT=4', seed: 'INT=42', latent: 'LATENT?' },
+		outputs: { latent: 'LATENT' },
+		async run({ cond, model, steps, seed, latent }, ctx) {
+			// ... ctx.progress(step, steps) after each step
+			return { latent: makeLatent('flux1', data, h, w) };
+		},
+	},
+});
+```
+
+Port types (`lib/graph/types.js`):
+
+| | |
+|---|---|
+| `IMAGE` | `{ width, height, channels, pixels }` on the host |
+| `LATENT` | `{ format, data, channels, h, w }`. A VAE decodes only its own `format` (`lib/latents.js`), so taef1 can stand in for the Flux 1 VAE and a Flux 2 latent is refused by it. |
+| `CONDITIONING` | `{ family, tensor, n, dim }`, the text encoder's hidden states on the GPU. A sampler takes only its own `family`. |
+| `MODEL`, `TEXT_ENCODER`, `VAE`, `LORA`, `REFERENCES` | loaders' handles; `LORA` is a list of `{ path, strength }` |
+| `STRING`, `INT`, `FLOAT`, `BOOL`, `ENUM(a\|b)`, `PATH(kind)` | settings; `=value` is the default, `?` optional, `*` multi-line |
+
+A node never disposes its inputs. The executor owns every output and disposes
+it (anything with a `dispose()`) once the last node that reads it has run. That
+keeps one-shot runs as lean as the old pipelines: the DiT is freed before the
+VAE decodes. The graph server keeps results between requests instead, keyed by
+a node's settings and inputs. A new seed then re-samples without reloading the
+model or re-encoding the prompt.
+
+A graph file lists nodes and their settings. `{ "from": "node.output" }` is a
+wire:
+
+```json
+{ "nodes": [
+	{ "id": "vae",    "type": "core.vae",          "params": { "path": "ae.safetensors" } },
+	{ "id": "decode", "type": "core.vae_decode",   "params": { "vae": { "from": "vae.vae" }, "latent": { "from": "sample.latent" } } },
+	{ "id": "save",   "type": "core.save_image",   "params": { "image": { "from": "decode.image" }, "path": "output/cat-#.png" } }
+] }
+```
+
+Only what the sinks (`core.save_image`, `core.preview`) need runs.
+`llm-runner run file.json node.input=value` overrides a setting, and
+`graph/templates/` holds the graphs the flux and zimage plugins build.
+`llm-runner graph --server` answers `GET /nodes` (the catalogue), `GET /plugins`
+and `POST /graph` (`{ graph, "node.input": value }` returns the sinks' results
+with images as base64 PNG).
+
+Plugins are found through their `plugin.json` under the plugins root.
+`~/.config/llm-runner/settings.json` can list `disabled_plugins`. Plugins are
+trusted code: they read and write files and run kernels on the GPU.
+
 ## The host API (`lib/llm.js`)
 
 | | |
@@ -74,6 +147,7 @@ between requests, so weights a plugin keeps are loaded once.
 | `llm.randomNormal(n, seed)` | The same noise the C3 pipelines drew for a seed |
 | `image.load / decode / savePng / encodePng / cropTo / fit16 / resize / toTensor / fromTensor` | Images as `{ width, height, channels, pixels }` |
 | `llm.readText / readBytes / writeBytes / exists / base64Encode / base64Decode` | Files |
+| `__llm.listDir / makeDir / homeDir` | Directories: `[{ name, dir }]`, make with parents, the home directory |
 | `llm.print(...)`, `llm.now()`, `llm.since(t0)` | Progress |
 
 GPU work goes through `three.compute` (see `lib/three.c3l/docs/functions.md`,
@@ -110,6 +184,11 @@ Qwen3 and Z-Image use it. A plugin reads `matrix_cores` (default true) and
 calls `useMatrixCores()`; `matrix_cores=false` runs everything in float32.
 
 ## Checking a port
+
+The move to nodes changed no output: every plugin's run through its graph is
+byte-identical to the PNG it wrote before (Flux txt2img, img2img, kontext with
+two LoRAs; Z-Image txt2img, img2img with TAESD, CFG with a LoRA; depth and
+height map).
 
 Each pipeline was compared image to image against the C3 build it replaced,
 with the same seed, before that build was deleted:

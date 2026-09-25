@@ -19,7 +19,14 @@ c3c build llm-runner
 ./build/llm-runner zimage --config zimage-t2i.json
 ./build/llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6
 ./build/llm-runner depth model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg
+./build/llm-runner run plugins/graph/templates/zimage-t2i.json sample.seed=7
+./build/llm-runner graph --server --port 7860     # POST /graph, GET /nodes
 ```
+
+Each model is also a set of typed nodes (loader, prompt, sampler, and shared
+VAE/LoRA/image nodes), and a graph file wires them the way ComfyUI does: swap
+the VAE, chain LoRAs, reuse a prompt. The graph server keeps unchanged results
+between requests, so a new seed doesn't reload the model.
 
 Ported: Flux 2 Klein (txt2img, img2img, kontext, LoRA/LoKr, the A1111-style
 server), Z-Image Turbo (txt2img, img2img, LoRA, TAESD), and Depth Anything V2.

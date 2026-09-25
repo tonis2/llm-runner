@@ -9,6 +9,7 @@ llm-runner: one binary, pipelines as JavaScript plugins.
 	llm-runner flux --config flux-t2i.json
 	llm-runner flux --config flux-t2i.json prompt="a lighthouse at dusk" seed=7
 	llm-runner flux --config flux-t2i.json --server --port 7860
+	llm-runner run flux-t2i.graph.json sample.seed=7
 	llm-runner tests/kernels.js
 
  A name is a plugin; a path ending in `.js` is a script run once as a module,
@@ -45,6 +46,7 @@ struct Options
 fn void usage()
 {
 	io::printn("usage: llm-runner <plugin | script.js> [--config file.json] [key=value ...]");
+	io::printn("       llm-runner run graph.json [node.input=value ...]");
 	io::printn("                  [--plugins dir] [--server [--bind addr] [--port n]] [--validate]");
 }
 
@@ -68,11 +70,20 @@ fn Options? parse_args(String[] args)
 				return io::EOF~;
 			case a.contains("=") && !a.starts_with("-"): o.overrides.push(a);
 			case o.target.len == 0 && !a.starts_with("-"): o.target = a;
+			// `run file.json` is the graph plugin with that file.
+			case o.target == "run" && !a.starts_with("-"):
+				o.target = "graph";
+				o.overrides.push(string::format(mem, "graph=%s", a));
 			default:
 				io::printfn("llm-runner: unexpected argument %s", a);
 				usage();
 				return io::EOF~;
 		}
+	}
+	if (o.target == "run")
+	{
+		io::printn("llm-runner: run takes a graph file: llm-runner run graph.json");
+		return io::EOF~;
 	}
 	if (o.target.len == 0)
 	{

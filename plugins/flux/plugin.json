@@ -1,0 +1,7 @@
+{
+	"name": "flux",
+	"version": "1.0",
+	"description": "Flux 2 (Klein): text to image, img2img and kontext editing, LoRA/LoKr.",
+	"nodes": "nodes.js",
+	"main": "main.js"
+}

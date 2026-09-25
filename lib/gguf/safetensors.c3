@@ -57,7 +57,7 @@ fn void free_metadata(SafetensorsMetaKV[] metadata) @local {
 }
 
 fn SafetensorsFile? safetensors_open(String path) {
-    mmap::FileMmap mm = file::mmap_open(path, "rb")!!;
+    mmap::FileMmap mm = file::mmap_open(path, "rb")!;
     // Every failure below returns before the caller has a SafetensorsFile to
     // close, so the mapping has to be released here — otherwise a rejected file
     // stays mapped for the life of the process.

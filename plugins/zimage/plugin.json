@@ -1,0 +1,7 @@
+{
+	"name": "zimage",
+	"version": "1.0",
+	"description": "Z-Image Turbo: text to image and img2img, CFG, LoRA.",
+	"nodes": "nodes.js",
+	"main": "main.js"
+}

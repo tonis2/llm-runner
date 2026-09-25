@@ -1,0 +1,6 @@
+{
+	"name": "core",
+	"version": "1.0",
+	"description": "Images in and out, the shared text encoder, VAE and LoRA loaders, VAE encode/decode.",
+	"nodes": "nodes.js"
+}
