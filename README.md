@@ -21,6 +21,7 @@ c3c build llm-runner
 ./build/llm-runner depth model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg
 ./build/llm-runner run plugins/graph/templates/zimage-t2i.json sample.seed=7
 ./build/llm-runner graph --server --port 7860     # POST /graph, GET /nodes
+./build/llm-runner ui                             # the node editor (plugins/studio/)
 ```
 
 Each model is also a set of typed nodes (loader, prompt, sampler, and shared

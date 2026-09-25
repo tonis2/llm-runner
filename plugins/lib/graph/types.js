@@ -23,6 +23,7 @@
 //   'LATENT?'               optional
 //   'ENUM(depth|height)=depth'
 //   'PATH(vae)'             a file; the kind is a hint for the editor's picker
+//   'LATENT(flux2)'         a latent in that format; two named formats must match
 //   'STRING*='              multi-line text, default ''
 //
 // or as an object { type, default, optional, options, kind, min, max, multiline }.

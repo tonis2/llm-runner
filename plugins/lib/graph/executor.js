@@ -115,9 +115,14 @@ function disposeValues(outputs, seen = new Set()) {
 export class Executor {
 	// keep: results stay between runs (a server, the editor). Otherwise each
 	// value lives only as long as something still has to read it.
-	constructor({ keep = false, log = (line) => llm.print(line) } = {}) {
+	// yieldFrame: a function returning a promise that settles when the host
+	// has drawn a frame (`three.nextFrame` in the studio). Awaited between
+	// nodes and at every progress report, so a window stays live through a
+	// run; left out, nothing waits.
+	constructor({ keep = false, log = (line) => llm.print(line), yieldFrame = null } = {}) {
 		this.keep = keep;
 		this.log = log;
+		this.yieldFrame = yieldFrame;
 		this.cache = new Map(); // key -> { outputs, type }
 	}
 
@@ -169,6 +174,10 @@ export class Executor {
 					const out = src.outputs.find((o) => o.name === w.port);
 					if (!out) throw new Error(`${where} is wired to ${w.node}.${w.port}, but ${src.type} has no output ${w.port}`);
 					if (!accepts(input.type, out.type)) throw new Error(`${where} takes ${input.type}, and ${w.node}.${w.port} is ${out.type}`);
+					// A latent's format is part of its type where both ends name one.
+					if (input.type === 'LATENT' && input.kind && out.kind && input.kind !== out.kind) {
+						throw new Error(`${where} takes ${input.kind} latents, and ${w.node}.${w.port} makes ${out.kind}`);
+					}
 					wired[input.name] = w;
 					parts.push(`${input.name}<${plan.get(w.node).key}.${w.port}`);
 					continue;
@@ -211,9 +220,13 @@ export class Executor {
 		const ran = [];
 		const cached = [];
 		const checkCancel = () => { if (cancelled && cancelled()) throw new Cancelled(); };
+		const pause = async () => {
+			if (this.yieldFrame) await this.yieldFrame();
+			checkCancel();
+		};
 		try {
 			for (const id of order) {
-				checkCancel();
+				await pause();
 				const p = plan.get(id);
 				const n = g.nodes.get(id);
 				let outputs;
@@ -232,13 +245,22 @@ export class Executor {
 						keep: this.keep,
 						log: this.log,
 						cancelled: checkCancel,
+						// Awaited by a node between steps: reports, lets a frame
+						// be drawn, and throws Cancelled if the run was stopped.
 						progress: (step, total, extra = {}) => {
 							if (onProgress) onProgress({ node: id, step, total, ...extra });
-							checkCancel();
+							return pause();
 						},
 					};
 					const t0 = llm.now();
-					outputs = (await p.def.run(inputs, ctx)) ?? {};
+					if (onProgress) onProgress({ node: id, start: true });
+					try {
+						outputs = (await p.def.run(inputs, ctx)) ?? {};
+					} catch (e) {
+						// Which node failed, for whoever shows the graph.
+						if (e && typeof e === 'object' && e.node === undefined) e.node = id;
+						throw e;
+					}
 					ran.push(id);
 					if (onProgress) onProgress({ node: id, done: true, ms: llm.now() - t0 });
 					if (p.def.output) results[id] = outputs;

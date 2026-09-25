@@ -35,7 +35,12 @@ export function writeSettings(settings) {
 	const path = settingsPath();
 	if (!path) throw new Error('no home directory to keep settings in');
 	H.makeDir(path.slice(0, path.lastIndexOf('/')));
-	llm.writeBytes(path, utf8(JSON.stringify(settings, null, '\t') + '\n'));
+	writeText(path, JSON.stringify(settings, null, '\t') + '\n');
+}
+
+// A text file, as UTF-8. QuickJS has no TextEncoder.
+export function writeText(path, text) {
+	llm.writeBytes(path, utf8(text));
 }
 
 function utf8(text) {

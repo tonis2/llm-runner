@@ -131,7 +131,7 @@ defineNodes('flux', {
 		inputs: {
 			cond: 'CONDITIONING',
 			refs: 'REFERENCES?',
-			latent: 'LATENT?',
+			latent: 'LATENT(flux2)?',
 			model: 'MODEL',
 			width: 'INT=1024',
 			height: 'INT=1024',
@@ -139,7 +139,7 @@ defineNodes('flux', {
 			seed: 'INT=42',
 			strength: 'FLOAT=0.6',
 		},
-		outputs: { latent: 'LATENT' },
+		outputs: { latent: 'LATENT(flux2)' },
 		async run({ cond, refs, latent: init, model, width, height, steps, seed, strength }, ctx) {
 			if (cond.family !== 'flux2') throw new Error(`flux.sample needs a Flux 2 prompt, not ${cond.family}`);
 			if (model.family !== 'flux2') throw new Error(`flux.sample needs a Flux 2 DiT, not ${model.family}`);
@@ -176,7 +176,10 @@ defineNodes('flux', {
 					eulerStep(dit.a.latent, dit.a.velocity, x.length, schedule[s + 1] - schedule[s]);
 					submit();
 					llm.print(`  step ${s + 1}/${steps}: sigma ${schedule[s].toFixed(4)}  ${(llm.now() - ts).toFixed(0)}ms`);
-					ctx.progress(s + 1, steps);
+					// `latent` is read back only if whoever is watching asks for it.
+					await ctx.progress(s + 1, steps, {
+						latent: () => makeLatent('flux2', new Float32Array(dit.a.latent.buffer.readBytes().buffer), latentH, latentW),
+					});
 				}
 				const out = new Float32Array(dit.a.latent.buffer.readBytes().buffer);
 				llm.print(`  [phase] denoise: ${llm.since(t2)}`);

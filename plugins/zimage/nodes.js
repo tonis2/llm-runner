@@ -96,7 +96,7 @@ defineNodes('zimage', {
 		inputs: {
 			positive: 'CONDITIONING',
 			negative: 'CONDITIONING?',
-			latent: 'LATENT?',
+			latent: 'LATENT(flux1)?',
 			model: 'MODEL',
 			width: 'INT=1024',
 			height: 'INT=1024',
@@ -105,7 +105,7 @@ defineNodes('zimage', {
 			cfg: 'FLOAT=0',
 			strength: 'FLOAT=0.6',
 		},
-		outputs: { latent: 'LATENT' },
+		outputs: { latent: 'LATENT(flux1)' },
 		async run({ positive, negative, latent: init, model, width, height, steps, seed, cfg, strength }, ctx) {
 			for (const c of [positive, negative]) {
 				if (c && c.family !== 'zimage') throw new Error(`zimage.sample needs Z-Image prompts, not ${c.family}`);
@@ -162,7 +162,9 @@ defineNodes('zimage', {
 					eulerStep(dit.a.latent, dit.a.velocity, count, sched[s + 1] - sched[s]);
 					submit();
 					llm.print(`  step ${s + 1}/${steps}: sigma ${sched[s].toFixed(4)}  ${(llm.now() - ts).toFixed(0)}ms`);
-					ctx.progress(s + 1, steps);
+					await ctx.progress(s + 1, steps, {
+						latent: () => makeLatent('flux1', new Float32Array(dit.a.latent.buffer.readBytes().buffer), latentH, latentW),
+					});
 				}
 				const out = new Float32Array(dit.a.latent.buffer.readBytes().buffer);
 				llm.print(`  [phase] denoise: ${llm.since(t2)}`);

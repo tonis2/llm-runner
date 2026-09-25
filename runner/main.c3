@@ -10,12 +10,18 @@ llm-runner: one binary, pipelines as JavaScript plugins.
 	llm-runner flux --config flux-t2i.json prompt="a lighthouse at dusk" seed=7
 	llm-runner flux --config flux-t2i.json --server --port 7860
 	llm-runner run flux-t2i.graph.json sample.seed=7
+	llm-runner ui
 	llm-runner tests/kernels.js
 
  A name is a plugin; a path ending in `.js` is a script run once as a module,
  which is how the kernel checks run. Paths inside the plugin are resolved
  against the plugins root (`--plugins`, default `plugins`), so a plugin imports
  the shared library as `../lib/llm.js`.
+
+ `ui` is the one mode with a window: the engine's own frame loop runs
+ `studio/main.js` as a game, with the same `__llm` verbs and settings, and a
+ generation awaits `three.nextFrame()` between steps so the window keeps
+ drawing.
 *>
 module runner;
 
@@ -41,18 +47,25 @@ struct Options
 	String bind;
 	uint port;
 	bool validate;
+	uint width;
+	uint height;
+	String entry;           // ui: the module to boot, default <plugins>/studio/main.js
 }
+
+// The options `ui_setup` reads: the loop calls it with nothing but the runtime.
+Options ui_options;
 
 fn void usage()
 {
 	io::printn("usage: llm-runner <plugin | script.js> [--config file.json] [key=value ...]");
 	io::printn("       llm-runner run graph.json [node.input=value ...]");
+	io::printn("       llm-runner ui [--size WxH] [--entry plugins/x.js]");
 	io::printn("                  [--plugins dir] [--server [--bind addr] [--port n]] [--validate]");
 }
 
 fn Options? parse_args(String[] args)
 {
-	Options o = { .plugins = "plugins", .bind = "127.0.0.1", .port = 7860 };
+	Options o = { .plugins = "plugins", .bind = "127.0.0.1", .port = 7860, .width = 1600, .height = 1000 };
 	o.overrides.init(mem, 4);
 	for (usz i = 1; i < args.len; i++)
 	{
@@ -65,6 +78,14 @@ fn Options? parse_args(String[] args)
 			case a == "--bind" && i + 1 < args.len: o.bind = args[++i];
 			case a == "--port" && i + 1 < args.len: o.port = args[++i].to_uint() ?? 7860;
 			case a == "--validate": o.validate = true;
+			case a == "--entry" && i + 1 < args.len: o.entry = args[++i];
+			case a == "--size" && i + 1 < args.len:
+				String[] wh = args[++i].tsplit("x");
+				if (wh.len == 2)
+				{
+					o.width = wh[0].to_uint() ?? o.width;
+					o.height = wh[1].to_uint() ?? o.height;
+				}
 			case a == "--help" || a == "-h":
 				usage();
 				return io::EOF~;
@@ -173,11 +194,63 @@ fn void report(three::RunResult* r, String what)
 	}
 }
 
+<*
+ The studio: a window, the engine's frame loop, and `studio/main.js` booted in it
+ as a game. What the headless modes do by hand - the verbs, the settings, no
+ budget - `ui_setup` does to the loop's runtime, on the first boot and on every
+ reload.
+*>
+fn int run_ui(Options* o)
+{
+	ui_options = *o;
+	three::debugging = o.validate;
+	three::Engine* engine = mem::new(three::Engine);
+	defer mem::free(engine);
+	defer engine.close();
+	if (catch err = engine.open(o.width, o.height))
+	{
+		io::printfn("llm-runner: could not open a window (%s)", err);
+		return 1;
+	}
+	io::printfn("llm-runner: %s", ((ZString)&engine.renderer.gpu.limits.device_name).str_view());
+	defer shutdown();
+
+	String entry = o.entry.len > 0 ? o.entry : string::tformat("%s/studio/main.js", o.plugins);
+	if (catch err = three::live(
+		&engine.renderer,
+		engine.viewer(),
+		0,
+		assets: o.plugins,
+		boot: false,
+		entry_module: entry,
+		setup: &ui_setup,
+		memory_limit: 0))
+	{
+		io::printfn("llm-runner: the studio stopped (%s)", err);
+		return 1;
+	}
+	return 0;
+}
+
+fn void ui_setup(three::JsRuntime* runtime)
+{
+	runtime.script_budget_ns = 0;
+	// Plugins are trusted code with the disk; the studio's file pickers go
+	// wherever the models are.
+	runtime.browse_anywhere = true;
+	shutdown();
+	install(runtime);
+	three::RunResult setup = runtime.run(config_script(&ui_options), "config");
+	defer setup.free();
+	report(&setup, "reading the config");
+}
+
 fn int main(String[] args)
 {
 	Options? parsed = parse_args(args);
 	if (catch parsed) return 1;
 	Options o = parsed;
+	if (o.target == "ui") return run_ui(&o);
 
 	vk::Instance instance = three::create_instance(o.validate, headless: true)!!;
 	defer instance.free();

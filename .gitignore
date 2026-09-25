@@ -10,3 +10,6 @@ venv_debug/*
 __pycache__
 analyze/
 .DS_STORE
+output/
+plugins/tests/out/
+graphs/

@@ -87,9 +87,12 @@ defineNodes('mine', {
 	'mine.sample': {
 		title: 'My sampler',
 		inputs: { cond: 'CONDITIONING', model: 'MODEL', steps: 'INT=4', seed: 'INT=42', latent: 'LATENT?' },
-		outputs: { latent: 'LATENT' },
+		outputs: { latent: 'LATENT(flux1)' },
 		async run({ cond, model, steps, seed, latent }, ctx) {
-			// ... ctx.progress(step, steps) after each step
+			// After each step: reports progress, lets the studio's window draw a
+			// frame, and throws if the run was cancelled. `latent` is read only
+			// if something shows a preview.
+			//   await ctx.progress(step, steps, { latent: () => makeLatent(...) });
 			return { latent: makeLatent('flux1', data, h, w) };
 		},
 	},
