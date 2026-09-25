@@ -3,17 +3,21 @@
 // background (or with the middle/right button anywhere) to pan, and the wheel
 // zooms around the pointer.
 //
-// One `Drawing` whose ops are rebuilt on every render. The widget layer diffs
-// them into a single patch, so moving a node is one list of drawings a frame.
+// One `Drawing` for the cards, wires and ports, rebuilt on every render - the
+// widget layer diffs it into a single patch. A node's settings are real editors
+// laid over it (see layout.js and fields.js), sized to the zoom; zoomed far out,
+// or under another node, a setting is drawn as its value instead.
 
 import { app } from './app.js';
-import { Doc, defOf, isSetting, isWire } from './doc.js';
+import { defOf, isSetting, isWire } from './doc.js';
+import { layoutOf } from './layout.js';
+import { editor } from './fields.js';
 import { accepts } from '../lib/graph/types.js';
 import {
-	THEME, typeColor, NODE_W, NODE_HEAD, NODE_ROW, NODE_PAD, PORT_R,
+	THEME, typeColor, NODE_W, NODE_HEAD, PORT_R, LABEL_H, EDIT_ZOOM,
 } from './theme.js';
 
-const { Drawing, Clip } = three.ui;
+const { Drawing, Clip, Stack, Anchored } = three.ui;
 
 const TEXT = 12;
 const HIT = 9;           // how near a port counts, in points on screen
@@ -46,22 +50,22 @@ function clip(text, width, size) {
 	return out;
 }
 
-// A node's picture below its rows, if it has one.
-function thumbOf(id) {
-	const img = app.images[id];
-	if (!img) return null;
-	const w = NODE_W - 2 * NODE_PAD;
-	return { ...img, w, h: Math.min(w * img.height / img.width, 320) };
-}
+function layout(n) { return layoutOf(n, app.images[n.id]); }
 
 function nodeBox(n) {
-	const def = defOf(n.type);
-	const thumb = thumbOf(n.id);
-	return { x: n.pos[0], y: n.pos[1], w: NODE_W, h: Doc.height(def, thumb ? thumb.h + NODE_PAD : 0), def, thumb };
+	const L = layout(n);
+	return { x: n.pos[0], y: n.pos[1], w: L.w, h: L.h, L };
 }
 
-function inPort(n, i) { return [n.pos[0], n.pos[1] + NODE_HEAD + i * NODE_ROW + NODE_ROW / 2]; }
-function outPort(n, i) { return [n.pos[0] + NODE_W, n.pos[1] + NODE_HEAD + i * NODE_ROW + NODE_ROW / 2]; }
+// Where a node's ports are, in graph units; null for a port it does not have.
+function inPort(n, name, L = layout(n)) {
+	const y = L.inputs.get(name);
+	return y === undefined ? null : [n.pos[0], n.pos[1] + y];
+}
+function outPort(n, name, L = layout(n)) {
+	const y = L.outputs.get(name);
+	return y === undefined ? null : [n.pos[0] + L.w, n.pos[1] + y];
+}
 
 export class GraphCanvas extends three.Widget {
 	constructor() {
@@ -111,7 +115,41 @@ export class GraphCanvas extends three.Widget {
 	render() {
 		// Clipped, or a node dragged past the edge would paint over the panels.
 		return new Clip({ size: this.size },
-			new Drawing({ key: 'graphCanvas', size: this.size, ops: this.ops(), onPointer: (e) => this.pointer(e) }));
+			new Stack({ size: this.size },
+				new Drawing({ key: 'graphCanvas', size: this.size, ops: this.ops(), onPointer: (e) => this.pointer(e) }),
+				...this.editors()));
+	}
+
+	// Whether a node's editors are live widgets right now: close enough to use,
+	// and not under a node drawn after it (a widget would paint over that card).
+	editable(n, L) {
+		if (this.view.zoom < EDIT_ZOOM || L.fields.length === 0) return false;
+		const nodes = app.doc.nodes;
+		const b = { x0: n.pos[0], y0: n.pos[1], x1: n.pos[0] + L.w, y1: n.pos[1] + L.h };
+		for (let k = nodes.indexOf(n) + 1; k < nodes.length; k++) {
+			const m = nodes[k];
+			const M = layout(m);
+			if (m.pos[0] < b.x1 && m.pos[0] + M.w > b.x0 && m.pos[1] < b.y1 && m.pos[1] + M.h > b.y0) return false;
+		}
+		return true;
+	}
+
+	editors() {
+		const z = this.view.zoom;
+		const [W, H] = this.size;
+		const out = [];
+		for (const n of app.doc.nodes) {
+			const L = layout(n);
+			if (!this.editable(n, L)) continue;
+			for (const f of L.fields) {
+				const [sx, sy] = this.toScreen([n.pos[0] + f.x, n.pos[1] + f.y + LABEL_H]);
+				if (sx > W || sy > H || sx + f.w * z < 0 || sy + f.h * z < 0) continue;
+				const key = `field:${n.id}:${f.input.name}`;
+				out.push(new Anchored({ key: `at:${key}`, h: 'start', v: 'start', margin: [sx, sy] },
+					editor(n, f.input, { key, width: f.w * z, height: f.h * z, textSize: 12 * z })));
+			}
+		}
+		return out;
 	}
 
 	// ------------------------------------------------------------------
@@ -135,16 +173,13 @@ export class GraphCanvas extends three.Widget {
 		// Wires under the nodes.
 		for (const n of doc.nodes) {
 			const def = defOf(n.type);
-			def.inputs.forEach((input, i) => {
-				const wv = n.params[input.name];
-				if (!isWire(wv)) return;
+			for (const input of def.inputs) {
 				const w0 = doc.wire(n.id, input.name);
-				const src = doc.node(w0.node);
-				if (!src) return;
-				const oi = defOf(src.type).outputs.findIndex((o) => o.name === w0.port);
-				if (oi < 0) return;
-				this.curve(ops, this.toScreen(outPort(src, oi)), this.toScreen(inPort(n, i)), typeColor(input.type), 2.2);
-			});
+				const src = w0 && doc.node(w0.node);
+				const from = src && outPort(src, w0.port);
+				const to = from && inPort(n, input.name);
+				if (to) this.curve(ops, this.toScreen(from), this.toScreen(to), typeColor(input.type), 2.2);
+			}
 		}
 		for (const n of doc.nodes) this.drawNode(ops, n);
 
@@ -180,10 +215,11 @@ export class GraphCanvas extends three.Widget {
 	drawNode(ops, n) {
 		const z = this.view.zoom;
 		const b = nodeBox(n);
+		const L = b.L;
 		const [sx, sy] = this.toScreen([b.x, b.y]);
 		const sw = b.w * z, sh = b.h * z;
 		if (sx > this.size[0] || sy > this.size[1] || sx + sw < 0 || sy + sh < 0) return;
-		const def = b.def;
+		const def = L.def;
 		const state = app.nodeState[n.id];
 		const selected = app.selected === n.id;
 		const border = state === 'running' ? THEME.running
@@ -208,34 +244,51 @@ export class GraphCanvas extends three.Widget {
 			ops.push({ op: 'rect', at: [sx + 1, sy + NODE_HEAD * z - 3 * z], size: [(sw - 2) * p.step / p.total, 3 * z], color: THEME.running });
 		}
 
-		def.inputs.forEach((input, i) => {
-			const [px, py] = this.toScreen(inPort(n, i));
+		const port = (name, at, type, filled) => {
+			const [px, py] = this.toScreen(at);
+			const color = typeColor(type);
+			const hovered = this.hoverPort && this.hoverPort.node === n.id && this.hoverPort.name === name;
+			ops.push({ op: 'circle', center: [px, py], radius: (hovered ? PORT_R + 2 : PORT_R) * z, color: filled ? color : [0, 0, 0, 0], borderColor: color, borderWidth: 1.5 * z });
+			return [px, py];
+		};
+
+		for (const input of L.sockets) {
 			const wired = isWire(n.params[input.name]);
-			const color = typeColor(input.type);
-			const hovered = this.hoverPort && this.hoverPort.node === n.id && this.hoverPort.input === input.name;
-			ops.push({ op: 'circle', center: [px, py], radius: (hovered ? PORT_R + 2 : PORT_R) * z, color: wired || !isSetting(input) ? color : [0, 0, 0, 0], borderColor: color, borderWidth: 1.5 * z });
-			if (z <= 0.3) return;
+			const [px, py] = port(input.name, inPort(n, input.name, L), input.type, wired || !isSetting(input));
+			if (z <= 0.3) continue;
 			const label = input.name + (input.optional || isSetting(input) ? '' : ' *');
 			ops.push({ op: 'text', at: [px + 10 * z, py - ts * 0.62], text: label, size: ts, color: THEME.text });
-			if (isSetting(input) && !wired) {
-				const v = n.params[input.name] ?? input.default;
-				const lw = measure(label, TEXT) + 18;
-				const room = NODE_W / 2 - 10 + (def.outputs.length > i ? 0 : NODE_W / 2 - 10) - lw;
-				if (room > 20) ops.push({ op: 'text', at: [px + lw * z, py - ts * 0.62], text: clip(shown(v), room, TEXT), size: ts, color: THEME.dim });
-			}
-		});
-		def.outputs.forEach((output, i) => {
-			const [px, py] = this.toScreen(outPort(n, i));
-			const color = typeColor(output.type);
-			ops.push({ op: 'circle', center: [px, py], radius: PORT_R * z, color, borderColor: color, borderWidth: 1.5 * z });
-			if (z <= 0.3) return;
+		}
+		for (const output of def.outputs) {
+			const [px, py] = port(output.name, outPort(n, output.name, L), output.type, true);
+			if (z <= 0.3) continue;
 			const label = output.kind ? `${output.name} (${output.kind})` : output.name;
 			ops.push({ op: 'text', at: [px - (measure(label, TEXT) + 10) * z, py - ts * 0.62], text: label, size: ts, color: THEME.text });
-		});
+		}
 
-		if (b.thumb) {
-			const ty = sy + (NODE_HEAD + Doc.rows(def) * NODE_ROW + NODE_PAD / 2) * z;
-			ops.push({ op: 'image', at: [sx + NODE_PAD * z, ty], size: [b.thumb.w * z, b.thumb.h * z], texture: b.thumb.tex, radius: 3 * z });
+		// Settings: a port each, a label over the box, and - when the editor is
+		// not a live widget - the box and its value drawn here.
+		const live = this.editable(n, L);
+		for (const f of L.fields) {
+			port(f.input.name, inPort(n, f.input.name, L), f.input.type, false);
+			if (z <= 0.3) continue;
+			const [fx, fy] = this.toScreen([n.pos[0] + f.x, n.pos[1] + f.y]);
+			if (f.input.type !== 'BOOL') {
+				ops.push({ op: 'text', at: [fx + 2 * z, fy], text: clip(f.input.name, f.w - 4, 10), size: 10 * z, color: THEME.dim });
+			}
+			if (live) continue;
+			const by = fy + LABEL_H * z;
+			ops.push({ op: 'rect', at: [fx, by], size: [f.w * z, f.h * z], radius: 4 * z, color: THEME.body, borderColor: THEME.border, borderWidth: 1 });
+			const v = n.params[f.input.name] ?? f.input.default;
+			const text = f.input.type === 'BOOL' ? `${f.input.name}: ${v ? 'on' : 'off'}` : shown(v);
+			ops.push({ op: 'text', at: [fx + 6 * z, by + 6 * z], text: clip(text, f.w - 12, TEXT), size: ts, color: THEME.dim });
+		}
+
+		if (L.thumb) {
+			const t = L.thumb;
+			const img = app.images[n.id];
+			const [tx, ty] = this.toScreen([n.pos[0] + t.x, n.pos[1] + t.y]);
+			ops.push({ op: 'image', at: [tx, ty], size: [t.w * z, t.h * z], texture: img.tex, radius: 3 * z });
 		}
 	}
 
@@ -244,15 +297,17 @@ export class GraphCanvas extends three.Widget {
 
 	portAt(p) {
 		const z = this.view.zoom;
-		const near = (q) => Math.hypot(q[0] - p[0], q[1] - p[1]) <= HIT * Math.max(z, 0.7);
+		const near = (q) => q && Math.hypot(q[0] - p[0], q[1] - p[1]) <= HIT * Math.max(z, 0.7);
 		for (let k = app.doc.nodes.length - 1; k >= 0; k--) {
 			const n = app.doc.nodes[k];
-			const def = defOf(n.type);
-			for (let i = 0; i < def.inputs.length; i++) {
-				if (near(this.toScreen(inPort(n, i)))) return { node: n.id, input: def.inputs[i].name, type: def.inputs[i].type, anchor: inPort(n, i) };
+			const L = layout(n);
+			for (const input of L.def.inputs) {
+				const at = inPort(n, input.name, L);
+				if (near(at && this.toScreen(at))) return { node: n.id, input: input.name, name: input.name, type: input.type, anchor: at };
 			}
-			for (let i = 0; i < def.outputs.length; i++) {
-				if (near(this.toScreen(outPort(n, i)))) return { node: n.id, output: def.outputs[i].name, type: def.outputs[i].type, anchor: outPort(n, i) };
+			for (const output of L.def.outputs) {
+				const at = outPort(n, output.name, L);
+				if (near(at && this.toScreen(at))) return { node: n.id, output: output.name, name: output.name, type: output.type, anchor: at };
 			}
 		}
 		return null;
@@ -306,10 +361,9 @@ export class GraphCanvas extends three.Widget {
 			if (w) {
 				// Picking up a connected input carries its wire away from it.
 				const src = app.doc.node(w.node);
-				const oi = defOf(src.type).outputs.findIndex((o) => o.name === w.port);
 				app.doc.disconnect(port.node, port.input);
 				app.changed();
-				this.drag = { mode: 'wire', fromOut: true, node: w.node, port: w.port, type: port.type, anchor: outPort(src, oi) };
+				this.drag = { mode: 'wire', fromOut: true, node: w.node, port: w.port, type: port.type, anchor: outPort(src, w.port) };
 			} else {
 				this.drag = { mode: 'wire', fromOut: false, node: port.node, input: port.input, type: port.type, anchor: port.anchor };
 			}

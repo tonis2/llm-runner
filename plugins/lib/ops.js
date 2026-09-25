@@ -108,8 +108,10 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 export function attentionCausal(q, k, v, out, headDim, kvHeads, qHeads, tokens) {
 	dispatch('attention_causal', [q, k, v, out], [qHeads, tokens], pc('uuuuf', headDim, kvHeads, qHeads, tokens, 1 / Math.sqrt(headDim)));
 }
-export function vaeAttention(q, k, v, out, channels, spatial) {
-	dispatch('vae_attention', [q, k, v, out], [spatial], pc('uuufu', channels, 1, spatial, 1 / Math.sqrt(channels), channels));
+// The queries `start` .. `start + count` only, so a caller can cut a large one
+// up (the Flux VAE's mid block at 1024 is seconds of work).
+export function vaeAttention(q, k, v, out, channels, spatial, start = 0, count = spatial) {
+	dispatch('vae_attention', [q, k, v, out], [count], pc('uuufuuu', channels, 1, spatial, 1 / Math.sqrt(channels), channels, start, count));
 }
 
 export function timestepEmbed(out, dim, timestep) {

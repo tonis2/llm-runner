@@ -39,11 +39,11 @@ defineNodes('zimage', {
 		description: 'A Z-Image Turbo GGUF, with any LoRAs folded in.',
 		inputs: { path: 'PATH(dit)', lora: 'LORA?' },
 		outputs: { model: 'MODEL' },
-		run({ path, lora }) {
+		async run({ path, lora }) {
 			const t0 = llm.now();
 			const file = llm.open(path);
 			const dit = new ZImageDiT(file);
-			dit.load();
+			await dit.load();
 			if (lora && lora.length > 0) mergeLoras(dit, lora);
 			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
 			return {
@@ -62,11 +62,11 @@ defineNodes('zimage', {
 		description: 'Qwen3-4B hidden states from the second-to-last layer.',
 		inputs: { encoder: 'TEXT_ENCODER', prompt: 'STRING*=' },
 		outputs: { cond: 'CONDITIONING' },
-		run({ encoder, prompt }) {
+		async run({ encoder, prompt }) {
 			const t0 = llm.now();
 			const enc = new TextEncoder(encoder.path);
 			const tokens = enc.tokenizer.encode(chat(prompt), true);
-			const out = enc.encodeLayers(tokens, [enc.config.nLayers - 2]);
+			const out = await enc.encodeLayers(tokens, [enc.config.nLayers - 2]);
 			enc.close();
 			llm.print(`  [phase] text_encode: ${llm.since(t0)}`);
 			return { cond: conditioning(out, tokens.length, enc.config.dim) };
@@ -146,10 +146,10 @@ defineNodes('zimage', {
 					if (useCfg) {
 						// v = uncond + cfg * (cond - uncond), on the GPU.
 						copy(dit.a.latent, saved, count * 4);
-						dit.forward(condText, sched[s]);
+						await dit.forward(condText, sched[s]);
 						copy(dit.a.velocity, condV, count * 4);
 						copy(saved, dit.a.latent, count * 4);
-						dit.forward(uncondText, sched[s]);
+						await dit.forward(uncondText, sched[s]);
 						scale(dit.a.velocity, count, -1);
 						add(condV, dit.a.velocity, count);        // cond - uncond
 						scale(condV, count, cfg);
@@ -157,7 +157,7 @@ defineNodes('zimage', {
 						add(dit.a.velocity, condV, count);
 						copy(saved, dit.a.latent, count * 4);
 					} else {
-						dit.forward(condText, sched[s]);
+						await dit.forward(condText, sched[s]);
 					}
 					eulerStep(dit.a.latent, dit.a.velocity, count, sched[s + 1] - sched[s]);
 					submit();

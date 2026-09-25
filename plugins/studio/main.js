@@ -11,6 +11,7 @@
 
 import { llm } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
+import { setBreather } from '../lib/gpu.js';
 import { loadPlugins, readSettings, writeText } from '../lib/graph/plugins.js';
 import { app, run, cancel, dropImages } from './app.js';
 import { Doc, refreshTypes } from './doc.js';
@@ -79,6 +80,8 @@ app.actions = {
 async function boot() {
 	app.settings = readSettings();
 	op.useMatrixCores(app.settings.matrix_cores ?? true);
+	// Long GPU work hands the window a frame between its layers.
+	setBreather(() => three.nextFrame());
 	app.plugins = await loadPlugins(llm.root, app.settings);
 	const types = refreshTypes();
 

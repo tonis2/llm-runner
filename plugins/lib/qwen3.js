@@ -9,7 +9,7 @@
 
 import { llm, f32 } from './llm.js';
 import * as op from './ops.js';
-import { submit } from './gpu.js';
+import { breathe } from './gpu.js';
 
 // The architecture's numbers, from the GGUF metadata the way
 // `lib/model/config.c3` reads them.
@@ -45,7 +45,7 @@ export class TextEncoder {
 	// Run `tokens` through the first `upTo` layers and return a tensor
 	// [n, layers.length * dim] holding, per token, the hidden state after each
 	// layer in `layers` (0-indexed), side by side.
-	encodeLayers(tokens, layers) {
+	async encodeLayers(tokens, layers) {
 		const c = this.config;
 		const n = tokens.length;
 		const dim = c.dim;
@@ -98,7 +98,7 @@ export class TextEncoder {
 
 			const slot = layers.indexOf(l);
 			if (slot >= 0) op.copyRows(hidden, out, n, dim, width, slot * dim);
-			submit();
+			await breathe(true);
 			for (const t of Object.values(w)) if (t) t.dispose();
 			runMs += llm.now() - t1;
 		}

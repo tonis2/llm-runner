@@ -27,7 +27,7 @@ const TEXT_MAX = 512;
 const MAX_REFS = 4;
 
 // Qwen3 chat-template wrap, padded with <|endoftext|> to a multiple of 64.
-export function encodePrompt(textModel, prompt, textPad = 0) {
+export async function encodePrompt(textModel, prompt, textPad = 0) {
 	const t0 = llm.now();
 	const enc = new TextEncoder(textModel);
 	const wrapped = `<|im_start|>user\n${prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`;
@@ -47,7 +47,7 @@ export function encodePrompt(textModel, prompt, textPad = 0) {
 	const spacing = Math.floor(n / 4);
 	const layers = n >= 12 ? [spacing - 1, 2 * spacing - 1, 3 * spacing - 1] : [0, Math.floor(n / 2), n - 1];
 	llm.print(`  text: ${real} tokens, padded to ${padded}; layers ${layers.join(', ')} of ${n}`);
-	const text = enc.encodeLayers(tokens, layers);
+	const text = await enc.encodeLayers(tokens, layers);
 	enc.close();
 	llm.print(`  [phase] text_encode: ${llm.since(t0)}`);
 	return { text, nTxt: padded, textDim: 3 * enc.config.dim };
@@ -74,11 +74,11 @@ defineNodes('flux', {
 		description: 'A Flux 2 (Klein) DiT GGUF, with any LoRAs folded in. Stays in VRAM while it is wired to something.',
 		inputs: { path: 'PATH(dit)', lora: 'LORA?' },
 		outputs: { model: 'MODEL' },
-		run({ path, lora }) {
+		async run({ path, lora }) {
 			const t0 = llm.now();
 			const file = llm.open(path);
 			const dit = new FluxDiT(file);
-			dit.load();
+			await dit.load();
 			if (lora && lora.length > 0) mergeLoras(dit, lora);
 			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
 			return {
@@ -97,8 +97,8 @@ defineNodes('flux', {
 		description: 'Qwen3 hidden states from three layers, side by side.',
 		inputs: { encoder: 'TEXT_ENCODER', prompt: 'STRING*=', text_pad: 'INT=0' },
 		outputs: { cond: 'CONDITIONING' },
-		run({ encoder, prompt, text_pad }) {
-			const { text, nTxt, textDim } = encodePrompt(encoder.path, prompt, text_pad);
+		async run({ encoder, prompt, text_pad }) {
+			const { text, nTxt, textDim } = await encodePrompt(encoder.path, prompt, text_pad);
 			return { cond: { family: 'flux2', tensor: text, n: nTxt, dim: textDim, dispose() { text.dispose(); } } };
 		},
 	},
@@ -109,7 +109,7 @@ defineNodes('flux', {
 		description: 'An image for kontext editing, encoded at its own aspect ratio with the long side at most `long_side`. Chain up to four.',
 		inputs: { vae: 'VAE', image: 'IMAGE', refs: 'REFERENCES?', long_side: 'INT=1024' },
 		outputs: { refs: 'REFERENCES' },
-		run({ vae, image: src, refs, long_side }) {
+		async run({ vae, image: src, refs, long_side }) {
 			if (vae.format !== 'flux2') throw new Error(`flux.reference needs a Flux 2 VAE; ${vae.path} is ${vae.kind}`);
 			const list = refs ?? [];
 			if (list.length >= MAX_REFS) throw new Error(`kontext takes at most ${MAX_REFS} reference images`);
@@ -118,7 +118,7 @@ defineNodes('flux', {
 			const native = Math.max(src.width, src.height);
 			const img = image.fit16(src, Math.min(ceiling, native));
 			const t0 = llm.now();
-			const latent = encodeImage(vae.path, img);
+			const latent = await encodeImage(vae.path, img);
 			llm.print(`  [phase] ref_vae_encode: ${llm.since(t0)}`);
 			return { refs: [...list, { w: img.width / 16, h: img.height / 16, data: latent.data }] };
 		},
@@ -172,7 +172,7 @@ defineNodes('flux', {
 			try {
 				for (let s = 0; s < steps; s++) {
 					const ts = llm.now();
-					dit.forward(cond.tensor, schedule[s]);
+					await dit.forward(cond.tensor, schedule[s]);
 					eulerStep(dit.a.latent, dit.a.velocity, x.length, schedule[s + 1] - schedule[s]);
 					submit();
 					llm.print(`  step ${s + 1}/${steps}: sigma ${schedule[s].toFixed(4)}  ${(llm.now() - ts).toFixed(0)}ms`);

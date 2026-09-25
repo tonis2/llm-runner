@@ -6,7 +6,7 @@
 
 import { llm, f32, GGML } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
-import { submit, copy } from '../lib/gpu.js';
+import { submit, copy, breathe, uploadEach } from '../lib/gpu.js';
 
 export const PATCH = 2;
 const PAD_TO = 32;
@@ -85,32 +85,32 @@ export class ZImageDiT {
 		this.nContext = count('context_refiner');
 	}
 
-	load() {
+	async load() {
 		const m = this.model;
 		const t0 = llm.now();
 		const up = (name) => m.upload(name, 'auto');
 		const f = (name) => m.upload(name, 'f32');
-		const layer = (prefix, l, adaln) => ({
-			qkv: up(`${prefix}.${l}.attention.qkv.weight`),
-			qNorm: f(`${prefix}.${l}.attention.q_norm.weight`),
-			kNorm: f(`${prefix}.${l}.attention.k_norm.weight`),
-			out: up(`${prefix}.${l}.attention.out.weight`),
-			w1: up(`${prefix}.${l}.feed_forward.w1.weight`),
-			w2: up(`${prefix}.${l}.feed_forward.w2.weight`),
-			w3: up(`${prefix}.${l}.feed_forward.w3.weight`),
-			attnNorm1: f(`${prefix}.${l}.attention_norm1.weight`),
-			attnNorm2: m.has(`${prefix}.${l}.attention_norm2.weight`) ? f(`${prefix}.${l}.attention_norm2.weight`) : null,
-			ffnNorm1: f(`${prefix}.${l}.ffn_norm1.weight`),
-			ffnNorm2: m.has(`${prefix}.${l}.ffn_norm2.weight`) ? f(`${prefix}.${l}.ffn_norm2.weight`) : null,
-			adaW: adaln ? f(`${prefix}.${l}.adaLN_modulation.0.weight`) : null,
-			adaB: adaln ? f(`${prefix}.${l}.adaLN_modulation.0.bias`) : null,
+		const layer = (prefix, l, adaln) => uploadEach({
+			qkv: () => up(`${prefix}.${l}.attention.qkv.weight`),
+			qNorm: () => f(`${prefix}.${l}.attention.q_norm.weight`),
+			kNorm: () => f(`${prefix}.${l}.attention.k_norm.weight`),
+			out: () => up(`${prefix}.${l}.attention.out.weight`),
+			w1: () => up(`${prefix}.${l}.feed_forward.w1.weight`),
+			w2: () => up(`${prefix}.${l}.feed_forward.w2.weight`),
+			w3: () => up(`${prefix}.${l}.feed_forward.w3.weight`),
+			attnNorm1: () => f(`${prefix}.${l}.attention_norm1.weight`),
+			attnNorm2: () => m.has(`${prefix}.${l}.attention_norm2.weight`) ? f(`${prefix}.${l}.attention_norm2.weight`) : null,
+			ffnNorm1: () => f(`${prefix}.${l}.ffn_norm1.weight`),
+			ffnNorm2: () => m.has(`${prefix}.${l}.ffn_norm2.weight`) ? f(`${prefix}.${l}.ffn_norm2.weight`) : null,
+			adaW: () => adaln ? f(`${prefix}.${l}.adaLN_modulation.0.weight`) : null,
+			adaB: () => adaln ? f(`${prefix}.${l}.adaLN_modulation.0.bias`) : null,
 		});
 		this.layers = [];
-		for (let l = 0; l < this.nLayers; l++) this.layers.push(layer('layers', l, true));
+		for (let l = 0; l < this.nLayers; l++) this.layers.push(await layer('layers', l, true));
 		this.noiseRefiner = [];
-		for (let l = 0; l < this.nRefiner; l++) this.noiseRefiner.push(layer('noise_refiner', l, true));
+		for (let l = 0; l < this.nRefiner; l++) this.noiseRefiner.push(await layer('noise_refiner', l, true));
 		this.contextRefiner = [];
-		for (let l = 0; l < this.nContext; l++) this.contextRefiner.push(layer('context_refiner', l, false));
+		for (let l = 0; l < this.nContext; l++) this.contextRefiner.push(await layer('context_refiner', l, false));
 		const finalNorm = ['final_layer.norm.weight', 'norm_out.norm.weight'].find((n) => m.has(n));
 		this.g = {
 			capNorm: f('cap_embedder.0.weight'),
@@ -191,7 +191,7 @@ export class ZImageDiT {
 	}
 
 	// velocity for the latent in this.a.latent at `sigma`, into this.a.velocity.
-	forward(text, sigma) {
+	async forward(text, sigma) {
 		const a = this.a, g = this.g, dim = this.dim;
 		const nP = this.nPatches, pP = this.paddedPatches;
 		op.patchify(a.latent, a.patches, this.channels, this.latentH, this.latentW, PATCH);
@@ -205,12 +205,15 @@ export class ZImageDiT {
 		op.silu(a.tMlp, this.tMlp);
 		op.linearBias(g.t2w, g.t2b, a.tMlp, a.tEmb, this.tDim, this.tMlp, 1);
 
-		for (const lw of this.noiseRefiner) this.layer(lw, a.hidden, pP, true, text.imgCos, text.imgSin);
+		for (const lw of this.noiseRefiner) {
+			this.layer(lw, a.hidden, pP, true, text.imgCos, text.imgSin);
+			await breathe();
+		}
 		copy(text.tensor, a.hidden, text.paddedText * dim * 4, 0, pP * dim * 4);
 		const seq = pP + text.paddedText;
 		for (const lw of this.layers) {
 			this.layer(lw, a.hidden, seq, true, text.cos, text.sin);
-			submit();
+			await breathe(true);
 		}
 
 		// Final layer: SiLU(t) -> scale; LayerNorm (or the RMSNorm a checkpoint

@@ -99,6 +99,45 @@ export function dispatchCount() { return dispatches; }
 // Run everything recorded and wait for it.
 export function submit() { C.submit(); }
 
+// A window's turn. Long work calls `await breathe()` between its blocks (a
+// layer, a weight upload). Headless nothing is set and it does nothing (but
+// submit, when `submitHere` says the caller wants its blocks cut there anyway);
+// the studio sets `setBreather(() => three.nextFrame())`, and then what is
+// recorded goes to the GPU and a frame is drawn while it runs. Work that is
+// done at once, and a breath soon after the last, draws nothing: small blocks
+// are not each held up by a frame.
+const FRAME_MS = 40;
+let breather = null;
+let lastBreath = 0;
+export function setBreather(fn) {
+	breather = fn;
+	lastBreath = llm.now();
+}
+
+// Weights uploaded one at a time with a breath after each: `spec` is
+// `{ key: () => tensor }`, and the answer is `{ key: tensor }`.
+export async function uploadEach(spec) {
+	const out = {};
+	for (const [key, make] of Object.entries(spec)) {
+		out[key] = make();
+		await breathe();
+	}
+	return out;
+}
+
+export async function breathe(submitHere = false) {
+	if (!breather) {
+		if (submitHere) C.submit();
+		return;
+	}
+	C.submitAsync();
+	if (C.busy() || llm.now() - lastBreath >= FRAME_MS) {
+		await breather();
+		C.submit();
+		lastBreath = llm.now();
+	}
+}
+
 // GPU-side copy of `bytes` bytes, in order with the dispatches.
 export function copy(src, dst, bytes, srcOffset = 0, dstOffset = 0) {
 	C.copy(src.buffer ?? src, dst.buffer ?? dst, { srcOffset, dstOffset, size: bytes });

@@ -247,8 +247,8 @@ export class Executor {
 						cancelled: checkCancel,
 						// Awaited by a node between steps: reports, lets a frame
 						// be drawn, and throws Cancelled if the run was stopped.
-						progress: (step, total, extra = {}) => {
-							if (onProgress) onProgress({ node: id, step, total, ...extra });
+						progress: async (step, total, extra = {}) => {
+							if (onProgress) await onProgress({ node: id, step, total, ...extra });
 							return pause();
 						},
 					};

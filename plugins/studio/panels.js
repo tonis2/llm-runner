@@ -2,7 +2,8 @@
 // node, the status bar, the menu, and the dialogs.
 
 import { llm } from '../lib/llm.js';
-import { app, run, cancel, freeMemory, dropImages } from './app.js';
+import { app, run, cancel, freeMemory, dropImages, safe } from './app.js';
+import { editor } from './fields.js';
 import { allTypes, defOf, isSetting, isWire } from './doc.js';
 import {
 	THEME, typeColor, BAR_H, STATUS_H, PALETTE_W, INSPECTOR_W,
@@ -13,19 +14,6 @@ const {
 	Rect, Label, Drawing, Select, TextField, Tree, Button, Checkbox,
 	MenuBar, FileBrowser, Dialog,
 } = three.ui;
-
-// A handler that reports instead of throwing: a throw inside a widget
-// callback stops that callback for good.
-export function safe(fn) {
-	return (...args) => {
-		try {
-			const r = fn(...args);
-			if (r && typeof r.catch === 'function') r.catch((e) => app.say(e.message ?? String(e), true));
-		} catch (e) {
-			app.say(e && e.message ? e.message : String(e), true);
-		}
-	};
-}
 
 // Lines of at most `width` points.
 function wrap(text, width, size) {
@@ -113,48 +101,10 @@ export class Inspector extends three.Widget {
 	constructor() {
 		super();
 		this.height = 400;
-		// Text typed into a number field that does not read as a number yet
-		// ("-", "0."), by field, so the field keeps it until it does.
-		this.drafts = {};
 	}
 
 	field(n, input, width) {
-		const key = `${n.id}:${input.name}`;
-		const v = n.params[input.name] ?? input.default;
-		const set = (value) => { app.doc.setParam(n.id, input.name, value); app.changed(); };
-		switch (input.type) {
-			case 'BOOL':
-				return new Checkbox(input.name, !!v, safe(set), { key });
-			case 'ENUM': {
-				const options = input.options ?? [];
-				return new Select(options, Math.max(0, options.indexOf(String(v))), safe((i) => set(options[i])), { key, size: [width, 0] });
-			}
-			case 'INT':
-			case 'FLOAT': {
-				const draft = this.drafts[key];
-				const field = new TextField({
-					key, text: draft ?? (v === undefined ? '' : String(v)), size: [input.name === 'seed' ? width - 80 : width, 0],
-					onChange: safe((t) => {
-						const x = Number(t);
-						if (t.trim() !== '' && Number.isFinite(x)) {
-							this.drafts = { ...this.drafts, [key]: undefined };
-							set(input.type === 'INT' ? Math.trunc(x) : x);
-						} else {
-							this.drafts = { ...this.drafts, [key]: t };
-						}
-					}),
-				});
-				if (input.name !== 'seed') return field;
-				return new Row({ gap: 6 }, field, new Button('Random', safe(() => set(Math.floor(Math.random() * 2 ** 31)))));
-			}
-			case 'PATH':
-				return new Row({ gap: 6 },
-					new TextField({ key, text: v ?? '', size: [width - 80, 0], onChange: safe((t) => set(t || undefined)) }),
-					new Button('Browse', safe(() => app.widgets.dialogs.pickFile(n.id, input))),
-				);
-			default:
-				return new TextField({ key, text: v ?? '', size: [width, 0], placeholder: input.multiline ? 'text' : '', onChange: safe((t) => set(t)) });
-		}
+		return editor(n, input, { key: `${n.id}:${input.name}`, width, height: input.multiline ? 140 : 0 });
 	}
 
 	render() {
@@ -460,4 +410,4 @@ function togglePlugin(p, on) {
 	app.widgets.dialogs.update();
 }
 
-export { dropImages };
+export { dropImages, safe };

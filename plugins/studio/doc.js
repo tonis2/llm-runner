@@ -12,7 +12,7 @@ import { llm } from '../lib/llm.js';
 import { catalogue } from '../lib/graph/registry.js';
 import { accepts, PRIMITIVES } from '../lib/graph/types.js';
 import { vaeKind, KIND_FORMAT } from '../lib/latents.js';
-import { NODE_W, NODE_HEAD, NODE_ROW, NODE_PAD } from './theme.js';
+import { NODE_W } from './theme.js';
 
 let types = {};
 export function refreshTypes() { types = catalogue(); return types; }
@@ -231,12 +231,8 @@ export class Doc {
 		return null;
 	}
 
-	// Rows a node is drawn with: its inputs down the left, outputs down the right.
-	static rows(def) { return Math.max(def.inputs.length, def.outputs.length, 1); }
-
-	static height(def, extra = 0) {
-		return NODE_HEAD + Doc.rows(def) * NODE_ROW + NODE_PAD + extra;
-	}
+	// How tall a node is drawn, for spacing a layout; `layout.js` sets it.
+	static heightOf = null;
 
 	// Columns by depth - the longest path from something with no inputs - and
 	// stacked down each column. For graphs that arrive without positions.
@@ -263,7 +259,7 @@ export class Doc {
 			let y = 40;
 			for (const n of col ?? []) {
 				n.pos = [40 + d * (NODE_W + 70), y];
-				y += Doc.height(defOf(n.type)) + 40;
+				y += (Doc.heightOf ? Doc.heightOf(n) : 160) + 40;
 			}
 		});
 	}

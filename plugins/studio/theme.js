@@ -42,8 +42,19 @@ export const PALETTE_W = 230;
 export const INSPECTOR_W = 330;
 
 // Node geometry, in graph units (one unit is one point at zoom 1).
-export const NODE_W = 240;
+export const NODE_W = 280;
 export const NODE_HEAD = 26;
 export const NODE_ROW = 22;
 export const NODE_PAD = 8;
 export const PORT_R = 5;
+
+// The editors inside a node: inset from its sides, a small label over each box,
+// and the gap between them.
+export const FIELD_X = 12;
+export const FIELD_H = 26;
+export const LABEL_H = 14;
+export const PROMPT_H = 90;
+export const FIELD_GAP = 6;
+// Below this zoom the editors are too small to use, and a node shows its values
+// as text instead.
+export const EDIT_ZOOM = 0.5;

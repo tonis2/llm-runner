@@ -84,7 +84,7 @@ export function conv1x1(input, weight, bias, inC, outC, spatial) {
 
 // Flux 2: undo the batch norm, pixel-shuffle to the VAE's 32 channels,
 // post_quant_conv, decode. [128, h, w] -> [3, 16h, 16w].
-function decodeFlux2(vae, data, latentH, latentW) {
+async function decodeFlux2(vae, data, latentH, latentW) {
 	const latent = data.slice();
 	const mean = vae.floats('bn.running_mean');
 	const variance = vae.floats('bn.running_var');
@@ -101,16 +101,18 @@ function decodeFlux2(vae, data, latentH, latentW) {
 		x = conv1x1(x, vae.floats('post_quant_conv.weight'), vae.floats('post_quant_conv.bias'), vaeCh, vaeCh, h * w);
 	}
 	const decoder = new FluxVAEDecoder(vae);
-	const pixels = decoder.decode(x, h, w);
-	decoder.dispose();
-	return pixels;
+	try {
+		return await decoder.decode(x, h, w);
+	} finally {
+		decoder.dispose();
+	}
 }
 
 // Flux 2: [3, H, W] in [-1, 1] through the encoder, quant_conv, the mean half,
 // unshuffled to 128 channels, then the batch norm the decode undoes.
-function encodeFlux2(vae, encoder, img) {
+async function encodeFlux2(vae, encoder, img) {
 	const H = img.height, W = img.width;
-	const enc = encoder.encode(image.toTensor(img), H, W);
+	const enc = await encoder.encode(image.toTensor(img), H, W);
 	const spatial = enc.h * enc.w;
 	let x = enc.data;
 	if (vae.has('quant_conv.weight')) {
@@ -129,8 +131,8 @@ function encodeFlux2(vae, encoder, img) {
 }
 
 // Flux 1: the encoder's mean, shifted and scaled.
-function encodeFlux1(encoder, img) {
-	const enc = encoder.encode(image.toTensor(img), img.height, img.width);
+async function encodeFlux1(encoder, img) {
+	const enc = await encoder.encode(image.toTensor(img), img.height, img.width);
 	const n = (enc.channels / 2) * enc.h * enc.w;
 	const latent = new Float32Array(n);
 	for (let i = 0; i < n; i++) latent[i] = (enc.data[i] - FLUX1_SHIFT) * FLUX1_SCALE;
@@ -139,7 +141,7 @@ function encodeFlux1(encoder, img) {
 
 // An image through a VAE file into its latent format. The image's sides must
 // be multiples of the format's factor.
-export function encodeImage(vaePath, img) {
+export async function encodeImage(vaePath, img) {
 	const vae = llm.open(vaePath);
 	const kind = vaeKind(vae);
 	if (kind === 'taesd') {
@@ -148,7 +150,7 @@ export function encodeImage(vaePath, img) {
 	}
 	const encoder = new FluxVAEEncoder(vae);
 	try {
-		return kind === 'flux2' ? encodeFlux2(vae, encoder, img) : encodeFlux1(encoder, img);
+		return await (kind === 'flux2' ? encodeFlux2(vae, encoder, img) : encodeFlux1(encoder, img));
 	} finally {
 		encoder.dispose();
 		vae.close();
@@ -156,7 +158,7 @@ export function encodeImage(vaePath, img) {
 }
 
 // A latent through a VAE file to [3, H, W] floats in [0, 1].
-export function decodeLatent(vaePath, latent) {
+export async function decodeLatent(vaePath, latent) {
 	const vae = llm.open(vaePath);
 	try {
 		const kind = vaeKind(vae);
@@ -164,7 +166,7 @@ export function decodeLatent(vaePath, latent) {
 		if (latent.format !== format) {
 			throw new Error(`${vaePath.split('/').pop()} decodes ${format} latents; this one is ${latent.format}`);
 		}
-		if (kind === 'flux2') return decodeFlux2(vae, latent.data, latent.h, latent.w);
+		if (kind === 'flux2') return await decodeFlux2(vae, latent.data, latent.h, latent.w);
 		if (kind === 'taesd') {
 			const decoder = new TAESDDecoder(vae);
 			const pixels = decoder.decode(latent.data, latent.h, latent.w);
@@ -174,9 +176,11 @@ export function decodeLatent(vaePath, latent) {
 		const data = latent.data.slice();
 		for (let i = 0; i < data.length; i++) data[i] = data[i] / FLUX1_SCALE + FLUX1_SHIFT;
 		const decoder = new FluxVAEDecoder(vae);
-		const pixels = decoder.decode(data, latent.h, latent.w);
-		decoder.dispose();
-		return pixels;
+		try {
+			return await decoder.decode(data, latent.h, latent.w);
+		} finally {
+			decoder.dispose();
+		}
 	} finally {
 		vae.close();
 	}

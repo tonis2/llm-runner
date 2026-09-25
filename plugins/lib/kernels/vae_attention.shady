@@ -1,11 +1,13 @@
 // Single-head self-attention for the VAE mid block, Q/K/V/out in [S, C] layout.
 // One workgroup per (head, query position); keys in tiles of 4096 with an
-// online softmax, so any spatial size fits. Dispatch 1D: n_heads * seq.
+// online softmax, so any spatial size fits. Dispatch 1D: n_heads * q_count,
+// for the queries q_start .. q_start + q_count - so a long one can be cut into
+// pieces, each query's answer the same whichever piece it is in.
 float q[];
 float k[];
 float v[];
 float output[];
-struct Push @pushconstant { uint head_dim; uint n_heads; uint seq_len; float scale; uint channels; }
+struct Push @pushconstant { uint head_dim; uint n_heads; uint seq_len; float scale; uint channels; uint q_start; uint q_count; }
 Push pc;
 shared float scores[4096];
 shared float red[256];
@@ -16,8 +18,8 @@ struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_in
 fn void main(ComputeIn input) @compute @threads(256, 1, 1)
 {
     uint S = pc.seq_len;
-    uint head = input.gid.x / S;
-    uint q_pos = input.gid.x % S;
+    uint head = input.gid.x / pc.q_count;
+    uint q_pos = pc.q_start + input.gid.x % pc.q_count;
     uint gi = input.lid.x;
     uint D = pc.head_dim;
     uint C = pc.channels;

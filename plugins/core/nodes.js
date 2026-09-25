@@ -113,11 +113,11 @@ defineNodes('core', {
 		description: 'An image into the VAE\'s latent space, cropped to width x height first (0 keeps the image\'s size, rounded down to 16).',
 		inputs: { vae: 'VAE', image: 'IMAGE', width: 'INT=0', height: 'INT=0' },
 		outputs: { latent: 'LATENT' },
-		run({ vae, image: img, width, height }) {
+		async run({ vae, image: img, width, height }) {
 			const w = Math.floor((width || img.width) / 16) * 16;
 			const h = Math.floor((height || img.height) / 16) * 16;
 			const t0 = llm.now();
-			const latent = encodeImage(vae.path, image.cropTo(img, w, h));
+			const latent = await encodeImage(vae.path, image.cropTo(img, w, h));
 			llm.print(`  [vae] encoded ${w}x${h} to ${latent.format} [${latent.channels}, ${latent.h}, ${latent.w}] in ${llm.since(t0)}`);
 			return { latent };
 		},
@@ -128,11 +128,11 @@ defineNodes('core', {
 		category: 'latent',
 		inputs: { vae: 'VAE', latent: 'LATENT' },
 		outputs: { image: 'IMAGE' },
-		run({ vae, latent }) {
+		async run({ vae, latent }) {
 			const t0 = llm.now();
 			const factor = FORMATS[latent.format].factor;
 			const width = latent.w * factor, height = latent.h * factor;
-			const pixels = decodeLatent(vae.path, latent);
+			const pixels = await decodeLatent(vae.path, latent);
 			const img = image.fromTensor(pixels, width, height, 3);
 			llm.print(`  [phase] vae_decode: ${llm.since(t0)}`);
 			return { image: img };

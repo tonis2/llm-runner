@@ -10,7 +10,7 @@
 
 import { llm, f32 } from './llm.js';
 import * as op from './ops.js';
-import { submit, copy } from './gpu.js';
+import { submit, copy, breathe } from './gpu.js';
 
 function conv(model, prefix, k = 3) {
 	const shape = model.shape(`${prefix}weight`); // [kw, kh, in, out]
@@ -105,7 +105,7 @@ export class FluxVAEDecoder {
 	}
 
 	// Decode `latent` (Float32Array [C, h, w]) and return [3, 8h, 8w] floats in [0, 1].
-	decode(latent, h, w) {
+	async decode(latent, h, w) {
 		const H = h * 8, W = w * 8;
 		// The widest stage: 256 channels at full resolution, or 512 at half.
 		const size = Math.max(256 * H * W, 512 * (H / 2) * (W / 2), 512 * h * w);
@@ -115,22 +115,22 @@ export class FluxVAEDecoder {
 
 		let r = op.conv2d(this.convIn, a.x, a.t, h, w);
 		copy(a.t, a.x, this.convIn.outC * h * w * 4);
-		this.resnet(this.mid1, a, h, w);
-		this.attention(this.midAttn, a, attn, h, w);
-		this.resnet(this.mid2, a, h, w);
+		await this.resnet(this.mid1, a, h, w);
+		await this.attention(this.midAttn, a, attn, h, w);
+		await this.resnet(this.mid2, a, h, w);
 		submit();
 
 		for (const stage of this.stages) {
 			for (const b of stage.blocks) {
-				this.resnet(b, a, h, w);
-				submit();
+				await this.resnet(b, a, h, w);
+				await breathe(true);
 			}
 			if (stage.upsample) {
 				const ch = stage.blocks[2].outC;
 				op.upsample2x(a.x, a.t, ch, h, w);
 				h *= 2; w *= 2;
 				op.conv2d(stage.upsample, a.t, a.x, h, w);
-				submit();
+				await breathe(true);
 			}
 		}
 
@@ -145,18 +145,19 @@ export class FluxVAEDecoder {
 		return out;
 	}
 
-	resnet(r, a, h, w) { runResnet(r, a, h, w); }
+	resnet(r, a, h, w) { return runResnet(r, a, h, w); }
 
-	attention(at, a, t, h, w) { runAttention(at, a, t, h, w); }
+	attention(at, a, t, h, w) { return runAttention(at, a, t, h, w); }
 }
 
 // x = x + conv2(silu(norm2(conv1(silu(norm1(x)))))), with a 1x1 shortcut on a
 // channel change. `a` is { x, t, s }: the state, and two scratch buffers.
-function runResnet(r, a, h, w) {
+async function runResnet(r, a, h, w) {
 	const n = h * w;
 	op.groupNorm(a.x, r.norm1w, r.norm1b, a.t, r.inC, n);
 	op.silu(a.t, r.inC * n);
 	op.conv2d(r.conv1, a.t, a.s, h, w);
+	await breathe();
 	op.groupNorm(a.s, r.norm2w, r.norm2b, a.t, r.outC, n);
 	op.silu(a.t, r.outC * n);
 	op.conv2d(r.conv2, a.t, a.s, h, w);
@@ -169,8 +170,11 @@ function runResnet(r, a, h, w) {
 	copy(a.s, a.x, r.outC * n * 4);
 }
 
+// Queries per attention dispatch: a window gets a frame between pieces.
+const ATTENTION_CHUNK = 512;
+
 // Single-head self-attention over the h*w positions, with a residual.
-function runAttention(at, a, t, h, w) {
+async function runAttention(at, a, t, h, w) {
 	const C = at.channels, S = h * w;
 	copy(a.x, t.save, C * S * 4);
 	op.groupNorm(a.x, at.normw, at.normb, a.t, C, S);
@@ -178,7 +182,10 @@ function runAttention(at, a, t, h, w) {
 	op.linearBias(at.qw, at.qb, a.s, t.q, C, C, S);
 	op.linearBias(at.kw, at.kb, a.s, t.k, C, C, S);
 	op.linearBias(at.vw, at.vb, a.s, t.v, C, C, S);
-	op.vaeAttention(t.q, t.k, t.v, t.o, C, S);
+	for (let start = 0; start < S; start += ATTENTION_CHUNK) {
+		op.vaeAttention(t.q, t.k, t.v, t.o, C, S, start, Math.min(ATTENTION_CHUNK, S - start));
+		await breathe();
+	}
 	op.linearBias(at.ow, at.ob, t.o, a.s, C, C, S);
 	op.transposeChannelSpatial(a.s, a.x, C, S, 1);
 	op.add(a.x, t.save, C * S);
@@ -229,7 +236,7 @@ export class FluxVAEEncoder {
 	}
 
 	// `pixels` is [3, H, W] floats in [-1, 1]; returns [outC, H/8, W/8].
-	encode(pixels, H, W) {
+	async encode(pixels, H, W) {
 		const size = Math.max(256 * H * W, 3 * H * W);
 		const a = { x: f32(size), t: f32(size), s: f32(size) };
 		a.x.buffer.write(pixels);
@@ -239,20 +246,20 @@ export class FluxVAEEncoder {
 		submit();
 		for (const stage of this.stages) {
 			for (const b of stage.blocks) {
-				runResnet(b, a, h, w);
-				submit();
+				await runResnet(b, a, h, w);
+				await breathe(true);
 			}
 			if (stage.down) {
 				op.conv2d(stage.down, a.x, a.t, h, w, 2, 0, { h: h / 2, w: w / 2 });
 				h /= 2; w /= 2;
 				copy(a.t, a.x, stage.down.outC * h * w * 4);
-				submit();
+				await breathe(true);
 			}
 		}
 		const t = attentionScratch(h * w);
-		runResnet(this.mid1, a, h, w);
-		runAttention(this.midAttn, a, t, h, w);
-		runResnet(this.mid2, a, h, w);
+		await runResnet(this.mid1, a, h, w);
+		await runAttention(this.midAttn, a, t, h, w);
+		await runResnet(this.mid2, a, h, w);
 		op.groupNorm(a.x, this.normOutW, this.normOutB, a.t, 512, h * w);
 		op.silu(a.t, 512 * h * w);
 		op.conv2d(this.convOut, a.t, a.x, h, w);

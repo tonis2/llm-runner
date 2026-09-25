@@ -60,6 +60,19 @@ export const app = {
 	},
 };
 
+// A handler that reports instead of throwing: a throw inside a widget
+// callback stops that callback for good.
+export function safe(fn) {
+	return (...args) => {
+		try {
+			const r = fn(...args);
+			if (r && typeof r.catch === 'function') r.catch((e) => app.say(e.message ?? String(e), true));
+		} catch (e) {
+			app.say(e && e.message ? e.message : String(e), true);
+		}
+	};
+}
+
 // Put a picture on a node: its texture is made once and replaced after that.
 export function setImage(id, img) {
 	const had = app.images[id];
@@ -80,7 +93,7 @@ export function dropImages() {
 // Flux 1 latents (Z-Image's). Flux 2 has none yet, so its steps show progress
 // only.
 let previewDecoder = null;
-function previewFor(latent) {
+async function previewFor(latent) {
 	const path = app.settings.preview_vae;
 	if (!path) return null;
 	if (!previewDecoder || previewDecoder.path !== path) {
@@ -94,7 +107,7 @@ function previewFor(latent) {
 	}
 	if (previewDecoder.format !== latent.format) return null;
 	const f = FORMATS[latent.format].factor;
-	return image.fromTensor(decodeLatent(path, latent), latent.w * f, latent.h * f, 3);
+	return image.fromTensor(await decodeLatent(path, latent), latent.w * f, latent.h * f, 3);
 }
 
 // Run the graph (or what `targets` need). Results stay cached between runs,
@@ -113,7 +126,7 @@ export async function run(targets = null) {
 		const { results, ran, cached } = await app.executor.run(app.doc.graph(), {
 			targets,
 			cancelled: () => app.cancelRequested,
-			onProgress(e) {
+			async onProgress(e) {
 				if (e.start) {
 					current = e.node;
 					app.nodeState[e.node] = 'running';
@@ -126,7 +139,7 @@ export async function run(targets = null) {
 					app.progress = { node: e.node, step: e.step, total: e.total };
 					app.say(`${e.node}: step ${e.step}/${e.total}`);
 					if (e.latent) {
-						const img = previewFor(e.latent());
+						const img = await previewFor(e.latent());
 						if (img) setImage(e.node, img);
 					}
 				}

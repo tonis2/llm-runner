@@ -8,7 +8,7 @@
 
 import { llm, f32, GGML } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
-import { submit } from '../lib/gpu.js';
+import { submit, breathe, uploadEach } from '../lib/gpu.js';
 
 // Architecture from the tensor shapes, the way `configure_flux_from_gguf` reads
 // it: Klein-9B and FLUX.2-dev share a graph and differ in these numbers.
@@ -94,7 +94,7 @@ export class FluxDiT {
 
 	// Upload every weight. Q8_0 stays Q8_0; BF16/F16 matrices and the norm
 	// scales are widened to f32, which is what `load_dit_tensor` did.
-	load() {
+	async load() {
 		const m = this.model;
 		const c = this.config;
 		const up = (name) => m.upload(name, 'auto');
@@ -113,30 +113,30 @@ export class FluxDiT {
 		this.dual = [];
 		for (let l = 0; l < c.nDual; l++) {
 			const p = (s) => `double_blocks.${l}.${s}`;
-			this.dual.push({
-				imgQkv: up(p('img_attn.qkv.weight')),
-				imgProj: up(p('img_attn.proj.weight')),
-				imgQNorm: up(p('img_attn.norm.query_norm.scale')),
-				imgKNorm: up(p('img_attn.norm.key_norm.scale')),
-				txtQkv: up(p('txt_attn.qkv.weight')),
-				txtProj: up(p('txt_attn.proj.weight')),
-				txtQNorm: up(p('txt_attn.norm.query_norm.scale')),
-				txtKNorm: up(p('txt_attn.norm.key_norm.scale')),
-				imgUp: up(p('img_mlp.0.weight')),
-				imgDown: up(p('img_mlp.2.weight')),
-				txtUp: up(p('txt_mlp.0.weight')),
-				txtDown: up(p('txt_mlp.2.weight')),
-			});
+			this.dual.push(await uploadEach({
+				imgQkv: () => up(p('img_attn.qkv.weight')),
+				imgProj: () => up(p('img_attn.proj.weight')),
+				imgQNorm: () => up(p('img_attn.norm.query_norm.scale')),
+				imgKNorm: () => up(p('img_attn.norm.key_norm.scale')),
+				txtQkv: () => up(p('txt_attn.qkv.weight')),
+				txtProj: () => up(p('txt_attn.proj.weight')),
+				txtQNorm: () => up(p('txt_attn.norm.query_norm.scale')),
+				txtKNorm: () => up(p('txt_attn.norm.key_norm.scale')),
+				imgUp: () => up(p('img_mlp.0.weight')),
+				imgDown: () => up(p('img_mlp.2.weight')),
+				txtUp: () => up(p('txt_mlp.0.weight')),
+				txtDown: () => up(p('txt_mlp.2.weight')),
+			}));
 		}
 		this.single = [];
 		for (let l = 0; l < c.nSingle; l++) {
 			const p = (s) => `single_blocks.${l}.${s}`;
-			this.single.push({
-				linear1: up(p('linear1.weight')),
-				linear2: up(p('linear2.weight')),
-				qNorm: up(p('norm.query_norm.scale')),
-				kNorm: up(p('norm.key_norm.scale')),
-			});
+			this.single.push(await uploadEach({
+				linear1: () => up(p('linear1.weight')),
+				linear2: () => up(p('linear2.weight')),
+				qNorm: () => up(p('norm.query_norm.scale')),
+				kNorm: () => up(p('norm.key_norm.scale')),
+			}));
 		}
 		this.loaded = true;
 		llm.print(`  DiT: ${c.nDual} dual + ${c.nSingle} single blocks, dim ${c.dim}, loaded in ${llm.since(t0)}`);
@@ -203,7 +203,7 @@ export class FluxDiT {
 
 	// One forward pass at `sigma`: this.a.latent in, this.a.velocity out (in the
 	// latent's [C, H, W] layout). `text` is [nTxt, textDim].
-	forward(text, sigma) {
+	async forward(text, sigma) {
 		const c = this.config;
 		const a = this.a;
 		const s = this.shape;
@@ -231,9 +231,15 @@ export class FluxDiT {
 		op.matmul(this.g.modSingle, a.siluT, a.modSingle, 3 * dim, dim, 1, 0, true);
 		op.matmul(this.g.finalAdaLN, a.siluT, a.modFinal, 2 * dim, dim, 1);
 
-		for (const b of this.dual) this.dualBlock(b, txtH, imgH);
+		for (const b of this.dual) {
+			this.dualBlock(b, txtH, imgH);
+			await breathe();
+		}
 		submit();
-		for (const b of this.single) this.singleBlock(b);
+		for (const b of this.single) {
+			this.singleBlock(b);
+			await breathe();
+		}
 
 		// Final layer over the image rows: LayerNorm, AdaLN (shift first, then
 		// scale, in this layer), project to patches, back to [C, H, W].
