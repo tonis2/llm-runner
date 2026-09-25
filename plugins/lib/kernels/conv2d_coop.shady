@@ -11,7 +11,8 @@
 // and goes in as half too. Results leave through a 16x16 staging tile per
 // subgroup, the bias added and the layout turned back to [out_c, h, w].
 //
-// in_c must be a multiple of 32 and out_c of 4. Half operands: inputs must be
+// in_c must be a multiple of 16 (the last chunk of 32 may be half full) and
+// out_c of 4. Half operands: inputs must be
 // inside +-65504. Same bindings and push block as conv2d.
 // Dispatch: ceil(h*w/128) * ceil(out_c/128).
 float4 weight[];
@@ -103,7 +104,7 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
         for (uint ic0 = 0u; ic0 < pc.in_c; ic0 += 32u) {
             for (uint c = 0u; c < 16u; c++) {
                 float v = 0.0;
-                if (inside) v = input_[(ic0 + a_c0 + c) * hw + src];
+                if (inside && ic0 + a_c0 + c < pc.in_c) v = input_[(ic0 + a_c0 + c) * hw + src];
                 As[a_m * 40u + a_c0 + c] = half(v);
             }
             // B: 32 rows of K (this tap, these channels) by 128 outputs, four float4s a thread.
@@ -113,7 +114,7 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
                 uint n4 = flat % 32u;
                 uint n = oc_base + n4 * 4u;
                 float4 wv = float4(0.0);
-                if (n < pc.out_c) wv = weight[(tap * pc.in_c + ic0 + kk) * out4 + n / 4u];
+                if (n < pc.out_c && ic0 + kk < pc.in_c) wv = weight[(tap * pc.in_c + ic0 + kk) * out4 + n / 4u];
                 uint at = kk * 136u + n4 * 4u;
                 Bs[at] = half(wv.x);
                 Bs[at + 1u] = half(wv.y);

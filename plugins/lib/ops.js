@@ -69,6 +69,20 @@ export function headNorm(x, weight, heads, headDim, rows, eps = 1e-6) {
 export function headNormSmall(x, weight, heads, headDim, rows, eps, independent = false) {
 	dispatch('head_rmsnorm_batch', [x, weight], [groups(rows * heads, 256)], pc('uuuf', headDim, heads, rows, eps), independent);
 }
+// The Wan-style VAE norm on [C, spatial]: per pixel, x / |x| * sqrt(C) * gamma,
+// then SiLU when `silu`.
+export function channelRmsNorm(x, gamma, y, channels, spatial, silu = false) {
+	dispatch('channel_rmsnorm', [x, gamma, y], [groups(spatial, 256)], pc('uuu', channels, spatial, silu ? 1 : 0));
+}
+// The residual VAE's parameter-free shortcuts, added into `y`: AvgDown3D from
+// [inC, h*fs, w*fs] to [outC, h, w], and DupUp3D from [inC, h, w] to
+// [outC, 2h, 2w]. `ftN` is the temporal factor (1 or 2) of one frame.
+export function avgDownAdd(x, y, inC, outC, h, w, ftN, fs) {
+	dispatch('avg_down', [x, y], [groups(outC * h * w, 256)], pc('uuuuuu', inC, outC, h, w, ftN, fs));
+}
+export function dupUpAdd(x, y, inC, outC, h, w, ftN) {
+	dispatch('dup_up', [x, y], [groups(outC * h * w * 4, 256)], pc('uuuuu', inC, outC, h, w, ftN));
+}
 export function groupNorm(x, weight, bias, y, channels, spatial, numGroups = 32, eps = 1e-6) {
 	dispatch('group_norm', [x, weight, bias, y], [numGroups], pc('uuuf', channels, spatial, numGroups, eps));
 }
@@ -82,8 +96,9 @@ export function gatedAdd(residual, mod, x, n, dim, gateAt) {
 	dispatch('gated_residual_linear', [residual, mod, x], [groups(n, 256)], pc('uuuu', n, dim, gateAt, 0));
 }
 
-export function ropeBatch(x, headDim, heads, tokens, theta, independent = false) {
-	dispatch('rope_batch', [x], [groups(tokens * heads * (headDim / 2), 128)], pc('uuuf', headDim, heads, tokens, theta), independent);
+// Rotate-half RoPE from cos/sin tables [tokens, headDim / 2] on [tokens, heads * headDim].
+export function ropeNeox(x, cos, sin, headDim, heads, tokens, independent = false) {
+	dispatch('rope_neox', [x, cos, sin], [groups(tokens * heads * (headDim / 2), 128)], pc('uuuu', headDim, heads, tokens, 0), independent);
 }
 // Rotary from tables on [heads, seq, 128].
 export function mrope(x, cos, sin, seq, heads, independent = false) {
@@ -103,6 +118,14 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 		return;
 	}
 	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)), false, flashDefines(hd));
+}
+// Q [heads, qLen, 128] over the keys of a cached prefix (k1, v1: [heads, l1,
+// 128]) followed by the current ones (k2, v2: [heads, l2, 128]); out [qLen,
+// heads * 128]. `limits` (a buffer of uints, one a query row, not falling)
+// caps the keys each row sees - a block-causal mask.
+export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2, limits = null) {
+	const bindings = [q, l1 > 0 ? k1 : k2, l1 > 0 ? v1 : v2, k2, v2, limits ?? q, out];
+	dispatch('flash_attention_split', bindings, [groups(qLen, 64), heads], pc('uuuufu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0));
 }
 // Causal GQA, Q [n, qHeads * hd], K/V [n, kvHeads * hd].
 export function attentionCausal(q, k, v, out, headDim, kvHeads, qHeads, tokens) {
@@ -151,7 +174,9 @@ export function conv2d(conv, x, y, h, w, stride = 1, pad = null, out = null) {
 	const ow = out ? out.w : Math.floor((w + 2 * p - k) / stride) + 1;
 	const bias = conv.bias ?? conv.weight;
 	const push = pc('uuuuuuuuuuuu', conv.inC, conv.outC, h, w, k, k, stride, p, 1, oh, ow, conv.bias ? 1 : 0);
-	if (stride === 1 && 2 * p === k - 1 && matrixCores && conv.inC % 32 === 0 && conv.outC % 4 === 0) {
+	// A narrow input that is not a multiple of 32 (144) runs a half-empty last chunk.
+	const coopIn = conv.inC % 32 === 0 || (conv.inC % 16 === 0 && conv.inC >= 128);
+	if (stride === 1 && 2 * p === k - 1 && matrixCores && coopIn && conv.outC % 4 === 0) {
 		// A size-keeping conv (3x3 or 1x1) as an implicit GEMM on the matrix cores.
 		dispatch('conv2d_coop', [conv.weight, bias, x, y], [groups(oh * ow, 128) * groups(conv.outC, 128)], push);
 	} else if (k === 3 && stride === 1 && p === 1) {
@@ -178,6 +203,20 @@ export function scale(x, n, s) { dispatch('scale', [x], [groups(n, 256)], pc('uf
 
 export function layerNormAffine(x, weight, bias, y, dim, rows, eps = 1e-6) {
 	dispatch('layernorm_affine', [x, weight, bias, y], [rows], pc('ufuu', dim, eps, rows, 0));
+}
+export function geluErf(x, n) { dispatch('gelu_erf', [x], [groups(n, 256)], pc('u', n)); }
+// [gh * gw, C] tokens to [(gh/2) * (gw/2), 4C], each 2x2 block's side by side.
+export function merge2x2(x, y, gh, gw, channels) {
+	dispatch('merge_2x2', [x, y], [groups(gh * gw * channels, 256)], pc('uuu', gh, gw, channels));
+}
+// [seq, heads * hd] to [heads, seq, hdp], zero-padded.
+export function padHeads(x, y, seq, heads, hd, hdp) {
+	dispatch('pad_heads', [x, y], [groups(heads * seq * hdp, 256)], pc('uuuu', seq, heads, hd, hdp));
+}
+// Non-causal attention of any head width up to 128 on [heads, seq, hd], the
+// width a multiple of 16; `scale` for a head padded out from a narrower one.
+export function flashAttentionScalar(q, k, v, out, heads, seq, hd, scale = 1 / Math.sqrt(hd)) {
+	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, scale), false, flashDefines(hd));
 }
 export function gelu(x, n) { dispatch('gelu', [x], [groups(n, 256)], pc('u', n)); }
 export function relu(x, n) { dispatch('relu', [x], [groups(n, 256)], pc('u', n)); }

@@ -1,0 +1,12 @@
+{
+	"nodes": [
+		{"id": "vae", "type": "core.vae", "params": {"path": "/run/media/tonis/extra/AI models/qwen_image_2.1_vae_bf16.safetensors"}},
+		{"id": "text_encoder", "type": "core.text_encoder", "params": {"path": "/run/media/tonis/extra/AI models/Qwen3-VL-8B-Instruct-Q8_0.gguf"}},
+		{"id": "input0", "type": "core.load_image", "params": {"path": "input.png"}},
+		{"id": "prompt", "type": "qwenimage.text_encode", "params": {"encoder": {"from": "text_encoder.encoder"}, "vision": "/run/media/tonis/extra/AI models/mmproj-F16.gguf", "image1": {"from": "input0.image"}, "resolution": 1024, "prompt": "turn the fox into a snow white arctic fox, keep the pose and the forest"}},
+		{"id": "dit", "type": "qwenimage.load", "params": {"path": "/run/media/tonis/extra/AI models/qwen-image-2.1-Q8_0.gguf"}},
+		{"id": "sample", "type": "qwenimage.sample", "params": {"positive": {"from": "prompt.cond"}, "model": {"from": "dit.model"}, "vae": {"from": "vae.vae"}, "width": 0, "height": 0, "steps": 40, "seed": 42, "cfg": 1}},
+		{"id": "decode", "type": "core.vae_decode", "params": {"vae": {"from": "vae.vae"}, "latent": {"from": "sample.latent"}}},
+		{"id": "save", "type": "core.save_image", "params": {"image": {"from": "decode.image"}, "path": "output/qwenimage-edit-#.png"}}
+	]
+}

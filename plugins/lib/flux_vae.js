@@ -12,7 +12,7 @@ import { llm, f32 } from './llm.js';
 import * as op from './ops.js';
 import { submit, copy, breathe } from './gpu.js';
 
-function conv(model, prefix, k = 3) {
+export function conv(model, prefix, k = 3) {
 	const shape = model.shape(`${prefix}weight`); // [kw, kh, in, out]
 	return {
 		weight: model.upload(`${prefix}weight`, 'conv'),
@@ -58,7 +58,7 @@ function attention(model, prefix) {
 	};
 }
 
-function disposeAll(value) {
+export function disposeAll(value) {
 	if (!value) return;
 	if (typeof value.dispose === 'function') { value.dispose(); return; }
 	if (Array.isArray(value)) { for (const v of value) disposeAll(v); return; }

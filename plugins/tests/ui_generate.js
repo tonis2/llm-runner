@@ -25,6 +25,7 @@ three.setAnimationLoop(() => {
 	frames++;
 	const now = llm.now();
 	if (lastFrame) longest = Math.max(longest, now - lastFrame);
+	if (lastFrame && now - lastFrame > 500) console.log(`ui_generate: ${(now - lastFrame).toFixed(0)}ms without a frame, during ${status}`);
 	lastFrame = now;
 });
 
@@ -40,9 +41,9 @@ function show(image) {
 async function main() {
 	show();
 	await loadPlugins();
-	const graph = JSON.parse(llm.readText(`${llm.root}/graph/templates/zimage-t2i.json`));
+	const graph = JSON.parse(llm.readText(config.graph ?? `${llm.root}/graph/templates/zimage-t2i.json`));
 	for (const n of graph.nodes) {
-		if (n.id === 'sample') Object.assign(n.params, { width: size, height: size });
+		if (n.id === 'sample' && !config.graph) Object.assign(n.params, { width: size, height: size });
 		if (n.id === 'save') { n.type = 'core.preview'; n.params = { image: n.params.image }; }
 	}
 
@@ -54,6 +55,7 @@ async function main() {
 	let previews = 0;
 	const { results } = await executor.run(graph, {
 		async onProgress(e) {
+			if (e.start) status = `${e.node} running`;
 			if (e.done) {
 				status = `${e.node} done in ${(e.ms / 1000).toFixed(2)}s`;
 				show();

@@ -1,0 +1,11 @@
+{
+	"nodes": [
+		{"id": "vae", "type": "core.vae", "params": {"path": "/run/media/tonis/extra/AI models/qwen_image_2.1_vae_bf16.safetensors"}},
+		{"id": "text_encoder", "type": "core.text_encoder", "params": {"path": "/run/media/tonis/extra/AI models/Qwen3-VL-8B-Instruct-Q8_0.gguf"}},
+		{"id": "prompt", "type": "qwenimage.text_encode", "params": {"encoder": {"from": "text_encoder.encoder"}, "prompt": "a photo of a red fox sitting in a snowy forest holding a wooden sign that says \"HELLO\""}},
+		{"id": "dit", "type": "qwenimage.load", "params": {"path": "/run/media/tonis/extra/AI models/qwen-image-2.1-Q8_0.gguf"}},
+		{"id": "sample", "type": "qwenimage.sample", "params": {"positive": {"from": "prompt.cond"}, "model": {"from": "dit.model"}, "width": 1024, "height": 1024, "steps": 40, "seed": 42, "cfg": 1}},
+		{"id": "decode", "type": "core.vae_decode", "params": {"vae": {"from": "vae.vae"}, "latent": {"from": "sample.latent"}}},
+		{"id": "save", "type": "core.save_image", "params": {"image": {"from": "decode.image"}, "path": "output/qwenimage-#.png"}}
+	]
+}

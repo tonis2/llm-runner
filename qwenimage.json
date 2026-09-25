@@ -1,0 +1,10 @@
+{
+	"model": "/run/media/tonis/extra/AI models/qwen-image-2.1-Q8_0.gguf",
+	"text_model": "/run/media/tonis/extra/AI models/Qwen3-VL-8B-Instruct-Q8_0.gguf",
+	"vae": "/run/media/tonis/extra/AI models/qwen_image_2.1_vae_bf16.safetensors",
+	"prompt": "a photo of a red fox sitting in a snowy forest holding a wooden sign that says \"HELLO\"",
+	"size": 1024,
+	"steps": 40,
+	"seed": 42,
+	"output": "output/qwenimage.png"
+}

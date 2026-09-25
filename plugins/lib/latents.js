@@ -5,6 +5,8 @@
 //          batch-normalised with the VAE's own running stats (`bn.*`).
 //   flux1  The Flux 1 VAE (`ae.safetensors`, Z-Image's): 16 channels at /8,
 //          shifted by 0.1159 and scaled by 0.3611. taef1 decodes it too.
+//   qwen   Qwen-Image 2.1's VAE: RGBA, 64 channels at /16, normalised with
+//          per-channel means and deviations.
 //
 // A LATENT value is { format, data: Float32Array [C, h, w], channels, h, w }.
 // A VAE decodes only its own format; that check is what lets a graph swap one
@@ -14,23 +16,26 @@
 import { llm, image } from './llm.js';
 import { FluxVAEDecoder, FluxVAEEncoder } from './flux_vae.js';
 import { TAESDDecoder } from './taesd.js';
+import { QwenVAEDecoder, QwenVAEEncoder, isQwenVAE, LATENT_MEAN, LATENT_STD } from './qwen_vae.js';
 
 export const FORMATS = {
 	flux2: { channels: 128, factor: 16 },
 	flux1: { channels: 16, factor: 8 },
+	qwen: { channels: 64, factor: 16 },
 };
 
 const FLUX1_SCALE = 0.3611;
 const FLUX1_SHIFT = 0.1159;
 
-// A VAE file's kind, from its tensor names: 'flux2', 'flux1' or 'taesd'.
+// A VAE file's kind, from its tensor names: 'flux2', 'flux1', 'qwen' or 'taesd'.
 export function vaeKind(model) {
 	if (model.has('bn.running_mean')) return 'flux2';
+	if (isQwenVAE(model)) return 'qwen';
 	if (model.has('decoder.layers.0.weight')) return 'taesd';
 	return 'flux1';
 }
 
-export const KIND_FORMAT = { flux2: 'flux2', flux1: 'flux1', taesd: 'flux1' };
+export const KIND_FORMAT = { flux2: 'flux2', flux1: 'flux1', qwen: 'qwen', taesd: 'flux1' };
 
 export function makeLatent(format, data, h, w) {
 	return { format, data, channels: data.length / (h * w), h, w };
@@ -116,6 +121,39 @@ async function encodeFlux1(encoder, img) {
 	return makeLatent('flux1', latent, enc.h, enc.w);
 }
 
+// Qwen: RGB with an opaque alpha plane through the encoder, the mean
+// normalised per channel.
+async function encodeQwen(encoder, img) {
+	const H = img.height, W = img.width, n = H * W;
+	const pixels = new Float32Array(4 * n);
+	pixels.set(image.toTensor(img).subarray(0, 3 * n));
+	pixels.fill(1, 3 * n);
+	const enc = await encoder.encode(pixels, H, W);
+	const spatial = enc.h * enc.w;
+	const latent = enc.data;
+	for (let c = 0; c < enc.channels; c++) {
+		const mean = LATENT_MEAN[c], std = LATENT_STD[c];
+		for (let j = 0; j < spatial; j++) latent[c * spatial + j] = (latent[c * spatial + j] - mean) / std;
+	}
+	return makeLatent('qwen', latent, enc.h, enc.w);
+}
+
+async function decodeQwen(vae, latent) {
+	const data = latent.data.slice();
+	const spatial = latent.h * latent.w;
+	for (let c = 0; c < latent.channels; c++) {
+		const mean = LATENT_MEAN[c], std = LATENT_STD[c];
+		for (let j = 0; j < spatial; j++) data[c * spatial + j] = data[c * spatial + j] * std + mean;
+	}
+	const decoder = new QwenVAEDecoder(vae);
+	try {
+		await decoder.load();
+		return await decoder.decode(data, latent.h, latent.w);
+	} finally {
+		decoder.dispose();
+	}
+}
+
 // An image through a VAE file into its latent format. The image's sides must
 // be multiples of the format's factor.
 export async function encodeImage(vaePath, img) {
@@ -124,6 +162,16 @@ export async function encodeImage(vaePath, img) {
 	if (kind === 'taesd') {
 		vae.close();
 		throw new Error(`${vaePath} is a TAESD decoder; it has no encoder`);
+	}
+	if (kind === 'qwen') {
+		const encoder = new QwenVAEEncoder(vae);
+		try {
+			await encoder.load();
+			return await encodeQwen(encoder, img);
+		} finally {
+			encoder.dispose();
+			vae.close();
+		}
 	}
 	const encoder = new FluxVAEEncoder(vae, { quantConv: kind === 'flux2' });
 	try {
@@ -144,6 +192,7 @@ export async function decodeLatent(vaePath, latent) {
 			throw new Error(`${vaePath.split('/').pop()} decodes ${format} latents; this one is ${latent.format}`);
 		}
 		if (kind === 'flux2') return await decodeFlux2(vae, latent.data, latent.h, latent.w);
+		if (kind === 'qwen') return await decodeQwen(vae, latent);
 		if (kind === 'taesd') {
 			const decoder = new TAESDDecoder(vae);
 			const pixels = decoder.decode(latent.data, latent.h, latent.w);

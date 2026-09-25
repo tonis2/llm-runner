@@ -1,0 +1,18 @@
+// GELU with the exact erf (torch's nn.GELU()), in place. erf is Abramowitz and
+// Stegun 7.1.26, within 1.5e-7.
+float data[];
+struct Push @pushconstant { uint n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    float x = data[i];
+    float z = abs(x) * 0.70710678118;
+    float t = 1.0 / (1.0 + 0.3275911 * z);
+    float poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    float e = 1.0 - poly * exp(-z * z);
+    if (x < 0.0) e = -e;
+    data[i] = 0.5 * x * (1.0 + e);
+}

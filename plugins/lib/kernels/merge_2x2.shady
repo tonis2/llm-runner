@@ -1,0 +1,22 @@
+// Tokens on a [gh, gw] grid, [gh * gw, C], to their 2x2 blocks side by side:
+// [(gh/2) * (gw/2), 4C], each block's four in row order - the vision merger's
+// input.
+float input_[];
+float output[];
+struct Push @pushconstant { uint gh; uint gw; uint channels; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint C = pc.channels;
+    uint i = input.id.x;
+    if (i >= pc.gh * pc.gw * C) return;
+    uint m = i / (4u * C);
+    uint rem = i % (4u * C);
+    uint q = rem / C;
+    uint c = rem % C;
+    uint mw = pc.gw / 2u;
+    uint y = (m / mw) * 2u + q / 2u;
+    uint x = (m % mw) * 2u + q % 2u;
+    output[i] = input_[(y * pc.gw + x) * C + c];
+}

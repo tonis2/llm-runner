@@ -1,0 +1,22 @@
+// The residual VAE's parameter-free up shortcut (DupUp3D) for a first chunk,
+// added into `output`: input [in_c, h, w], output [out_c, 2h, 2w]. Each input
+// channel is repeated `repeats` times and the copies laid out as
+// (o, ft, sy, sx); a first chunk keeps the last temporal slot.
+float input_[];
+float output[];
+struct Push @pushconstant { uint in_c; uint out_c; uint in_h; uint in_w; uint ft_n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint ow = pc.in_w * 2u;
+    uint ohw = pc.in_h * 2u * ow;
+    uint i = input.id.x;
+    if (i >= pc.out_c * ohw) return;
+    uint o = i / ohw;
+    uint y = (i % ohw) / ow;
+    uint x = i % ow;
+    uint repeats = pc.out_c * pc.ft_n * 4u / pc.in_c;
+    uint j = ((o * pc.ft_n + pc.ft_n - 1u) * 2u + y % 2u) * 2u + x % 2u;
+    output[i] += input_[(j / repeats) * pc.in_h * pc.in_w + (y / 2u) * pc.in_w + x / 2u];
+}

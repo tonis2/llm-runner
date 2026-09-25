@@ -1,0 +1,16 @@
+// [seq, heads * hd] to [heads, seq, hdp], each head zero-padded from hd to hdp
+// wide - for flash attention, whose head width must be a multiple of 16.
+float input_[];
+float output[];
+struct Push @pushconstant { uint seq; uint heads; uint hd; uint hdp; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.heads * pc.seq * pc.hdp) return;
+    uint head = i / (pc.seq * pc.hdp);
+    uint t = (i / pc.hdp) % pc.seq;
+    uint d = i % pc.hdp;
+    output[i] = d < pc.hd ? input_[t * pc.heads * pc.hd + head * pc.hd + d] : 0.0;
+}

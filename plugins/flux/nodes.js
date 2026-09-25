@@ -15,7 +15,7 @@ import { sigmas, noise } from './latent.js';
 import { mergeLoras } from './lora.js';
 
 export const KERNELS = [
-	'matmul_q8', 'matmul_f32', 'matmul_f32_rows', 'rmsnorm_batch', 'head_rmsnorm_batch', 'rope_batch',
+	'matmul_q8', 'matmul_f32', 'matmul_f32_rows', 'rmsnorm_batch', 'head_rmsnorm_batch', 'rope_neox',
 	'attention_causal', 'residual_add', 'silu_mul', 'copy_rows', 'patchify', 'unpatchify', 'timestep_embed',
 	'silu', 'batch_layernorm', 'adaln_modulate', 'batch_head_norm', 'transpose_heads', 'mrope',
 	'flash_attention', 'gated_residual_linear', 'concat_rows', 'flow_euler_step',

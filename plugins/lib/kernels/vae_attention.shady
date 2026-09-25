@@ -2,7 +2,7 @@
 // One workgroup per (head, query position); keys in tiles of 4096 with an
 // online softmax, so any spatial size fits. Dispatch 1D: n_heads * q_count,
 // for the queries q_start .. q_start + q_count - so a long one can be cut into
-// pieces, each query's answer the same whichever piece it is in.
+// pieces, each query's answer the same whichever piece it is in. head_dim <= 1280.
 float q[];
 float k[];
 float v[];
@@ -11,7 +11,7 @@ struct Push @pushconstant { uint head_dim; uint n_heads; uint seq_len; float sca
 Push pc;
 shared float scores[4096];
 shared float red[256];
-shared float qv[1024];
+shared float qv[1280];
 shared float run_max[1];
 shared float run_sum[1];
 struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
@@ -26,8 +26,8 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     if (head >= pc.n_heads) return;
     uint hd0 = head * D;
 
-    float acc[4];
-    for (uint i = 0u; i < 4u; i++) acc[i] = 0.0;
+    float acc[5];
+    for (uint i = 0u; i < 5u; i++) acc[i] = 0.0;
     for (uint d = gi; d < D; d += 256u) qv[d] = q[q_pos * C + hd0 + d];
     if (gi == 0u) {
         run_max[0] = -1.0e30;
@@ -79,7 +79,7 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
         float tile_sum = red[0];
         barrier;
 
-        for (uint j = 0u; j < 4u; j++) {
+        for (uint j = 0u; j < 5u; j++) {
             uint d = gi + j * 256u;
             if (d < D) {
                 float a = 0.0;
@@ -96,7 +96,7 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     }
 
     float inv = 1.0 / run_sum[0];
-    for (uint j = 0u; j < 4u; j++) {
+    for (uint j = 0u; j < 5u; j++) {
         uint d = gi + j * 256u;
         if (d < D) output[q_pos * C + hd0 + d] = acc[j] * inv;
     }

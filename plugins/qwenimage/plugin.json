@@ -1,0 +1,7 @@
+{
+	"name": "qwenimage",
+	"version": "1.0",
+	"description": "Qwen-Image 2.1: text to image and image editing with reference images.",
+	"nodes": "nodes.js",
+	"main": "main.js"
+}

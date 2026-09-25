@@ -1,0 +1,34 @@
+// The residual VAE's parameter-free down shortcut (AvgDown3D) for one frame,
+// added into `output`. The input [in_c, 2h, 2w] (or [in_c, h, w] when fs is 1)
+// is read as channels of (c, ft, sy, sx) - ft the temporal slot, the frame
+// padded with a zero frame in front when ft_n is 2 - and each output channel is
+// the mean of `group` consecutive ones. Output [out_c, h, w].
+float input_[];
+float output[];
+struct Push @pushconstant { uint in_c; uint out_c; uint out_h; uint out_w; uint ft_n; uint fs; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint hw = pc.out_h * pc.out_w;
+    uint i = input.id.x;
+    if (i >= pc.out_c * hw) return;
+    uint o = i / hw;
+    uint y = (i % hw) / pc.out_w;
+    uint x = i % pc.out_w;
+    uint per = pc.ft_n * pc.fs * pc.fs;
+    uint group = pc.in_c * per / pc.out_c;
+    uint in_w = pc.out_w * pc.fs;
+    uint in_hw = pc.out_h * pc.fs * in_w;
+    float sum = 0.0;
+    for (uint g = 0u; g < group; g++) {
+        uint idx = o * group + g;
+        uint c = idx / per;
+        uint r = idx % per;
+        uint ft = r / (pc.fs * pc.fs);
+        uint sy = (r / pc.fs) % pc.fs;
+        uint sx = r % pc.fs;
+        if (ft == pc.ft_n - 1u) sum += input_[c * in_hw + (y * pc.fs + sy) * in_w + x * pc.fs + sx];
+    }
+    output[i] += sum / float(group);
+}

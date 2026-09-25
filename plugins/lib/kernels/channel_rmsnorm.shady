@@ -1,0 +1,27 @@
+// The Wan-style VAE's RMS norm on [C, H*W]: each pixel's channel vector over its
+// length (at least 1e-12, as F.normalize), times sqrt(C) and a per-channel gamma,
+// then SiLU when `silu` is set. A thread per pixel; consecutive threads read
+// consecutive pixels of a channel.
+float input_[];
+float gamma[];
+float output[];
+struct Push @pushconstant { uint channels; uint spatial; uint silu; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint s = input.id.x;
+    if (s >= pc.spatial) return;
+    float sum = 0.0;
+    for (uint c = 0u; c < pc.channels; c++) {
+        float v = input_[c * pc.spatial + s];
+        sum += v * v;
+    }
+    float scale = sqrt(float(pc.channels)) / max(sqrt(sum), 1.0e-12);
+    for (uint c = 0u; c < pc.channels; c++) {
+        uint i = c * pc.spatial + s;
+        float v = input_[i] * scale * gamma[c];
+        if (pc.silu != 0u) v = v / (1.0 + exp(-v));
+        output[i] = v;
+    }
+}

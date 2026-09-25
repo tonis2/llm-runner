@@ -1,0 +1,27 @@
+// Rotate-half ("NeoX") RoPE from tables on [n_tokens, n_heads * dim] in place:
+// element j of a head turns with element j + dim/2 by the angle whose cos/sin
+// sit at [token, j]. The tables are [n_tokens, dim/2], so any positions - a
+// plain count, or Qwen3-VL's 3D image positions - are the caller's to lay out.
+float data[];
+float cos_table[];
+float sin_table[];
+struct Push @pushconstant { uint dim; uint n_heads; uint n_tokens; uint pad; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(128, 1, 1)
+{
+    uint half_dim = pc.dim / 2u;
+    uint per_token = pc.n_heads * half_dim;
+    uint i = input.id.x;
+    if (i >= pc.n_tokens * per_token) return;
+    uint tok = i / per_token;
+    uint head = (i % per_token) / half_dim;
+    uint j = i % half_dim;
+    float c = cos_table[tok * half_dim + j];
+    float s = sin_table[tok * half_dim + j];
+    uint base = tok * pc.n_heads * pc.dim + head * pc.dim + j;
+    float x0 = data[base];
+    float x1 = data[base + half_dim];
+    data[base] = x0 * c - x1 * s;
+    data[base + half_dim] = x1 * c + x0 * s;
+}

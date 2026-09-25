@@ -12,6 +12,8 @@ llm-runner flux   --config flux-t2i.json keep_dit=true --server --port 7860
 llm-runner zimage --config zimage-t2i.json
 llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6 taesd=taef1.safetensors
 llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg output=depth.png
+llm-runner qwenimage --config qwenimage.json prompt="a neon sign that says OPEN"
+llm-runner run graph/templates/qwenimage-edit.json input0.path=photo.png prompt.prompt="make it winter"
 llm-runner run graph/templates/flux-t2i.json sample.seed=7   # a node graph
 llm-runner graph list=true                                     # the node types there are
 llm-runner tests/matmul_coop.js     # a script: run once as a module
@@ -29,16 +31,19 @@ plugins/
     llm.js             the host API: models, tensors, tokenizer, images, noise
     gpu.js             kernels by name, push-block packing, dispatch
     ops.js             the operations models are written in (matmul, norms, attention, conv ...)
-    qwen3.js           Qwen-family text encoder (layer-streamed)
+    qwen3.js           Qwen-family text encoder (layer-streamed); Qwen3-VL's image rows and 3D positions
+    qwen3_vision.js    Qwen3-VL vision encoder (mmproj GGUF), with its deepstack outputs
+    qwen_vae.js        Qwen-Image 2.1's VAE: RGBA, 64 channels at /16
     flux_vae.js        Flux VAE encoder and decoder (Flux 1 and Flux 2 namings)
     taesd.js           TAESD decoder for 16-channel latents (taef1)
     lora.js            LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
-    latents.js         latent formats ('flux2', 'flux1') and the VAE encode/decode for each
+    latents.js         latent formats ('flux2', 'flux1', 'qwen') and the VAE encode/decode for each
     graph/             node registry, port types, the executor, plugin discovery
     kernels/*.shady    one kernel per file; common.shady is put in front of each
   core/                nodes every graph uses: image load/save/preview, loaders, VAE
   flux/                Flux 2 Klein: txt2img, img2img, kontext, LoRA/LoKr, server
   zimage/              Z-Image Turbo: txt2img, img2img, LoRA, TAESD
+  qwenimage/           Qwen-Image 2.1: txt2img, img2img, editing with up to three images, CFG
   depth/               Depth Anything V2
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
@@ -129,7 +134,7 @@ wire:
 
 Only what the sinks (`core.save_image`, `core.preview`) need runs.
 `llm-runner run file.json node.input=value` overrides a setting, and
-`graph/templates/` holds the graphs the flux and zimage plugins build.
+`graph/templates/` holds the graphs the flux, zimage and qwenimage plugins build.
 `llm-runner graph --server` answers `GET /nodes` (the catalogue), `GET /plugins`
 and `POST /graph` (`{ graph, "node.input": value }` returns the sinks' results
 with images as base64 PNG).
@@ -209,6 +214,22 @@ Z-Image had no clean reference: the C3 build's Q8_0 matmul converted
 activations to fp16, some of Z-Image's FFN activations exceed 65,504, and from
 the second step on it overflowed into a washed-out image. The plugin keeps
 those matmuls in float32 and produces a clean one.
+
+The Qwen3 text encoder turned its rotary pairs the wrong way until the
+Qwen-Image port: element 2j with 2j+1, where Qwen3 turns j with j + 64 (and the
+GGUF weights are not permuted for the other convention). Against transformers
+on the same weights, layer 0 was 21% off and is now 0.1%. Flux and Z-Image
+read this encoder, so their images changed with the fix; the tables above are
+from before it.
+
+Qwen-Image 2.1 was checked against diffusers' own code (the PR that added it)
+run on the CPU from the same files:
+
+| | against diffusers |
+|---|---|
+| VAE encode and decode, 512² | 62.8 dB |
+| DiT velocity, one step at 256² | relative error 1%, cosine 0.99995 (reference in bf16) |
+| Sigmas, 40 and 4 steps | equal to 6 places |
 
 The matrix-core kernels were checked against the float32 plugin itself:
 `tests/matmul_coop.js`, `tests/bench_attention.js` and `tests/conv_coop.js`
