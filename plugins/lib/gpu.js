@@ -82,15 +82,49 @@ export function groups(n, per) { return Math.ceil(n / per); }
 
 let dispatches = 0;
 
+// `profile: true` in the config runs every dispatch on its own and adds its
+// wall time to a table by kernel (and, for the matmuls, by shape), which
+// `profileReport` prints. It is slow; the numbers are each kernel alone.
+const PROFILE = !!globalThis.__llm_config?.profile;
+const profile = new Map();
+
 // Record one dispatch. `workgroups` is [x] or [x, y] or [x, y, z].
 export function dispatch(name, bindings, workgroups, push, independent = false, defines = null) {
 	const wg = typeof workgroups === 'number' ? [workgroups, 1, 1] : workgroups;
-	kernel(name, defines).dispatch(bindings, {
+	const k = kernel(name, defines);
+	if (PROFILE) C.submit();
+	const t0 = PROFILE ? llm.now() : 0;
+	k.dispatch(bindings, {
 		workgroups: [wg[0], wg[1] ?? 1, wg[2] ?? 1],
 		push,
 		independent,
 	});
 	dispatches++;
+	if (PROFILE) {
+		C.submit();
+		let key = name;
+		if (name.startsWith('matmul') && push) {
+			const u = new Uint32Array(push.buffer, push.byteOffset, 3);
+			key = `${name} ${u[2]}x${u[1]}->${u[0]}`;
+		}
+		const e = profile.get(key) ?? { ms: 0, n: 0 };
+		e.ms += llm.now() - t0;
+		e.n++;
+		profile.set(key, e);
+	}
+}
+
+export function profileReset() { profile.clear(); }
+
+// The profile table, slowest first, as a share of the total.
+export function profileReport(title = 'profile') {
+	if (!PROFILE) return;
+	const rows = [...profile].sort((a, b) => b[1].ms - a[1].ms);
+	const total = rows.reduce((s, [, e]) => s + e.ms, 0);
+	llm.print(`  [${title}] ${total.toFixed(0)}ms in kernels`);
+	for (const [key, e] of rows) {
+		llm.print(`    ${(100 * e.ms / total).toFixed(1).padStart(5)}%  ${e.ms.toFixed(1).padStart(9)}ms  ${String(e.n).padStart(6)}x  ${(e.ms / e.n).toFixed(3).padStart(8)}ms  ${key}`);
+	}
 }
 
 // How many dispatches have been recorded, for a step's report.

@@ -3,7 +3,7 @@
 // the core VAE nodes decode and encode.
 
 import { llm, f32, image } from '../lib/llm.js';
-import { submit, copy } from '../lib/gpu.js';
+import { submit, copy, profileReset, profileReport } from '../lib/gpu.js';
 import { eulerStep, add, scale } from '../lib/ops.js';
 import { TextEncoder } from '../lib/qwen3.js';
 import { Qwen3Vision } from '../lib/qwen3_vision.js';
@@ -249,6 +249,7 @@ defineNodes('qwenimage', {
 				}
 				dit.a.latent.buffer.write(x0);
 				const condV = useCfg ? f32(count) : null;
+				profileReset();
 				try {
 					for (let s = 0; s < n; s++) {
 						const ts = llm.now();
@@ -273,6 +274,7 @@ defineNodes('qwenimage', {
 				} finally {
 					if (condV) condV.dispose();
 				}
+				profileReport('denoise');
 				const out = new Float32Array(dit.a.latent.buffer.readBytes().buffer);
 				llm.print(`  [phase] denoise: ${llm.since(t2)}`);
 				return { latent: makeLatent('qwen', out, latentH, latentW) };

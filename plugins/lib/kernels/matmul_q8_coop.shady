@@ -5,10 +5,14 @@
 // 64x64 quarter as 4x4 accumulator tiles. K goes one Q8_0 block (32) at a
 // time. x is rounded to half on its way into shared memory and the weight is
 // dequantised to half with its block's scale; the next block of both is read
-// into registers while this block's products run, so the loads wait on
-// nothing. The weight is read as 32-bit words, a block's 32 bytes sitting two
-// bytes off a word half of the time. Results leave through a 16x16 float
-// staging tile per subgroup, so y's edges are bounds-checked.
+// into registers after this block is in shared memory, so its loads are in
+// flight while this block's products run. The weight is read as aligned 32-bit
+// words, a block's 32 bytes sitting two bytes off a word half of the time, and
+// put back together with a select: a branch there made each word wait on
+// every load before it. The weight tile is kept a row per output (k runs
+// along a row, as in the file) and read as a column-major `b`, so a lane's
+// column is one wide read instead of sixteen. Results leave through a 16x16
+// float staging tile per subgroup, so y's edges are bounds-checked.
 //
 // Half operands: x must stay inside +-65504, which a model whose activations
 // grow past that (Z-Image's FFN) cannot promise. Dispatch: ceil(seq/128) * ceil(out_dim/128).
@@ -18,25 +22,30 @@ float y[];
 struct Push @pushconstant { uint out_dim; uint in_dim; uint seq_len; uint row_offset; }
 Push pc;
 shared half As[5120];     // [128 m][40]: 32 k + 8 of padding
-shared half Bs[4352];      // [32 k][136]: 128 n + 8 of padding
+shared half Bs[5120];     // [128 n][40]: 32 k + 8 of padding
 shared float Cs[1024];          // [4 subgroups][16][16]
 struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
 
-// The 32-bit word at an even byte address, whichever half of a word it starts in.
-fn uint word_at(uint byte)
+// The 32-bit word at an even byte address from the two aligned words around
+// it: a select rather than a branch, so a load never waits on another.
+fn uint funnel(uint lo, uint hi, bool odd)
 {
-    uint i = byte / 4u;
-    uint lo = w[i];
-    if ((byte & 2u) == 0u) return lo;
-    return (lo >> 16u) | (w[i + 1u] << 16u);
+    return odd ? ((lo >> 16u) | (hi << 16u)) : lo;
+}
+
+// A block's scale: the half at an even byte address.
+fn float scale_at(uint byte)
+{
+    return unpack_f16((w[byte / 4u] >> ((byte & 2u) * 8u)) & 65535u);
 }
 
 fn void store_b(uint n, uint k, float s, uint word)
 {
-    Bs[k * 136u + n] = half(s * float(sign_extend8(word & 255u)));
-    Bs[(k + 1u) * 136u + n] = half(s * float(sign_extend8((word >> 8u) & 255u)));
-    Bs[(k + 2u) * 136u + n] = half(s * float(sign_extend8((word >> 16u) & 255u)));
-    Bs[(k + 3u) * 136u + n] = half(s * float(sign_extend8(word >> 24u)));
+    uint at = n * 40u + k;
+    Bs[at] = half(s * float(sign_extend8(word & 255u)));
+    Bs[at + 1u] = half(s * float(sign_extend8((word >> 8u) & 255u)));
+    Bs[at + 2u] = half(s * float(sign_extend8((word >> 16u) & 255u)));
+    Bs[at + 3u] = half(s * float(sign_extend8(word >> 24u)));
 }
 
 fn void store_a(uint m, uint k4, float4 v)
@@ -88,12 +97,15 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     if (pos_base + a_m + 64u < pc.seq_len) ra2 = x[(pos_base + a_m + 64u) * in4 + 0u * 8u + a_k4];
     if (pos_base + a_m + 96u < pc.seq_len) ra3 = x[(pos_base + a_m + 96u) * in4 + 0u * 8u + a_k4];
     if (b_live) {
-        uint bb = b_row + 0u * 34u;
-        rs = unpack_f16(word_at(bb) & 65535u);
-        rw0 = word_at(bb + 2u + b_k0 + 0u);
-        rw1 = word_at(bb + 2u + b_k0 + 4u);
-        rw2 = word_at(bb + 2u + b_k0 + 8u);
-        rw3 = word_at(bb + 2u + b_k0 + 12u);
+        uint bb = b_row;
+        rs = scale_at(bb);
+        uint q = bb + 2u + b_k0;
+        uint i = q / 4u;
+        bool odd = (q & 2u) != 0u;
+        rw0 = funnel(w[i], w[i + 1u], odd);
+        rw1 = funnel(w[i + 1u], w[i + 2u], odd);
+        rw2 = funnel(w[i + 2u], w[i + 3u], odd);
+        rw3 = funnel(w[i + 3u], w[i + 4u], odd);
     }
     coopmat<float, 16, 16, subgroup, accumulator> c00;
     coopmat<float, 16, 16, subgroup, accumulator> c01;
@@ -141,18 +153,6 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     coop_load(c33, &Cs[sg * 256u], 16u);
 
     for (uint t = 0u; t < blocks; t++) {
-        if (pos_base + a_m + 0u < pc.seq_len) ra0 = x[(pos_base + a_m + 0u) * in4 + t * 8u + a_k4];
-        if (pos_base + a_m + 32u < pc.seq_len) ra1 = x[(pos_base + a_m + 32u) * in4 + t * 8u + a_k4];
-        if (pos_base + a_m + 64u < pc.seq_len) ra2 = x[(pos_base + a_m + 64u) * in4 + t * 8u + a_k4];
-        if (pos_base + a_m + 96u < pc.seq_len) ra3 = x[(pos_base + a_m + 96u) * in4 + t * 8u + a_k4];
-        if (b_live) {
-            uint bb = b_row + t * 34u;
-            rs = unpack_f16(word_at(bb) & 65535u);
-            rw0 = word_at(bb + 2u + b_k0 + 0u);
-            rw1 = word_at(bb + 2u + b_k0 + 4u);
-            rw2 = word_at(bb + 2u + b_k0 + 8u);
-            rw3 = word_at(bb + 2u + b_k0 + 12u);
-        }
         store_a(a_m + 0u, a_k4, ra0);
         store_a(a_m + 32u, a_k4, ra1);
         store_a(a_m + 64u, a_k4, ra2);
@@ -162,15 +162,37 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
         store_b(b_n, b_k0 + 8u, rs, rw2);
         store_b(b_n, b_k0 + 12u, rs, rw3);
         barrier;
+        if (t + 1u < blocks) {
+            if (pos_base + a_m + 0u < pc.seq_len) ra0 = x[(pos_base + a_m + 0u) * in4 + (t + 1u) * 8u + a_k4];
+            if (pos_base + a_m + 32u < pc.seq_len) ra1 = x[(pos_base + a_m + 32u) * in4 + (t + 1u) * 8u + a_k4];
+            if (pos_base + a_m + 64u < pc.seq_len) ra2 = x[(pos_base + a_m + 64u) * in4 + (t + 1u) * 8u + a_k4];
+            if (pos_base + a_m + 96u < pc.seq_len) ra3 = x[(pos_base + a_m + 96u) * in4 + (t + 1u) * 8u + a_k4];
+            if (b_live) {
+                uint bb = b_row + (t + 1u) * 34u;
+                rs = scale_at(bb);
+                uint q = bb + 2u + b_k0;
+                uint i = q / 4u;
+                bool odd = (q & 2u) != 0u;
+                uint w0 = w[i];
+                uint w1 = w[i + 1u];
+                uint w2 = w[i + 2u];
+                uint w3 = w[i + 3u];
+                uint w4 = w[i + 4u];
+                rw0 = funnel(w0, w1, odd);
+                rw1 = funnel(w1, w2, odd);
+                rw2 = funnel(w2, w3, odd);
+                rw3 = funnel(w3, w4, odd);
+            }
+        }
         for (uint kk = 0u; kk < 32u; kk += 16u) {
             coop_load(a0, &As[(sm + 0u) * 40u + kk], 40u);
             coop_load(a1, &As[(sm + 16u) * 40u + kk], 40u);
             coop_load(a2, &As[(sm + 32u) * 40u + kk], 40u);
             coop_load(a3, &As[(sm + 48u) * 40u + kk], 40u);
-            coop_load(b0, &Bs[kk * 136u + sn + 0u], 136u);
-            coop_load(b1, &Bs[kk * 136u + sn + 16u], 136u);
-            coop_load(b2, &Bs[kk * 136u + sn + 32u], 136u);
-            coop_load(b3, &Bs[kk * 136u + sn + 48u], 136u);
+            coop_load(b0, &Bs[(sn + 0u) * 40u + kk], 40u, column_major);
+            coop_load(b1, &Bs[(sn + 16u) * 40u + kk], 40u, column_major);
+            coop_load(b2, &Bs[(sn + 32u) * 40u + kk], 40u, column_major);
+            coop_load(b3, &Bs[(sn + 48u) * 40u + kk], 40u, column_major);
             coop_muladd(a0, b0, c00, c00);
             coop_muladd(a0, b1, c01, c01);
             coop_muladd(a0, b2, c02, c02);
