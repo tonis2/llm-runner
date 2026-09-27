@@ -100,7 +100,7 @@ llm.plugin({
 		state.executor = new Executor({ keep: !!config.keep_dit });
 		const t0 = llm.now();
 		op.useMatrixCores(config.matrix_cores ?? true);
-		const kernels = op.matrixCoresOn() ? [...KERNELS, 'matmul_q8_coop', 'flash_attention_coop', 'conv2d_coop'] : KERNELS;
+		const kernels = op.matrixCoresOn() ? [...KERNELS, 'matmul_q8_coop', 'flash_attention_split', 'conv2d_coop'] : KERNELS;
 		precompile(kernels);
 		llm.print(`flux: ${kernels.length} kernels ready in ${llm.since(t0)}${op.matrixCoresOn() ? ', matmuls on the matrix cores' : ''}`);
 		// Load the DiT now rather than on the first request.

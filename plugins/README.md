@@ -43,7 +43,7 @@ plugins/
   core/                nodes every graph uses: image load/save/preview, loaders, VAE
   flux/                Flux 2 Klein: txt2img, img2img, kontext, LoRA/LoKr, server
   zimage/              Z-Image Turbo: txt2img, img2img, LoRA, TAESD
-  qwenimage/           Qwen-Image 2.1: txt2img, img2img, editing with up to three images, CFG
+  qwenimage/           Qwen-Image 2.1: txt2img, img2img, editing with up to three images, LoRA, CFG
   depth/               Depth Anything V2
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
@@ -183,7 +183,7 @@ work to kernels built on 16x16x16 float16 products with float32 accumulators:
 | | kernel | against the float32 kernel, RX 7800 XT |
 |---|---|---|
 | Q8_0 matmul | `matmul_q8_coop` | 7-8 -> 28-36 TFLOPS |
-| attention, head 128 | `flash_attention_coop` | 42 -> 6.8 ms (32 heads x 2176) |
+| attention, head 128 | `flash_attention_split` (wave32) | 42 -> 3.1 ms (32 heads x 2176) |
 | 3x3 / 1x1 conv | `conv2d_coop` | 5x / 40x |
 
 Their operands are float16, so an input past 65504 overflows. `ops.matmul`
@@ -230,6 +230,13 @@ run on the CPU from the same files:
 | VAE encode and decode, 512² | 62.8 dB |
 | DiT velocity, one step at 256² | relative error 1%, cosine 0.99995 (reference in bf16) |
 | Sigmas, 40 and 4 steps | equal to 6 places |
+
+Qwen-Image 2.1 LoRAs were checked in both layouts files come in: PEFT's
+(`transformer.` prefix, `img_mlp.gate_layer` and `proj` folded into the two
+halves of the fused `gate_up`) and ai-toolkit's (`diffusion_model.` prefix,
+`gate_up` fused whole). Every site of a constant-delta test file merges, and
+rows sampled at both halves match the host's `B @ A` at the file's scale —
+PEFT's `lora_alpha` read from its metadata, rank when no alpha is given.
 
 The matrix-core kernels were checked against the float32 plugin itself:
 `tests/matmul_coop.js`, `tests/bench_attention.js` and `tests/conv_coop.js`

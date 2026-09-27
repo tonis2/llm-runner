@@ -12,17 +12,20 @@ for (const [heads, seq, hd] of shapes) {
 	const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296 - 0.5) * 4;
 	for (const t of [q, k, v]) t.write(Float32Array.from({ length: n }, rnd));
 	const push = pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd));
-	const scalar = kernel('flash_attention', flashDefines(hd)), coop = kernel('flash_attention_coop');
-	const g1 = [Math.ceil(seq / 16), heads, 1], g2 = [Math.ceil(seq / 64), heads, 1];
+	// The matrix-core kernel is the split one with no prefix: [q, k1, v1, k2, v2, limits, out].
+	const pushSplit = pc('uuuufu', heads, seq, 0, seq, 1 / Math.sqrt(hd), 0);
+	const scalar = kernel('flash_attention', flashDefines(hd)), coop = kernel('flash_attention_split');
+	const g1 = [Math.ceil(seq / 16), heads, 1], g2 = [Math.ceil(seq / 128), heads, 1];
 	scalar.dispatch([q, k, v, o1], { workgroups: g1, push });
-	coop.dispatch([q, k, v, o2], { workgroups: g2, push });
+	coop.dispatch([q, k, v, k, v, q, o2], { workgroups: g2, push: pushSplit });
 	C.submit();
 	const a = new Float32Array(o1.readBytes().buffer), b = new Float32Array(o2.readBytes().buffer);
 	let err = 0, ref = 0;
 	for (let i = 0; i < n; i++) { err = Math.max(err, Math.abs(a[i] - b[i])); ref = Math.max(ref, Math.abs(a[i])); }
 	const time = (kern, g, out, reps = 5) => {
+		const split = kern === coop;
 		const t0 = llm.now();
-		for (let i = 0; i < reps; i++) kern.dispatch([q, k, v, out], { workgroups: g, push });
+		for (let i = 0; i < reps; i++) kern.dispatch(split ? [q, k, v, k, v, q, out] : [q, k, v, out], { workgroups: g, push: split ? pushSplit : push });
 		C.submit();
 		return (llm.now() - t0) / reps;
 	};

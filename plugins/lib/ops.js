@@ -114,7 +114,8 @@ export function transposeChannelSpatial(x, y, channels, spatial, direction) {
 // Q, K, V [heads, seq, hd] -> out [seq, heads * hd], non-causal.
 export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 	if (matrixCores && hd === 128) {
-		dispatch('flash_attention_coop', [q, k, v, out], [groups(seq, 64), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)));
+		// The split kernel with no prefix.
+		flashAttentionSplit(q, null, null, k, v, out, heads, seq, 0, seq);
 		return;
 	}
 	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)), false, flashDefines(hd));
@@ -125,7 +126,7 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 // caps the keys each row sees - a block-causal mask.
 export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2, limits = null) {
 	const bindings = [q, l1 > 0 ? k1 : k2, l1 > 0 ? v1 : v2, k2, v2, limits ?? q, out];
-	dispatch('flash_attention_split', bindings, [groups(qLen, 64), heads], pc('uuuufu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0));
+	dispatch('flash_attention_split', bindings, [groups(qLen, 128), heads], pc('uuuufu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0));
 }
 // Causal GQA, Q [n, qHeads * hd], K/V [n, kvHeads * hd].
 export function attentionCausal(q, k, v, out, headDim, kvHeads, qHeads, tokens) {
