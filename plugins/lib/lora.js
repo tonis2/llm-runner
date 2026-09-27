@@ -42,6 +42,21 @@ function globalAlpha(file) {
 		const v = parseFloat(file.meta(key));
 		if (Number.isFinite(v) && v !== 0) return v;
 	}
+	// PEFT writes its adapter config as JSON under `lora_adapter_metadata`.
+	const peft = file.meta('lora_adapter_metadata');
+	if (peft) {
+		try {
+			const meta = JSON.parse(peft);
+			for (const key of Object.keys(meta)) {
+				if (key === 'lora_alpha' || key.endsWith('.lora_alpha')) {
+					const a = parseFloat(meta[key]);
+					if (Number.isFinite(a) && a !== 0) return a;
+				}
+			}
+		} catch {
+			// not the JSON we know
+		}
+	}
 	return 0;
 }
 

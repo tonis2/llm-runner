@@ -5,12 +5,14 @@
 // Qwen3-VL-8B's last hidden layer as the text conditioning, a flow-matching
 // Euler loop through the single-stream DiT (optionally with true CFG and a
 // negative prompt), and the model's own 64-channel VAE. `input` starts from an
-// image instead of noise (img2img, `strength` of the way back to noise).
+// image instead of noise (img2img, `strength` of the way back to noise), and
+// `lora`/`loras` fold adapters in, as the flux plugin's config does.
 //
 // The work is the nodes in `nodes.js`; `qwenImageGraph(config)` wires them.
 
 import { llm } from '../lib/llm.js';
 import { useMatrixCores } from '../lib/ops.js';
+import { loraList } from '../lib/lora.js';
 import { Executor, link } from '../lib/graph/executor.js';
 import '../core/nodes.js';
 import './nodes.js';
@@ -38,7 +40,12 @@ export function qwenImageGraph(config, { sink = 'save' } = {}) {
 		add('negative', 'qwenimage.text_encode', { encoder: link('text_encoder', 'encoder'), prompt: config.negative_prompt ?? '' });
 		sample.negative = link('negative', 'cond');
 	}
-	add('dit', 'qwenimage.load', { path: config.model });
+	let lora = null;
+	loraList(config).forEach((l, i) => {
+		add(`lora${i}`, 'core.lora', { path: l.path, strength: l.strength, ...(lora ? { lora } : {}) });
+		lora = link(`lora${i}`, 'lora');
+	});
+	add('dit', 'qwenimage.load', { path: config.model, ...(lora ? { lora } : {}) });
 	sample.model = link('dit', 'model');
 	add('sample', 'qwenimage.sample', sample);
 	add('decode', 'core.vae_decode', { vae: link('vae', 'vae'), latent: link('sample', 'latent') });

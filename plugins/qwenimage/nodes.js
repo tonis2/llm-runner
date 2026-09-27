@@ -10,6 +10,7 @@ import { Qwen3Vision } from '../lib/qwen3_vision.js';
 import { makeLatent, encodeImage } from '../lib/latents.js';
 import { defineNodes } from '../lib/graph/registry.js';
 import { QwenImageDiT } from './dit.js';
+import { mergeLoras } from './lora.js';
 import { sigmas } from './sched.js';
 
 const SYSTEM = '<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n';
@@ -123,14 +124,15 @@ defineNodes('qwenimage', {
 	'qwenimage.load': {
 		title: 'Qwen-Image DiT',
 		category: 'loaders',
-		description: 'A Qwen-Image 2.1 GGUF.',
-		inputs: { path: 'PATH(dit)' },
+		description: 'A Qwen-Image 2.1 GGUF, with any LoRAs folded in.',
+		inputs: { path: 'PATH(dit)', lora: 'LORA?' },
 		outputs: { model: 'MODEL' },
-		async run({ path }) {
+		async run({ path, lora }) {
 			const t0 = llm.now();
 			const file = llm.open(path);
 			const dit = new QwenImageDiT(file);
 			await dit.load();
+			if (lora && lora.length > 0) mergeLoras(dit, lora);
 			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
 			return {
 				model: {
