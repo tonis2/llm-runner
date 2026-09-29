@@ -128,9 +128,13 @@ export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2,
 	const bindings = [q, l1 > 0 ? k1 : k2, l1 > 0 ? v1 : v2, k2, v2, limits ?? q, out];
 	dispatch('flash_attention_split', bindings, [groups(qLen, 128), heads], pc('uuuufu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0));
 }
-// Causal GQA, Q [n, qHeads * hd], K/V [n, kvHeads * hd].
+// GQA over a whole prompt, Q [n, qHeads * hd], K/V [n, kvHeads * hd];
+// `causal` false lets every token see every other (an LLM2Vec encoder).
+export function attentionGqa(q, k, v, out, headDim, kvHeads, qHeads, tokens, causal) {
+	dispatch('attention_gqa', [q, k, v, out], [qHeads, tokens], pc('uuuufu', headDim, kvHeads, qHeads, tokens, 1 / Math.sqrt(headDim), causal ? 1 : 0));
+}
 export function attentionCausal(q, k, v, out, headDim, kvHeads, qHeads, tokens) {
-	dispatch('attention_causal', [q, k, v, out], [qHeads, tokens], pc('uuuuf', headDim, kvHeads, qHeads, tokens, 1 / Math.sqrt(headDim)));
+	attentionGqa(q, k, v, out, headDim, kvHeads, qHeads, tokens, true);
 }
 // The queries `start` .. `start + count` only, so a caller can cut a large one
 // up (the Flux VAE's mid block at 1024 is seconds of work).

@@ -16,8 +16,12 @@ The `__llm` host object: what a pipeline plugin cannot do in JavaScript.
  type and shape; the bytes go from the page cache to VRAM.
 
  The prelude that makes these verbs readable is `plugins/lib/llm.js`.
+
+ Part of the `llm` library: the runner executable installs these on its own
+ runtime, and `llm::pipeline` installs them on the one a host program runs a
+ pipeline on. One set per process - the handle tables are module globals.
 *>
-module runner;
+module llm::host;
 
 import three;
 import llm;
@@ -54,6 +58,14 @@ struct TokenizerSlot
 List{ModelSlot} models;
 List{TokenizerSlot} tokenizers;
 Clock started;
+
+<*
+ Where `print` lines go instead of stdout, when set: a program running a
+ pipeline in-process reads its progress this way.
+*>
+alias PrintHook = fn void(void* context, String line);
+PrintHook print_hook;
+void* print_context;
 
 fn void install(three::JsRuntime* runtime)
 {
@@ -178,7 +190,13 @@ fn qjs::Value uint_array(qjs::Context* js, uint* data, usz count) @local
 fn void js_print(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
 {
 	qjs::Context js = qjs::wrap(ctx);
-	io::printn(@text(&js, argc, args, 0));
+	String line = @text(&js, argc, args, 0);
+	if (print_hook)
+	{
+		print_hook(print_context, line);
+		return;
+	}
+	io::printn(line);
 	(void)io::stdout().flush();
 }
 

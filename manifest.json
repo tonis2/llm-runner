@@ -1,7 +1,7 @@
 {
-  "provides": "llm_engine",
-  "dependencies": ["vk", "image"],
-  "sources": ["lib/**"],
+  "provides": "llm",
+  "dependencies": ["vk", "image", "quickjs"],
+  "sources": ["lib/gguf/**", "lib/model/**", "lib/host/**", "lib/pipeline/**"],
   "targets": {
     "linux-x64": {
       "linked-libraries": ["vulkan"]

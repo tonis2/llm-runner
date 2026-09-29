@@ -1,0 +1,6 @@
+{
+	"name": "kimodo",
+	"version": "0.1",
+	"description": "Kimodo text-to-motion: a prompt to a skeletal animation (SOMA, SMPL-X or G1 skeleton).",
+	"main": "main.js"
+}

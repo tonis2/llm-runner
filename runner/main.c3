@@ -27,6 +27,7 @@ module runner;
 
 import three;
 import vk;
+import llm::host;
 import std::io;
 import std::io::file;
 import std::io::path;
@@ -213,7 +214,7 @@ fn int run_ui(Options* o)
 		return 1;
 	}
 	io::printfn("llm-runner: %s", ((ZString)&engine.renderer.gpu.limits.device_name).str_view());
-	defer shutdown();
+	defer host::shutdown();
 
 	String entry = o.entry.len > 0 ? o.entry : string::tformat("%s/studio/main.js", o.plugins);
 	if (catch err = three::live(
@@ -238,8 +239,8 @@ fn void ui_setup(three::JsRuntime* runtime)
 	// Plugins are trusted code with the disk; the studio's file pickers go
 	// wherever the models are.
 	runtime.browse_anywhere = true;
-	shutdown();
-	install(runtime);
+	host::shutdown();
+	host::install(runtime);
 	three::RunResult setup = runtime.run(config_script(&ui_options), "config");
 	defer setup.free();
 	report(&setup, "reading the config");
@@ -268,8 +269,8 @@ fn int main(String[] args)
 	runtime.open(&renderer.pass, renderer, memory_limit: 0)!!;
 	defer runtime.close();
 	runtime.script_budget_ns = 0;
-	install(&runtime);
-	defer shutdown();
+	host::install(&runtime);
+	defer host::shutdown();
 
 	io::printfn("llm-runner: %s", ((ZString)&renderer.gpu.limits.device_name).str_view());
 

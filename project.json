@@ -8,7 +8,9 @@
   "version": "0.1.0",
   "sources": [
     "lib/gguf/**",
-    "lib/model/**"
+    "lib/model/**",
+    "lib/host/**",
+    "lib/pipeline/**"
   ],
   "test-sources": [ "test/**" ],
   "build-dir": "build",

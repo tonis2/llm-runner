@@ -188,6 +188,7 @@ export const llm = {
 	readBytes(path) { return H.readBytes(path); },
 	writeBytes(path, bytes) { H.writeBytes(path, bytes instanceof Uint8Array ? bytes : asBytes(bytes)); },
 	exists(path) { return H.exists(path); },
+	makeDir(path) { H.makeDir(path); },
 	base64Encode(bytes) { return H.base64Encode(bytes); },
 	base64Decode(text) { return H.base64Decode(text); },
 

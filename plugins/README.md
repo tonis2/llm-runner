@@ -45,6 +45,8 @@ plugins/
   zimage/              Z-Image Turbo: txt2img, img2img, LoRA, TAESD
   qwenimage/           Qwen-Image 2.1: txt2img, img2img, editing with up to three images, LoRA, CFG
   depth/               Depth Anything V2
+  kimodo/              Kimodo text-to-motion: LLM2Vec text encoder, two-stage motion denoiser, DDIM,
+                       guide poses (full-body keyframes), rest skeletons in skeletons/
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
