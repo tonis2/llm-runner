@@ -108,13 +108,16 @@ function quaternion(m, q, o) {
 }
 
 // A normalised motion [frames, 9 + 12 J] as parent-local joint rotations
-// [frames, J, 4] (x, y, z, w) and root positions [frames, 3] in metres.
+// [frames, J, 4] (x, y, z, w), root positions [frames, 3] in metres and foot
+// contacts [frames, 4] (left heel, left toe, right heel, right toe; 1 down, 0
+// not, at upstream's 0.5).
 export function decodeMotion(motion, frames, skeleton, stats) {
 	const J = skeleton.parents.length;
 	const D = 9 + 12 * J, body = D - 5, rotations = 5 + 3 * J;
 	const { globalMean: gm, globalStd: gs, bodyMean: bm, bodyStd: bs } = stats;
 	const local = new Float32Array(frames * J * 4);
 	const root = new Float32Array(frames * 3);
+	const contacts = new Float32Array(frames * 4);
 	const f = new Float64Array(D);
 	const global = new Array(J);
 	for (let t = 0; t < frames; t++) {
@@ -123,11 +126,12 @@ export function decodeMotion(motion, frames, skeleton, stats) {
 		root[t * 3] = f[0] + f[5];
 		root[t * 3 + 1] = f[6];
 		root[t * 3 + 2] = f[2] + f[7];
+		for (let k = 0; k < 4; k++) contacts[t * 4 + k] = f[D - 4 + k] > 0.5 ? 1 : 0;
 		for (let j = 0; j < J; j++) global[j] = sixD(f, rotations + j * 6);
 		for (let j = 0; j < J; j++) {
 			const p = skeleton.parents[j];
 			quaternion(p < 0 ? global[j] : localOf(global[p], global[j]), local, (t * J + j) * 4);
 		}
 	}
-	return { rotations: local, root };
+	return { rotations: local, root, contacts };
 }

@@ -5,8 +5,8 @@
 //       prompt="a person waves" output=wave
 //
 // The text encoder runs first and is dropped before the motion weights load.
-// `output` is a directory: motion.glb, motion.json (skeleton, fps, root positions and
-// parent-local xyzw rotations a frame), plus the raw float32 streams kimodo.cpp's
+// `output` is a directory: motion.glb, motion.json (skeleton, fps, root positions,
+// parent-local xyzw rotations and the model's foot contacts a frame), plus the raw float32 streams kimodo.cpp's
 // `kmd-sample-embedding` writes (sampling_final_state, root_positions,
 // local_rotations_xyzw) and the noise and embedding used, so a run can be
 // replayed there.
@@ -18,7 +18,10 @@
 // heading (0, radians), progress (false; true prints every step, for a caller
 // reading stdout). `poses` are guide keyframes the motion has to pass through
 // (see poses.js for their form), weighted by constraint_cfg (2); a pose on frame
-// 0 also sets the starting heading.
+// 0 also sets the starting heading. `cleanup` runs upstream's clean-up on the
+// result (see cleanup.js): planted feet stop sliding and the guide poses'
+// frames land on them exactly. It is on unless `reference` is given, which
+// compares the model's own output.
 //
 // `skeleton_glb` writes one skeleton at rest as a .glb - `skeleton` names it
 // (soma30 by default) - and needs no weights: what a caller matches its own rig
@@ -38,6 +41,7 @@ import { writeText } from '../lib/graph/plugins.js';
 import { writeMotionGlb } from './glb.js';
 import { SKELETONS } from './skeletons.js';
 import { restPositions, placePoses, encodePoses } from './poses.js';
+import { canCleanUp, cleanUpMotion } from './cleanup.js';
 
 function compare(a, b) {
 	let dot = 0, na = 0, nb = 0, maxDiff = 0;
@@ -98,15 +102,17 @@ llm.plugin({
 		const steps = config.steps ?? 100;
 		const seed = config.seed ?? 42;
 		const noise = config.noise ? floats(config.noise) : llm.randomNormal(frames * denoiser.motionDim, seed);
-		let constraint = null, heading = config.heading ?? 0, keyed = 0;
+		let constraint = null, heading = config.heading ?? 0, keyed = 0, placed = [];
 		if (config.poses) {
-			const placed = placePoses(config.poses, denoiser.skeleton, frames);
+			placed = placePoses(config.poses, denoiser.skeleton, frames);
 			if (placed.length === 0) throw new Error(`none of the guide poses falls inside the ${frames} frames generated`);
 			const encoded = encodePoses(placed, denoiser.skeleton, denoiser.stats, frames);
 			constraint = { observed: encoded.observed, mask: encoded.mask };
 			if (encoded.heading !== null && config.heading === undefined) heading = encoded.heading;
 			keyed = placed.length;
-			llm.print(`  ${keyed} guide pose(s), on frame(s) ${placed.map((p) => p.frame).join(', ')}`);
+			const partial = placed.filter((p) => p.effectors).length;
+			llm.print(`  ${keyed} guide pose(s), on frame(s) ${placed.map((p) => p.frame).join(', ')}` +
+				(partial ? `; ${partial} holding only ${[...new Set(placed.flatMap((p) => p.effectors ?? []))].join(', ')}` : ''));
 		}
 		const t0 = llm.now();
 		let lastPrint = t0;
@@ -128,7 +134,14 @@ llm.plugin({
 		denoiser.close();
 		llm.print(`  ${frames} frames, ${steps} steps in ${llm.since(t0)}`);
 
-		const result = { frames, fps, steps, seed, skeleton: skeletonKey, poses: keyed, seconds: (llm.now() - start) / 1000 };
+		let cleaned = null;
+		if ((config.cleanup ?? !config.reference) && canCleanUp(skeleton, skeletonKey)) {
+			const t1 = llm.now();
+			cleaned = cleanUpMotion({ skeleton, key: skeletonKey, frames, ...decoded, keys: placed });
+			llm.print(`  cleaned up: feet held on ${cleaned.plantedFrames} frame(s), ${cleaned.keyedFrames} guide pose(s) met, in ${llm.since(t1)}`);
+		}
+
+		const result = { frames, fps, steps, seed, skeleton: skeletonKey, poses: keyed, cleaned: cleaned !== null, seconds: (llm.now() - start) / 1000 };
 		const clip = { name: config.name ?? config.prompt ?? 'Kimodo', skeleton, fps, frames, rotations: decoded.rotations, root: decoded.root };
 		if (config.glb) writeMotionGlb((result.glb = config.glb), clip);
 		if (config.output) {
@@ -144,6 +157,7 @@ llm.plugin({
 				names: skeleton.names, parents: skeleton.parents, offsets: skeleton.offsets,
 				root_positions: Array.from(decoded.root),
 				local_rotations_xyzw: Array.from(decoded.rotations),
+				foot_contacts: Array.from(decoded.contacts),
 			};
 			writeText(`${dir}/motion.json`, JSON.stringify(json));
 			writeMotionGlb(`${dir}/motion.glb`, clip);

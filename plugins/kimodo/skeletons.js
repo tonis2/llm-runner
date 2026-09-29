@@ -6,9 +6,18 @@
 // A motion frame of a J-joint skeleton is 9 + 12 J floats: the global root
 // (x, y, z, heading cos, sin), then the body - J joint positions, J 6D global
 // rotations and the rest (velocities, foot contacts) that decoding does not read.
+//
+// `hips` are the right and left hip joints the facing is read from, and
+// `effectors` each hand and foot as a chain - the joint itself, then the one
+// beyond it - the way upstream's end-effector constraints name them.
 
 export const SKELETONS = {
 	soma30: {
+		hips: ['RightLeg', 'LeftLeg'],
+		effectors: {
+			LeftHand: ['LeftHand', 'LeftHandMiddleEnd'], RightHand: ['RightHand', 'RightHandMiddleEnd'],
+			LeftFoot: ['LeftFoot', 'LeftToeBase'], RightFoot: ['RightFoot', 'RightToeBase'],
+		},
 		names: ['Hips', 'Spine1', 'Spine2', 'Chest', 'Neck1', 'Neck2', 'Head', 'Jaw',
 			'LeftEye', 'RightEye', 'LeftShoulder', 'LeftArm', 'LeftForeArm', 'LeftHand',
 			'LeftHandThumbEnd', 'LeftHandMiddleEnd', 'RightShoulder', 'RightArm', 'RightForeArm',
@@ -33,6 +42,11 @@ export const SKELETONS = {
 			[-3.42907669e-9, -0.0507960932, 0.132841956]],
 	},
 	smplx22: {
+		hips: ['right_hip', 'left_hip'],
+		effectors: {
+			LeftHand: ['left_wrist'], RightHand: ['right_wrist'],
+			LeftFoot: ['left_ankle', 'left_foot'], RightFoot: ['right_ankle', 'right_foot'],
+		},
 		names: ['pelvis', 'left_hip', 'right_hip', 'spine1', 'left_knee', 'right_knee',
 			'spine2', 'left_ankle', 'right_ankle', 'spine3', 'left_foot', 'right_foot', 'neck',
 			'left_collar', 'right_collar', 'head', 'left_shoulder', 'right_shoulder', 'left_elbow',
@@ -52,6 +66,11 @@ export const SKELETONS = {
 			[-0.271878421, -0.004834589, -0.016445294]],
 	},
 	g1skel34: {
+		hips: ['right_hip_pitch_skel', 'left_hip_pitch_skel'],
+		effectors: {
+			LeftHand: ['left_wrist_yaw_skel', 'left_hand_roll_skel'], RightHand: ['right_wrist_yaw_skel', 'right_hand_roll_skel'],
+			LeftFoot: ['left_ankle_roll_skel', 'left_toe_base'], RightFoot: ['right_ankle_roll_skel', 'right_toe_base'],
+		},
 		names: ['pelvis_skel', 'left_hip_pitch_skel', 'left_hip_roll_skel', 'left_hip_yaw_skel',
 			'left_knee_skel', 'left_ankle_pitch_skel', 'left_ankle_roll_skel', 'left_toe_base',
 			'right_hip_pitch_skel', 'right_hip_roll_skel', 'right_hip_yaw_skel', 'right_knee_skel',

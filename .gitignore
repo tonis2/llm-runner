@@ -13,3 +13,4 @@ analyze/
 output/
 plugins/tests/out/
 graphs/
+shader-cache

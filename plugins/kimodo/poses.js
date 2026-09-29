@@ -1,14 +1,24 @@
 // Guide poses: keyframes a generation has to pass through, as upstream's
-// full-body constraints (kimodo/constraints.py FullBodyConstraintSet, encoded
-// the way motion_rep/reps/kimodo_motionrep.py create_conditions does).
+// full-body and end-effector constraints (kimodo/constraints.py
+// FullBodyConstraintSet and EndEffectorConstraintSet, encoded the way
+// motion_rep/reps/kimodo_motionrep.py create_conditions does).
 //
 // A caller hands them over in its own rig's terms - joint positions in its own
 // units and frame, keyed by the name of the skeleton joint each one stands for:
 //
 //   poses: {
 //     rest: { Hips: [x, y, z], LeftLeg: [...], ... },   // the rig at rest
-//     keys: [{ frame: 0, joints: { Hips: [...], ... } }, ...],
+//     keys: [
+//       { frame: 0, joints: { Hips: [...], ... } },                  // whole body
+//       { frame: 60, joints: { ... }, effectors: ['RightHand'] },     // one hand
+//     ],
 //   }
+//
+// A key with `effectors` holds only those hands and feet (LeftHand, RightHand,
+// LeftFoot, RightFoot): where each is and how it is turned, and where the hips
+// stand and face - the rest of the body is the model's to choose. A key without
+// holds the whole body. Either way `joints` is the whole pose, since the hands
+// and feet are placed down the chains from the hips.
 //
 // Only the joints the rig has an answer for are named. `rest` gives the scale
 // and the floor: the rig's hips height over its lowest named joint becomes the
@@ -25,7 +35,10 @@
 // a leaf (jaw, eyes, finger ends). That bone's swing carries no twist, so a
 // filled joint follows the bend and not the roll.
 //
-// The rig is taken as facing +Z, Y up - glTF's convention and Kimodo's.
+// The rig is taken as facing +Z, Y up - glTF's convention and Kimodo's. A
+// caller whose rig faces elsewhere turns its points about the hips first.
+
+import { IDENTITY, sub, add, length, cross, normalized, mul, conjugate, rotate, between, fromAxes } from './rotation.js';
 
 const scale = (std) => Math.sqrt(std * std + 1e-5);
 
@@ -39,31 +52,8 @@ export function restPositions(skeleton) {
 	return out;
 }
 
-const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-const length = (v) => Math.hypot(v[0], v[1], v[2]);
-const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-
 // `v` turned by the shortest rotation carrying direction `from` onto `to`.
-function swing(v, from, to) {
-	const a = length(from), b = length(to);
-	if (a < 1e-9 || b < 1e-9) return v;
-	const f = from.map((x) => x / a), t = to.map((x) => x / b);
-	const axis = cross(f, t), sin = length(axis), cos = dot(f, t);
-	if (sin < 1e-9) {
-		if (cos > 0) return v;
-		// Half a turn: about any axis square to the bone.
-		const other = Math.abs(f[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
-		const k = cross(f, other), n = length(k);
-		const u = k.map((x) => x / n);
-		return sub(u.map((x) => 2 * dot(u, v) * x), v);
-	}
-	const k = axis.map((x) => x / sin);
-	// Rodrigues.
-	const kv = cross(k, v), kd = dot(k, v);
-	return [0, 1, 2].map((i) => v[i] * cos + kv[i] * sin + k[i] * kd * (1 - cos));
-}
+const swing = (v, from, to) => rotate(between(from, to), v);
 
 // Upstream's compute_heading_angle: the facing, from the right hip to the left.
 export function headingOf(right, left) {
@@ -81,8 +71,59 @@ function firstNamedBelow(skeleton, j, at) {
 	return -1;
 }
 
-// The guide poses in the skeleton's space: [{ frame, positions }] with
-// positions[j] an [x, y, z] in metres or null for a joint left free.
+// The hands and feet a key holds on their own, as the skeleton's effector
+// names; null for a whole-body key.
+function effectorsOf(key, skeleton) {
+	if (!Array.isArray(key.effectors)) return null;
+	const known = key.effectors.filter((name) => skeleton.effectors?.[name]);
+	if (known.length < key.effectors.length) {
+		const unknown = key.effectors.filter((name) => !known.includes(name));
+		throw new Error(`a guide pose holds ${unknown.join(', ')}; the effectors are ${Object.keys(skeleton.effectors ?? {}).join(', ')}`);
+	}
+	return known.length > 0 ? known : null;
+}
+
+// Each joint's global turn in a placed pose, from the positions alone: a joint
+// with two or more children is turned so they point as placed, one with a
+// single child swings its parent's turn onto that child's direction, and a leaf
+// turns with its parent. At rest every joint is unturned.
+export function globalTurns(positions, skeleton) {
+	const { parents } = skeleton;
+	const rest = restPositions(skeleton);
+	const children = parents.map(() => []);
+	parents.forEach((p, j) => { if (p >= 0) children[p].push(j); });
+	const frame = (u, v) => {
+		const z = cross(u, v);
+		if (length(z) < 1e-6 * length(u) * length(v)) return null;
+		const x = normalized(u), zz = normalized(z);
+		return fromAxes(x, cross(zz, x), zz);
+	};
+	const turns = new Array(parents.length);
+	parents.forEach((p, j) => {
+		const above = p < 0 ? IDENTITY : turns[p];
+		const kids = children[j];
+		if (kids.length >= 2) {
+			const [a, b] = kids;
+			const posed = frame(sub(positions[a], positions[j]), sub(positions[b], positions[j]));
+			const resting = frame(sub(rest[a], rest[j]), sub(rest[b], rest[j]));
+			if (posed && resting) {
+				turns[j] = mul(posed, conjugate(resting));
+				return;
+			}
+		}
+		if (kids.length >= 1) {
+			const c = kids[0];
+			turns[j] = mul(between(rotate(above, sub(rest[c], rest[j])), sub(positions[c], positions[j])), above);
+			return;
+		}
+		turns[j] = above;
+	});
+	return turns;
+}
+
+// The guide poses in the skeleton's space: [{ frame, positions, turns,
+// effectors }] with positions[j] an [x, y, z] in metres, turns[j] its global
+// turn, and effectors the hands and feet a partial key holds (null: all of it).
 export function placePoses(poses, skeleton, frames) {
 	const names = skeleton.names;
 	const index = new Map(names.map((n, j) => [n, j]));
@@ -142,7 +183,7 @@ export function placePoses(poses, skeleton, frames) {
 			}
 			at[j] = add(at[p], swing(sub(skeletonRest[j], skeletonRest[p]), from, to));
 		}
-		placed.push({ frame, positions: at });
+		placed.push({ frame, positions: at, turns: globalTurns(at, skeleton), effectors: effectorsOf(key, skeleton) });
 	}
 	placed.sort((a, b) => a.frame - b.frame);
 	return placed;
@@ -152,6 +193,11 @@ export function placePoses(poses, skeleton, frames) {
 // normalised feature values where a pose says something and 1 in the mask
 // there, zeros everywhere else. `heading` is the first frame's facing when a
 // pose is keyed on it.
+//
+// Every key holds the hips: where they stand over the floor (the smooth root),
+// how high, and which way the body faces. A whole-body key adds every joint's
+// position; a hand-and-foot key adds each held effector's chain positions and
+// the global turn of its first joint.
 export function encodePoses(placed, skeleton, stats, frames) {
 	const J = skeleton.parents.length, D = 9 + 12 * J;
 	const observed = new Float32Array(frames * D);
@@ -161,9 +207,11 @@ export function encodePoses(placed, skeleton, stats, frames) {
 		observed[t * D + i] = i < 5 ? (v - gm[i]) / scale(gs[i]) : (v - bm[i - 5]) / scale(bs[i - 5]);
 		mask[t * D + i] = 1;
 	};
-	const right = skeleton.names.indexOf('RightLeg'), left = skeleton.names.indexOf('LeftLeg');
+	const index = new Map(skeleton.names.map((n, j) => [n, j]));
+	const [right, left] = (skeleton.hips ?? []).map((n) => index.get(n) ?? -1);
+	const rotationsAt = 5 + 3 * J;
 	let heading = null;
-	for (const { frame: t, positions } of placed) {
+	for (const { frame: t, positions, turns, effectors } of placed) {
 		const hips = positions[0];
 		// The smooth root is the hips on the floor plane; its height is the hips'.
 		put(t, 0, hips[0]);
@@ -175,12 +223,23 @@ export function encodePoses(placed, skeleton, stats, frames) {
 			put(t, 4, Math.sin(angle));
 			if (t === 0) heading = angle;
 		}
-		positions.forEach((p, j) => {
-			if (!p) return;
-			put(t, 5 + 3 * j, p[0] - hips[0]);
-			put(t, 5 + 3 * j + 1, p[1]);
-			put(t, 5 + 3 * j + 2, p[2] - hips[2]);
-		});
+		const putPosition = (j) => {
+			put(t, 5 + 3 * j, positions[j][0] - hips[0]);
+			put(t, 5 + 3 * j + 1, positions[j][1]);
+			put(t, 5 + 3 * j + 2, positions[j][2] - hips[2]);
+		};
+		if (!effectors) {
+			positions.forEach((p, j) => { if (p) putPosition(j); });
+			continue;
+		}
+		for (const name of effectors) {
+			const chain = skeleton.effectors[name].map((n) => index.get(n));
+			chain.forEach(putPosition);
+			// The 6D turn: the rotation matrix's first two columns.
+			const j = chain[0];
+			const columns = [...rotate(turns[j], [1, 0, 0]), ...rotate(turns[j], [0, 1, 0])];
+			columns.forEach((v, k) => put(t, rotationsAt + 6 * j + k, v));
+		}
 	}
 	return { observed, mask, heading };
 }
