@@ -47,6 +47,8 @@ plugins/
   depth/               Depth Anything V2
   kimodo/              Kimodo text-to-motion: LLM2Vec text encoder, two-stage motion denoiser, DDIM,
                        guide poses (full-body keyframes), rest skeletons in skeletons/
+  unimate/             UniMate text-to-motion for any skeleton: the rig's own joints, T5 captions,
+                       either released flow model (graph or full attention) read straight from its .pt
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
@@ -144,6 +146,64 @@ with images as base64 PNG).
 Plugins are found through their `plugin.json` under the plugins root.
 `~/.config/llm-runner/settings.json` can list `disabled_plugins`. Plugins are
 trusted code: they read and write files and run kernels on the GPU.
+
+## Kimodo's weights
+
+`model=` takes NVIDIA's release as it is downloaded — no conversion:
+
+```
+huggingface-cli download nvidia/Kimodo-SOMA-RP-v1.1 model.safetensors --local-dir Kimodo-SOMA-RP-v1.1
+llm-runner kimodo model=Kimodo-SOMA-RP-v1.1 text_model=Llama-3-Kimodo-Q8_0.gguf prompt="a person waves"
+```
+
+`model=` is the folder or its `.safetensors`, under any name. The motion
+statistics (the release's `stats/motion/`, six small `.npy` files) are carried
+by the plugin for the models it recognises (`kimodo/stats.js`, currently
+Kimodo-SOMA-RP-v1.1, licensed by NVIDIA Corporation under the NVIDIA Open Model
+License, `kimodo/NVIDIA-LICENSE.txt`), so for those the weights file is the
+whole download; for any other, put `stats/motion/` beside the weights, which is
+also read first when it is there. `config.yaml` is
+not read: the network's shape and the skeleton are read off the weights, and
+what they cannot say (30 fps, the 1000-step schedule, 8 heads, 50 prompt
+tokens) is the plugin's own default. kimodo.cpp's `kimodo-*-f32.gguf` still
+works. The text encoder (`text_model`, plus `Llama-3-Kimodo-tokenizer.gguf`
+beside it) is only read as a GGUF, from `LocalAI-io/Llama-3-Kimodo-GGML`: it is
+Llama-3-8B with LLM2Vec's adapters merged and quantized, not part of NVIDIA's
+release.
+
+## UniMate's weights
+
+```
+hf download Linzhan/UniMate unimate_uniml3d_f60_v2/checkpoints/checkpoint_step_100000.pt --local-dir UniMate
+hf download google/flan-t5-base model.safetensors tokenizer.json --local-dir flan-t5-base
+llm-runner unimate model=UniMate/unimate_uniml3d_f60_v2/checkpoints/checkpoint_step_100000.pt \
+    text_model=flan-t5-base rig_glb=character.glb prompt="walks forward" glb=walk.glb
+```
+
+The `.pt` is a training checkpoint (model, EMA copy, optimizer state; 1.2 GB):
+the plugin reads its EMA weights out of the zip itself and needs nothing else
+from the release - the normalisation statistics (`unimate/stats.js`) and the
+joint-name vocabulary (`unimate/names_vocab.js`) are carried, and the shape
+is the released v2 models'. About 1.5 GB of GPU memory. One motion is 60 frames
+at 30 fps; a 65-joint rig takes about 7 s for 20 steps on an RX 7800 XT.
+
+The other released model,
+`unimate_uniml3d_f60_v2_full_cross_attn/checkpoints/checkpoint_step_90000.pt`,
+runs the same way (the checkpoint says which it is): one attention over the
+whole motion instead of per-frame and per-joint ones, and the caption's words
+attended to in every block instead of their mean. About 9 s for the same rig.
+
+Which way a rig faces is read off its left/right joint names, as the reference
+does; a rig whose head then stands well behind its root (sides named the wrong
+way round for its head, as happens on quadrupeds) is turned round to face its
+head, or it would move tail first. The clip comes back in the rig's own space
+and facing, the root at its rest position, with `extras.facing = "as-is"` so
+crig does not turn it again when it reads it.
+
+`tests/unimate_golden.js`, `tests/t5_golden.js` and `tests/unimate_names.js`
+compare against the reference implementation's numbers, which
+`tools/unimate/unimate_golden.py` writes (it needs PyTorch and a clone of the
+UniMate repository).
 
 ## The host API (`lib/llm.js`)
 

@@ -4,6 +4,12 @@
 //   llm-runner kimodo text_model=Llama-3-Kimodo-Q8_0.gguf model=kimodo-soma-rp-v1.1-f32.gguf \
 //       prompt="a person waves" output=wave
 //
+// `model` is kimodo.cpp's motion GGUF or NVIDIA's release as downloaded from
+// huggingface.co/nvidia/Kimodo-SOMA-RP-v1.1 (the folder, or its .safetensors
+// under any name; stats.js carries the statistics for the models it knows,
+// others need stats/ beside it; config.yaml is not needed). The text
+// encoder is only available as a GGUF (LocalAI-io/Llama-3-Kimodo-GGML).
+//
 // The text encoder runs first and is dropped before the motion weights load.
 // `output` is a directory: motion.glb, motion.json (skeleton, fps, root positions,
 // parent-local xyzw rotations and the model's foot contacts a frame), plus the raw float32 streams kimodo.cpp's

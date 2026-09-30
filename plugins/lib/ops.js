@@ -133,6 +133,16 @@ export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2,
 export function attentionGqa(q, k, v, out, headDim, kvHeads, qHeads, tokens, causal) {
 	dispatch('attention_gqa', [q, k, v, out], [qHeads, tokens], pc('uuuufu', headDim, kvHeads, qHeads, tokens, 1 / Math.sqrt(headDim), causal ? 1 : 0));
 }
+// Many short attentions over rows of [rows, heads * hd] buffers, picked by
+// strides (see attention_rows.shady): `s` is { lq, lk, sequences, qOff, qBs, qIs,
+// kvOff, kvBs, kvIs, scale }, strides in rows. `bias` (or null) is added to
+// the scores at [sequence * biasBs + (head * lq + i) * lk + key]. lk <= 1024,
+// hd <= 128.
+export function attentionRows(q, k, v, out, heads, hd, s, bias = null, biasBs = 0) {
+	const push = pc('uuuuuuuuuuuuf', heads, hd, s.lq, s.lk, s.qOff ?? 0, s.qBs ?? 0, s.qIs ?? 1,
+		s.kvOff ?? 0, s.kvBs ?? 0, s.kvIs ?? 1, biasBs, bias ? 1 : 0, s.scale ?? 1 / Math.sqrt(hd));
+	dispatch('attention_rows', [q, k, v, bias ?? q, out], [s.lq, heads, s.sequences ?? 1], push);
+}
 export function attentionCausal(q, k, v, out, headDim, kvHeads, qHeads, tokens) {
 	attentionGqa(q, k, v, out, headDim, kvHeads, qHeads, tokens, true);
 }

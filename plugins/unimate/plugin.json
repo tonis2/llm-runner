@@ -1,0 +1,6 @@
+{
+	"name": "unimate",
+	"version": "0.1",
+	"description": "UniMate text-to-motion for any skeleton (graph or full-attention model): a rig and a prompt to a 2-second skeletal animation of that rig.",
+	"main": "main.js"
+}

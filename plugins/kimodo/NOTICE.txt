@@ -1,0 +1,2 @@
+Kimodo-SOMA-RP-v1.1 motion statistics (stats.js):
+Licensed by NVIDIA Corporation under the NVIDIA Open Model License

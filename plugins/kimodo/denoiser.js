@@ -22,12 +22,15 @@
 // they do without constraints.
 //
 // All weights are float32 and stay resident (about 1.1 GB for both stages).
+// They are read from kimodo.cpp's GGUF or straight from NVIDIA's release
+// folder; checkpoint.js hides which.
 
 import { llm, f32 } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
 import { copy, zero, submit } from '../lib/gpu.js';
 import { cosineSchedule, ddimStep, globalToLocalRoot } from './motion.js';
 import { SKELETONS } from './skeletons.js';
+import { openMotionCheckpoint } from './checkpoint.js';
 
 const EMBEDDING = 4096;
 const F = 4;
@@ -204,34 +207,27 @@ class MotionTransformer {
 
 export class KimodoDenoiser {
 	constructor(path) {
-		const m = (this.model = llm.open(path));
-		if (m.meta('general.architecture') !== 'kimodo-motion') {
-			m.close();
-			throw new Error(`${path} is not a Kimodo motion GGUF`);
-		}
-		this.name = m.meta('general.name', 'Kimodo');
-		this.skeletonKey = m.meta('kimodo.skeleton');
+		const c = openMotionCheckpoint(path);
+		const m = (this.model = c.model);
+		this.name = c.name;
+		this.skeletonKey = c.skeletonKey;
 		this.skeleton = SKELETONS[this.skeletonKey];
-		if (!this.skeleton) throw new Error(`no skeleton table for ${this.skeletonKey}`);
-		this.motionDim = m.meta('kimodo.motion_dim');
-		this.fps = m.meta('kimodo.fps', 30);
-		this.baseSteps = m.meta('kimodo.base_diffusion_steps', 1000);
-		if (this.motionDim !== 9 + 12 * this.skeleton.parents.length) throw new Error(`motion_dim ${this.motionDim} does not fit the ${this.skeletonKey} skeleton`);
-		const config = {
-			width: m.meta('kimodo.hidden_size', 1024),
-			heads: m.meta('kimodo.heads', 8),
-			ffn: m.meta('kimodo.feed_forward_size', 2048),
-			layers: m.meta('kimodo.layers', 16),
-			textTokens: m.meta('kimodo.num_text_tokens', 50),
-		};
-		this.stats = {
-			globalMean: m.floats('stats.global_root.mean'), globalStd: m.floats('stats.global_root.std'),
-			localMean: m.floats('stats.local_root.mean'), localStd: m.floats('stats.local_root.std'),
-			bodyMean: m.floats('stats.body.mean'), bodyStd: m.floats('stats.body.std'),
-		};
+		if (!this.skeleton) {
+			m.close();
+			throw new Error(`no skeleton table for ${this.skeletonKey}`);
+		}
+		this.motionDim = c.motionDim;
+		this.fps = c.fps;
+		this.baseSteps = c.baseSteps;
+		if (this.motionDim !== 9 + 12 * this.skeleton.parents.length) {
+			m.close();
+			throw new Error(`motion_dim ${this.motionDim} does not fit the ${this.skeletonKey} skeleton`);
+		}
+		const config = c.config;
+		this.stats = c.stats;
 		const t0 = llm.now();
-		this.root = new MotionTransformer(m, 'root_model.', config);
-		this.body = new MotionTransformer(m, 'body_model.', config);
+		this.root = new MotionTransformer(m, c.prefix + 'root_model.', config);
+		this.body = new MotionTransformer(m, c.prefix + 'body_model.', config);
 		llm.print(`  [kimodo motion] ${this.name} (${this.skeletonKey}) resident in ${llm.since(t0)}`);
 	}
 
