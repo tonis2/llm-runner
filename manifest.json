@@ -3,6 +3,12 @@
   "dependencies": ["vk", "image", "quickjs"],
   "sources": ["lib/gguf/**", "lib/model/**", "lib/host/**", "lib/pipeline/**"],
   "targets": {
+    "macos-aarch64": {
+      "linked-libraries": []
+    },
+    "macos-x64": {
+      "linked-libraries": []
+    },
     "linux-x64": {
       "linked-libraries": ["vulkan"]
     },
