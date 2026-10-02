@@ -155,7 +155,8 @@ function groupAdapters(weights) {
 	if (adapters.some((ad) => ad.inDim !== inDim || ad.a.type !== type)) throw new Error('adapters grouped on one input must share its width');
 	const rank = adapters.reduce((sum, ad) => sum + ad.rank, 0);
 	const rowBytes = type === GGML.Q8_0 ? (inDim / 32) * 34 : inDim * 4;
-	const a = f32(rank * rowBytes / 4, [inDim, rank]);
+	// A word of slack: the Q8_0 kernels read one word past a row's last block.
+	const a = f32(rank * rowBytes / 4 + 4, [inDim, rank]);
 	a.type = type;
 	const g = { a, rank, ready: null, refs: adapters.length };
 	let col = 0;

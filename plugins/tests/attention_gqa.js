@@ -4,7 +4,8 @@ import { llm, f32 } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
 import { submit } from '../lib/gpu.js';
 
-const [n, qHeads, kvHeads, hd] = [23, 8, 2, 64];
+// 1300 tokens: past one 1024-key chunk of scores, and a partial last one.
+const [n, qHeads, kvHeads, hd] = [1300, 2, 1, 64];
 let seed = 7;
 const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296 - 0.5) * 2;
 const fill = (count) => Float32Array.from({ length: count }, rnd);

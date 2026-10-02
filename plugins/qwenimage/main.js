@@ -6,7 +6,8 @@
 // Euler loop through the single-stream DiT (optionally with true CFG and a
 // negative prompt), and the model's own 64-channel VAE. `input` starts from an
 // image instead of noise (img2img, `strength` of the way back to noise), and
-// `lora`/`loras` fold adapters in, as the flux plugin's config does.
+// `lora`/`loras` fold adapters in, as the flux plugin's config does
+// (`lora_merge: false` keeps them unmerged: exact, a little slower).
 //
 // The work is the nodes in `nodes.js`; `qwenImageGraph(config)` wires them.
 
@@ -45,7 +46,7 @@ export function qwenImageGraph(config, { sink = 'save' } = {}) {
 		add(`lora${i}`, 'core.lora', { path: l.path, strength: l.strength, ...(lora ? { lora } : {}) });
 		lora = link(`lora${i}`, 'lora');
 	});
-	add('dit', 'qwenimage.load', { path: config.model, ...(lora ? { lora } : {}) });
+	add('dit', 'qwenimage.load', { path: config.model, merge_lora: config.lora_merge ?? true, ...(lora ? { lora } : {}) });
 	sample.model = link('dit', 'model');
 	add('sample', 'qwenimage.sample', sample);
 	add('decode', 'core.vae_decode', { vae: link('vae', 'vae'), latent: link('sample', 'latent') });

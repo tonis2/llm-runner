@@ -299,8 +299,9 @@ halves of the fused `gate_up`) and ai-toolkit's (`diffusion_model.` prefix,
 `gate_up` fused whole). Every site of a constant-delta test file merges, and
 rows sampled at both halves match the host's `B @ A` at the file's scale —
 PEFT's `lora_alpha` read from its metadata, rank when no alpha is given.
-Qwen-Image keeps its LoRAs unmerged (`ops.matmul` adds x @ A^T @ B^T): their
-deltas are about one Q8_0 step, and requantising merged weights rounded much of
+Qwen-Image merges LoRAs by default; `lora_merge: false` (the load node's
+`merge_lora`) keeps them unmerged (`ops.matmul` adds x @ A^T @ B^T). Their
+deltas are about one Q8_0 step, and requantising merged weights rounds much of
 them away. On two blocks with a real LoRA (VNCCS PoseStudio) against diffusers
 with W + B @ A in float32, the merged velocity was 1% off (the LoRA's effect 9%
 short), the unmerged one 0.035%, the same as with no LoRA. Q, K and V share one

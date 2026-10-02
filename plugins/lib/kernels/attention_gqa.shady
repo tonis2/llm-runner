@@ -1,8 +1,10 @@
 // Grouped-query attention over a whole prompt, Q/K/V straight from the
 // projections: q [n, n_q_heads * hd], k and v [n, n_kv_heads * hd]. `causal`
 // lets a position see only itself and those before it; otherwise every
-// position sees them all. One workgroup per (q_head, position); scores in
-// shared memory, so n <= 1024. Dispatch 2D: (n_q_heads, n_tokens).
+// position sees them all. One workgroup per (q_head, position), hd <= 256.
+// The keys go 1024 at a time, their scores in shared memory, with a running
+// max and sum carried across (an online softmax), so n has no limit.
+// Dispatch 2D: (n_q_heads, n_tokens).
 float q[];
 float k[];
 float v[];
@@ -29,42 +31,50 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     if (gi < hd) qv[gi] = q[q_base + gi];
     barrier;
 
-    for (uint p = gi; p < seq; p += 256u) {
-        float dot = 0.0;
-        for (uint d = 0u; d < hd; d++) dot += qv[d] * k[p * kv_dim + kv_off + d];
-        scores[p] = dot * pc.scale;
-    }
-    barrier;
+    float run_max = -1.0e30;
+    float run_sum = 0.0;
+    float acc = 0.0;            // output dimension gi
+    for (uint c0 = 0u; c0 < seq; c0 += 1024u) {
+        uint cn = min(1024u, seq - c0);
+        for (uint p = gi; p < cn; p += 256u) {
+            float dot = 0.0;
+            for (uint d = 0u; d < hd; d++) dot += qv[d] * k[(c0 + p) * kv_dim + kv_off + d];
+            scores[p] = dot * pc.scale;
+        }
+        barrier;
 
-    float mx = -1.0e30;
-    for (uint i = gi; i < seq; i += 256u) mx = max(mx, scores[i]);
-    red[gi] = mx;
-    barrier;
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (gi < s) red[gi] = max(red[gi], red[gi + s]);
+        float mx = -1.0e30;
+        for (uint i = gi; i < cn; i += 256u) mx = max(mx, scores[i]);
+        red[gi] = mx;
+        barrier;
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (gi < s) red[gi] = max(red[gi], red[gi + s]);
+            barrier;
+        }
+        float new_max = max(run_max, red[0]);
+        barrier;
+
+        float sum = 0.0;
+        for (uint i = gi; i < cn; i += 256u) {
+            float e = exp(scores[i] - new_max);
+            scores[i] = e;
+            sum += e;
+        }
+        red[gi] = sum;
+        barrier;
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (gi < s) red[gi] += red[gi + s];
+            barrier;
+        }
+        float corr = exp(run_max - new_max);
+        run_sum = run_sum * corr + red[0];
+        run_max = new_max;
+        if (gi < hd) {
+            float a = 0.0;
+            for (uint p = 0u; p < cn; p++) a += scores[p] * v[(c0 + p) * kv_dim + kv_off + gi];
+            acc = acc * corr + a;
+        }
         barrier;
     }
-    float gmax = red[0];
-    barrier;
-
-    float sum = 0.0;
-    for (uint i = gi; i < seq; i += 256u) {
-        float e = exp(scores[i] - gmax);
-        scores[i] = e;
-        sum += e;
-    }
-    red[gi] = sum;
-    barrier;
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (gi < s) red[gi] += red[gi + s];
-        barrier;
-    }
-    float inv = 1.0 / red[0];
-    barrier;
-
-    for (uint d = gi; d < hd; d += 256u) {
-        float a = 0.0;
-        for (uint p = 0u; p < seq; p++) a += scores[p] * v[p * kv_dim + kv_off + d];
-        output[q_base + d] = a * inv;
-    }
+    if (gi < hd) output[q_base + gi] = acc / run_sum;
 }
