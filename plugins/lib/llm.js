@@ -40,7 +40,12 @@ export class Tensor {
 	get typeName() { return GGML_NAME[this.type] ?? String(this.type); }
 	view(byteOffset, byteSize) { return this.buffer.view(byteOffset, byteSize); }
 	get _binding() { return this.buffer._binding; }
-	dispose() { this.buffer.dispose(); }
+	dispose() {
+		this.buffer.dispose();
+		// Unmerged LoRAs on a weight (`lib/lora.js`) go with it.
+		for (const ad of this.adapters ?? []) ad.dispose();
+		this.adapters = null;
+	}
 }
 
 // A float32 scratch tensor of `count` elements.

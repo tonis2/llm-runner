@@ -40,11 +40,15 @@ function* sites(dit, scheme, last = Infinity) {
 	}
 }
 
-// Fold `loras` ([{ path, strength }]) into `dit`'s resident weights, in order.
+// Put `loras` ([{ path, strength }]) on `dit`'s resident weights, in order.
+// They stay unmerged: Qwen-Image LoRA deltas are about one Q8_0 step, and
+// requantising the merged weights rounds much of them away.
 export function mergeLoras(dit, loras) {
 	lora.mergeLoras({
 		schemes: SCHEMES,
 		sites: (scheme) => sites(dit, scheme),
 		firstSites: (scheme) => sites(dit, scheme, 0),
-	}, loras);
+		// Q, K and V read one input; so do the gate and up halves.
+		inputs: () => dit.blocks.flatMap((b) => [[b.q, b.k, b.v], [b.gateUp]]),
+	}, loras, { unmerged: true });
 }

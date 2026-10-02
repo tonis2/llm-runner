@@ -9,8 +9,8 @@
 // dispatch: the next op does not read what this one wrote (Q, K and V are three
 // matmuls over one input).
 
-import { GGML } from './llm.js';
-import { dispatch, pc, groups, flashDefines } from './gpu.js';
+import { GGML, f32 } from './llm.js';
+import { dispatch, dispatchCount, pc, groups, flashDefines, submit } from './gpu.js';
 
 // Whether Q8_0 matmuls may run on the matrix cores, in float16. They do when
 // the device has cooperative matrices and 64-wide subgroups (the kernel's
@@ -25,8 +25,14 @@ export function matrixCoresOn() { return matrixCores; }
 // `exact` keeps a Q8_0 matmul in float32 when the matrix cores are on: their
 // operands are float16, so an x that can pass 65504 (the input of a SwiGLU
 // down-projection in a model with large activations) has to take the slow path.
+//
+// A weight with `adapters` (unmerged LoRAs, see `lib/lora.js`) has each one's
+// rows that fall in the slice added on: y += x @ A^T @ B^T, B carrying the scale.
 export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = false, exact = false) {
 	const push = pc('uuuu', out, inDim, seq, rowOffset);
+	const adapters = w.adapters;
+	// The adapters' dispatches read y, so the base matmul keeps its barrier.
+	if (adapters) independent = false;
 	switch (w.type) {
 		case GGML.Q8_0:
 			if (matrixCores && !exact && seq >= 16) {
@@ -34,14 +40,54 @@ export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = fa
 			} else {
 				dispatch('matmul_q8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
 			}
-			return;
+			break;
 		case GGML.F32:
 			if (seq <= 4) dispatch('matmul_f32_rows', [w, x, y], [seq, out], push, independent);
 			else dispatch('matmul_f32', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
-			return;
+			break;
 		default:
 			throw new Error(`matmul: no kernel for weight type ${w.typeName ?? w.type} (${w.name})`);
 	}
+	if (adapters) applyAdapters(adapters, x, y, out, inDim, seq, rowOffset);
+}
+
+// x @ A^T for the adapters, one buffer for all of them: each adapter's two
+// dispatches keep their barriers, so the next one cannot write it early.
+let adapterScratch = null;
+function adapterRows(count) {
+	if (!adapterScratch || adapterScratch.elements < count) {
+		if (adapterScratch) {
+			// Recorded work may still read the old buffer.
+			submit();
+			adapterScratch.dispose();
+		}
+		adapterScratch = f32(count);
+	}
+	return adapterScratch;
+}
+
+// The adapters of weights that read one input (Q, K and V; the two halves of a
+// fused gate/up) share a `group`: their A matrices stacked, so one matmul gives
+// x @ A^T for all of them. The scratch holds it until anything else is
+// dispatched: a member's matmul reuses it when the only dispatch since is its
+// own base matmul, over the same x.
+function applyAdapters(adapters, x, y, out, inDim, seq, rowOffset) {
+	for (const ad of adapters) {
+		const lo = Math.max(rowOffset, ad.rowOffset), hi = Math.min(rowOffset + out, ad.rowOffset + ad.rows);
+		if (lo >= hi) continue;
+		const g = ad.group;
+		const r = g.ready;
+		if (!(r && r.x === x && r.seq === seq && r.inDim === inDim && dispatchCount() === r.at)) {
+			matmul(g.a, x, adapterRows(seq * g.rank), g.rank, inDim, seq);
+			g.ready = { x, seq, inDim, at: 0 };
+		}
+		const count = hi - lo;
+		dispatch('lora_up_add', [adapterScratch, ad.b, y], [groups(seq, 64) * groups(count, 64)],
+			pc('uuuuuuuu', count, ad.rank, seq, lo - ad.rowOffset, out, lo - rowOffset, g.rank, ad.col));
+		g.ready.at = dispatchCount();
+	}
+	// The next member's base matmul is the one dispatch allowed in between.
+	for (const ad of adapters) if (ad.group.ready) ad.group.ready.at = dispatchCount() + 1;
 }
 
 // y = x @ W^T + b, W f32 [out, in].

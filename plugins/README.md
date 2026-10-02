@@ -299,6 +299,14 @@ halves of the fused `gate_up`) and ai-toolkit's (`diffusion_model.` prefix,
 `gate_up` fused whole). Every site of a constant-delta test file merges, and
 rows sampled at both halves match the host's `B @ A` at the file's scale —
 PEFT's `lora_alpha` read from its metadata, rank when no alpha is given.
+Qwen-Image keeps its LoRAs unmerged (`ops.matmul` adds x @ A^T @ B^T): their
+deltas are about one Q8_0 step, and requantising merged weights rounded much of
+them away. On two blocks with a real LoRA (VNCCS PoseStudio) against diffusers
+with W + B @ A in float32, the merged velocity was 1% off (the LoRA's effect 9%
+short), the unmerged one 0.035%, the same as with no LoRA. Q, K and V share one
+stacked A (as do gate and up), held as Q8_0 for the matrix cores: a rank-32
+LoRA costs 6% a step (3.71 s against 3.51 s, 992x1056, RX 7800 XT). The edit path itself
+(two reference latents, the block-causal mask, their rope) is 0.028% off.
 
 The matrix-core kernels were checked against the float32 plugin itself:
 `tests/matmul_coop.js`, `tests/bench_attention.js` and `tests/conv_coop.js`
