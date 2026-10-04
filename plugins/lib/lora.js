@@ -30,6 +30,14 @@ export const MERGE_KERNELS = ['lora_merge_q8', 'lokr_merge_q8'];
 
 const names = (module) => (Array.isArray(module) ? module : [module]);
 
+// A LoRA's down and up matrices after a site's name: PEFT's, PEFT's with its
+// adapter name ('default') left in, and kohya's.
+const PAIRS = [
+	['.lora_A.weight', '.lora_B.weight'],
+	['.lora_A.default.weight', '.lora_B.default.weight'],
+	['.lora_down.weight', '.lora_up.weight'],
+];
+
 // The first scheme with any site at block 0 in this file, for `suffixes` (the
 // LoRA pair names, or `.lokr_w1`). `firstSites(scheme)` is that scheme's block 0.
 function detect(file, schemes, firstSites, suffixes) {
@@ -80,11 +88,11 @@ function mergeLora(file, sites, strength, unmerged) {
 	const alpha = globalAlpha(file);
 	let merged = 0, skipped = 0;
 	for (const site of sites) {
-		let module = present(file, site, '.lora_A.weight');
-		let aName, bName;
-		if (module) { aName = `${module}.lora_A.weight`; bName = `${module}.lora_B.weight`; }
-		else if ((module = present(file, site, '.lora_down.weight'))) { aName = `${module}.lora_down.weight`; bName = `${module}.lora_up.weight`; }
-		else continue;
+		let module = null, aName, bName;
+		for (const [a, b] of PAIRS) {
+			if ((module = present(file, site, a))) { aName = module + a; bName = module + b; break; }
+		}
+		if (!module) continue;
 		if (!file.has(bName)) continue;
 		const w = site.weight;
 		const inDim = w.shape[0];
@@ -190,7 +198,7 @@ export function mergeLoras(model, loras, { unmerged = false } = {}) {
 		if (scheme) {
 			const r = mergeLokr(file, model.sites(scheme), s);
 			llm.print(`  LoKr ${name}: ${r.merged} sites merged${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
-		} else if ((scheme = detect(file, model.schemes, model.firstSites, ['.lora_A.weight', '.lora_down.weight']))) {
+		} else if ((scheme = detect(file, model.schemes, model.firstSites, PAIRS.map(([a]) => a)))) {
 			const r = mergeLora(file, model.sites(scheme), s, unmerged);
 			llm.print(`  LoRA ${name}: ${r.merged} sites ${unmerged ? 'attached' : 'merged'}${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
 		} else {

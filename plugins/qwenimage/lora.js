@@ -16,6 +16,13 @@ const SCHEMES = [
 		gate_up: 'img_mlp.gate_up', gate_layer: 'img_mlp.gate_layer', proj: 'img_mlp.proj', down: 'img_mlp.out',
 	},
 	{
+		// PEFT on the bare transformer, its adapter name left in the keys
+		// (`.lora_A.default.weight`).
+		prefix: 'transformer_blocks.', sep: '.',
+		q: 'attn.to_q', k: 'attn.to_k', v: 'attn.to_v', out: 'attn.to_out.0',
+		gate_up: 'img_mlp.gate_up', gate_layer: 'img_mlp.gate_layer', proj: 'img_mlp.proj', down: 'img_mlp.out',
+	},
+	{
 		// ai-toolkit's transformer_blocks format.
 		prefix: 'diffusion_model.transformer_blocks.', sep: '.',
 		q: 'attn.to_q', k: 'attn.to_k', v: 'attn.to_v', out: 'attn.to_out.0',
