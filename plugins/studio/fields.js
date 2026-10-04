@@ -7,9 +7,17 @@ import { app, safe } from './app.js';
 
 const { Row, TextField, Select, Checkbox, Button } = three.ui;
 
-// Text typed into a number field that does not read as a number yet ("-",
-// "0."), by node and input, so the field keeps it until it does.
+// Text typed into a number field that does not read back as the number it
+// holds ("-", "0.", "1.50"), by node and input, with the value it held then,
+// so the field keeps showing it until the value changes.
 const drafts = new Map();
+
+function draftText(draftKey, v) {
+	const d = drafts.get(draftKey);
+	if (d && Object.is(d.value, v)) return d.text;
+	drafts.delete(draftKey);
+	return v === undefined ? '' : String(v);
+}
 
 // `width` and `height` are in points on screen; `textSize` scales the whole
 // editor, which is how a node's editors follow the zoom.
@@ -37,16 +45,18 @@ export function editor(n, input, { key, width, height = 0, textSize = 12 }) {
 			const seed = input.name === 'seed';
 			const field = new TextField({
 				key,
-				text: drafts.get(draftKey) ?? (v === undefined ? '' : String(v)),
+				text: draftText(draftKey, v),
 				size: [seed ? width - side - gap : width, 0],
 				textSize,
 				onChange: safe((t) => {
 					const x = Number(t);
 					if (t.trim() !== '' && Number.isFinite(x)) {
-						drafts.delete(draftKey);
-						set(input.type === 'INT' ? Math.trunc(x) : x);
+						const value = input.type === 'INT' ? Math.trunc(x) : x;
+						if (String(value) === t) drafts.delete(draftKey);
+						else drafts.set(draftKey, { text: t, value });
+						set(value);
 					} else {
-						drafts.set(draftKey, t);
+						drafts.set(draftKey, { text: t, value: v });
 						app.changed();
 					}
 				}),
