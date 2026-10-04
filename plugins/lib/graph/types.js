@@ -25,8 +25,10 @@
 //   'PATH(vae)'             a file; the kind is a hint for the editor's picker
 //   'LATENT(flux2)'         a latent in that format; two named formats must match
 //   'STRING*='              multi-line text, default ''
+//   'LORA+?'                takes any number of wires; the node gets their
+//                           values as a list, in the order they were connected
 //
-// or as an object { type, default, optional, options, kind, min, max, multiline }.
+// or as an object { type, default, optional, options, kind, min, max, multiline, many }.
 
 export const TYPES = [
 	'IMAGE', 'LATENT', 'CONDITIONING', 'MODEL', 'TEXT_ENCODER', 'VAE', 'LORA', 'REFERENCES',
@@ -35,7 +37,7 @@ export const TYPES = [
 
 export const PRIMITIVES = new Set(['STRING', 'INT', 'FLOAT', 'BOOL', 'ENUM', 'PATH']);
 
-const SPEC = /^([A-Z_]+)(?:\(([^)]*)\))?(\*)?(\?)?(?:=(.*))?$/s;
+const SPEC = /^([A-Z_]+)(?:\(([^)]*)\))?(\+)?(\*)?(\?)?(?:=(.*))?$/s;
 
 function parseDefault(type, text) {
 	switch (type) {
@@ -52,12 +54,13 @@ export function parsePort(spec, where = '') {
 	if (typeof spec === 'string') {
 		const m = SPEC.exec(spec);
 		if (!m) throw new Error(`${where}: cannot read the port type '${spec}'`);
-		const [, type, args, star, question, def] = m;
+		const [, type, args, plus, star, question, def] = m;
 		port = { type, optional: !!question };
 		if (args !== undefined) {
 			if (type === 'ENUM') port.options = args.split('|');
 			else port.kind = args;
 		}
+		if (plus) port.many = true;
 		if (star) port.multiline = true;
 		if (def !== undefined) port.default = parseDefault(type, def);
 	} else {

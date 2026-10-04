@@ -124,15 +124,17 @@ defineNodes('qwenimage', {
 	'qwenimage.load': {
 		title: 'Qwen-Image DiT',
 		category: 'loaders',
-		description: 'A Qwen-Image 2.1 GGUF, with any LoRAs folded in. `merge_lora` off keeps them unmerged: exact, about 6% slower a step.',
-		inputs: { path: 'PATH(dit)', lora: 'LORA?', merge_lora: 'BOOL=true' },
+		description: 'A Qwen-Image 2.1 GGUF, with any LoRAs folded in: wire in as many LoRA nodes (or chains of them) as you like, applied in the order they are wired. `merge_lora` off keeps them unmerged: exact, about 6% slower a step.',
+		inputs: { path: 'PATH(dit)', lora: 'LORA+?', merge_lora: 'BOOL=true' },
 		outputs: { model: 'MODEL' },
 		async run({ path, lora, merge_lora }) {
 			const t0 = llm.now();
 			const file = llm.open(path);
 			const dit = new QwenImageDiT(file);
 			await dit.load();
-			if (lora && lora.length > 0) mergeLoras(dit, lora, merge_lora !== false);
+			// One list per wire; each is a LoRA node's chain.
+			const loras = (lora ?? []).flat();
+			if (loras.length > 0) mergeLoras(dit, loras, merge_lora !== false);
 			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
 			return {
 				model: {

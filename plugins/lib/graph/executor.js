@@ -11,8 +11,9 @@
 //     "edges": [ { "from": ["te", "encoder"], "to": ["enc", "encoder"] } ]
 //   }
 //
-// A wire is either an edge or an input written as { "from": "node.port" };
-// `nodes` may also be an object keyed by id. Only what the sinks (save,
+// A wire is either an edge or an input written as { "from": "node.port" }; an
+// input that takes many (`LORA+`) is written as a list of them. `nodes` may
+// also be an object keyed by id. Only what the sinks (save,
 // preview) need is run.
 //
 // Every node's result is keyed by its type, its settings and the keys of what
@@ -69,13 +70,20 @@ function isWire(value) {
 	return value !== null && typeof value === 'object' && !Array.isArray(value) && typeof value.from === 'string' && Object.keys(value).length === 1;
 }
 
+// An input's wires: one { from }, or a list of them. Null when it is a setting.
+function wiresIn(value) {
+	if (isWire(value)) return [value];
+	if (Array.isArray(value) && value.length > 0 && value.every(isWire)) return value;
+	return null;
+}
+
 function splitWire(text, where) {
 	const dot = text.lastIndexOf('.');
 	if (dot <= 0) throw new Error(`${where}: a wire is "node.port", not "${text}"`);
 	return { node: text.slice(0, dot), port: text.slice(dot + 1) };
 }
 
-// { nodes: Map(id -> { id, type, params, wires: { input: { node, port } } }) }
+// { nodes: Map(id -> { id, type, params, wires: { input: [{ node, port }] } }) }
 export function normalizeGraph(graph) {
 	if (!graph || typeof graph !== 'object') throw new Error('a graph is an object with nodes');
 	const list = Array.isArray(graph.nodes)
@@ -88,7 +96,8 @@ export function normalizeGraph(graph) {
 		const params = {};
 		const wires = {};
 		for (const [k, v] of Object.entries(n.params ?? n.inputs ?? {})) {
-			if (isWire(v)) wires[k] = splitWire(v.from, `${n.id}.${k}`);
+			const ws = wiresIn(v);
+			if (ws) wires[k] = ws.map((w) => splitWire(w.from, `${n.id}.${k}`));
 			else params[k] = v;
 		}
 		nodes.set(n.id, { id: n.id, type: n.type, params, wires, pos: n.pos });
@@ -98,7 +107,7 @@ export function normalizeGraph(graph) {
 		const [toNode, toInput] = e.to;
 		const n = nodes.get(toNode);
 		if (!n) throw new Error(`an edge goes to ${toNode}, which is not a node`);
-		n.wires[toInput] = { node: fromNode, port: fromPort };
+		(n.wires[toInput] ??= []).push({ node: fromNode, port: fromPort });
 	}
 	return { nodes };
 }
@@ -146,8 +155,7 @@ export class Executor {
 			if (s === 'visiting') throw new Error(`the graph has a cycle through ${id}`);
 			state.set(id, 'visiting');
 			for (const input of defs.get(id).inputs) {
-				const w = n.wires[input.name];
-				if (w) visit(w.node, `${id}.${input.name}`);
+				for (const w of n.wires[input.name] ?? []) visit(w.node, `${id}.${input.name}`);
 			}
 			state.set(id, 'done');
 			order.push(id);
@@ -168,18 +176,21 @@ export class Executor {
 			const parts = [n.type];
 			for (const input of def.inputs) {
 				const where = `${id}.${input.name}`;
-				const w = n.wires[input.name];
-				if (w) {
-					const src = defs.get(w.node);
-					const out = src.outputs.find((o) => o.name === w.port);
-					if (!out) throw new Error(`${where} is wired to ${w.node}.${w.port}, but ${src.type} has no output ${w.port}`);
-					if (!accepts(input.type, out.type)) throw new Error(`${where} takes ${input.type}, and ${w.node}.${w.port} is ${out.type}`);
-					// A latent's format is part of its type where both ends name one.
-					if (input.type === 'LATENT' && input.kind && out.kind && input.kind !== out.kind) {
-						throw new Error(`${where} takes ${input.kind} latents, and ${w.node}.${w.port} makes ${out.kind}`);
+				const ws = n.wires[input.name];
+				if (ws) {
+					if (ws.length > 1 && !input.many) throw new Error(`${where} takes one wire, and ${ws.length} go into it`);
+					for (const w of ws) {
+						const src = defs.get(w.node);
+						const out = src.outputs.find((o) => o.name === w.port);
+						if (!out) throw new Error(`${where} is wired to ${w.node}.${w.port}, but ${src.type} has no output ${w.port}`);
+						if (!accepts(input.type, out.type)) throw new Error(`${where} takes ${input.type}, and ${w.node}.${w.port} is ${out.type}`);
+						// A latent's format is part of its type where both ends name one.
+						if (input.type === 'LATENT' && input.kind && out.kind && input.kind !== out.kind) {
+							throw new Error(`${where} takes ${input.kind} latents, and ${w.node}.${w.port} makes ${out.kind}`);
+						}
 					}
-					wired[input.name] = w;
-					parts.push(`${input.name}<${plan.get(w.node).key}.${w.port}`);
+					wired[input.name] = ws;
+					parts.push(`${input.name}<${ws.map((w) => `${plan.get(w.node).key}.${w.port}`).join(',')}`);
 					continue;
 				}
 				let v = n.params[input.name];
@@ -210,7 +221,7 @@ export class Executor {
 		// How many reads of each result are still to come.
 		const reads = new Map();
 		for (const p of plan.values()) {
-			for (const w of Object.values(p.wired)) {
+			for (const w of Object.values(p.wired).flat()) {
 				const k = plan.get(w.node).key;
 				reads.set(k, (reads.get(k) ?? 0) + 1);
 			}
@@ -235,9 +246,10 @@ export class Executor {
 					cached.push(id);
 				} else {
 					const inputs = { ...p.values };
-					for (const [name, w] of Object.entries(p.wired)) {
-						const src = this.cache.get(plan.get(w.node).key);
-						inputs[name] = src.outputs[w.port];
+					for (const [name, ws] of Object.entries(p.wired)) {
+						const values = ws.map((w) => this.cache.get(plan.get(w.node).key).outputs[w.port]);
+						// A many port gets the list, in wire order.
+						inputs[name] = p.def.inputs.find((i) => i.name === name).many ? values : values[0];
 					}
 					const ctx = {
 						id,
@@ -268,7 +280,7 @@ export class Executor {
 				}
 				// This node's reads are done: without `keep`, anything nobody else
 				// will read goes now.
-				for (const w of Object.values(p.wired)) {
+				for (const w of Object.values(p.wired).flat()) {
 					const k = plan.get(w.node).key;
 					const left = reads.get(k) - 1;
 					reads.set(k, left);

@@ -36,15 +36,17 @@ defineNodes('zimage', {
 	'zimage.load': {
 		title: 'Z-Image DiT',
 		category: 'loaders',
-		description: 'A Z-Image Turbo GGUF, with any LoRAs folded in.',
-		inputs: { path: 'PATH(dit)', lora: 'LORA?' },
+		description: 'A Z-Image Turbo GGUF, with any LoRAs folded in (wire in as many as you like).',
+		inputs: { path: 'PATH(dit)', lora: 'LORA+?' },
 		outputs: { model: 'MODEL' },
 		async run({ path, lora }) {
 			const t0 = llm.now();
 			const file = llm.open(path);
 			const dit = new ZImageDiT(file);
 			await dit.load();
-			if (lora && lora.length > 0) mergeLoras(dit, lora);
+			// One list per wire; each is a LoRA node's chain.
+			const loras = (lora ?? []).flat();
+			if (loras.length > 0) mergeLoras(dit, loras);
 			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
 			return {
 				model: {

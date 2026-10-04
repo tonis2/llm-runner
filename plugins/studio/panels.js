@@ -4,7 +4,7 @@
 import { llm } from '../lib/llm.js';
 import { app, run, cancel, freeMemory, dropImages, safe } from './app.js';
 import { editor } from './fields.js';
-import { allTypes, defOf, isSetting, isWire } from './doc.js';
+import { allTypes, defOf, isSetting } from './doc.js';
 import {
 	THEME, typeColor, BAR_H, STATUS_H, PALETTE_W, INSPECTOR_W,
 } from './theme.js';
@@ -125,18 +125,20 @@ export class Inspector extends three.Widget {
 				for (const line of wrap(app.status, w, 11)) rows.push(new Label(line, { color: THEME.error, textSize: 11 }));
 			}
 			for (const input of def.inputs) {
-				const wire = app.doc.wire(n.id, input.name);
-				const tag = input.kind && input.type !== 'ENUM' ? `${input.type}(${input.kind})` : input.type;
+				const wires = app.doc.wires(n.id, input.name);
+				const tag = (input.kind && input.type !== 'ENUM' ? `${input.type}(${input.kind})` : input.type) + (input.many ? ' (many)' : '');
 				rows.push(new Row({ gap: 6, cross: 'center' },
 					new Rect({ size: [8, 8], radius: 4, color: typeColor(input.type) }),
 					new Label(input.name, { textSize: 12 }),
 					new Label(tag, { color: THEME.dim, textSize: 10 }),
 				));
-				if (wire) {
-					rows.push(new Row({ gap: 6, cross: 'center' },
-						new Label(`← ${wire.node}.${wire.port}`, { color: THEME.dim, textSize: 12 }),
-						new Button('Unwire', safe(() => { app.doc.disconnect(n.id, input.name); app.changed(); }), { key: `unwire:${n.id}:${input.name}` }),
-					));
+				if (wires.length > 0) {
+					for (const wire of wires) {
+						rows.push(new Row({ gap: 6, cross: 'center' },
+							new Label(`← ${wire.node}.${wire.port}`, { color: THEME.dim, textSize: 12 }),
+							new Button('Unwire', safe(() => { app.doc.disconnect(n.id, input.name, wire); app.changed(); }), { key: `unwire:${n.id}:${input.name}:${wire.node}.${wire.port}` }),
+						));
+					}
 				} else if (isSetting(input)) {
 					rows.push(this.field(n, input, w));
 				} else {

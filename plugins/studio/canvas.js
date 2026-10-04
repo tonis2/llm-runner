@@ -9,7 +9,7 @@
 // or under another node, a setting is drawn as its value instead.
 
 import { app } from './app.js';
-import { defOf, isSetting, isWire } from './doc.js';
+import { defOf, isSetting, isWired } from './doc.js';
 import { layoutOf } from './layout.js';
 import { editor } from './fields.js';
 import { accepts } from '../lib/graph/types.js';
@@ -176,11 +176,12 @@ export class GraphCanvas extends three.Widget {
 		for (const n of doc.nodes) {
 			const def = defOf(n.type);
 			for (const input of def.inputs) {
-				const w0 = doc.wire(n.id, input.name);
-				const src = w0 && doc.node(w0.node);
-				const from = src && outPort(src, w0.port);
-				const to = from && inPort(n, input.name);
-				if (to) this.curve(ops, this.toScreen(from), this.toScreen(to), typeColor(input.type), 2.2);
+				for (const w0 of doc.wires(n.id, input.name)) {
+					const src = doc.node(w0.node);
+					const from = src && outPort(src, w0.port);
+					const to = from && inPort(n, input.name);
+					if (to) this.curve(ops, this.toScreen(from), this.toScreen(to), typeColor(input.type), 2.2);
+				}
 			}
 		}
 		for (const n of doc.nodes) this.drawNode(ops, n);
@@ -255,7 +256,7 @@ export class GraphCanvas extends three.Widget {
 		};
 
 		for (const input of L.sockets) {
-			const wired = isWire(n.params[input.name]);
+			const wired = isWired(n.params[input.name]);
 			const [px, py] = port(input.name, inPort(n, input.name, L), input.type, wired || !isSetting(input));
 			if (z <= 0.3) continue;
 			const label = input.name + (input.optional || isSetting(input) ? '' : ' *');
@@ -364,11 +365,12 @@ export class GraphCanvas extends three.Widget {
 			return;
 		}
 		if (port && port.input) {
-			const w = app.doc.wire(port.node, port.input);
+			// Picking up a connected input carries its wire away from it - the
+			// last one connected, when it takes many.
+			const w = app.doc.wires(port.node, port.input).at(-1);
 			if (w) {
-				// Picking up a connected input carries its wire away from it.
 				const src = app.doc.node(w.node);
-				app.doc.disconnect(port.node, port.input);
+				app.doc.disconnect(port.node, port.input, w);
 				app.changed();
 				this.drag = { mode: 'wire', fromOut: true, node: w.node, port: w.port, type: port.type, anchor: outPort(src, w.port) };
 			} else {

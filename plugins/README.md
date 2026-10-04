@@ -118,6 +118,12 @@ Port types (`lib/graph/types.js`):
 | `MODEL`, `TEXT_ENCODER`, `VAE`, `LORA`, `REFERENCES` | loaders' handles; `LORA` is a list of `{ path, strength }` |
 | `STRING`, `INT`, `FLOAT`, `BOOL`, `ENUM(a\|b)`, `PATH(kind)` | settings; `=value` is the default, `?` optional, `*` multi-line |
 
+`+` after a type (`LORA+?`) lets an input take any number of wires. The node
+then gets a list of their values, in the order they were wired; in a graph
+file the input is a list of `{ "from": ... }`. The DiT loaders take LoRAs this
+way, so two LoRA nodes can be wired straight into one loader, as well as
+chained.
+
 A node never disposes its inputs. The executor owns every output and disposes
 it (anything with a `dispose()`) once the last node that reads it has run. That
 keeps one-shot runs as lean as the old pipelines: the DiT is freed before the
