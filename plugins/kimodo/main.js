@@ -18,7 +18,9 @@
 // replayed there.
 //
 // `glb` names a .glb to write the clip to on its own - the skeleton as nodes and
-// one animation, named `name` (the prompt by default) - which is what crig reads.
+// one animation, named `name` (the prompt by default). `glb_output` hands the
+// same bytes to the program running the job in-process instead, as its output
+// "glb" (llm.output), so nothing is written to disk - which is what crig does.
 //
 // Settings: frames (150, at 30 fps), steps (100), seed (42), text_cfg (2),
 // heading (0, radians), progress (false; true prints every step, for a caller
@@ -44,7 +46,7 @@ import { KimodoTextEncoder } from './encoder.js';
 import { KimodoDenoiser } from './denoiser.js';
 import { decodeMotion } from './motion.js';
 import { writeText } from '../lib/graph/plugins.js';
-import { writeMotionGlb } from './glb.js';
+import { writeMotionGlb, motionGlb } from './glb.js';
 import { SKELETONS } from './skeletons.js';
 import { restPositions, placePoses, encodePoses } from './poses.js';
 import { canCleanUp, cleanUpMotion } from './cleanup.js';
@@ -150,6 +152,11 @@ llm.plugin({
 		const result = { frames, fps, steps, seed, skeleton: skeletonKey, poses: keyed, cleaned: cleaned !== null, seconds: (llm.now() - start) / 1000 };
 		const clip = { name: config.name ?? config.prompt ?? 'Kimodo', skeleton, fps, frames, rotations: decoded.rotations, root: decoded.root };
 		if (config.glb) writeMotionGlb((result.glb = config.glb), clip);
+		if (config.glb_output) {
+			const bytes = motionGlb(clip);
+			llm.output('glb', bytes);
+			result.glb_bytes = bytes.length;
+		}
 		if (config.output) {
 			const dir = config.output;
 			llm.makeDir(dir);

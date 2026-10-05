@@ -187,6 +187,14 @@ export const llm = {
 	readText(path) { return H.readText(path); },
 	readBytes(path) { return H.readBytes(path); },
 	writeBytes(path, bytes) { H.writeBytes(path, bytes instanceof Uint8Array ? bytes : asBytes(bytes)); },
+	// Hand bytes to the program running this job in-process (llm::pipeline::Job,
+	// read back with job.output(name)) instead of writing a file. Only there: the
+	// runner executable has nobody to hand them to.
+	canOutput() { return typeof globalThis.__llm_job_output === 'function'; },
+	output(name, bytes) {
+		if (!this.canOutput()) throw new Error(`output('${name}') needs a program running the job in-process; write a file instead`);
+		globalThis.__llm_job_output(name, bytes instanceof Uint8Array ? bytes : asBytes(bytes));
+	},
 	exists(path) { return H.exists(path); },
 	makeDir(path) { H.makeDir(path); },
 	base64Encode(bytes) { return H.base64Encode(bytes); },

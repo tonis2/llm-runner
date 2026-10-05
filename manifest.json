@@ -10,10 +10,10 @@
       "linked-libraries": []
     },
     "linux-x64": {
-      "linked-libraries": ["vulkan"]
+      "linked-libraries": []
     },
     "windows-x64": {
-      "linked-libraries": ["vulkan-1"]
+      "linked-libraries": []
     }
   }
 }

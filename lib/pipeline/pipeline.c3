@@ -6,6 +6,7 @@
 	job.start(&renderer, "kimodo", config_json, plugins_root)!;
 	while (job.pump()) { draw a frame }        // one call a frame
 	if (job.state == DONE) use(job.result());  // the plugin's result, as JSON
+	char[] glb = job.output("glb");            // bytes it handed over, if any
 	job.close();
 	mem::free(job);
 
@@ -40,6 +41,7 @@ import std::io::path;
 import std::core::mem;
 import std::core::string;
 import std::time::clock;
+import std::collections::list;
 
 faultdef JOB_BUSY, JOB_NOT_STARTED;
 
@@ -63,6 +65,18 @@ enum JobState
 alias LineHook = fn void(void* context, String line);
 
 <*
+ Bytes a plugin handed the host with `llm.output(name, bytes)` instead of
+ writing a file. Owned by the job.
+*>
+struct JobOutput
+{
+	String name;
+	char[] bytes;
+}
+
+alias JobOutputs = List{JobOutput};
+
+<*
  One generation. Must not move once started - its runtime is addressed by the
  engine - so it lives on the heap or in a place that outlives the run.
 *>
@@ -77,6 +91,8 @@ struct Job
 	// Every `llm.print` line, as it is printed. Optional.
 	LineHook on_line;
 	void* line_context;
+	// What the plugin handed over with `llm.output`; see `output`.
+	JobOutputs outputs;
 }
 
 // The job running now: the host verbs have one set of tables.
@@ -118,6 +134,26 @@ fn String Job.result(&self) => self.state == DONE ? self.outcome.str_view() : ""
 fn String Job.error(&self) => self.state == FAILED ? self.outcome.str_view() : "";
 
 <*
+ The bytes the plugin handed over under `name` with `llm.output`, or empty when
+ it handed none. Borrowed: valid until the job is freed or started again.
+*>
+fn char[] Job.output(&self, String name)
+{
+	foreach (held : self.outputs) if (held.name == name) return held.bytes;
+	return {};
+}
+
+fn void Job.free_outputs(&self)
+{
+	foreach (held : self.outputs)
+	{
+		mem::free(held.name.ptr);
+		if (held.bytes.len > 0) mem::free(held.bytes.ptr);
+	}
+	self.outputs.free();
+}
+
+<*
  Start `plugin`'s generate on `config` (a JSON object, the settings the runner
  reads from its config file). Returns at once; `pump` does the work.
 
@@ -132,8 +168,12 @@ fn void? Job.start(&self, three::Renderer* renderer, String plugin, String confi
 	LineHook on_line = null, void* line_context = null)
 {
 	if (active != null) return JOB_BUSY~;
+	// A job started again keeps nothing of its last run.
+	self.free_outputs();
+	self.outcome.free();
 	*self = { .renderer = renderer, .on_line = on_line, .line_context = line_context };
 	self.outcome.init(mem, 256);
+	self.outputs.init(mem);
 
 	// No scene: a pipeline dispatches kernels and draws nothing.
 	if (catch err = self.runtime.open(null, renderer, memory_limit: 0))
@@ -152,6 +192,7 @@ fn void? Job.start(&self, three::Renderer* renderer, String plugin, String confi
 
 	qjs::Value global = self.runtime.js.global();
 	self.runtime.js.set_property(global, "__llm_job_done", self.runtime.js.function(&js_job_done, "done", 2, &self.runtime));
+	self.runtime.js.set_property(global, "__llm_job_output", self.runtime.js.function(&js_job_output, "output", 2, &self.runtime));
 	self.runtime.js.release(global);
 
 	three::RunResult started = self.runtime.run(kickoff_script(plugin, config, plugins_root), "llm:start", drain_frame: false);
@@ -259,12 +300,13 @@ fn void Job.close(&self)
 }
 
 <*
- Free what `close` leaves: the outcome text.
+ Free what `close` leaves: the outcome text and the handed-over bytes.
 *>
 fn void Job.free(&self)
 {
 	self.close();
 	self.outcome.free();
+	self.free_outputs();
 }
 
 fn void job_print(void* context, String line) @local
@@ -282,6 +324,27 @@ fn void js_job_done(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Va
 	job.outcome.clear();
 	job.outcome.append(three::arg_text(&js, argc, args, 1, tmem));
 	job.state = ok ? DONE : FAILED;
+}
+
+// `__llm_job_output(name, bytes)`: keep a copy of the bytes under `name`,
+// replacing any handed over under it before.
+fn void js_job_output(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	Job* job = active;
+	if (job == null || job.state != RUNNING) return;
+	qjs::Context js = qjs::wrap(ctx);
+	String name = three::arg_text(&js, argc, args, 0, tmem);
+	char[] bytes = argc >= 2 ? js.bytes(args[1]) : (char[]){};
+	char[] kept = bytes.len > 0 ? mem::new_array(char, bytes.len) : (char[]){};
+	if (bytes.len > 0) kept[..] = bytes[..];
+	foreach (&held : job.outputs)
+	{
+		if (held.name != name) continue;
+		if (held.bytes.len > 0) mem::free(held.bytes.ptr);
+		held.bytes = kept;
+		return;
+	}
+	job.outputs.push({ .name = name.copy(mem), .bytes = kept });
 }
 
 <*

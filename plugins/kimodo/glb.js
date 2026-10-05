@@ -22,7 +22,12 @@ function utf8(text) {
 // `rotations` [frames, J, 4] parent-local xyzw, `root` [frames, 3] metres.
 // `rest` is where the root stands at rest (frame 0's root when not given),
 // `generator` the asset's generator and `extras` the scene-wide glTF extras.
-export function writeMotionGlb(path, { name, skeleton, fps, frames, rotations, root, rest = null, generator = 'llm-runner kimodo', extras = null }) {
+export function writeMotionGlb(path, clip) {
+	llm.writeBytes(path, motionGlb(clip));
+}
+
+// The same .glb as bytes, for a caller that keeps it in memory.
+export function motionGlb({ name, skeleton, fps, frames, rotations, root, rest = null, generator = 'llm-runner kimodo', extras = null }) {
 	const J = skeleton.parents.length;
 	const views = [], accessors = [], chunks = [];
 	let offset = 0;
@@ -95,5 +100,5 @@ export function writeMotionGlb(path, { name, skeleton, fps, frames, rotations, r
 		out.set(c, at);
 		at += c.length;
 	}
-	llm.writeBytes(path, out);
+	return out;
 }
