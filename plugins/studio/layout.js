@@ -12,7 +12,7 @@
 // The canvas draws from this, places the editors from it and hit-tests with it,
 // so the three cannot disagree.
 
-import { Doc, defOf, isSetting, isWire } from './doc.js';
+import { Doc, defOf, isSetting, isWired } from './doc.js';
 import {
 	NODE_W, NODE_HEAD, NODE_ROW, NODE_PAD, FIELD_X, FIELD_H, LABEL_H, PROMPT_H, FIELD_GAP,
 } from './theme.js';
@@ -25,7 +25,7 @@ export function layoutOf(n, image) {
 	const sockets = [];
 	const settings = [];
 	for (const input of def.inputs) {
-		if (isSetting(input) && !isWire(n.params[input.name])) settings.push(input);
+		if (isSetting(input) && !isWired(n.params[input.name])) settings.push(input);
 		else sockets.push(input);
 	}
 

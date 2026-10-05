@@ -118,6 +118,12 @@ Port types (`lib/graph/types.js`):
 | `MODEL`, `TEXT_ENCODER`, `VAE`, `LORA`, `REFERENCES` | loaders' handles; `LORA` is a list of `{ path, strength }` |
 | `STRING`, `INT`, `FLOAT`, `BOOL`, `ENUM(a\|b)`, `PATH(kind)` | settings; `=value` is the default, `?` optional, `*` multi-line |
 
+`+` after a type (`LORA+?`) lets an input take any number of wires. The node
+then gets a list of their values, in the order they were wired; in a graph
+file the input is a list of `{ "from": ... }`. The DiT loaders take LoRAs this
+way, so two LoRA nodes can be wired straight into one loader, as well as
+chained.
+
 A node never disposes its inputs. The executor owns every output and disposes
 it (anything with a `dispose()`) once the last node that reads it has run. That
 keeps one-shot runs as lean as the old pipelines: the DiT is freed before the
@@ -299,6 +305,15 @@ halves of the fused `gate_up`) and ai-toolkit's (`diffusion_model.` prefix,
 `gate_up` fused whole). Every site of a constant-delta test file merges, and
 rows sampled at both halves match the host's `B @ A` at the file's scale —
 PEFT's `lora_alpha` read from its metadata, rank when no alpha is given.
+Qwen-Image merges LoRAs by default; `lora_merge: false` (the load node's
+`merge_lora`) keeps them unmerged (`ops.matmul` adds x @ A^T @ B^T). Their
+deltas are about one Q8_0 step, and requantising merged weights rounds much of
+them away. On two blocks with a real LoRA (VNCCS PoseStudio) against diffusers
+with W + B @ A in float32, the merged velocity was 1% off (the LoRA's effect 9%
+short), the unmerged one 0.035%, the same as with no LoRA. Q, K and V share one
+stacked A (as do gate and up), held as Q8_0 for the matrix cores: a rank-32
+LoRA costs 6% a step (3.71 s against 3.51 s, 992x1056, RX 7800 XT). The edit path itself
+(two reference latents, the block-causal mask, their rope) is 0.028% off.
 
 The matrix-core kernels were checked against the float32 plugin itself:
 `tests/matmul_coop.js`, `tests/bench_attention.js` and `tests/conv_coop.js`

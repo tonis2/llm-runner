@@ -16,6 +16,13 @@ const SCHEMES = [
 		gate_up: 'img_mlp.gate_up', gate_layer: 'img_mlp.gate_layer', proj: 'img_mlp.proj', down: 'img_mlp.out',
 	},
 	{
+		// PEFT on the bare transformer, its adapter name left in the keys
+		// (`.lora_A.default.weight`).
+		prefix: 'transformer_blocks.', sep: '.',
+		q: 'attn.to_q', k: 'attn.to_k', v: 'attn.to_v', out: 'attn.to_out.0',
+		gate_up: 'img_mlp.gate_up', gate_layer: 'img_mlp.gate_layer', proj: 'img_mlp.proj', down: 'img_mlp.out',
+	},
+	{
 		// ai-toolkit's transformer_blocks format.
 		prefix: 'diffusion_model.transformer_blocks.', sep: '.',
 		q: 'attn.to_q', k: 'attn.to_k', v: 'attn.to_v', out: 'attn.to_out.0',
@@ -40,11 +47,16 @@ function* sites(dit, scheme, last = Infinity) {
 	}
 }
 
-// Fold `loras` ([{ path, strength }]) into `dit`'s resident weights, in order.
-export function mergeLoras(dit, loras) {
+// Put `loras` ([{ path, strength }]) on `dit`'s resident weights, in order.
+// `merge` folds them into the Q8_0 weights: no cost per step, but Qwen-Image
+// LoRA deltas are about one Q8_0 step and requantising rounds much of them
+// away. Without it they stay unmerged and are added exactly at every matmul.
+export function mergeLoras(dit, loras, merge = true) {
 	lora.mergeLoras({
 		schemes: SCHEMES,
 		sites: (scheme) => sites(dit, scheme),
 		firstSites: (scheme) => sites(dit, scheme, 0),
-	}, loras);
+		// Q, K and V read one input; so do the gate and up halves.
+		inputs: () => dit.blocks.flatMap((b) => [[b.q, b.k, b.v], [b.gateUp]]),
+	}, loras, { unmerged: !merge });
 }

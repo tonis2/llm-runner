@@ -71,15 +71,17 @@ defineNodes('flux', {
 	'flux.load': {
 		title: 'Flux 2 DiT',
 		category: 'loaders',
-		description: 'A Flux 2 (Klein) DiT GGUF, with any LoRAs folded in. Stays in VRAM while it is wired to something.',
-		inputs: { path: 'PATH(dit)', lora: 'LORA?' },
+		description: 'A Flux 2 (Klein) DiT GGUF, with any LoRAs folded in (wire in as many as you like). Stays in VRAM while it is wired to something.',
+		inputs: { path: 'PATH(dit)', lora: 'LORA+?' },
 		outputs: { model: 'MODEL' },
 		async run({ path, lora }) {
 			const t0 = llm.now();
 			const file = llm.open(path);
 			const dit = new FluxDiT(file);
 			await dit.load();
-			if (lora && lora.length > 0) mergeLoras(dit, lora);
+			// One list per wire; each is a LoRA node's chain.
+			const loras = (lora ?? []).flat();
+			if (loras.length > 0) mergeLoras(dit, loras);
 			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
 			return {
 				model: {

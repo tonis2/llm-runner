@@ -1,0 +1,75 @@
+// y[s, col0 + j] += t[s, t_col ..+ rank] . b[b_row0 + j, :] for j < count: the
+// up half of an unmerged LoRA added onto a projection's output, with t = x @ A^T
+// [seq, t_stride] (the adapters of one input stacked) and the scale already in
+// b [rows, rank]. matmul_f32's 64x64 tiles, K (the rank) in steps of 32; a
+// thread has 4 rows and 4 columns 16 apart, so a row's writes to y are 16
+// threads side by side (the add is a read and a write of y: memory-bound).
+// Dispatch: ceil(seq/64) * ceil(count/64) workgroups.
+float t[];
+float b[];
+float y[];
+struct Push @pushconstant { uint count; uint rank; uint seq; uint b_row0; uint y_stride; uint col0; uint t_stride; uint t_col; }
+Push pc;
+shared float As[2112];
+shared float Bs[2112];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint tiles_n = (pc.count + 63u) / 64u;
+    uint tile_m = input.gid.x / tiles_n;
+    uint tile_n = input.gid.x % tiles_n;
+    uint pos_base = tile_m * 64u;
+    uint col_base = tile_n * 64u;
+    uint tm = gi / 16u;
+    uint tn = gi % 16u;
+
+    float acc[16];
+    for (uint i = 0u; i < 16u; i++) acc[i] = 0.0;
+
+    uint k_tiles = (pc.rank + 31u) / 32u;
+    for (uint kt = 0u; kt < k_tiles; kt++) {
+        uint k_base = kt * 32u;
+        for (uint i = 0u; i < 8u; i++) {
+            uint flat = gi + i * 256u;
+            uint m = flat >> 5u;
+            uint k = flat & 31u;
+            uint gm = pos_base + m;
+            uint gk = k_base + k;
+            As[m * 33u + k] = (gm < pc.seq && gk < pc.rank) ? t[gm * pc.t_stride + pc.t_col + gk] : 0.0;
+            uint gn = col_base + m;
+            Bs[m * 33u + k] = (gn < pc.count && gk < pc.rank) ? b[(pc.b_row0 + gn) * pc.rank + gk] : 0.0;
+        }
+        barrier;
+        uint a_base = tm * 4u * 33u;
+        uint b_base = tn * 33u;
+        for (uint k = 0u; k < 32u; k++) {
+            float a0 = As[a_base + k];
+            float a1 = As[a_base + 33u + k];
+            float a2 = As[a_base + 66u + k];
+            float a3 = As[a_base + 99u + k];
+            float b0 = Bs[b_base + k];
+            float b1 = Bs[b_base + 528u + k];
+            float b2 = Bs[b_base + 1056u + k];
+            float b3 = Bs[b_base + 1584u + k];
+            acc[0] += a0 * b0; acc[1] += a0 * b1; acc[2] += a0 * b2; acc[3] += a0 * b3;
+            acc[4] += a1 * b0; acc[5] += a1 * b1; acc[6] += a1 * b2; acc[7] += a1 * b3;
+            acc[8] += a2 * b0; acc[9] += a2 * b1; acc[10] += a2 * b2; acc[11] += a2 * b3;
+            acc[12] += a3 * b0; acc[13] += a3 * b1; acc[14] += a3 * b2; acc[15] += a3 * b3;
+        }
+        barrier;
+    }
+
+    for (uint r = 0u; r < 4u; r++) {
+        uint gm = pos_base + tm * 4u + r;
+        if (gm < pc.seq) {
+            for (uint c = 0u; c < 4u; c++) {
+                uint gn = col_base + tn + c * 16u;
+                if (gn < pc.count) {
+                    uint at = gm * pc.y_stride + pc.col0 + gn;
+                    y[at] = y[at] + acc[r * 4u + c];
+                }
+            }
+        }
+    }
+}

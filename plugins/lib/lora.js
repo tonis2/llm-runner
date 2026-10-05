@@ -6,6 +6,15 @@
 // weights the previous one left. The merge cannot be undone, which is why a
 // resident DiT with a different adapter set is reloaded rather than re-merged.
 //
+// The requantisation is lossy for a LoRA whose delta is about one Q8_0 step:
+// a block whose largest value does not move keeps its scale, and every
+// element's delta under half a step rounds back to where it was. A model can
+// instead keep LoRAs unmerged (`{ unmerged: true }`): A and B (B scaled) stay
+// on the weight as `adapters` and `ops.matmul` adds x @ A^T @ B^T, exactly.
+// Weights that read one input (the model's `inputs()`, as lists of weights)
+// share one stacked A, so x @ A^T is one matmul for all of them.
+// LoKr always merges.
+//
 // A model describes where its sites are: `sites(scheme)` yields every
 // { module, weight, rowOffset } a naming scheme names, where `module` is the
 // file's name for the site (or a list of names to try) and `rowOffset` is where
@@ -14,12 +23,20 @@
 // the file's. Scale rules are the old C3 loader's; the merge kernels are
 // `lora_merge_q8` and `lokr_merge_q8`.
 
-import { llm, GGML } from './llm.js';
-import { dispatch, pc, submit } from './gpu.js';
+import { llm, GGML, f32 } from './llm.js';
+import { dispatch, pc, submit, copy } from './gpu.js';
 
 export const MERGE_KERNELS = ['lora_merge_q8', 'lokr_merge_q8'];
 
 const names = (module) => (Array.isArray(module) ? module : [module]);
+
+// A LoRA's down and up matrices after a site's name: PEFT's, PEFT's with its
+// adapter name ('default') left in, and kohya's.
+const PAIRS = [
+	['.lora_A.weight', '.lora_B.weight'],
+	['.lora_A.default.weight', '.lora_B.default.weight'],
+	['.lora_down.weight', '.lora_up.weight'],
+];
 
 // The first scheme with any site at block 0 in this file, for `suffixes` (the
 // LoRA pair names, or `.lokr_w1`). `firstSites(scheme)` is that scheme's block 0.
@@ -67,25 +84,38 @@ function present(file, site, suffix) {
 	return null;
 }
 
-function mergeLora(file, sites, strength) {
+function mergeLora(file, sites, strength, unmerged) {
 	const alpha = globalAlpha(file);
 	let merged = 0, skipped = 0;
 	for (const site of sites) {
-		let module = present(file, site, '.lora_A.weight');
-		let aName, bName;
-		if (module) { aName = `${module}.lora_A.weight`; bName = `${module}.lora_B.weight`; }
-		else if ((module = present(file, site, '.lora_down.weight'))) { aName = `${module}.lora_down.weight`; bName = `${module}.lora_up.weight`; }
-		else continue;
+		let module = null, aName, bName;
+		for (const [a, b] of PAIRS) {
+			if ((module = present(file, site, a))) { aName = module + a; bName = module + b; break; }
+		}
+		if (!module) continue;
 		if (!file.has(bName)) continue;
 		const w = site.weight;
 		const inDim = w.shape[0];
 		const [rank] = file.info(aName).shape;             // A: [rank, in]
 		const [bRows] = file.info(bName).shape;            // B: [rows, rank]
-		if (w.type !== GGML.Q8_0 || inDim % 256 !== 0 || rank > 256) { skipped++; continue; }
+		if (!unmerged && (w.type !== GGML.Q8_0 || inDim % 256 !== 0 || rank > 256)) { skipped++; continue; }
 		let effective = scalar(file, `${module}.alpha`);
 		if (effective < 0) effective = alpha;
 		if (effective <= 0) effective = rank;
 		const scale = (strength * effective) / rank;
+		if (unmerged) {
+			const bHost = file.floats(bName);
+			for (let i = 0; i < bHost.length; i++) bHost[i] *= scale;
+			const b = f32(bHost.length);
+			b.buffer.write(bHost);
+			// A goes up as Q8_0 when its rows are whole blocks: x @ A^T then runs on
+			// the Q8_0 kernels (the matrix cores), at A's own precision - a rounding
+			// of A is small against A, where a merge's is a step of W.
+			const a = file.upload(aName, inDim % 32 === 0 ? 'q8' : 'f32');
+			(w.adapters ??= []).push({ a, b, rank, rowOffset: site.rowOffset, rows: bRows, inDim });
+			merged++;
+			continue;
+		}
 		const a = file.upload(aName, 'f32');
 		const b = file.upload(bName, 'f32');
 		dispatch('lora_merge_q8', [w, a, b], [inDim / 256, bRows], pc('uuuufuuu', inDim, bRows, site.rowOffset, rank, scale, 0, 0, 0));
@@ -122,9 +152,43 @@ function mergeLokr(file, sites, strength) {
 	return { merged, skipped };
 }
 
+// One group for the adapters of `weights`, which all read one input: their A
+// matrices stacked into one [sum of ranks, in] tensor (rows are whole in either
+// type, so stacking is appending bytes), each adapter's rows of it at `col`.
+// The adapter's own A goes; it disposes with its weight.
+function groupAdapters(weights) {
+	const adapters = weights.flatMap((w) => w.adapters ?? []);
+	if (adapters.length === 0) return;
+	const { inDim, a: { type } } = adapters[0];
+	if (adapters.some((ad) => ad.inDim !== inDim || ad.a.type !== type)) throw new Error('adapters grouped on one input must share its width');
+	const rank = adapters.reduce((sum, ad) => sum + ad.rank, 0);
+	const rowBytes = type === GGML.Q8_0 ? (inDim / 32) * 34 : inDim * 4;
+	// A word of slack: the Q8_0 kernels read one word past a row's last block.
+	const a = f32(rank * rowBytes / 4 + 4, [inDim, rank]);
+	a.type = type;
+	const g = { a, rank, ready: null, refs: adapters.length };
+	let col = 0;
+	for (const ad of adapters) {
+		copy(ad.a, g.a, ad.rank * rowBytes, 0, col * rowBytes);
+		ad.col = col;
+		col += ad.rank;
+	}
+	submit();
+	for (const ad of adapters) {
+		ad.a.dispose();
+		ad.a = null;
+		ad.group = g;
+		ad.dispose = () => {
+			ad.b.dispose();
+			if (--g.refs === 0) g.a.dispose();
+		};
+	}
+}
+
 // Fold `loras` ([{ path, strength }]) into a model's resident weights, in
-// order. `model` is { schemes, sites(scheme), firstSites(scheme) }.
-export function mergeLoras(model, loras) {
+// order. `model` is { schemes, sites(scheme), firstSites(scheme), inputs()? };
+// with `unmerged`, LoRAs are attached to the weights instead of folded in.
+export function mergeLoras(model, loras, { unmerged = false } = {}) {
 	for (const { path, strength } of loras) {
 		const t0 = llm.now();
 		const file = llm.open(path);
@@ -134,13 +198,27 @@ export function mergeLoras(model, loras) {
 		if (scheme) {
 			const r = mergeLokr(file, model.sites(scheme), s);
 			llm.print(`  LoKr ${name}: ${r.merged} sites merged${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
-		} else if ((scheme = detect(file, model.schemes, model.firstSites, ['.lora_A.weight', '.lora_down.weight']))) {
-			const r = mergeLora(file, model.sites(scheme), s);
-			llm.print(`  LoRA ${name}: ${r.merged} sites merged${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
+		} else if ((scheme = detect(file, model.schemes, model.firstSites, PAIRS.map(([a]) => a)))) {
+			const r = mergeLora(file, model.sites(scheme), s, unmerged);
+			llm.print(`  LoRA ${name}: ${r.merged} sites ${unmerged ? 'attached' : 'merged'}${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
 		} else {
 			llm.print(`  ${path}: no LoRA or LoKr naming this knows - skipped`);
 		}
 		file.close();
+	}
+	if (!unmerged) return;
+	// Group what shares an input; every other adapted weight is its own group.
+	const grouped = new Set();
+	for (const weights of model.inputs?.() ?? []) {
+		groupAdapters(weights);
+		for (const w of weights) grouped.add(w);
+	}
+	for (const scheme of model.schemes) {
+		for (const { weight } of model.sites(scheme)) {
+			if (grouped.has(weight)) continue;
+			groupAdapters([weight]);
+			grouped.add(weight);
+		}
 	}
 }
 

@@ -4,6 +4,8 @@
 //
 //   { nodes: [ { id, type, params: { input: value | { from: 'node.port' } }, pos: [x, y] } ] }
 //
+// An input that takes many wires (`LORA+`) holds a list of { from }.
+//
 // Everything that changes the graph goes through here, and the checks a wire
 // has to pass - types, latent formats, cycles - are made when it is connected
 // rather than when the graph runs.
@@ -32,6 +34,15 @@ function splitWire(text) {
 	const dot = text.lastIndexOf('.');
 	return { node: text.slice(0, dot), port: text.slice(dot + 1) };
 }
+
+// The { from } wires a setting holds: none, one, or a many input's list.
+function wireList(v) {
+	if (isWire(v)) return [v];
+	return Array.isArray(v) && v.length > 0 && v.every(isWire) ? v : [];
+}
+
+// Whether a setting is wired rather than set.
+export function isWired(v) { return wireList(v).length > 0; }
 
 // The format a VAE file decodes, read from its tensor names once per path.
 const vaeFormats = new Map();
@@ -70,7 +81,10 @@ export class Doc {
 		}));
 		for (const e of graph.edges ?? []) {
 			const n = this.node(e.to[0]);
-			if (n) n.params[e.to[1]] = { from: `${e.from[0]}.${e.from[1]}` };
+			if (!n) continue;
+			const w = { from: `${e.from[0]}.${e.from[1]}` };
+			const many = defOf(n.type).inputs.find((i) => i.name === e.to[1])?.many;
+			n.params[e.to[1]] = many ? [...wireList(n.params[e.to[1]]), w] : w;
 		}
 		if (this.nodes.some((n) => !n.pos)) this.autoLayout();
 		this.dirty = false;
@@ -87,11 +101,15 @@ export class Doc {
 
 	node(id) { return this.nodes.find((n) => n.id === id) ?? null; }
 
-	// A node's input wire as { node, port }, or null.
+	// A node's input wire as { node, port }, or null; a many input's first.
 	wire(id, input) {
+		return this.wires(id, input)[0] ?? null;
+	}
+
+	// Every wire into a node's input, as [{ node, port }].
+	wires(id, input) {
 		const n = this.node(id);
-		const v = n && n.params[input];
-		return isWire(v) ? splitWire(v.from) : null;
+		return n ? wireList(n.params[input]).map((w) => splitWire(w.from)) : [];
 	}
 
 	freshId(type) {
@@ -111,7 +129,12 @@ export class Doc {
 		this.nodes = this.nodes.filter((n) => n.id !== id);
 		for (const n of this.nodes) {
 			for (const [k, v] of Object.entries(n.params)) {
-				if (isWire(v) && splitWire(v.from).node === id) delete n.params[k];
+				const ws = wireList(v);
+				if (ws.length === 0) continue;
+				const left = ws.filter((w) => splitWire(w.from).node !== id);
+				if (left.length === ws.length) continue;
+				if (left.length === 0) delete n.params[k];
+				else n.params[k] = Array.isArray(v) ? left : left[0];
 			}
 		}
 		this.dirty = true;
@@ -122,7 +145,7 @@ export class Doc {
 		const n = this.node(id);
 		if (!n) return null;
 		const params = {};
-		for (const [k, v] of Object.entries(n.params)) if (!isWire(v)) params[k] = JSON.parse(JSON.stringify(v));
+		for (const [k, v] of Object.entries(n.params)) if (!isWired(v)) params[k] = JSON.parse(JSON.stringify(v));
 		const copy = { id: this.freshId(n.type), type: n.type, params, pos: [n.pos[0] + 30, n.pos[1] + 30] };
 		this.nodes.push(copy);
 		this.dirty = true;
@@ -137,21 +160,24 @@ export class Doc {
 		this.dirty = true;
 	}
 
-	disconnect(id, input) {
+	// Unwire an input, or with `src` ({ node, port }) only that one of its wires.
+	disconnect(id, input, src = null) {
 		const n = this.node(id);
-		if (n && isWire(n.params[input])) {
-			delete n.params[input];
-			this.dirty = true;
-		}
+		const ws = n ? wireList(n.params[input]) : [];
+		if (ws.length === 0) return;
+		const left = src ? ws.filter((w) => w.from !== `${src.node}.${src.port}`) : [];
+		if (left.length === ws.length) return;
+		if (left.length === 0) delete n.params[input];
+		else n.params[input] = left;
+		this.dirty = true;
 	}
 
 	// Every node `id` reads from, directly or not.
 	upstream(id, seen = new Set()) {
 		const n = this.node(id);
 		if (!n) return seen;
-		for (const v of Object.values(n.params)) {
-			if (!isWire(v)) continue;
-			const src = splitWire(v.from).node;
+		for (const w of Object.values(n.params).flatMap(wireList)) {
+			const src = splitWire(w.from).node;
 			if (seen.has(src)) continue;
 			seen.add(src);
 			this.upstream(src, seen);
@@ -216,7 +242,15 @@ export class Doc {
 		if (!accepts(into.type, out.type)) return `${b.id}.${input} takes ${into.type}, not ${out.type}`;
 		if (this.upstream(src).has(dst)) return 'that wire would make a loop';
 		const before = b.params[input];
-		b.params[input] = { from: `${src}.${port}` };
+		const w = { from: `${src}.${port}` };
+		// A many input gains the wire; any other has it replace what was there.
+		if (into.many) {
+			const ws = wireList(before);
+			if (ws.some((x) => x.from === w.from)) return null;
+			b.params[input] = [...ws, w];
+		} else {
+			b.params[input] = w;
+		}
 		// Checked with the wire in place, and every node downstream of it too:
 		// connecting a VAE can make an existing latent wire wrong.
 		for (const n of [b, ...this.nodes.filter((m) => this.upstream(m.id).has(dst))]) {
@@ -244,8 +278,8 @@ export class Doc {
 			trail.add(id);
 			let d = 0;
 			const n = this.node(id);
-			for (const v of Object.values(n?.params ?? {})) {
-				if (isWire(v)) d = Math.max(d, depthOf(splitWire(v.from).node, trail) + 1);
+			for (const w of Object.values(n?.params ?? {}).flatMap(wireList)) {
+				d = Math.max(d, depthOf(splitWire(w.from).node, trail) + 1);
 			}
 			depth.set(id, d);
 			return d;
