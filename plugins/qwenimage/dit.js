@@ -11,7 +11,7 @@
 //
 // Ported from diffusers' `transformer_qwenimage21.py`.
 
-import { llm, f32 } from '../lib/llm.js';
+import { llm, f32, NATIVE_TYPES } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
 import { submit, copy, breathe, uploadEach } from '../lib/gpu.js';
 
@@ -91,7 +91,9 @@ export class QwenImageDiT {
 	async load() {
 		const m = this.model, p = this.p;
 		const t0 = llm.now();
-		const up = (name) => m.upload(p + name, 'auto');
+		// Q8_0 and FP8 go up as they are; a type the matmuls can't read (a bf16
+		// or f16 safetensors) is requantised to Q8_0, as f32 would not fit.
+		const up = (name) => m.upload(p + name, NATIVE_TYPES.has(m.type(p + name)) ? 'raw' : 'q8');
 		const f = (name) => m.upload(p + name, 'f32');
 		this.blocks = [];
 		for (let l = 0; l < this.nLayers; l++) {
@@ -183,8 +185,9 @@ export class QwenImageDiT {
 	// `slots` ([{ at, h, w }], in order) the text positions each reference
 	// image's tokens go in at. `refs` are those images' latents [C, h, w]. Returns
 	// the per-block caches and the rope for the target, which must follow
-	// `prepare`.
-	async encodePrefix(cond, refs = []) {
+	// `prepare`. `reserve` leaves that many rows free after the prompt's in each
+	// cache, for `encodeTail` to park a second prompt's own rows in.
+	async encodePrefix(cond, refs = [], reserve = 0) {
 		const D = this.dim, g = this.g;
 		const slots = cond.slots ?? [];
 		if (slots.length !== refs.length) throw new Error(`the prompt has ${slots.length} image slots; ${refs.length} reference latents came`);
@@ -198,8 +201,10 @@ export class QwenImageDiT {
 			segments.push({ kind: 'image', h: refs[i].h, w: refs[i].w, ref: i });
 			text = s.at;
 		});
+		const lead = segments.slice();
 		if (cond.n > text) segments.push({ kind: 'text', n: cond.n - text, from: text });
 		const P = segments.reduce((sum, s) => sum + (s.kind === 'text' ? s.n : s.h * s.w), 0);
+		const stride = P + reserve;
 		const rope = ropeTable([...segments, { kind: 'image', h: this.latentH, w: this.latentW }]);
 
 		// Each row's key limit: a text row sees up to itself, an image row its block.
@@ -251,24 +256,34 @@ export class QwenImageDiT {
 
 		const mod0 = f32(4 * D);
 		this.modulation(0, mod0);
+		// With rows reserved, each block runs into a packed buffer and is moved
+		// into its cache's rows after.
+		const packed = reserve > 0 ? { k: f32(P * D), v: f32(P * D) } : null;
 		const caches = [];
 		for (let l = 0; l < this.nLayers; l++) {
-			const kv = { k: f32(P * D), v: f32(P * D) };
+			const kv = { k: f32(stride * D), v: f32(stride * D) };
 			caches.push(kv);
+			const out = packed ?? kv;
 			// The last block's own output is never read: only its keys and values.
 			const attend = l < this.nLayers - 1
-				? (q, out) => op.flashAttentionSplit(q, null, null, kv.k, kv.v, out, this.heads, P, 0, P, limitBuf)
+				? (q, o) => op.flashAttentionSplit(q, null, null, out.k, out.v, o, this.heads, P, 0, P, limitBuf)
 				: null;
-			this.block(this.blocks[l], sc, hidden, P, mod0, cos, sin, kv, attend);
+			this.block(this.blocks[l], sc, hidden, P, mod0, cos, sin, out, attend);
+			if (packed) this.park(packed, kv, P, stride, 0);
 			await breathe(true);
 		}
 		submit();
 		for (const t of [hidden, limitBuf, cos, sin, mod0]) t.dispose();
+		if (packed) disposeAll(packed);
 		disposeAll(sc);
 		llm.print(`  prefix: ${P} tokens (${segments.length} segments) through ${this.nLayers} blocks in ${llm.since(t0)}`);
 		return {
 			length: P,
 			caches,
+			layout: { stride, skipAt: P, skipLen: 0 },
+			// What `encodeTail` needs: the rows before the last text run, and
+			// where it starts among the prompt's text rows.
+			lead, shared: P - (cond.n - text), slots, reserve,
 			cos: upload(rope.cos.subarray(P * 64)),
 			sin: upload(rope.sin.subarray(P * 64)),
 			dispose() {
@@ -279,6 +294,84 @@ export class QwenImageDiT {
 		};
 	}
 
+	// Packed [heads, rows, headDim] keys and values into rows `at` .. of a
+	// cache whose heads are `stride` rows apart.
+	park(packed, cache, rows, stride, at) {
+		const hd = this.headDim;
+		op.copyRows(packed.k, cache.k, this.heads, rows * hd, stride * hd, at * hd);
+		op.copyRows(packed.v, cache.v, this.heads, rows * hd, stride * hd, at * hd);
+	}
+
+	// A second prompt that agrees with `base`'s up to the end of its last
+	// reference image - the same images and the text before them, so the same
+	// rows there - and differs only in the text after (the empty prompt CFG runs
+	// against). Only that text goes through the blocks; its keys and values go
+	// into the rows `base` reserved, and the result reads `base`'s shared rows
+	// and then those. Disposing it leaves `base`'s caches alone.
+	async encodeTail(base, cond) {
+		const D = this.dim, g = this.g;
+		const slots = cond.slots ?? [];
+		const same = slots.length === base.slots.length
+			&& slots.every((s, i) => s.at === base.slots[i].at && s.h === base.slots[i].h && s.w === base.slots[i].w);
+		if (!same) throw new Error('encodeTail needs a prompt with the same images in the same places');
+		const from = slots.length ? slots[slots.length - 1].at : 0;
+		const n = cond.n - from;
+		if (n > base.reserve) throw new Error(`the second prompt's ${n} tail rows do not fit the ${base.reserve} reserved`);
+		const M = base.shared, stride = base.layout.stride;
+		const segments = n > 0 ? [...base.lead, { kind: 'text', n, from }] : base.lead;
+		const rope = ropeTable([...segments, { kind: 'image', h: this.latentH, w: this.latentW }]);
+		const result = {
+			length: M + n,
+			caches: base.caches,
+			layout: { stride, skipAt: M, skipLen: base.length - M },
+			cos: upload(rope.cos.subarray((M + n) * 64)),
+			sin: upload(rope.sin.subarray((M + n) * 64)),
+			dispose() {
+				this.cos.dispose();
+				this.sin.dispose();
+			},
+		};
+		if (n === 0) return result;
+
+		const t0 = llm.now();
+		const limits = new Uint32Array(n);
+		for (let i = 0; i < n; i++) limits[i] = M + i + 1;
+		const hidden = f32(n * D);
+		const sc = this.scratch(Math.max(n, cond.n));
+		const limitBuf = f32(n);
+		limitBuf.buffer.write(limits);
+		const cos = upload(rope.cos.subarray(M * 64, (M + n) * 64)), sin = upload(rope.sin.subarray(M * 64, (M + n) * 64));
+		const tn = f32(cond.n * this.textDim);
+		const tt = f32(cond.n * D);
+		op.rmsNorm(cond.tensor, g.textNorm, tn, this.textDim, cond.n, EPS);
+		op.matmul(g.textIn, tn, tt, D, this.textDim, cond.n);
+		op.gelu(tt, cond.n * D);
+		op.matmul(g.textOut, tt, sc.bufA, D, D, cond.n);
+		copy(sc.bufA, hidden, n * D * 4, from * D * 4, 0);
+		submit();
+		tn.dispose();
+		tt.dispose();
+
+		const mod0 = f32(4 * D);
+		this.modulation(0, mod0);
+		const packed = { k: f32(n * D), v: f32(n * D) };
+		for (let l = 0; l < this.nLayers; l++) {
+			const cache = base.caches[l];
+			const attend = l < this.nLayers - 1
+				? (q, o) => op.flashAttentionSplit(q, cache.k, cache.v, packed.k, packed.v, o, this.heads, n, M, n, limitBuf, { stride, skipAt: M, skipLen: 0 })
+				: null;
+			this.block(this.blocks[l], sc, hidden, n, mod0, cos, sin, packed, attend);
+			this.park(packed, cache, n, stride, base.length);
+			await breathe(true);
+		}
+		submit();
+		for (const t of [hidden, limitBuf, cos, sin, mod0]) t.dispose();
+		disposeAll(packed);
+		disposeAll(sc);
+		llm.print(`  prefix tail: ${n} tokens after ${M} shared through ${this.nLayers} blocks in ${llm.since(t0)}`);
+		return result;
+	}
+
 	// The velocity for the latent in this.a.latent at `sigma`, into this.a.velocity.
 	async forward(prefix, sigma) {
 		const a = this.a, g = this.g, D = this.dim, T = this.tokens, C = this.channels;
@@ -287,7 +380,7 @@ export class QwenImageDiT {
 		this.modulation(sigma, a.mod, a.finalScale);
 		for (let l = 0; l < this.nLayers; l++) {
 			const cache = prefix.caches[l];
-			const attend = (q, out) => op.flashAttentionSplit(q, cache.k, cache.v, a.kT, a.vT, out, this.heads, T, prefix.length, T);
+			const attend = (q, out) => op.flashAttentionSplit(q, cache.k, cache.v, a.kT, a.vT, out, this.heads, T, prefix.length, T, null, prefix.layout);
 			this.block(this.blocks[l], this.s, a.hidden, T, a.mod, prefix.cos, prefix.sin, { k: a.kT, v: a.vT }, attend);
 			await breathe(true);
 		}

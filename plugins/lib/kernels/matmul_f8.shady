@@ -1,0 +1,107 @@
+// y[seq, out_dim] = x[seq, in_dim] @ W[row_offset .. row_offset + out_dim, :]^T,
+// W in FP8 E4M3 (a safetensors F8_E4M3 weight as it is in the file, a byte per
+// element, no scale).
+//
+// matmul_q8's tiling - a 64x64 output tile per workgroup, a 4x4 patch per
+// thread, K in steps of 32 - with the weight decoded on its way into shared
+// memory, exactly, by placing its bits in a float's.
+// Dispatch: ceil(seq/64) * ceil(out_dim/64).
+uint8 w[];
+float x[];
+float y[];
+struct Push @pushconstant { uint out_dim; uint in_dim; uint seq_len; uint row_offset; }
+Push pc;
+shared float4 As[544];      // [32 k][16 m4 + 1]
+shared float4 Bs[544];      // [32 k][16 n4 + 1]
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+
+fn float a_at(uint gm, uint col)
+{
+    return gm < pc.seq_len ? x[gm * pc.in_dim + col] : 0.0;
+}
+
+// An E4M3 byte as a float: exponent and mantissa moved into a float's bits,
+// the exponent rebiased (7 to 127); a subnormal (exponent 0) is its mantissa
+// times 2^-9. Selects, not branches.
+fn float f8(uint b)
+{
+    uint mag = b & 127u;
+    float v = mag >= 8u ? asfloat((mag << 20u) + 0x3C000000u) : float(mag) * 0.001953125;
+    return (b & 128u) != 0u ? -v : v;
+}
+
+fn float b_at(uint gn, uint byte)
+{
+    return gn < pc.row_offset + pc.out_dim ? f8(uint(w[byte])) : 0.0;
+}
+
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint gi = input.lid.x;
+    uint tiles_n = (pc.out_dim + 63u) / 64u;
+    uint tile_m = input.gid.x / tiles_n;
+    uint tile_n = input.gid.x % tiles_n;
+    uint pos_base = tile_m * 64u;
+    uint row_base = pc.row_offset + tile_n * 64u;
+    uint row_upper = pc.row_offset + pc.out_dim;
+    uint tm = gi / 16u;
+    uint tn = gi % 16u;
+
+    float4 c0 = float4(0.0);
+    float4 c1 = float4(0.0);
+    float4 c2 = float4(0.0);
+    float4 c3 = float4(0.0);
+
+    uint blocks = pc.in_dim / 32u;
+
+    for (uint t = 0u; t < blocks; t++) {
+        uint k_base = t * 32u;
+        // A: each thread fills two float4s, four rows at one k. Lanes run along
+        // k, so each of the four row reads is one coalesced stretch.
+        for (uint i = 0u; i < 2u; i++) {
+            uint flat = gi + i * 256u;
+            uint k = flat & 31u;
+            uint m4 = flat >> 5u;
+            uint gm = pos_base + m4 * 4u;
+            uint col = k_base + k;
+            As[k * 17u + m4] = float4(a_at(gm, col), a_at(gm + 1u, col), a_at(gm + 2u, col), a_at(gm + 3u, col));
+        }
+        barrier;
+        for (uint i = 0u; i < 2u; i++) {
+            uint flat = gi + i * 256u;
+            uint k = flat & 31u;
+            uint n4 = flat >> 5u;
+            uint gn = row_base + n4 * 4u;
+            uint byte = gn * pc.in_dim + k_base + k;
+            Bs[k * 17u + n4] = float4(b_at(gn, byte), b_at(gn + 1u, byte + pc.in_dim),
+                b_at(gn + 2u, byte + 2u * pc.in_dim), b_at(gn + 3u, byte + 3u * pc.in_dim));
+        }
+        barrier;
+
+        for (uint k = 0u; k < 32u; k++) {
+            float4 a = As[k * 17u + tm];
+            float4 b = Bs[k * 17u + tn];
+            c0 += a.x * b;
+            c1 += a.y * b;
+            c2 += a.z * b;
+            c3 += a.w * b;
+        }
+        barrier;
+    }
+
+    uint col0 = tile_n * 64u + tn * 4u;
+    store4(pos_base + tm * 4u, col0, c0);
+    store4(pos_base + tm * 4u + 1u, col0, c1);
+    store4(pos_base + tm * 4u + 2u, col0, c2);
+    store4(pos_base + tm * 4u + 3u, col0, c3);
+}
+
+fn void store4(uint gm, uint col0, float4 v)
+{
+    if (gm >= pc.seq_len) return;
+    uint base = gm * pc.out_dim + col0;
+    if (col0 < pc.out_dim) y[base] = v.x;
+    if (col0 + 1u < pc.out_dim) y[base + 1u] = v.y;
+    if (col0 + 2u < pc.out_dim) y[base + 2u] = v.z;
+    if (col0 + 3u < pc.out_dim) y[base + 3u] = v.w;
+}

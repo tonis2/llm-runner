@@ -120,11 +120,32 @@ async function encodeWithImages(encoder, prompt, vision, images, resolution, t0)
 	}
 }
 
+async function encodePrompt(encoder, prompt, vision, images, resolution) {
+	const t0 = llm.now();
+	if (images.length > 0) return encodeWithImages(encoder, prompt, vision, images, resolution, t0);
+	const enc = new TextEncoder(encoder.path);
+	try {
+		const tokens = enc.tokenizer.encode(template(prompt), true);
+		const drop = enc.tokenizer.encode(SYSTEM, true).length;
+		const all = await enc.encodeLayers(tokens, [enc.config.nLayers - 1]);
+		const dim = enc.config.dim;
+		const n = tokens.length - drop;
+		const out = f32(n * dim);
+		copy(all, out, n * dim * 4, drop * dim * 4);
+		submit();
+		all.dispose();
+		llm.print(`  [phase] text_encode: ${n} tokens in ${llm.since(t0)}`);
+		return conditioning(out, n, dim);
+	} finally {
+		enc.close();
+	}
+}
+
 defineNodes('qwenimage', {
 	'qwenimage.load': {
 		title: 'Qwen-Image DiT',
 		category: 'loaders',
-		description: 'A Qwen-Image 2.1 GGUF, with any LoRAs folded in: wire in as many LoRA nodes (or chains of them) as you like, applied in the order they are wired. `merge_lora` off keeps them unmerged: exact, about 6% slower a step.',
+		description: 'A Qwen-Image 2.1 GGUF or safetensors (fp8 weights run as they are, bf16/f16 are requantised to Q8_0), with any LoRAs folded in: wire in as many LoRA nodes (or chains of them) as you like, applied in the order they are wired. `merge_lora` off keeps them unmerged: exact, about 6% slower a step.',
 		inputs: { path: 'PATH(dit)', lora: 'LORA+?', merge_lora: 'BOOL=true' },
 		outputs: { model: 'MODEL' },
 		async run({ path, lora, merge_lora }) {
@@ -161,32 +182,26 @@ defineNodes('qwenimage', {
 		},
 		outputs: { cond: 'CONDITIONING' },
 		async run({ encoder, prompt, vision, image1, image2, image3, resolution }) {
-			const t0 = llm.now();
 			const images = [image1, image2, image3].filter(Boolean);
-			if (images.length > 0) return { cond: await encodeWithImages(encoder, prompt, vision, images, resolution, t0) };
-			const enc = new TextEncoder(encoder.path);
-			try {
-				const tokens = enc.tokenizer.encode(template(prompt), true);
-				const drop = enc.tokenizer.encode(SYSTEM, true).length;
-				const all = await enc.encodeLayers(tokens, [enc.config.nLayers - 1]);
-				const dim = enc.config.dim;
-				const n = tokens.length - drop;
-				const out = f32(n * dim);
-				copy(all, out, n * dim * 4, drop * dim * 4);
-				submit();
-				all.dispose();
-				llm.print(`  [phase] text_encode: ${n} tokens in ${llm.since(t0)}`);
-				return { cond: conditioning(out, n, dim) };
-			} finally {
-				enc.close();
-			}
+			const cond = await encodePrompt(encoder, prompt, vision, images, resolution);
+			// The empty prompt with the same images, for a sampler running CFG
+			// with no negative wired in: encoded the first time one asks, and
+			// kept with this prompt for the next run.
+			let negative = null;
+			cond.negative = async () => (negative ??= await encodePrompt(encoder, '', vision, images, resolution));
+			const dispose = cond.dispose;
+			cond.dispose = () => {
+				dispose();
+				if (negative) negative.dispose();
+			};
+			return { cond };
 		},
 	},
 
 	'qwenimage.sample': {
 		title: 'Qwen-Image sampler',
 		category: 'sampling',
-		description: 'Flow-matching Euler steps (40 is what Qwen recommends), with true CFG when cfg > 1 and a negative prompt. With a latent it is img2img. A prompt with images needs the VAE to encode them; a width or height of 0 then takes the last image\'s.',
+		description: 'Flow-matching Euler steps (40 is what Qwen recommends), with true CFG when cfg > 1 (against the empty prompt when no negative is wired in). With a latent it is img2img. A prompt with images needs the VAE to encode them; a width or height of 0 then takes the last image\'s.',
 		inputs: {
 			positive: 'CONDITIONING',
 			negative: 'CONDITIONING?',
@@ -208,7 +223,12 @@ defineNodes('qwenimage', {
 			if (model.family !== 'qwenimage') throw new Error(`qwenimage.sample needs a Qwen-Image DiT, not ${model.family}`);
 			if (init && init.format !== 'qwen') throw new Error(`qwenimage.sample starts from qwen latents; this one is ${init.format}`);
 			const useCfg = cfg > 1;
-			if (useCfg && !negative) throw new Error('cfg > 1 needs a negative prompt wired in');
+			// With no negative wired in, CFG runs against the empty prompt. With
+			// images it carries the same ones, so the two agree up to the end of
+			// the last image and share those rows of the DiT's caches - two full
+			// prefixes of reference tokens do not fit beside the DiT.
+			const shared = useCfg && !negative && positive.images.length > 0;
+			if (useCfg && !negative) negative = await positive.negative();
 			const refsOf = async (c) => {
 				if (!c || c.images.length === 0) return [];
 				if (!vae || vae.format !== 'qwen') throw new Error('a prompt with images needs the Qwen-Image VAE wired into `vae`');
@@ -218,7 +238,7 @@ defineNodes('qwenimage', {
 			};
 			const t0 = llm.now();
 			const condRefs = await refsOf(positive);
-			const uncondRefs = useCfg ? await refsOf(negative) : [];
+			const uncondRefs = useCfg && !shared ? await refsOf(negative) : [];
 			if (condRefs.length + uncondRefs.length > 0) llm.print(`  [phase] reference_encode: ${llm.since(t0)}`);
 			const last = condRefs[condRefs.length - 1];
 			if (last) {
@@ -236,8 +256,14 @@ defineNodes('qwenimage', {
 			dit.prepare(latentH, latentW);
 			let cond = null, uncond = null;
 			try {
-				cond = await dit.encodePrefix(positive, condRefs);
-				uncond = useCfg ? await dit.encodePrefix(negative, uncondRefs) : null;
+				if (shared) {
+					const tail = negative.n - negative.slots[negative.slots.length - 1].at;
+					cond = await dit.encodePrefix(positive, condRefs, tail);
+					uncond = await dit.encodeTail(cond, negative);
+				} else {
+					cond = await dit.encodePrefix(positive, condRefs);
+					uncond = useCfg ? await dit.encodePrefix(negative, uncondRefs) : null;
+				}
 				llm.print(`  [phase] dit_setup: ${llm.since(t1)}`);
 
 				const t2 = llm.now();
@@ -281,7 +307,8 @@ defineNodes('qwenimage', {
 				llm.print(`  [phase] denoise: ${llm.since(t2)}`);
 				return { latent: makeLatent('qwen', out, latentH, latentW) };
 			} finally {
-				for (const p of [cond, uncond]) if (p) p.dispose();
+				// uncond first: a shared one only frees its own rope.
+				for (const p of [uncond, cond]) if (p) p.dispose();
 				dit.release();
 			}
 		},

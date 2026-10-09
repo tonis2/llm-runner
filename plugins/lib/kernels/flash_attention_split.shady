@@ -9,6 +9,11 @@
 // its whole block). Limits must not fall along the rows. Without it every row
 // sees all l1 + l2 keys.
 //
+// The prefix need not be packed: its rows are `stride1` apart a head (>= l1),
+// and keys from `skip_at` on are read `skip_len` rows further in - so a second
+// prompt sharing the first's leading rows reads those, then its own tail parked
+// after the first's (stride1 = l1, skip_at = l1, skip_len = 0 is a packed one).
+//
 // FA2 tiles, float16 operands, float32 accumulators, lazy rescaling. Q, K and
 // V must be inside +-65504.
 //
@@ -29,7 +34,7 @@ float4 k2[];
 float4 v2[];
 uint limits[];
 float output[];
-struct Push @pushconstant { uint n_heads; uint q_len; uint l1; uint l2; float scale; uint use_limit; }
+struct Push @pushconstant { uint n_heads; uint q_len; uint l1; uint l2; float scale; uint use_limit; uint stride1; uint skip_at; uint skip_len; }
 Push pc;
 shared half kv[16384];      // K [32 keys][136] at 0, Vt [128 d][36] at 4352; Q [128][128] before the loop
 shared float sw[4352];      // per subgroup 544: S column-major [32 keys][17], or O staging [16][32]
@@ -49,7 +54,9 @@ fn float4 fetch(bool value, uint head, uint j, uint d4)
 {
     uint l1 = pc.l1;
     uint l2 = pc.l2;
-    uint i1 = (head * l1 + min(j, max(l1, 1u) - 1u)) * 32u + d4;
+    uint s1 = pc.stride1;
+    uint j1 = j < pc.skip_at ? j : j + pc.skip_len;
+    uint i1 = (head * s1 + min(j1, max(s1, 1u) - 1u)) * 32u + d4;
     uint i2 = (head * l2 + min(j - min(j, l1), l2 - 1u)) * 32u + d4;
     float4 a = value ? v1[i1] : k1[i1];
     float4 b = value ? v2[i2] : k2[i2];

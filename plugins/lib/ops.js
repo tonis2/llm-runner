@@ -22,7 +22,7 @@ export function matrixCoresOn() { return matrixCores; }
 
 // y[seq, out] = x[seq, in] @ W[rowOffset .. rowOffset + out, :]^T
 //
-// `exact` keeps a Q8_0 matmul in float32 when the matrix cores are on: their
+// `exact` keeps a Q8_0 or FP8 matmul in float32 when the matrix cores are on: their
 // operands are float16, so an x that can pass 65504 (the input of a SwiGLU
 // down-projection in a model with large activations) has to take the slow path.
 //
@@ -39,6 +39,13 @@ export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = fa
 				dispatch('matmul_q8_coop', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
 			} else {
 				dispatch('matmul_q8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
+			}
+			break;
+		case GGML.F8_E4M3:
+			if (matrixCores && !exact && seq >= 16) {
+				dispatch('matmul_f8_coop', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
+			} else {
+				dispatch('matmul_f8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
 			}
 			break;
 		case GGML.F32:
@@ -169,10 +176,14 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 // Q [heads, qLen, 128] over the keys of a cached prefix (k1, v1: [heads, l1,
 // 128]) followed by the current ones (k2, v2: [heads, l2, 128]); out [qLen,
 // heads * 128]. `limits` (a buffer of uints, one a query row, not falling)
-// caps the keys each row sees - a block-causal mask.
-export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2, limits = null) {
+// caps the keys each row sees - a block-causal mask. A prefix that is not
+// packed gives `layout` { stride, skipAt, skipLen }: its rows `stride` apart a
+// head, and keys from `skipAt` on read `skipLen` rows further in.
+export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2, limits = null, layout = null) {
 	const bindings = [q, l1 > 0 ? k1 : k2, l1 > 0 ? v1 : v2, k2, v2, limits ?? q, out];
-	dispatch('flash_attention_split', bindings, [groups(qLen, 128), heads], pc('uuuufu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0));
+	const { stride = l1, skipAt = l1, skipLen = 0 } = layout ?? {};
+	dispatch('flash_attention_split', bindings, [groups(qLen, 128), heads],
+		pc('uuuufuuuu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0, stride, skipAt, skipLen));
 }
 // GQA over a whole prompt, Q [n, qHeads * hd], K/V [n, kvHeads * hd];
 // `causal` false lets every token see every other (an LLM2Vec encoder).

@@ -56,45 +56,48 @@ const char[*] BUNDLED_50 = $embed("../../plugins/lib/kernels/layernorm_affine.sh
 const char[*] BUNDLED_51 = $embed("../../plugins/lib/kernels/linear_bias.shady");
 const char[*] BUNDLED_52 = $embed("../../plugins/lib/kernels/lokr_merge_q8.shady");
 const char[*] BUNDLED_53 = $embed("../../plugins/lib/kernels/lora_merge_q8.shady");
-const char[*] BUNDLED_54 = $embed("../../plugins/lib/kernels/matmul_f32.shady");
-const char[*] BUNDLED_55 = $embed("../../plugins/lib/kernels/matmul_f32_rows.shady");
-const char[*] BUNDLED_56 = $embed("../../plugins/lib/kernels/matmul_q8.shady");
-const char[*] BUNDLED_57 = $embed("../../plugins/lib/kernels/matmul_q8_coop.shady");
-const char[*] BUNDLED_58 = $embed("../../plugins/lib/kernels/merge_2x2.shady");
-const char[*] BUNDLED_59 = $embed("../../plugins/lib/kernels/mrope.shady");
-const char[*] BUNDLED_60 = $embed("../../plugins/lib/kernels/pad_heads.shady");
-const char[*] BUNDLED_61 = $embed("../../plugins/lib/kernels/patchify.shady");
-const char[*] BUNDLED_62 = $embed("../../plugins/lib/kernels/relu.shady");
-const char[*] BUNDLED_63 = $embed("../../plugins/lib/kernels/residual_add.shady");
-const char[*] BUNDLED_64 = $embed("../../plugins/lib/kernels/rmsnorm_batch.shady");
-const char[*] BUNDLED_65 = $embed("../../plugins/lib/kernels/rope_neox.shady");
-const char[*] BUNDLED_66 = $embed("../../plugins/lib/kernels/scale.shady");
-const char[*] BUNDLED_67 = $embed("../../plugins/lib/kernels/scale_modulate.shady");
-const char[*] BUNDLED_68 = $embed("../../plugins/lib/kernels/scale_shift_clamp.shady");
-const char[*] BUNDLED_69 = $embed("../../plugins/lib/kernels/silu.shady");
-const char[*] BUNDLED_70 = $embed("../../plugins/lib/kernels/silu_mul.shady");
-const char[*] BUNDLED_71 = $embed("../../plugins/lib/kernels/tanh_clamp.shady");
-const char[*] BUNDLED_72 = $embed("../../plugins/lib/kernels/timestep_embed.shady");
-const char[*] BUNDLED_73 = $embed("../../plugins/lib/kernels/transpose_channel_spatial.shady");
-const char[*] BUNDLED_74 = $embed("../../plugins/lib/kernels/transpose_heads.shady");
-const char[*] BUNDLED_75 = $embed("../../plugins/lib/kernels/unpatchify.shady");
-const char[*] BUNDLED_76 = $embed("../../plugins/lib/kernels/upsample_nearest.shady");
-const char[*] BUNDLED_77 = $embed("../../plugins/lib/kernels/vae_attention.shady");
-const char[*] BUNDLED_78 = $embed("../../plugins/lib/latents.js");
-const char[*] BUNDLED_79 = $embed("../../plugins/lib/llm.js");
-const char[*] BUNDLED_80 = $embed("../../plugins/lib/lora.js");
-const char[*] BUNDLED_81 = $embed("../../plugins/lib/ops.js");
-const char[*] BUNDLED_82 = $embed("../../plugins/lib/qwen3.js");
-const char[*] BUNDLED_83 = $embed("../../plugins/lib/qwen3_vision.js");
-const char[*] BUNDLED_84 = $embed("../../plugins/lib/qwen_vae.js");
-const char[*] BUNDLED_85 = $embed("../../plugins/lib/t5.js");
-const char[*] BUNDLED_86 = $embed("../../plugins/lib/taesd.js");
+const char[*] BUNDLED_54 = $embed("../../plugins/lib/kernels/lora_up_add.shady");
+const char[*] BUNDLED_55 = $embed("../../plugins/lib/kernels/matmul_f32.shady");
+const char[*] BUNDLED_56 = $embed("../../plugins/lib/kernels/matmul_f32_rows.shady");
+const char[*] BUNDLED_57 = $embed("../../plugins/lib/kernels/matmul_f8.shady");
+const char[*] BUNDLED_58 = $embed("../../plugins/lib/kernels/matmul_f8_coop.shady");
+const char[*] BUNDLED_59 = $embed("../../plugins/lib/kernels/matmul_q8.shady");
+const char[*] BUNDLED_60 = $embed("../../plugins/lib/kernels/matmul_q8_coop.shady");
+const char[*] BUNDLED_61 = $embed("../../plugins/lib/kernels/merge_2x2.shady");
+const char[*] BUNDLED_62 = $embed("../../plugins/lib/kernels/mrope.shady");
+const char[*] BUNDLED_63 = $embed("../../plugins/lib/kernels/pad_heads.shady");
+const char[*] BUNDLED_64 = $embed("../../plugins/lib/kernels/patchify.shady");
+const char[*] BUNDLED_65 = $embed("../../plugins/lib/kernels/relu.shady");
+const char[*] BUNDLED_66 = $embed("../../plugins/lib/kernels/residual_add.shady");
+const char[*] BUNDLED_67 = $embed("../../plugins/lib/kernels/rmsnorm_batch.shady");
+const char[*] BUNDLED_68 = $embed("../../plugins/lib/kernels/rope_neox.shady");
+const char[*] BUNDLED_69 = $embed("../../plugins/lib/kernels/scale.shady");
+const char[*] BUNDLED_70 = $embed("../../plugins/lib/kernels/scale_modulate.shady");
+const char[*] BUNDLED_71 = $embed("../../plugins/lib/kernels/scale_shift_clamp.shady");
+const char[*] BUNDLED_72 = $embed("../../plugins/lib/kernels/silu.shady");
+const char[*] BUNDLED_73 = $embed("../../plugins/lib/kernels/silu_mul.shady");
+const char[*] BUNDLED_74 = $embed("../../plugins/lib/kernels/tanh_clamp.shady");
+const char[*] BUNDLED_75 = $embed("../../plugins/lib/kernels/timestep_embed.shady");
+const char[*] BUNDLED_76 = $embed("../../plugins/lib/kernels/transpose_channel_spatial.shady");
+const char[*] BUNDLED_77 = $embed("../../plugins/lib/kernels/transpose_heads.shady");
+const char[*] BUNDLED_78 = $embed("../../plugins/lib/kernels/unpatchify.shady");
+const char[*] BUNDLED_79 = $embed("../../plugins/lib/kernels/upsample_nearest.shady");
+const char[*] BUNDLED_80 = $embed("../../plugins/lib/kernels/vae_attention.shady");
+const char[*] BUNDLED_81 = $embed("../../plugins/lib/latents.js");
+const char[*] BUNDLED_82 = $embed("../../plugins/lib/llm.js");
+const char[*] BUNDLED_83 = $embed("../../plugins/lib/lora.js");
+const char[*] BUNDLED_84 = $embed("../../plugins/lib/ops.js");
+const char[*] BUNDLED_85 = $embed("../../plugins/lib/qwen3.js");
+const char[*] BUNDLED_86 = $embed("../../plugins/lib/qwen3_vision.js");
+const char[*] BUNDLED_87 = $embed("../../plugins/lib/qwen_vae.js");
+const char[*] BUNDLED_88 = $embed("../../plugins/lib/t5.js");
+const char[*] BUNDLED_89 = $embed("../../plugins/lib/taesd.js");
 
 const String[1] BUNDLED_PLUGINS = { "kimodo" };
 
 fn BundledFile[] bundled_files()
 {
-	static BundledFile[87] files;
+	static BundledFile[90] files;
 	files = {
 		{ "kimodo/NOTICE.txt", (char[])BUNDLED_0[..] },
 		{ "kimodo/NVIDIA-LICENSE.txt", (char[])BUNDLED_1[..] },
@@ -150,39 +153,42 @@ fn BundledFile[] bundled_files()
 		{ "lib/kernels/linear_bias.shady", (char[])BUNDLED_51[..] },
 		{ "lib/kernels/lokr_merge_q8.shady", (char[])BUNDLED_52[..] },
 		{ "lib/kernels/lora_merge_q8.shady", (char[])BUNDLED_53[..] },
-		{ "lib/kernels/matmul_f32.shady", (char[])BUNDLED_54[..] },
-		{ "lib/kernels/matmul_f32_rows.shady", (char[])BUNDLED_55[..] },
-		{ "lib/kernels/matmul_q8.shady", (char[])BUNDLED_56[..] },
-		{ "lib/kernels/matmul_q8_coop.shady", (char[])BUNDLED_57[..] },
-		{ "lib/kernels/merge_2x2.shady", (char[])BUNDLED_58[..] },
-		{ "lib/kernels/mrope.shady", (char[])BUNDLED_59[..] },
-		{ "lib/kernels/pad_heads.shady", (char[])BUNDLED_60[..] },
-		{ "lib/kernels/patchify.shady", (char[])BUNDLED_61[..] },
-		{ "lib/kernels/relu.shady", (char[])BUNDLED_62[..] },
-		{ "lib/kernels/residual_add.shady", (char[])BUNDLED_63[..] },
-		{ "lib/kernels/rmsnorm_batch.shady", (char[])BUNDLED_64[..] },
-		{ "lib/kernels/rope_neox.shady", (char[])BUNDLED_65[..] },
-		{ "lib/kernels/scale.shady", (char[])BUNDLED_66[..] },
-		{ "lib/kernels/scale_modulate.shady", (char[])BUNDLED_67[..] },
-		{ "lib/kernels/scale_shift_clamp.shady", (char[])BUNDLED_68[..] },
-		{ "lib/kernels/silu.shady", (char[])BUNDLED_69[..] },
-		{ "lib/kernels/silu_mul.shady", (char[])BUNDLED_70[..] },
-		{ "lib/kernels/tanh_clamp.shady", (char[])BUNDLED_71[..] },
-		{ "lib/kernels/timestep_embed.shady", (char[])BUNDLED_72[..] },
-		{ "lib/kernels/transpose_channel_spatial.shady", (char[])BUNDLED_73[..] },
-		{ "lib/kernels/transpose_heads.shady", (char[])BUNDLED_74[..] },
-		{ "lib/kernels/unpatchify.shady", (char[])BUNDLED_75[..] },
-		{ "lib/kernels/upsample_nearest.shady", (char[])BUNDLED_76[..] },
-		{ "lib/kernels/vae_attention.shady", (char[])BUNDLED_77[..] },
-		{ "lib/latents.js", (char[])BUNDLED_78[..] },
-		{ "lib/llm.js", (char[])BUNDLED_79[..] },
-		{ "lib/lora.js", (char[])BUNDLED_80[..] },
-		{ "lib/ops.js", (char[])BUNDLED_81[..] },
-		{ "lib/qwen3.js", (char[])BUNDLED_82[..] },
-		{ "lib/qwen3_vision.js", (char[])BUNDLED_83[..] },
-		{ "lib/qwen_vae.js", (char[])BUNDLED_84[..] },
-		{ "lib/t5.js", (char[])BUNDLED_85[..] },
-		{ "lib/taesd.js", (char[])BUNDLED_86[..] },
+		{ "lib/kernels/lora_up_add.shady", (char[])BUNDLED_54[..] },
+		{ "lib/kernels/matmul_f32.shady", (char[])BUNDLED_55[..] },
+		{ "lib/kernels/matmul_f32_rows.shady", (char[])BUNDLED_56[..] },
+		{ "lib/kernels/matmul_f8.shady", (char[])BUNDLED_57[..] },
+		{ "lib/kernels/matmul_f8_coop.shady", (char[])BUNDLED_58[..] },
+		{ "lib/kernels/matmul_q8.shady", (char[])BUNDLED_59[..] },
+		{ "lib/kernels/matmul_q8_coop.shady", (char[])BUNDLED_60[..] },
+		{ "lib/kernels/merge_2x2.shady", (char[])BUNDLED_61[..] },
+		{ "lib/kernels/mrope.shady", (char[])BUNDLED_62[..] },
+		{ "lib/kernels/pad_heads.shady", (char[])BUNDLED_63[..] },
+		{ "lib/kernels/patchify.shady", (char[])BUNDLED_64[..] },
+		{ "lib/kernels/relu.shady", (char[])BUNDLED_65[..] },
+		{ "lib/kernels/residual_add.shady", (char[])BUNDLED_66[..] },
+		{ "lib/kernels/rmsnorm_batch.shady", (char[])BUNDLED_67[..] },
+		{ "lib/kernels/rope_neox.shady", (char[])BUNDLED_68[..] },
+		{ "lib/kernels/scale.shady", (char[])BUNDLED_69[..] },
+		{ "lib/kernels/scale_modulate.shady", (char[])BUNDLED_70[..] },
+		{ "lib/kernels/scale_shift_clamp.shady", (char[])BUNDLED_71[..] },
+		{ "lib/kernels/silu.shady", (char[])BUNDLED_72[..] },
+		{ "lib/kernels/silu_mul.shady", (char[])BUNDLED_73[..] },
+		{ "lib/kernels/tanh_clamp.shady", (char[])BUNDLED_74[..] },
+		{ "lib/kernels/timestep_embed.shady", (char[])BUNDLED_75[..] },
+		{ "lib/kernels/transpose_channel_spatial.shady", (char[])BUNDLED_76[..] },
+		{ "lib/kernels/transpose_heads.shady", (char[])BUNDLED_77[..] },
+		{ "lib/kernels/unpatchify.shady", (char[])BUNDLED_78[..] },
+		{ "lib/kernels/upsample_nearest.shady", (char[])BUNDLED_79[..] },
+		{ "lib/kernels/vae_attention.shady", (char[])BUNDLED_80[..] },
+		{ "lib/latents.js", (char[])BUNDLED_81[..] },
+		{ "lib/llm.js", (char[])BUNDLED_82[..] },
+		{ "lib/lora.js", (char[])BUNDLED_83[..] },
+		{ "lib/ops.js", (char[])BUNDLED_84[..] },
+		{ "lib/qwen3.js", (char[])BUNDLED_85[..] },
+		{ "lib/qwen3_vision.js", (char[])BUNDLED_86[..] },
+		{ "lib/qwen_vae.js", (char[])BUNDLED_87[..] },
+		{ "lib/t5.js", (char[])BUNDLED_88[..] },
+		{ "lib/taesd.js", (char[])BUNDLED_89[..] },
 	};
 	return files[..];
 }

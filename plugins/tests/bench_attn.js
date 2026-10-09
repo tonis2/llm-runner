@@ -43,7 +43,7 @@ for (const [heads, qLen, l1, l2] of shapes) {
 	for (let i = 0; i < qLen; i++) lims[i] = Math.min(l1 + l2, (Math.floor(i / 37) + 1) * 37 + 5);
 	lim.write(new Uint8Array(lims.buffer));
 	const y1 = C.f32(qLen * heads * 128), y2 = C.f32(qLen * heads * 128);
-	const push = pc('uuuufu', heads, qLen, l1, l2, 1 / Math.sqrt(128), cfg.limits ? 1 : 0);
+	const push = pc('uuuufuuuu', heads, qLen, l1, l2, 1 / Math.sqrt(128), cfg.limits ? 1 : 0, l1, l1, 0);
 	const grid = (name) => ({ workgroups: [Math.ceil(qLen / rows(name)), heads, 1], push });
 	kernel(ref).dispatch([q, ...(ref.endsWith('_h') ? h : f), lim, y1], grid(ref));
 	C.submit();

@@ -13,7 +13,9 @@
 // on the weight as `adapters` and `ops.matmul` adds x @ A^T @ B^T, exactly.
 // Weights that read one input (the model's `inputs()`, as lists of weights)
 // share one stacked A, so x @ A^T is one matmul for all of them.
-// LoKr always merges.
+// A site whose weight cannot take the Q8_0 merge (an FP8 weight, rows that are
+// not whole merge tiles) gets its LoRA attached unmerged the same way, rather
+// than dropped. LoKr always merges.
 //
 // A model describes where its sites are: `sites(scheme)` yields every
 // { module, weight, rowOffset } a naming scheme names, where `module` is the
@@ -86,7 +88,7 @@ function present(file, site, suffix) {
 
 function mergeLora(file, sites, strength, unmerged) {
 	const alpha = globalAlpha(file);
-	let merged = 0, skipped = 0;
+	let merged = 0, attached = 0;
 	for (const site of sites) {
 		let module = null, aName, bName;
 		for (const [a, b] of PAIRS) {
@@ -98,12 +100,12 @@ function mergeLora(file, sites, strength, unmerged) {
 		const inDim = w.shape[0];
 		const [rank] = file.info(aName).shape;             // A: [rank, in]
 		const [bRows] = file.info(bName).shape;            // B: [rows, rank]
-		if (!unmerged && (w.type !== GGML.Q8_0 || inDim % 256 !== 0 || rank > 256)) { skipped++; continue; }
+		const attach = unmerged || w.type !== GGML.Q8_0 || inDim % 256 !== 0 || rank > 256;
 		let effective = scalar(file, `${module}.alpha`);
 		if (effective < 0) effective = alpha;
 		if (effective <= 0) effective = rank;
 		const scale = (strength * effective) / rank;
-		if (unmerged) {
+		if (attach) {
 			const bHost = file.floats(bName);
 			for (let i = 0; i < bHost.length; i++) bHost[i] *= scale;
 			const b = f32(bHost.length);
@@ -113,7 +115,7 @@ function mergeLora(file, sites, strength, unmerged) {
 			// of A is small against A, where a merge's is a step of W.
 			const a = file.upload(aName, inDim % 32 === 0 ? 'q8' : 'f32');
 			(w.adapters ??= []).push({ a, b, rank, rowOffset: site.rowOffset, rows: bRows, inDim });
-			merged++;
+			attached++;
 			continue;
 		}
 		const a = file.upload(aName, 'f32');
@@ -124,7 +126,7 @@ function mergeLora(file, sites, strength, unmerged) {
 		b.dispose();
 		merged++;
 	}
-	return { merged, skipped };
+	return { merged, attached };
 }
 
 function mergeLokr(file, sites, strength) {
@@ -200,14 +202,15 @@ export function mergeLoras(model, loras, { unmerged = false } = {}) {
 			llm.print(`  LoKr ${name}: ${r.merged} sites merged${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
 		} else if ((scheme = detect(file, model.schemes, model.firstSites, PAIRS.map(([a]) => a)))) {
 			const r = mergeLora(file, model.sites(scheme), s, unmerged);
-			llm.print(`  LoRA ${name}: ${r.merged} sites ${unmerged ? 'attached' : 'merged'}${r.skipped ? `, ${r.skipped} skipped` : ''} (${llm.since(t0)})`);
+			const parts = [r.merged && `${r.merged} sites merged`, r.attached && `${r.attached} sites attached`].filter(Boolean);
+			llm.print(`  LoRA ${name}: ${parts.join(', ') || 'no sites'} (${llm.since(t0)})`);
 		} else {
 			llm.print(`  ${path}: no LoRA or LoKr naming this knows - skipped`);
 		}
 		file.close();
 	}
-	if (!unmerged) return;
 	// Group what shares an input; every other adapted weight is its own group.
+	// (Nothing to do when every LoRA merged: a weight with no adapters is left be.)
 	const grouped = new Set();
 	for (const weights of model.inputs?.() ?? []) {
 		groupAdapters(weights);

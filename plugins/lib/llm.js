@@ -16,10 +16,11 @@
 const H = globalThis.__llm;
 const C = three.compute;
 
-// GGML tensor types, as GGUF numbers them.
+// GGML tensor types, as GGUF numbers them. F8_E4M3 is not a GGUF type: it is
+// a safetensors one, numbered here out of GGUF's way.
 export const GGML = {
 	F32: 0, F16: 1, Q4_0: 2, Q4_1: 3, Q5_0: 6, Q5_1: 7, Q8_0: 8, Q8_1: 9,
-	Q2_K: 10, Q3_K: 11, Q4_K: 12, Q5_K: 13, Q6_K: 14, BF16: 30,
+	Q2_K: 10, Q3_K: 11, Q4_K: 12, Q5_K: 13, Q6_K: 14, BF16: 30, F8_E4M3: 1000,
 };
 export const GGML_NAME = Object.fromEntries(Object.entries(GGML).map(([k, v]) => [v, k]));
 
@@ -54,9 +55,9 @@ export function f32(count, shape = [count], name = '') {
 }
 
 // Weight types `ops.matmul` has a kernel for, uploaded as they are.
-export const NATIVE_TYPES = new Set([GGML.F32, GGML.Q8_0]);
+export const NATIVE_TYPES = new Set([GGML.F32, GGML.Q8_0, GGML.F8_E4M3]);
 
-const SAFETENSORS_TYPE = { F32: GGML.F32, F16: GGML.F16, BF16: GGML.BF16 };
+const SAFETENSORS_TYPE = { F32: GGML.F32, F16: GGML.F16, BF16: GGML.BF16, F8_E4M3: GGML.F8_E4M3 };
 
 // A model file, mapped: its metadata and its tensor table. The bytes stay in the
 // mapping until something is uploaded.
@@ -85,8 +86,8 @@ export class Model {
 		return this.format === 'gguf' ? t.shape.slice() : t.shape.slice().reverse();
 	}
 
-	// The file's own type of a tensor, as a GGML number (safetensors F8 and the
-	// like come back as their dtype string).
+	// The file's own type of a tensor, as a GGML number (a safetensors dtype
+	// with no number comes back as its string).
 	type(name) {
 		const t = this.info(name);
 		return this.format === 'gguf' ? t.type : (SAFETENSORS_TYPE[t.type] ?? t.type);
