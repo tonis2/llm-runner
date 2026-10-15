@@ -38,6 +38,7 @@ export function typeColor(type) { return TYPE_COLOR[type] ?? PRIMITIVE_COLOR; }
 
 export const BAR_H = 28;       // cui's menu bar
 export const STATUS_H = 30;
+export const TAB_H = 36;       // the Nodes / Queue tabs over the left panel
 export const PALETTE_W = 230;
 export const INSPECTOR_W = 330;
 

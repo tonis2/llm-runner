@@ -5,8 +5,9 @@ import { llm } from '../lib/llm.js';
 import { app, run, cancel, freeMemory, dropImages, safe } from './app.js';
 import { editor } from './fields.js';
 import { allTypes, defOf, isSetting } from './doc.js';
+import { addToQueue, runQueue, stopQueueAfterCurrent, queueCounts } from './queue.js';
 import {
-	THEME, typeColor, BAR_H, STATUS_H, PALETTE_W, INSPECTOR_W,
+	THEME, typeColor, BAR_H, STATUS_H, TAB_H, PALETTE_W, INSPECTOR_W,
 } from './theme.js';
 
 const {
@@ -190,6 +191,7 @@ export class StatusBar extends three.Widget {
 		const frac = p && p.total ? p.step / p.total : app.running ? 0.02 : 0;
 		const doc = app.doc;
 		const name = `${doc.path ? doc.path.split('/').pop() : 'untitled'}${doc.dirty ? ' *' : ''}`;
+		const q = queueCounts();
 		return new Stack({ size: [this.width, STATUS_H] },
 			new Rect({ color: THEME.header, solid: true }),
 			new Anchored({ h: 'start', v: 'center', margin: [8, 0] },
@@ -197,6 +199,10 @@ export class StatusBar extends three.Widget {
 					app.running
 						? new Button('Cancel', safe(cancel), { key: 'runButton' })
 						: new Button('Run', safe(() => run()), { key: 'runButton' }),
+						new Button('Add to queue', safe(addToQueue), { key: 'queueAddButton' }),
+						app.queueRunning
+							? new Button(app.queueStopAfter ? 'Stopping…' : 'Stop queue after this', safe(stopQueueAfterCurrent), { key: 'queueRunButton' })
+							: new Button(`Run queue (${q.runnable})`, safe(runQueue), { key: 'queueRunButton' }),
 					new Drawing({
 						key: 'progress', size: [140, 6], ops: [
 							{ op: 'rect', at: [0, 0], size: [140, 6], radius: 3, color: THEME.body },
@@ -223,7 +229,7 @@ function menuSpec() {
 	return [
 		{ title: 'File', items: ['New', 'Open…', 'Save', 'Save as…', '-', 'Quit'] },
 		{ title: 'Templates', items: templates().map((t) => t.name) },
-		{ title: 'Run', items: ['Run', 'Cancel', '-', 'Free memory'] },
+		{ title: 'Run', items: ['Run', 'Cancel', '-', 'Add to queue', 'Run queue', 'Stop queue after this item', '-', 'Free memory'] },
 		{ title: 'View', items: ['Frame all', '-', 'Plugins and settings…'] },
 	];
 }
@@ -241,6 +247,9 @@ function onMenu(menu, item) {
 		case 'Quit': return three.quit();
 		case 'Run': return run();
 		case 'Cancel': return cancel();
+		case 'Add to queue': return addToQueue();
+		case 'Run queue': return runQueue();
+		case 'Stop queue after this item': return stopQueueAfterCurrent();
 		case 'Free memory': return freeMemory();
 		case 'Frame all': return app.widgets.canvas.frame();
 		case 'Plugins and settings…': d.settingsText = app.settings.preview_vae ?? ''; d.plugins = true; return;
@@ -256,15 +265,27 @@ export class Chrome extends three.Widget {
 	render() {
 		const [W, H] = this.size;
 		const mid = Math.max(H - BAR_H - STATUS_H, 100);
-		const { canvas, palette, inspector, status } = app.widgets;
+		const { canvas, palette, queue, inspector, status } = app.widgets;
 		// Keyed by the size, so a new window size rebuilds the layout rather
 		// than patching sizes into boxes that were laid out for the old one.
 		const k = `${W}x${H}`;
+		const tab = app.leftTab ?? 'nodes';
+		const tabButton = (id, label) => new Button(label, safe(() => { app.leftTab = id; this.update(); }), {
+			key: `tab:${id}`, size: [(PALETTE_W - 20) / 2, TAB_H - 6], color: tab === id ? THEME.accent : THEME.header,
+		});
+		const left = new Column({},
+			new Padding({ insets: [6, 8, 0, 8] },
+				new Row({ gap: 4 },
+					tabButton('nodes', 'Nodes'),
+					tabButton('queue', `Queue (${app.queue.length})`),
+				)),
+			tab === 'queue' ? queue : palette,
+		);
 		return new Stack({},
 			new Column({ key: `layout:${k}` },
 				new Rect({ size: [W, BAR_H], color: THEME.header }),
 				new Row({},
-					new Stack({ key: `left:${k}`, size: [PALETTE_W, mid] }, new Rect({ color: THEME.panel, solid: true }), palette),
+					new Stack({ key: `left:${k}`, size: [PALETTE_W, mid] }, new Rect({ color: THEME.panel, solid: true }), left),
 					new Rect({ size: [1, mid], color: THEME.border }),
 					canvas,
 					new Rect({ size: [1, mid], color: THEME.border }),
@@ -282,9 +303,10 @@ export class Chrome extends three.Widget {
 		if (this.size[0] === W && this.size[1] === H) return;
 		this.size = [W, H];
 		const mid = Math.max(H - BAR_H - STATUS_H, 100);
-		const { canvas, palette, inspector, status } = app.widgets;
+		const { canvas, palette, queue, inspector, status } = app.widgets;
 		canvas.setSize([Math.max(W - PALETTE_W - INSPECTOR_W - 2, 100), mid]);
-		palette.height = mid;
+		palette.height = mid - TAB_H;
+		queue.height = mid - TAB_H;
 		inspector.height = mid;
 		status.width = W;
 	}

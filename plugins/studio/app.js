@@ -114,31 +114,42 @@ async function previewFor(latent) {
 // so changing the seed re-samples without reloading the model.
 export async function run(targets = null) {
 	if (app.running) return;
+	await runGraph(app.doc.graph(), { targets, show: true });
+}
+
+// Run `graph`, reporting as it goes, and say how it ended:
+// { status: 'done' | 'cancelled' | 'error', error, node, outputs, results }.
+// `label` goes before every status line; `show` puts the node states and
+// pictures on the open graph's nodes, which only makes sense when `graph` is
+// that graph.
+export async function runGraph(graph, { targets = null, label = '', show = true } = {}) {
+	if (app.running) return { status: 'error', error: 'already running', node: null, outputs: [] };
+	const say = (text, error = false) => app.say(label ? `${label} · ${text}` : text, error);
 	app.running = true;
 	app.cancelRequested = false;
 	app.nodeState = {};
 	app.progress = null;
-	app.say('running…');
+	say('running…');
 	app.executor ??= new Executor({ keep: true, yieldFrame: () => three.nextFrame() });
 	const t0 = llm.now();
 	let current = null;
 	try {
-		const { results, ran, cached } = await app.executor.run(app.doc.graph(), {
+		const { results, ran, cached } = await app.executor.run(graph, {
 			targets,
 			cancelled: () => app.cancelRequested,
 			async onProgress(e) {
 				if (e.start) {
 					current = e.node;
-					app.nodeState[e.node] = 'running';
+					if (show) app.nodeState[e.node] = 'running';
 					app.progress = { node: e.node, step: 0, total: 0 };
-					app.say(`running ${e.node}…`);
+					say(`running ${e.node}…`);
 				} else if (e.done) {
-					app.nodeState[e.node] = 'done';
+					if (show) app.nodeState[e.node] = 'done';
 					app.progress = null;
 				} else {
 					app.progress = { node: e.node, step: e.step, total: e.total };
-					app.say(`${e.node}: step ${e.step}/${e.total}`);
-					if (e.latent) {
+					say(`${e.node}: step ${e.step}/${e.total}`);
+					if (show && e.latent) {
 						const img = await previewFor(e.latent());
 						if (img) setImage(e.node, img);
 					}
@@ -146,25 +157,30 @@ export async function run(targets = null) {
 				app.changed();
 			},
 		});
-		for (const id of cached) app.nodeState[id] = 'cached';
-		for (const [id, r] of Object.entries(results)) {
-			if (r && r.image && r.image.pixels) setImage(id, r.image);
-			else if (r && typeof r.output === 'string' && llm.exists(r.output)) setImage(id, image.load(r.output));
+		if (show) {
+			for (const id of cached) app.nodeState[id] = 'cached';
+			for (const [id, r] of Object.entries(results)) {
+				if (r && r.image && r.image.pixels) setImage(id, r.image);
+				else if (r && typeof r.output === 'string' && llm.exists(r.output)) setImage(id, image.load(r.output));
+			}
 		}
-		const saved = Object.values(results).map((r) => r && r.output).filter(Boolean);
-		app.say(`done in ${((llm.now() - t0) / 1000).toFixed(1)}s: ${ran.length} ran, ${cached.length} cached${saved.length ? ` · saved ${saved.join(', ')}` : ''}`);
+		const outputs = Object.values(results).map((r) => r && r.output).filter((o) => typeof o === 'string');
+		say(`done in ${((llm.now() - t0) / 1000).toFixed(1)}s: ${ran.length} ran, ${cached.length} cached${outputs.length ? ` · saved ${outputs.join(', ')}` : ''}`);
+		return { status: 'done', error: null, node: null, outputs, results };
 	} catch (e) {
 		if (e instanceof Cancelled) {
 			if (current) delete app.nodeState[current];
-			app.say('cancelled');
-		} else {
-			const at = e && e.node ? e.node : current;
-			if (at) {
-				app.nodeState[at] = 'error';
-				app.selected = at;
-			}
-			app.say(`${at ? at + ': ' : ''}${e && e.message ? e.message : e}`, true);
+			say('cancelled');
+			return { status: 'cancelled', error: null, node: current, outputs: [] };
 		}
+		const at = e && e.node ? e.node : current;
+		const message = e && e.message ? e.message : String(e);
+		if (at && show) {
+			app.nodeState[at] = 'error';
+			app.selected = at;
+		}
+		say(`${at ? at + ': ' : ''}${message}`, true);
+		return { status: 'error', error: message, node: at, outputs: [] };
 	} finally {
 		app.running = false;
 		app.progress = null;

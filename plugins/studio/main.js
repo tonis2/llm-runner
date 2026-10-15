@@ -7,8 +7,9 @@
 // `llm-runner run` takes, so a graph built here runs headless too.
 //
 // Keys: delete removes the selected node, ctrl+d duplicates it, ctrl+s saves,
-// ctrl+r runs, f frames the graph, escape cancels a run. Images dragged in from
-// a file manager become Load image nodes.
+// ctrl+r runs, ctrl+e adds the graph as it is to the run queue, f frames the
+// graph, escape cancels a run (and the queue). Images dragged in from a file
+// manager become Load image nodes.
 
 import { llm } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
@@ -18,6 +19,7 @@ import { app, run, cancel, dropImages } from './app.js';
 import { Doc, refreshTypes } from './doc.js';
 import { GraphCanvas } from './canvas.js';
 import { Palette, Inspector, StatusBar, Chrome, Dialogs, safe, removeSelected } from './panels.js';
+import { QueuePanel, addToQueue } from './queue.js';
 
 try { three.window.title = 'llm-runner studio'; } catch { /* headless */ }
 
@@ -88,6 +90,7 @@ async function boot() {
 
 	app.widgets.canvas = new GraphCanvas();
 	app.widgets.palette = new Palette();
+	app.widgets.queue = new QueuePanel();
 	app.widgets.inspector = new Inspector();
 	app.widgets.status = new StatusBar();
 	app.widgets.dialogs = new Dialogs();
@@ -121,6 +124,7 @@ async function boot() {
 	three.onKeyDown('f', safe(() => { if (!ctrl()) app.widgets.canvas.frame(); }));
 	three.onKeyDown('s', safe(() => { if (ctrl()) app.actions.save(); }));
 	three.onKeyDown('r', safe(() => { if (ctrl()) run(); }));
+	three.onKeyDown('e', safe(() => { if (ctrl()) addToQueue(); }));
 	three.onKeyDown('d', safe(() => {
 		if (!ctrl() || !app.selected) return;
 		const c = app.doc.duplicate(app.selected);

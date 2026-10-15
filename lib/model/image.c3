@@ -16,9 +16,9 @@ fn image::Image? load_image(String filename) {
     String lower = filename.to_lower_tcopy();
     image::Image img;
     if (lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
-        img = jpeg::load_file(filename)!!;
+        img = jpeg::load_file(filename)!;
     } else {
-        img = png::load_file(filename)!!;
+        img = png::load_file(filename)!;
     }
 
     if (img.format != PixelFormat.RGB && img.format != PixelFormat.RGBA && img.format != PixelFormat.GRAYSCALE) {
@@ -40,9 +40,9 @@ fn image::Image? load_image_from_bytes(char[] data) {
     bool is_png  = data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47;
     bool is_jpeg = data[0] == 0xFF && data[1] == 0xD8;
     if (is_png) {
-        img = png::load_bytes(data)!!;
+        img = png::load_bytes(data)!;
     } else if (is_jpeg) {
-        img = jpeg::load_bytes(data)!!;
+        img = jpeg::load_bytes(data)!;
     } else {
         io::printfn("Error: input bytes are neither PNG nor JPEG");
         return COMPUTE_ERROR~;
