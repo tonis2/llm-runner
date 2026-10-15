@@ -221,6 +221,12 @@ export function unpatchify(patches, latent, channels, height, width, patchSize =
 export function eulerStep(x, v, n, dt) {
 	dispatch('flow_euler_step', [x, v], [groups(n, 256)], pc('uf', n, dt));
 }
+// Guidance on [channels, spatial] velocities: v (the unconditional one coming
+// in) = v + s * (cond - v), and with `rescale` each pixel's channel vector put
+// back to cond's length.
+export function cfgCombine(cond, v, channels, spatial, s, rescale) {
+	dispatch('cfg_combine', [cond, v], [groups(spatial, 256)], pc('uufu', channels, spatial, s, rescale ? 1 : 0));
+}
 export function concatRows(a, b, out, rows, aCols, bCols) {
 	dispatch('concat_rows', [a, b, out], [groups(rows * (aCols + bCols), 256)], pc('uuu', rows, aCols, bCols));
 }

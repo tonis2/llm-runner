@@ -27,7 +27,7 @@ export function qwenImageGraph(config, { sink = 'save' } = {}) {
 	const add = (id, type, params) => nodes.push({ id, type, params });
 
 	add('vae', 'core.vae', { path: config.vae });
-	const sample = { width, height, steps: config.steps ?? 40, seed: config.seed ?? 42, cfg };
+	const sample = { width, height, steps: config.steps ?? 40, seed: config.seed ?? 42, cfg, cfg_rescale: config.cfg_rescale ?? true };
 	if (input) {
 		add('input', 'core.load_image', { path: input });
 		add('encode', 'core.vae_encode', { vae: link('vae', 'vae'), image: link('input', 'image'), width, height });
