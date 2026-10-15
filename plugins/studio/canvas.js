@@ -36,7 +36,7 @@ function shown(v) {
 }
 
 const clipCache = new Map();
-function clip(text, width, size) {
+export function clip(text, width, size) {
 	const key = `${size}|${width | 0}|${text}`;
 	const hit = clipCache.get(key);
 	if (hit !== undefined) return hit;
