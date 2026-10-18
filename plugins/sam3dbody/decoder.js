@@ -1,15 +1,22 @@
-// SAM 3D Body's promptable body decoder on the GPU (`decoders/promptable_decoder.py`,
-// `modules/transformer.py` TransformerDecoderLayer, `SAM3DBody.forward_decoder`,
-// `keypoint_token_update_fn`, `keypoint3d_token_update_fn`).
+// SAM 3D Body's promptable decoders on the GPU (`decoders/promptable_decoder.py`,
+// `modules/transformer.py` TransformerDecoderLayer, `SAM3DBody.forward_decoder`
+// and `forward_decoder_hand`, `keypoint_token_update_fn` and
+// `keypoint3d_token_update_fn`, and their `_hand` twins).
+//
+// The body decoder and the hand decoder are one design with two sets of
+// weights: the hand's are the body's names with `_hand` (`decoder_hand`,
+// `ray_cond_emb_hand`, `init_pose_hand` ...) and its image PE is
+// `hand_pe_layer`'s; the prompt encoder, `prompt_to_token` and the hand-box
+// embedding are shared.
 //
 // Image tokens: the backbone's [1280, 32, 32] plus the no-mask embedding, the
 // 99 ray channels appended, a 1x1 conv back to 1280 and a LayerNorm2d; their
 // position embedding is the prompt encoder's random-Fourier grid.
 //
-// 145 tokens of 1024: the pose token (from the CLIFF condition and the initial
-// pose and camera), the previous estimate, the prompt (a dummy point with no
-// prompt), two hand-box tokens, 70 2D keypoint tokens and 70 3D keypoint
-// tokens. Six layers of: self-attention (the token PEs added to the queries
+// 144 + P tokens of 1024: the pose token (from the CLIFF condition and the
+// initial pose and camera), the previous estimate (the initial one again
+// without one), P prompt points (one dummy point with no prompt), two
+// hand-box tokens, 70 2D keypoint tokens and 70 3D keypoint tokens. Six layers of: self-attention (the token PEs added to the queries
 // and keys from the second layer on), cross-attention to the image tokens,
 // GELU MLP; 8 heads of 64, LayerNorms at 1e-6, each PE LayerNormed per layer
 // (LaPE). After every layer but the last, the pose token (after the final
@@ -22,8 +29,6 @@ import * as op from '../lib/ops.js';
 import { submit, copy, breathe, uploadEach } from '../lib/gpu.js';
 import { KEYPOINTS } from './heads.js';
 
-export const TOKENS = 145;
-const KP2D = 5, KP3D = KP2D + KEYPOINTS;
 const HEAD = 64;
 const EPS = 1e-6;
 const GRID = 32;
@@ -64,50 +69,69 @@ function randomFourier(G, half, x, y) {
 	return out;
 }
 
+// The weights the hand decoder has its own of, by their first name part.
+const OWN = new Set(['decoder', 'ray_cond_emb', 'init_to_token_mhr', 'prev_to_token_mhr', 'keypoint_posemb_linear', 'keypoint3d_posemb_linear',
+	'keypoint_feat_linear', 'keypoint_embedding', 'keypoint3d_embedding', 'init_pose', 'init_camera']);
+
+// The token layout for `prompts` prompt points.
+function layout(prompts) {
+	const kp2d = 4 + prompts;
+	return { tokens: kp2d + 2 * KEYPOINTS, hands: 2 + prompts, kp2d, kp3d: kp2d + KEYPOINTS };
+}
+
 export class BodyDecoder {
 	// `linear` is how the layers' matmul weights go up: 'f32' (the default; the
 	// decoder is small and feeds its own predictions back five times) or 'q8'.
-	constructor(m, { linear = 'f32' } = {}) {
+	// `hand` loads the hand decoder.
+	constructor(m, { linear = 'f32', hand = false } = {}) {
 		this.m = m;
 		this.linear = linear;
-		const shape = (name) => m.shape(name);
+		this.hand = hand;
+		const n = (name) => {
+			const dot = name.indexOf('.');
+			return hand && OWN.has(name.slice(0, dot)) ? `${name.slice(0, dot)}_hand${name.slice(dot)}` : name;
+		};
+		this.name = n;
+		const shape = (name) => m.shape(n(name));
 		this.dim = shape('decoder.norm_final.weight')[0];
 		this.context = shape('ray_cond_emb.norm.weight')[0];
 		this.inner = shape('decoder.layers.0.self_attn.q_proj.weight')[1];
 		this.heads = this.inner / HEAD;
 		this.mlp = shape('decoder.layers.0.ffn.layers.0.0.weight')[1];
-		let n = 0;
-		while (m.has(`decoder.layers.${n}.ln1.weight`)) n++;
-		this.depth = n;
+		let depth = 0;
+		while (m.has(n(`decoder.layers.${depth}.ln1.weight`))) depth++;
+		this.depth = depth;
 	}
 
 	async load() {
-		const m = this.m, D = this.dim, C = this.context;
+		const m = this.m, D = this.dim, C = this.context, n = this.name;
 		const t0 = llm.now();
-		const f = (name) => m.upload(name, 'f32');
-		const w = (name) => m.upload(name, this.linear);
+		const f = (name) => m.upload(n(name), 'f32');
+		const w = (name) => m.upload(n(name), this.linear);
+		const floats = (name) => m.floats(n(name));
 		const N = GRID * GRID;
 		// The image tokens' PE: the dense random-Fourier grid, token-major.
-		const G = m.floats('prompt_encoder.pe_layer.positional_encoding_gaussian_matrix');
+		const G = m.floats(this.hand ? 'hand_pe_layer.positional_encoding_gaussian_matrix' : 'prompt_encoder.pe_layer.positional_encoding_gaussian_matrix');
 		const pe = new Float32Array(N * C);
 		for (let i = 0; i < GRID; i++) {
 			for (let j = 0; j < GRID; j++) pe.set(randomFourier(G, C / 2, (j + 0.5) / GRID, (i + 0.5) / GRID), (i * GRID + j) * C);
 		}
 		// Host-side pieces of the token set-up and the keypoint updates.
 		this.host = {
-			init: { w: m.floats('init_to_token_mhr.weight'), b: m.floats('init_to_token_mhr.bias'), in: m.shape('init_to_token_mhr.weight')[0] },
-			prev: { w: m.floats('prev_to_token_mhr.weight'), b: m.floats('prev_to_token_mhr.bias'), in: m.shape('prev_to_token_mhr.weight')[0] },
+			init: { w: floats('init_to_token_mhr.weight'), b: floats('init_to_token_mhr.bias'), in: m.shape(n('init_to_token_mhr.weight'))[0] },
+			prev: { w: floats('prev_to_token_mhr.weight'), b: floats('prev_to_token_mhr.bias'), in: m.shape(n('prev_to_token_mhr.weight'))[0] },
 			promptW: m.floats('prompt_to_token.weight'), promptB: m.floats('prompt_to_token.bias'),
+			promptG: m.floats('prompt_encoder.pe_layer.positional_encoding_gaussian_matrix'),
 			invalidPoint: m.floats('prompt_encoder.invalid_point_embed.weight'),
-			pos2d: { w: m.floats('keypoint_posemb_linear.layers.0.0.weight'), b: m.floats('keypoint_posemb_linear.layers.0.0.bias') },
-			pos3d: { w: m.floats('keypoint3d_posemb_linear.layers.0.0.weight'), b: m.floats('keypoint3d_posemb_linear.layers.0.0.bias') },
-			initPose: m.floats('init_pose.weight'), initCamera: m.floats('init_camera.weight'),
+			notAPoint: m.floats('prompt_encoder.not_a_point_embed.weight'),
+			points: new Map(),
+			pos2d: { w: floats('keypoint_posemb_linear.layers.0.0.weight'), b: floats('keypoint_posemb_linear.layers.0.0.bias') },
+			pos3d: { w: floats('keypoint3d_posemb_linear.layers.0.0.weight'), b: floats('keypoint3d_posemb_linear.layers.0.0.bias') },
+			initPose: floats('init_pose.weight'), initCamera: floats('init_camera.weight'),
+			// The learned tokens: hand boxes and keypoints.
+			handBox: m.floats('hand_box_embedding.weight'),
+			keypoints: floats('keypoint_embedding.weight'), keypoints3d: floats('keypoint3d_embedding.weight'),
 		};
-		// The learned tokens: hand boxes and keypoints.
-		this.fixed = new Float32Array(TOKENS * D);
-		this.fixed.set(m.floats('hand_box_embedding.weight'), 3 * D);
-		this.fixed.set(m.floats('keypoint_embedding.weight'), KP2D * D);
-		this.fixed.set(m.floats('keypoint3d_embedding.weight'), KP3D * D);
 		this.g = {
 			noMask: f('prompt_encoder.no_mask_embed.weight'),
 			rayConv: f('ray_cond_emb.conv.weight'),
@@ -147,7 +171,7 @@ export class BodyDecoder {
 			pe2B.dispose();
 			this.layers.push(layer);
 		}
-		llm.print(`  body decoder: ${this.depth} layers, ${TOKENS} tokens of ${D}, ${this.heads} heads, ${this.linear} weights, loaded in ${llm.since(t0)}`);
+		llm.print(`  ${this.hand ? 'hand' : 'body'} decoder: ${this.depth} layers of ${D}, ${this.heads} heads, ${this.linear} weights, loaded in ${llm.since(t0)}`);
 	}
 
 	dispose() {
@@ -157,18 +181,38 @@ export class BodyDecoder {
 		this.layers = null;
 	}
 
-	// The pose token and its PE before the first layer, and the other two
-	// tokens the host makes: [3, dim] each. `condition` is the CLIFF [3].
-	firstTokens(condition) {
+	// A prompt point [x, y, label] (x, y in the crop, 0 .. 1) as the prompt
+	// encoder embeds it: label -2 is no point (the invalid-point embedding),
+	// -1 a wrong one, 0 .. 69 a keypoint (its position's random-Fourier PE
+	// plus that keypoint's embedding).
+	promptEmbedding([x, y, label]) {
+		const h = this.host;
+		if (label === -2) return h.invalidPoint;
+		if (label === -1) return h.notAPoint;
+		if (!h.points.has(label)) h.points.set(label, this.m.floats(`prompt_encoder.point_embeddings.${label}.weight`));
+		const e = randomFourier(h.promptG, h.promptG.length / 2, x, y), p = h.points.get(label);
+		for (let i = 0; i < e.length; i++) e[i] += p[i];
+		return e;
+	}
+
+	// The tokens the host makes and their PEs, [2 + P, dim] each: the pose
+	// token (no PE), the previous estimate, the prompt points. `condition` is
+	// the CLIFF [3], `prev` the previous estimate [522] or null, `prompts` the
+	// points.
+	firstTokens(condition, prev, prompts) {
 		const h = this.host, D = this.dim;
 		const init = [...condition, ...h.initPose, ...h.initCamera];
-		const pose = hostLinear(h.init.w, h.init.b, init, D, h.init.in);
-		const prev = hostLinear(h.prev.w, h.prev.b, init.slice(3), D, h.prev.in);
-		// A dummy prompt (label -2): its PE zeroed, the invalid-point embedding.
-		const prompt = hostLinear(h.promptW, h.promptB, h.invalidPoint, D, h.invalidPoint.length);
-		const tokens = new Float32Array(3 * D), pe = new Float32Array(3 * D);
-		tokens.set(pose); tokens.set(prev, D); tokens.set(prompt, 2 * D);
-		pe.set(prev, D); pe.set(prompt, 2 * D);
+		const tokens = new Float32Array((2 + prompts.length) * D), pe = new Float32Array(tokens.length);
+		tokens.set(hostLinear(h.init.w, h.init.b, init, D, h.init.in));
+		const p = hostLinear(h.prev.w, h.prev.b, prev ?? init.slice(3), D, h.prev.in);
+		tokens.set(p, D);
+		pe.set(p, D);
+		prompts.forEach((point, i) => {
+			const e = this.promptEmbedding(point);
+			const t = hostLinear(h.promptW, h.promptB, e, D, e.length);
+			tokens.set(t, (2 + i) * D);
+			pe.set(t, (2 + i) * D);
+		});
 		return { tokens, pe };
 	}
 
@@ -177,12 +221,19 @@ export class BodyDecoder {
 	// `onLayer(token, layer)` gets each layer's pose token after the final norm
 	// (a Float32Array [dim]) and returns the pose it decodes to with
 	// `pred_keypoints_2d_cropped`, `pred_keypoints_2d_depth` and
-	// `pred_keypoints_3d` (it may be async). Returns the last layer's tokens
-	// 0 .. 5 after the final norm [5, dim] (the pose token and the hand-box
-	// tokens), and `stopAfter` (a layer) the raw tokens [145, dim] after it.
-	async run(features, rays, condition, onLayer, { stopAfter = -1, contextOut = null } = {}) {
-		const D = this.dim, C = this.context, A = this.inner, T = TOKENS, N = GRID * GRID, g = this.g;
+	// `pred_keypoints_3d` (it may be async). `prompts` are keypoint prompts
+	// [[x, y, label]] (see promptEmbedding; one dummy point without), `prev`
+	// the previous estimate [522] they refine (pose raw, identity, scale,
+	// hands, face, camera). Returns the last layer's pose, `tokens` its tokens
+	// up to the hand-box ones after the final norm and `handTokens` those two
+	// [2, dim]; `stopAfter` (a layer) returns the raw tokens [144 + P, dim]
+	// after it instead.
+	async run(features, rays, condition, onLayer, { stopAfter = -1, contextOut = null, prompts = null, prev = null } = {}) {
+		const points = prompts?.length ? prompts : [[0, 0, -2]];
+		const at = layout(points.length);
+		const D = this.dim, C = this.context, A = this.inner, T = at.tokens, N = GRID * GRID, g = this.g, h = this.host;
 		const a = {
+			at,
 			tok: f32(N * C), cat: f32(N * (C + 99)), raw: f32(N * C), ctx: f32(N * C), ctxT: f32(C * N, [N, C]),
 			ctxN: f32(N * C), ctxK: f32(N * C), k: f32(N * A), v: f32(N * A),
 			x: f32(T * D), pe: f32(T * D), pen: f32(T * D), h: f32(T * D), qk: f32(T * D),
@@ -202,9 +253,12 @@ export class BodyDecoder {
 			op.transposeChannelSpatial(a.ctx, a.ctxT, C, N, 1);
 			if (contextOut) copy(a.ctx, contextOut, N * C * 4);
 
-			const first = this.firstTokens(condition);
-			const x = this.fixed.slice(), pe = new Float32Array(T * D);
+			const first = this.firstTokens(condition, prev, points);
+			const x = new Float32Array(T * D), pe = new Float32Array(T * D);
 			x.set(first.tokens);
+			x.set(h.handBox, at.hands * D);
+			x.set(h.keypoints, at.kp2d * D);
+			x.set(h.keypoints3d, at.kp3d * D);
 			pe.set(first.pe);
 			a.x.buffer.write(x);
 			a.pe.buffer.write(pe);
@@ -218,11 +272,12 @@ export class BodyDecoder {
 					submit();
 					return { tokens: t };
 				}
-				op.layerNormAffine(a.x, g.normW, g.normB, a.out, D, 5, EPS);
+				op.layerNormAffine(a.x, g.normW, g.normB, a.out, D, at.kp2d, EPS);
 				submit();
 				const token = new Float32Array(a.out.buffer.readBytes(0, D * 4).buffer);
 				if (l === this.depth - 1) {
-					last = { tokens: new Float32Array(a.out.buffer.readBytes(0, 5 * D * 4).buffer), pose: await onLayer(token, l) };
+					const tokens = new Float32Array(a.out.buffer.readBytes(0, at.kp2d * D * 4).buffer);
+					last = { tokens, handTokens: tokens.subarray(at.hands * D, (at.hands + 2) * D), pose: await onLayer(token, l) };
 					break;
 				}
 				const pose = await onLayer(token, l);
@@ -236,9 +291,9 @@ export class BodyDecoder {
 		}
 	}
 
-	// One TransformerDecoderLayer over a.x [145, dim] in place.
+	// One TransformerDecoderLayer over a.x [144 + P, dim] in place.
 	layer(L, l, a, N) {
-		const D = this.dim, C = this.context, A = this.inner, nh = this.heads, T = TOKENS;
+		const D = this.dim, C = this.context, A = this.inner, nh = this.heads, T = a.at.tokens;
 		op.layerNormAffine(a.pe, L.pe1W, L.pe1B, a.pen, D, T, EPS);
 		// Self-attention; the first layer leaves the token PEs out of it.
 		op.layerNormAffine(a.x, L.ln1W, L.ln1B, a.h, D, T, EPS);
@@ -320,13 +375,13 @@ export class BodyDecoder {
 		a.mask.buffer.write(mask);
 		a.sample.buffer.write(sample);
 		a.kpIn.buffer.write(firstLayer(h.pos2d.w, h.pos2d.b, Float32Array.from(kp), 2));
-		const pe2d = rows(a.pe, KP2D, K), pe3d = rows(a.pe, KP3D, K);
+		const pe2d = rows(a.pe, a.at.kp2d, K), pe3d = rows(a.pe, a.at.kp3d, K);
 		op.linearBiasRows(g.pos2dW, g.pos2dB, a.kpIn, pe2d, D, D, K);
 		op.mul(pe2d, a.mask, K * D);
 		// The features under the keypoints: [K, N] @ ctx [N, C].
 		op.matmul(a.ctxT, a.sample, a.sampled, C, N, K);
 		op.linearBiasRows(g.featW, g.featB, a.sampled, a.y, D, C, K);
-		op.add(rows(a.x, KP2D, K), a.y, K * D);
+		op.add(rows(a.x, a.at.kp2d, K), a.y, K * D);
 		submit();
 		a.kpIn.buffer.write(firstLayer(h.pos3d.w, h.pos3d.b, centred, 3));
 		op.linearBiasRows(g.pos3dW, g.pos3dB, a.kpIn, pe3d, D, D, K);

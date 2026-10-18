@@ -180,7 +180,7 @@ if (only.has('decoder')) {
 	llm.print(`  decoder, 6 layers with the heads and rig between: ${llm.since(t0)}`);
 	feat.dispose();
 	checkPose('decoded', last.pose, layers[layers.length - 1], q8Decoder);
-	const hb = heads.handBoxes(last.tokens.subarray(3 * 1024));
+	const hb = heads.handBoxes(last.handTokens);
 	compare('hand boxes', hb.boxes, layers[layers.length - 1].hand_box, ...tokenBound);
 	compare('hand logits', hb.logits, layers[layers.length - 1].hand_logits, ...tokenBound);
 }

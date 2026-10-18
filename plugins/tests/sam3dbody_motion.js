@@ -8,6 +8,8 @@
 //    MHR's own FK puts it, for random poses and proportions.
 // 3. BVH's Z-X-Y Euler angles turn back into the same rotations.
 // 4. A clip of a standing pose stands on y = 0 with both feet down.
+// 5. A camera tilted down sees a person walking up to it sink: the floor is
+//    levelled, and the feet are on it at both ends.
 import { llm } from '../lib/llm.js';
 import { forward, mul, axisAngle } from '../kimodo/rotation.js';
 import { MHR, JOINTS, MODEL_PARAMS } from '../sam3dbody/mhr.js';
@@ -112,6 +114,30 @@ function worst(a, b) {
 	let moved = 0;
 	posAt(5).forEach((v, j) => { for (let d = 0; d < 3; d++) moved = Math.max(moved, Math.abs(v[d] - before[j][d])); });
 	check(done.plantedFrames > 0 && moved < 0.01, `clean-up planted ${done.plantedFrames} foot frames, moved joints at most ${(moved * 1000).toFixed(2)} mm`);
+}
+
+// 5. Tilted camera.
+{
+	const tilt = (6 * Math.PI) / 180;
+	const params = new Float64Array(MODEL_PARAMS);
+	params[3] = tilt;
+	// Walking 2 m towards a camera pitched down by `tilt`: in its frame (y
+	// down, z forward) the body leans by the tilt, and its path is the level one
+	// turned by it, coming nearer and lower.
+	const frames = Array.from({ length: 48 }, (_, f) => {
+		const d = 5 - (2 * f) / 47;
+		return { params, cam_t: [0, 1.2 * Math.cos(tilt) - d * Math.sin(tilt), d * Math.cos(tilt) + 1.2 * Math.sin(tilt)] };
+	});
+	const clip = assembleMotion(mhr, frames, { fps: 24, smooth: 5 });
+	const J = clip.skeleton.jointCount;
+	const posAt = (f) => forward(clip.skeleton, (j) => Array.from(clip.rotations.subarray((f * J + j) * 4, (f * J + j + 1) * 4)), clip.root.subarray(f * 3, f * 3 + 3)).positions;
+	const angle = (2 * Math.acos(Math.min(1, clip.cameraRotation[3])) * 180) / Math.PI;
+	check(Math.abs(angle - 6) < 0.2, `camera found ${angle.toFixed(2)} degrees off level`);
+	const lows = [0, 47].map((f) => Math.min(...posAt(f).map((v) => v[1])));
+	check(lows.every((v) => Math.abs(v - clip.skeleton.aboveGround) < 0.005), `on the floor at both ends (lowest joints ${lows.map((v) => v.toFixed(4)).join(', ')} m)`);
+	const head = posAt(47)[clip.skeleton.index('c_head')];
+	const head0 = posAt(0)[clip.skeleton.index('c_head')];
+	check(Math.abs(head[1] - head0[1]) < 0.005, `head height steady (${head0[1].toFixed(3)} to ${head[1].toFixed(3)} m)`);
 }
 
 mhr.close();

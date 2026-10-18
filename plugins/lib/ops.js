@@ -37,6 +37,10 @@ export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = fa
 		case GGML.Q8_0:
 			if (matrixCores && !exact && seq >= 16) {
 				dispatch('matmul_q8_coop', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
+			} else if (seq >= 64) {
+				// Without matrix cores: an 8x8 patch a thread, half the shared-memory
+				// reads per multiply-add of the 4x4 kernel.
+				dispatch('matmul_q8_8x8', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
 			} else {
 				dispatch('matmul_q8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
 			}
@@ -169,6 +173,11 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 	if (matrixCores && hd === 128) {
 		// The split kernel with no prefix.
 		flashAttentionSplit(q, null, null, k, v, out, heads, seq, 0, seq);
+		return;
+	}
+	if (hd === 64 && !matrixCores) {
+		// A query row a thread, in registers: no reductions between keys.
+		dispatch('flash_attention_64', [q, k, v, out], [groups(seq, 128), heads], pc('uuf', heads, seq, 1 / Math.sqrt(hd)));
 		return;
 	}
 	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)), false, flashDefines(hd));

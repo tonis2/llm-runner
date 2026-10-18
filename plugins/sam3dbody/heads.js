@@ -9,6 +9,13 @@
 //   angles as sin/cos, 6 translations), 45 identity, 28 scale PCA, 2 x 54
 //   hand pose PCA, 72 face (multiplied by zero).
 // The camera head's 3 (s, tx, ty) give a perspective translation.
+//
+// The hand heads (`head_pose_hand`, `head_camera_hand`, MHRHead with
+// enable_hand_model) are the same with their own weights, for a crop around a
+// right hand: the root rotation is the right wrist's, turned to the body's
+// root and moved so that wrist stays put; everything but the root and the
+// hands is zeroed, and every keypoint but the right hand's 21; the camera's
+// scale is ten times the body's (DEFAULT_SCALE_FACTOR_HAND).
 
 import { f32 } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
@@ -47,6 +54,32 @@ export function rot6dToMatrix(p) {
 // roma.rotmat_to_euler("ZYX", R): R = Rz(a) Ry(b) Rx(c), returned (a, b, c).
 export function matrixToEulerZYX(R) {
 	return [Math.atan2(R[3], R[0]), Math.atan2(-R[6], Math.hypot(R[0], R[3])), Math.atan2(R[7], R[8])];
+}
+
+// roma's "xyz" (extrinsic, MHR's own order): R = Rz(c) Ry(b) Rx(a) from and
+// to (a, b, c).
+export function eulerXyzToMatrix([a, b, c]) {
+	const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cc = Math.cos(c), sc = Math.sin(c);
+	return [
+		cc * cb, cc * sb * sa - sc * ca, cc * sb * ca + sc * sa,
+		sc * cb, sc * sb * sa + cc * ca, sc * sb * ca - cc * sa,
+		-sb, cb * sa, cb * ca,
+	];
+}
+export function matrixToEulerXyz(R) {
+	return [Math.atan2(R[7], R[8]), Math.atan2(-R[6], Math.hypot(R[0], R[3])), Math.atan2(R[3], R[0])];
+}
+
+// Row-major 3 x 3 products: A B, and A^T B.
+export function matmul3(A, B) {
+	const C = new Array(9);
+	for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) C[r * 3 + c] = A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c];
+	return C;
+}
+export function matmul3T(A, B) {
+	const C = new Array(9);
+	for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) C[r * 3 + c] = A[r] * B[c] + A[3 + r] * B[3 + c] + A[6 + r] * B[6 + c];
+	return C;
 }
 
 // batchXYZfrom6D: the XYZ Euler angles (R = Rz Ry Rx) of a 6D rotation whose
@@ -155,19 +188,30 @@ export class BodyHeads {
 	// `m` is the open checkpoint, `mhr` an MHR. `gpu` runs the head MLPs and the
 	// keypoint vertices' pose correctives on the GPU (the host is ten times
 	// slower at them); the host path gives the same numbers to float32.
-	constructor(m, mhr, { gpu = true } = {}) {
+	// `hand` makes the hand heads.
+	constructor(m, mhr, { gpu = true, hand = false } = {}) {
 		this.mhr = mhr;
+		this.hand = hand;
 		const f = (name) => m.floats(name);
 		const layer = (p) => {
 			const s = m.shape(`${p}.weight`);
 			return { w: f(`${p}.weight`), b: f(`${p}.bias`), in: s[0], out: s[1] };
 		};
-		this.poseMlp = [layer('head_pose.proj.layers.0.0'), layer('head_pose.proj.layers.1')];
-		this.cameraMlp = [layer('head_camera.proj.layers.0.0'), layer('head_camera.proj.layers.1')];
-		this.handBox = [layer('bbox_embed.layers.0'), layer('bbox_embed.layers.1'), layer('bbox_embed.layers.2')];
-		this.handCls = [layer('hand_cls_embed')];
-		this.initPose = f('init_pose.weight');
-		this.initCamera = f('init_camera.weight');
+		const own = hand ? '_hand' : '';
+		this.poseMlp = [layer(`head_pose${own}.proj.layers.0.0`), layer(`head_pose${own}.proj.layers.1`)];
+		this.cameraMlp = [layer(`head_camera${own}.proj.layers.0.0`), layer(`head_camera${own}.proj.layers.1`)];
+		this.initPose = f(`init_pose${own}.weight`);
+		this.initCamera = f(`init_camera${own}.weight`);
+		this.cameraScale = hand ? 10 : 1;
+		if (hand) {
+			this.rightWrist = f('head_pose_hand.right_wrist_coords');
+			this.root = f('head_pose_hand.root_coords');
+			this.wristToWorld = Array.from(f('head_pose_hand.local_to_world_wrist'));
+			this.nonHand = m.ints('head_pose_hand.nonhand_param_idxs');
+		} else {
+			this.handBox = [layer('bbox_embed.layers.0'), layer('bbox_embed.layers.1'), layer('bbox_embed.layers.2')];
+			this.handCls = [layer('hand_cls_embed')];
+		}
 		this.scaleMean = f('head_pose.scale_mean');
 		this.scaleComps = f('head_pose.scale_comps');
 		this.handMean = f('head_pose.hand_pose_mean');
@@ -192,11 +236,14 @@ export class BodyHeads {
 			this.keypointTerms.push(terms);
 		}
 		this.keypointVertices = [...used].sort((a, b) => a - b);
-		this.vertexSlot = new Map(this.keypointVertices.map((v, i) => [v, i]));
 		if (gpu) {
 			this.gpu = new GpuMlps([this.poseMlp, this.cameraMlp]);
-			mhr.offload(this.keypointVertices);
+			// The body and hand heads skin the same vertices: one list on the GPU.
+			const g = mhr.gpu?.list;
+			if (g && g.length === this.keypointVertices.length && g.every((v, i) => v === this.keypointVertices[i])) this.keypointVertices = g;
+			else mhr.offload(this.keypointVertices);
 		}
+		this.vertexSlot = new Map(this.keypointVertices.map((v, i) => [v, i]));
 	}
 
 	dispose() {
@@ -204,13 +251,15 @@ export class BodyHeads {
 		this.gpu = null;
 	}
 
-	// mhr_forward's model parameters [204]: no root translation, the root
-	// rotation, the body angles with the hands' put in from their PCA, and
-	// the 68 scales from theirs.
-	modelParams(globalRot, body, hand, scale) {
+	// mhr_forward's model parameters [204]: the root translation (none without
+	// `trans`, metres, which MHR takes as tenths), the root rotation, the body
+	// angles with the hands' put in from their PCA, and the 68 scales from
+	// theirs.
+	modelParams(globalRot, body, hand, scale, trans = null) {
 		const scales = Float64Array.from(this.scaleMean);
 		for (let c = 0; c < scale.length; c++) for (let i = 0; i < scales.length; i++) scales[i] += scale[c] * this.scaleComps[c * scales.length + i];
 		const params = new Float64Array(204);
+		if (trans) for (let k = 0; k < 3; k++) params[k] = trans[k] * 10;
 		params.set(globalRot, 3);
 		params.set(body.subarray(0, 130), 6);
 		for (const [side, idx] of [[0, this.handLeft], [1, this.handRight]]) {
@@ -264,8 +313,22 @@ export class BodyHeads {
 		const shape = pred.slice(p, p + 45); p += 45;
 		const scale = pred.slice(p, p + 28); p += 28;
 		const hand = pred.slice(p, p + 108);
-		const params = this.modelParams(globalRot, body, hand, scale);
+		let params;
+		if (this.hand) {
+			// The right wrist's turn to the root's, about the wrist.
+			const R = matmul3(eulerXyzToMatrix(globalRot), this.wristToWorld);
+			const d = [0, 1, 2].map((k) => this.rightWrist[k] - this.root[k]);
+			const trans = [0, 1, 2].map((r) => -(R[r * 3] * d[0] + R[r * 3 + 1] * d[1] + R[r * 3 + 2] * d[2] + this.root[r]));
+			params = this.modelParams(matrixToEulerXyz(R), body, hand, scale, trans);
+			for (const i of this.nonHand) params[i] = 0;
+		} else {
+			params = this.modelParams(globalRot, body, hand, scale);
+		}
 		const mhr = this.pose(params, shape, { allVertices });
+		if (this.hand) {
+			mhr.keypoints.fill(0, 0, 21 * 3);
+			mhr.keypoints.fill(0, 42 * 3);
+		}
 		// The camera's y and z point the other way from MHR's.
 		const flip = (a) => { for (let i = 0; i < a.length; i += 3) { a[i + 1] = -a[i + 1]; a[i + 2] = -a[i + 2]; } return a; };
 		const kp3d = flip(mhr.keypoints);
@@ -282,7 +345,7 @@ export class BodyHeads {
 			pred_keypoints_3d: kp3d,
 			pred_vertices: mhr.vertices ? flip(Float64Array.from(mhr.vertices)) : null,
 		};
-		Object.assign(out, project(kp3d, cam, view));
+		Object.assign(out, project(kp3d, cam, view, this.cameraScale));
 		return out;
 	}
 
@@ -302,11 +365,18 @@ export class BodyHeads {
 // PerspectiveHead.perspective_projection (USE_INTRIN_CENTER) and
 // _full_to_crop: the camera translation from (s, tx, ty) and the box, the
 // keypoints in the image, in the crop ([-0.5, 0.5]) and their depths.
-export function project(points, predCam, { crop, cam }) {
+export function project(points, predCam, { crop, cam }, scaleFactor = 1) {
 	const [f, fy, ppx, ppy] = cam;
 	const s = -predCam[0], tx = predCam[1], ty = -predCam[2];
-	const bs = crop.scale[0] * s + 1e-8;
+	const bs = crop.scale[0] * s * scaleFactor + 1e-8;
 	const t = [tx + (2 * (crop.center[0] - ppx)) / bs, ty + (2 * (crop.center[1] - ppy)) / bs, (2 * f) / bs];
+	return { ...projectAt(points, t, { crop, cam }), pred_cam_t: t };
+}
+
+// Points [n * 3] moved by the camera translation `t` into the image, the crop
+// and their depths.
+export function projectAt(points, t, { crop, cam }) {
+	const [f, fy, ppx, ppy] = cam;
 	const n = points.length / 3;
 	const kp2d = new Float64Array(n * 2), cropped = new Float64Array(n * 2), depth = new Float64Array(n);
 	const A = crop.affine;
@@ -319,7 +389,7 @@ export function project(points, predCam, { crop, cam }) {
 		cropped[i * 2 + 1] = (A[3] * u + A[4] * v + A[5]) / crop.size - 0.5;
 		depth[i] = z;
 	}
-	return { pred_cam_t: t, focal_length: f, pred_keypoints_2d: kp2d, pred_keypoints_2d_cropped: cropped, pred_keypoints_2d_depth: depth };
+	return { focal_length: f, pred_keypoints_2d: kp2d, pred_keypoints_2d_cropped: cropped, pred_keypoints_2d_depth: depth };
 }
 
 export { JOINTS };

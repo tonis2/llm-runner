@@ -53,21 +53,25 @@ function inCrop(pose) {
  *   bbox     the person's box in the first frame; without one the whole frame,
  *            posed twice - the second time in the box the first found
  *   focal    focal length in pixels (the image diagonal without one)
+ *   hands    pose the hands as well (the model loaded with them)
  *   onFrame  (record, index, count) after each frame, awaited
  *
  * Returns a record a frame: { path, size, bbox, camera, params [204],
- * cam_t [3], keypoints_2d [140], in_crop }.
+ * cam_t [3], keypoints_2d [140], in_crop }, and with hands `hands` [left,
+ * right], whether each hand decoder's hand was used.
  */
-export async function poseFrames(model, paths, { bbox = null, focal = null, onFrame = null } = {}) {
+export async function poseFrames(model, paths, { bbox = null, focal = null, hands = false, onFrame = null } = {}) {
 	const out = [];
 	let box = bbox;
 	for (let i = 0; i < paths.length; i++) {
 		const t0 = llm.now();
 		const img = llm.image.load(paths[i]);
-		let pose = await model.poseImage(img, { bbox: box, focal, quiet: true });
-		if (i === 0 && !bbox) {
+		// The first frame without a box is posed once for the box alone: no hands.
+		const search = i === 0 && !bbox;
+		let pose = await model.poseImage(img, { bbox: box, focal, hands: hands && !search, quiet: true });
+		if (search) {
 			const found = keypointBox(pose.pred_keypoints_2d, img.width, img.height);
-			if (found) pose = await model.poseImage(img, { bbox: found, focal, quiet: true });
+			if (found || hands) pose = await model.poseImage(img, { bbox: found, focal, hands, quiet: true });
 		}
 		const record = {
 			path: paths[i],
@@ -79,6 +83,7 @@ export async function poseFrames(model, paths, { bbox = null, focal = null, onFr
 			keypoints_2d: Float64Array.from(pose.pred_keypoints_2d),
 			in_crop: inCrop(pose),
 		};
+		if (pose.hands_used) record.hands = pose.hands_used.slice();
 		out.push(record);
 		// The next frame's box: around this one's keypoints, or this box again
 		// when they make none.

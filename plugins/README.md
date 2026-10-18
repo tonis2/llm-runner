@@ -198,13 +198,23 @@ the gated download asks you to accept; the MHR rig is Apache-2.0. The plugin
 writes motion made with them, so what you do with that motion is under the
 same license's terms.
 
-A frame takes about 8 s on an Apple M5 (the q8 DINOv3 backbone is 6.9 s of
-it). A clip is the MHR skeleton's 126
+A frame takes about 4.4 s on an Apple M5 (the q8 DINOv3 backbone is 3.5 s of
+it). The camera may look up or down: the floor is fitted as a plane under the
+feet over the whole clip and levelled, and the turn is kept as the camera's
+rotation in the .glb's extras and the frames JSON. `hands=true` poses the
+hands as SAM 3D Body's full inference does: a crop around each hand through the
+backbone and the hand decoder (the left one mirrored, the decoder knowing only
+right hands), the good ones' wrists and the elbows as prompts to the body
+decoder again, and their finger angles and wrist turns put in. It takes about
+13.4 s a frame (three backbone passes). `posed=frames.json` (a
+run's `output`) makes the clip again from the posed frames in seconds, to try
+other `smooth` or `cleanup` settings. A clip is the MHR skeleton's 126
 joints, y up, metres, its proportions held to their median over the clip and
 standing on y = 0, the camera taken as fixed; `graph/templates/sam3dbody-motion.json`
 is the same as nodes. `tests/sam3dbody_golden.js` checks every stage of one
 image against the reference (`tools/sam3dbody/golden.py` writes its numbers),
-and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
+`tests/sam3dbody_hands.js` the hand passes and their merge
+(`tools/sam3dbody/golden_hands.py`), and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
 own kinematics.
 
 ## UniMate's weights

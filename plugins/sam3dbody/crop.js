@@ -30,9 +30,13 @@ export function boxToCrop(box, { padding = 1.25, size = SIZE } = {}) {
 	fix(0.75);
 	fix(1);
 	// get_warp_matrix with no rotation: the box onto the crop, scaled by the
-	// width. cv2.getAffineTransform solves it in double from float32 points.
-	const a = size / w;
-	const affine = [a, 0, size / 2 - a * center[0], 0, a, size / 2 - a * center[1]];
+	// width. Its three source points are float32 - the centre, half a width
+	// above it, and that turned about the second - and cv2.getAffineTransform
+	// solves through them in double, so x and y scale apart by their rounding.
+	const above = f32(center[1] - w * 0.5);
+	const left = f32(center[0] - f32(center[1] - above));
+	const ax = size / 2 / (center[0] - left), ay = size / 2 / (center[1] - above);
+	const affine = [ax, 0, -ax * left, 0, ay, -ay * above];
 	return { center, scale: [w, h], affine, size };
 }
 
@@ -48,8 +52,9 @@ export function defaultCamera(width, height) {
 // blend in float32 with fused multiply-adds, rounded to nearest-even. (Older
 // OpenCV cut positions to 1/32 pixel in fixed point; its crops differ by one
 // level here and there.) `img` is { width, height, channels, pixels }; returns
-// RGB bytes [size, size, 3].
-export function warpCrop(img, affine, size = SIZE) {
+// RGB bytes [size, size, 3]. `mirror` warps the image mirrored left to right
+// (`img[:, ::-1]`) without making it.
+export function warpCrop(img, affine, { size = SIZE, mirror = false } = {}) {
 	const { width, height, channels, pixels } = img;
 	// cv2's invertAffineTransform, M having no shear.
 	const [a, , tx, , d, ty] = affine;
@@ -60,19 +65,32 @@ export function warpCrop(img, affine, size = SIZE) {
 		const r = Math.round(v);
 		return Math.abs(v - Math.trunc(v)) === 0.5 && r % 2 !== 0 ? r - 1 : r;
 	};
+	// Each column's source: its two pixels' offsets in a row (-1 off the
+	// image) and the blend between them. A product of two float32s is exact
+	// in a double: one rounding, an fma.
+	const col0 = new Int32Array(size), col1 = new Int32Array(size), alphas = new Float64Array(size);
+	const offset = (x) => (x < 0 || x >= width ? -1 : (mirror ? width - 1 - x : x) * channels);
+	for (let x = 0; x < size; x++) {
+		const sx = f32(m0 * x + f32(M[1]));
+		const ix = Math.floor(sx);
+		alphas[x] = f32(sx - ix);
+		col0[x] = offset(ix);
+		col1[x] = offset(ix + 1);
+	}
 	const out = new Uint8Array(size * size * 3);
-	const tap = (x, y, c) => (x < 0 || y < 0 || x >= width || y >= height ? 0 : pixels[(y * width + x) * channels + c]);
 	for (let y = 0; y < size; y++) {
-		// A product of two float32s is exact in a double: one rounding, an fma.
 		const sy = f32(m3 * y + f32(M[3]));
 		const iy = Math.floor(sy), beta = f32(sy - iy);
+		const row0 = iy >= 0 && iy < height ? iy * width * channels : -1;
+		const row1 = iy + 1 >= 0 && iy + 1 < height ? (iy + 1) * width * channels : -1;
 		for (let x = 0; x < size; x++) {
-			const sx = f32(m0 * x + f32(M[1]));
-			const ix = Math.floor(sx), alpha = f32(sx - ix);
+			const alpha = alphas[x], c0 = col0[x], c1 = col1[x];
+			const o = (y * size + x) * 3;
 			for (let c = 0; c < 3; c++) {
-				const p00 = tap(ix, iy, c), p01 = tap(ix + 1, iy, c), p10 = tap(ix, iy + 1, c), p11 = tap(ix + 1, iy + 1, c);
+				const p00 = row0 < 0 || c0 < 0 ? 0 : pixels[row0 + c0 + c], p01 = row0 < 0 || c1 < 0 ? 0 : pixels[row0 + c1 + c];
+				const p10 = row1 < 0 || c0 < 0 ? 0 : pixels[row1 + c0 + c], p11 = row1 < 0 || c1 < 0 ? 0 : pixels[row1 + c1 + c];
 				const v0 = f32(alpha * (p01 - p00) + p00), v1 = f32(alpha * (p11 - p10) + p10);
-				out[(y * size + x) * 3 + c] = Math.max(0, Math.min(255, round(f32(beta * f32(v1 - v0) + v0))));
+				out[o + c] = Math.max(0, Math.min(255, round(f32(beta * f32(v1 - v0) + v0))));
 			}
 		}
 	}

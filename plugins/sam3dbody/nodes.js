@@ -34,12 +34,12 @@ defineNodes('sam3dbody', {
 	'sam3dbody.load': {
 		title: 'Load SAM 3D Body',
 		category: 'motion',
-		description: 'The sam-3d-body-dinov3 folder (model.ckpt, assets/mhr_model.pt). `linear` is the backbone\'s weights, `decoder` the decoder\'s.',
-		inputs: { path: 'PATH(sam3dbody)', linear: 'ENUM(q8|f32)=q8', decoder: 'ENUM(f32|q8)=f32', matrix_cores: 'BOOL=true' },
+		description: 'The sam-3d-body-dinov3 folder (model.ckpt, assets/mhr_model.pt). `linear` is the backbone\'s weights, `decoder` the decoders\'. `hands` poses the hands too, with the hand decoder: three backbone passes a frame instead of one.',
+		inputs: { path: 'PATH(sam3dbody)', linear: 'ENUM(q8|f32)=q8', decoder: 'ENUM(f32|q8)=f32', hands: 'BOOL=false', matrix_cores: 'BOOL=true' },
 		outputs: { model: 'MODEL' },
 		async run(i) {
 			op.useMatrixCores(i.matrix_cores);
-			const model = new Sam3dBody(i.path, { linear: i.linear, decoder: i.decoder });
+			const model = new Sam3dBody(i.path, { linear: i.linear, decoder: i.decoder, hands: i.hands });
 			await model.load();
 			return { model };
 		},
@@ -79,7 +79,7 @@ defineNodes('sam3dbody', {
 			let paths = listFrames(i.frames).slice(Math.max(0, i.first)).filter((_, k) => k % stride === 0);
 			if (i.count > 0) paths = paths.slice(0, i.count);
 			const posed = await poseFrames(i.model, paths, {
-				bbox: parseBox(i.bbox), focal: i.focal || null,
+				bbox: parseBox(i.bbox), focal: i.focal || null, hands: i.model.hands,
 				onFrame: (_, k, n) => ctx?.progress(k + 1, n),
 			});
 			const motion = assembleMotion(i.model.mhr, posed, { fps: i.fps / stride, smooth: i.smooth });

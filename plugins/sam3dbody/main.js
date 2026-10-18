@@ -2,16 +2,20 @@
 // a folder of video frames to a motion clip on the MHR skeleton.
 //
 //   llm-runner sam3dbody model=sam-3d-body-dinov3 input=person.jpg output=pose.json \
-//       [bbox=x1,y1,x2,y2] [focal=1400] [preview=pose.png] [mesh=pose.obj]
+//       [bbox=x1,y1,x2,y2] [focal=1400] [hands=false] [preview=pose.png] [mesh=pose.obj]
 //
 //   llm-runner sam3dbody model=sam-3d-body-dinov3 frames=frames/ fps=24 glb=motion.glb \
 //       [bvh=motion.bvh] [output=frames.json] [bbox=...] [first=0] [count=0] [stride=1] \
-//       [smooth=7] [cleanup=true]
+//       [hands=false] [smooth=7] [cleanup=true]
 //
 // `model` is the folder downloaded from huggingface.co/facebook/sam-3d-body-dinov3
 // (gated): model.ckpt, and the MHR rig as assets/mhr_model.pt. Without `bbox`
 // the whole image is the person's box, as SAM 3D Body with no detector; without
 // `focal` the focal length is the image diagonal, as with no FOV estimator.
+// `hands` poses the hands as SAM 3D Body's full inference does (a crop around
+// each through the hand decoder, the body decoder again with their wrists as
+// prompts): finger angles and wrists the body decoder alone gets roughly, for
+// three backbone passes a frame instead of one.
 //
 // One image: `output` is JSON: the 70 keypoints (names, 2D in the image, 3D),
 // the 127 MHR joints' positions and world rotations, the camera translation and
@@ -31,23 +35,29 @@
 // `bvh` (centimetres). `smooth` is the smoothing window in frames (1: none);
 // `cleanup` plants the feet where they touch the floor (Kimodo's clean-up).
 // `output` writes each frame's box, camera, camera translation and 2D keypoints
-// as JSON. Run in-process, the clip and that JSON are also handed over as the
+// as JSON, with its MHR model parameters: `posed=frames.json` in place of
+// `frames` makes the clip again from those, without the network (to try other
+// `smooth` or `cleanup` settings in seconds). Run in-process, the clip and that JSON are also handed over as the
 // job's outputs `glb` (as Kimodo's) and `frames.json`.
 //
 // Settings: linear (q8, the backbone's weights; f32), decoder (f32; q8),
-// matrix_cores (true).
+// matrix_cores (true); profile (false: times each kernel on its own, slowly).
 
 import { llm } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
+import { profileReport } from '../lib/gpu.js';
 import { writeText, utf8 } from '../lib/graph/plugins.js';
 import { Sam3dBody } from './pose.js';
+import { MHR } from './mhr.js';
+import { mhrPath } from './weights.js';
 import { KEYPOINT_NAMES, drawPreview } from './keypoints.js';
 import { listFrames, poseFrames } from './frames.js';
 import { assembleMotion } from './motion.js';
 import { cleanUpMotion } from '../kimodo/cleanup.js';
-import { clipGlb, clipBvh, framesJson } from './output.js';
+import { clipGlb, clipBvh, framesJson, readPosed } from './output.js';
 
 const round = (v, d = 5) => Number(v.toFixed(d));
+const flag = (v, otherwise) => (v === undefined || v === null || v === '' ? otherwise : v === true || v === 'true' || v === '1');
 const rows = (a, n) => Array.from({ length: a.length / n }, (_, i) => Array.from(a.slice(i * n, i * n + n), (v) => round(v)));
 
 function parseList(v, n, what) {
@@ -92,6 +102,10 @@ async function poseOne(model, config, bbox, focal) {
 		},
 		hand_boxes: rows(pose.hand_box, 4),
 	};
+	if (pose.hands_used) {
+		doc.hands_used = { left: pose.hands_used[0], right: pose.hands_used[1] };
+		doc.hand_crops = pose.hand_boxes.map((b) => b.map((v) => round(v, 2)));
+	}
 	writeText(out, jsonLines(doc));
 	llm.print(`  wrote ${out}`);
 	if (config.preview) {
@@ -113,14 +127,32 @@ async function poseClip(model, config, bbox, focal) {
 	let paths = listFrames(config.frames).slice(first).filter((_, i) => i % stride === 0);
 	if (count) paths = paths.slice(0, count);
 	llm.print(`  ${paths.length} frames from ${config.frames}`);
-	const posed = await poseFrames(model, paths, { bbox, focal });
-	const clip = assembleMotion(model.mhr, posed, { fps: fps / stride, smooth: Number(config.smooth ?? 7) });
-	const cleanup = config.cleanup === undefined || config.cleanup === true || config.cleanup === 'true' || config.cleanup === '1';
+	const posed = await poseFrames(model, paths, { bbox, focal, hands: model.hands });
+	return writeClip(model.mhr, posed, config, fps / stride, config.frames);
+}
+
+// A clip again from frames a run before posed (its `output` JSON), at that
+// clip's fps unless `fps` says otherwise.
+function reposeClip(config) {
+	const { fps, posed } = readPosed(llm.readText(config.posed));
+	llm.print(`  ${posed.length} posed frames from ${config.posed}`);
+	const mhr = new MHR(mhrPath(config.model));
+	try {
+		return writeClip(mhr, posed, config, Number(config.fps ?? fps), config.posed.replace(/\.json$/, ''));
+	} finally {
+		mhr.close();
+	}
+}
+
+function writeClip(mhr, posed, config, fps, source) {
+	const clip = assembleMotion(mhr, posed, { fps, smooth: Number(config.smooth ?? 7) });
+	if (clip.cameraRotation[3] < 1) llm.print(`  floor levelled: the camera looks ${(2 * Math.acos(clip.cameraRotation[3]) * 180 / Math.PI).toFixed(1)} degrees off level`);
+	const cleanup = flag(config.cleanup, true);
 	if (cleanup && clip.frames > 2) {
 		const done = cleanUpMotion({ skeleton: clip.skeleton, key: 'mhr', frames: clip.frames, rotations: clip.rotations, root: clip.root, contacts: clip.contacts });
 		llm.print(`  clean-up: ${done.plantedFrames} planted foot frames`);
 	}
-	const glb = clipGlb(clip, config.frames.replace(/\/+$/, '').split('/').pop() || 'capture');
+	const glb = clipGlb(clip, source.replace(/\/+$/, '').split('/').pop() || 'capture');
 	const glbPath = config.glb ?? (config.bvh ? null : 'motion.glb');
 	if (glbPath) {
 		llm.writeBytes(glbPath, glb);
@@ -147,12 +179,18 @@ llm.plugin({
 	async generate(config) {
 		const start = llm.now();
 		if (!config.model) throw new Error('model= is the sam-3d-body-dinov3 folder');
-		if (!config.input && !config.frames) throw new Error('input= is the image, or frames= a folder of video frames');
+		if (!config.input && !config.frames && !config.posed) throw new Error('input= is the image, or frames= a folder of video frames, or posed= a frames JSON');
+		if (config.posed) {
+			llm.print(`=== SAM 3D Body: ${config.posed} ===`);
+			const result = reposeClip(config);
+			llm.print(`=== done in ${llm.since(start)} ===`);
+			return result;
+		}
 		op.useMatrixCores(config.matrix_cores ?? true);
 		llm.print(`=== SAM 3D Body: ${config.input ?? config.frames} ===`);
 		const bbox = parseList(config.bbox, 4, 'bbox');
 		const focal = config.focal ? Number(config.focal) : null;
-		const model = new Sam3dBody(config.model, { linear: config.linear ?? 'q8', decoder: config.decoder ?? 'f32' });
+		const model = new Sam3dBody(config.model, { linear: config.linear ?? 'q8', decoder: config.decoder ?? 'f32', hands: flag(config.hands, false) });
 		await model.load();
 		let result;
 		try {
@@ -160,6 +198,7 @@ llm.plugin({
 		} finally {
 			model.dispose();
 		}
+		if (config.profile) profileReport('sam3dbody');
 		llm.print(`=== done in ${llm.since(start)} ===`);
 		return result;
 	},
