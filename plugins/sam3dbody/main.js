@@ -6,7 +6,7 @@
 //
 //   llm-runner sam3dbody model=sam-3d-body-dinov3 frames=frames/ fps=24 glb=motion.glb \
 //       [bvh=motion.bvh] [output=frames.json] [bbox=...] [first=0] [count=0] [stride=1] \
-//       [hands=false] [smooth=7] [cleanup=true]
+//       [hands=false] [hand_stride=1] [smooth=7] [cleanup=true]
 //
 // `model` is the folder downloaded from huggingface.co/facebook/sam-3d-body-dinov3
 // (gated): model.ckpt, and the MHR rig as assets/mhr_model.pt. Without `bbox`
@@ -15,7 +15,8 @@
 // `hands` poses the hands as SAM 3D Body's full inference does (a crop around
 // each through the hand decoder, the body decoder again with their wrists as
 // prompts): finger angles and wrists the body decoder alone gets roughly, for
-// three backbone passes a frame instead of one.
+// three backbone passes a frame instead of one. `hand_stride=2` runs the hand
+// passes on every second frame only and blends the fingers between them.
 //
 // One image: `output` is JSON: the 70 keypoints (names, 2D in the image, 3D),
 // the 127 MHR joints' positions and world rotations, the camera translation and
@@ -49,9 +50,9 @@ import { profileReport } from '../lib/gpu.js';
 import { writeText, utf8 } from '../lib/graph/plugins.js';
 import { Sam3dBody } from './pose.js';
 import { MHR } from './mhr.js';
-import { mhrPath } from './weights.js';
+import { mhrPath, openWeights } from './weights.js';
 import { KEYPOINT_NAMES, drawPreview } from './keypoints.js';
-import { listFrames, poseFrames } from './frames.js';
+import { listFrames, poseFrames, holdHands } from './frames.js';
 import { assembleMotion } from './motion.js';
 import { cleanUpMotion } from '../kimodo/cleanup.js';
 import { clipGlb, clipBvh, framesJson, readPosed } from './output.js';
@@ -127,15 +128,21 @@ async function poseClip(model, config, bbox, focal) {
 	let paths = listFrames(config.frames).slice(first).filter((_, i) => i % stride === 0);
 	if (count) paths = paths.slice(0, count);
 	llm.print(`  ${paths.length} frames from ${config.frames}`);
-	const posed = await poseFrames(model, paths, { bbox, focal, hands: model.hands });
+	const posed = await poseFrames(model, paths, { bbox, focal, hands: model.hands, handStride: Number(config.hand_stride ?? 1) });
 	return writeClip(model.mhr, posed, config, fps / stride, config.frames);
 }
 
 // A clip again from frames a run before posed (its `output` JSON), at that
 // clip's fps unless `fps` says otherwise.
 function reposeClip(config) {
-	const { fps, posed } = readPosed(llm.readText(config.posed));
+	const { fps, posed, handStride } = readPosed(llm.readText(config.posed));
 	llm.print(`  ${posed.length} posed frames from ${config.posed}`);
+	if (posed.some((r) => r.hands)) {
+		const m = openWeights(config.model);
+		const [l, r] = holdHands(posed, [m.ints('head_pose.hand_joint_idxs_left'), m.ints('head_pose.hand_joint_idxs_right')], { stride: handStride });
+		m.close();
+		llm.print(`  hands from neighbouring accepted frames: left ${l.held} held, ${l.blended} blended; right ${r.held} held, ${r.blended} blended`);
+	}
 	const mhr = new MHR(mhrPath(config.model));
 	try {
 		return writeClip(mhr, posed, config, Number(config.fps ?? fps), config.posed.replace(/\.json$/, ''));

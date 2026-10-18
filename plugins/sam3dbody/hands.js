@@ -15,7 +15,7 @@
 //
 // Sides are [left, right] throughout, as the reference has them.
 
-import { boxToCrop, warpCrop, normalize, rayFeatures, cliffCondition, SIZE } from './crop.js';
+import { boxToCrop, rayFeatures, cliffCondition, SIZE } from './crop.js';
 import { matmul3, matmul3T, projectAt } from './heads.js';
 import { quatToMatrix } from './mhr.js';
 
@@ -78,11 +78,11 @@ export function handBoxes(handBox, crop) {
 	});
 }
 
-// A hand crop's inputs: `box` in the image the hand is cut from, the image
-// mirrored left to right with `mirror` (the box is in the mirrored image).
-export function handInputs(img, box, cam, { mirror = false } = {}) {
+// A hand crop's inputs but the pixels: `box` in the image the hand is cut
+// from (mirrored left to right for the left hand).
+export function handInputs(box, cam) {
 	const crop = boxToCrop(box, { padding: HAND_PADDING });
-	return { crop, view: { crop, cam }, pixels: normalize(warpCrop(img, crop.affine, { mirror })), rays: rayFeatures(crop.affine, cam), condition: cliffCondition(crop, cam) };
+	return { crop, view: { crop, cam }, rays: rayFeatures(crop.affine, cam), condition: cliffCondition(crop, cam) };
 }
 
 // The left hand's pose, decoded from the mirrored image as a right hand, as

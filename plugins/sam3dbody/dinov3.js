@@ -145,7 +145,8 @@ export class DinoV3 {
 	}
 
 	// `pixels` is [3, H, W], normalised (ImageNet mean and std), the sides
-	// multiples of 16. Returns the feature map [dim, H / 16, W / 16] as a
+	// multiples of 16: a Float32Array, or a Tensor already on the GPU (which
+	// stays the caller's). Returns the feature map [dim, H / 16, W / 16] as a
 	// Tensor, which the caller disposes. `stopAfter` (a block index) returns
 	// the tokens [prefix + patches, dim] after that block instead, for
 	// comparing a port stage by stage.
@@ -154,7 +155,7 @@ export class DinoV3 {
 		const gh = H / PATCH, gw = W / PATCH, N = gh * gw, pre = this.prefixTokens, n = pre + N;
 		if (!Number.isInteger(gh) || !Number.isInteger(gw)) throw new Error(`DINOv3: ${W}x${H} is not a multiple of ${PATCH}`);
 		const t0 = llm.now();
-		const img = upload(pixels);
+		const img = pixels instanceof Float32Array ? upload(pixels) : pixels;
 		const a = {
 			patches: f32(N * 3 * PATCH * PATCH),
 			h: f32(n * D), x: f32(n * D), q: f32(n * D), k: f32(n * D), v: f32(n * D),
@@ -190,7 +191,7 @@ export class DinoV3 {
 			submit();
 			disposeAll(a);
 			disposeAll(rope);
-			img.dispose();
+			if (img !== pixels) img.dispose();
 		}
 	}
 

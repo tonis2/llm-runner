@@ -17,7 +17,7 @@
 import { llm } from '../lib/llm.js';
 import { DinoV3 } from './dinov3.js';
 import { openWeights, mhrPath } from './weights.js';
-import { boxToCrop, warpCrop, normalize, defaultCamera, rayFeatures, cliffCondition, SIZE } from './crop.js';
+import { boxToCrop, uploadImage, warpCropGpu, defaultCamera, rayFeatures, cliffCondition, SIZE } from './crop.js';
 import { MHR } from './mhr.js';
 import { BodyHeads } from './heads.js';
 import { BodyDecoder } from './decoder.js';
@@ -83,18 +83,30 @@ export class Sam3dBody {
 		const crop = boxToCrop(box);
 		const view = { crop, cam };
 		const rays = rayFeatures(crop.affine, cam), condition = cliffCondition(crop, cam);
-		const features = await this.encoder.encode(normalize(warpCrop(img, crop.affine)), SIZE, SIZE);
-		let pose;
+		// The frame's bytes go up once; every crop is cut from them there.
+		const image = uploadImage(img);
+		let features = null, decoded = null, pose;
 		try {
+			const input = warpCropGpu(image, img, crop.affine);
+			try {
+				features = await this.encoder.encode(input, SIZE, SIZE);
+			} finally {
+				input.dispose();
+			}
+			// With hands the body decoder runs again on the same crop: keep its
+			// image side.
 			const result = await this.decoder.run(features, rays, condition,
-				(token, layer) => this.heads.decode(token, view, { allVertices: mesh && !hands && layer === this.decoder.depth - 1 }));
+				(token, layer) => this.heads.decode(token, view, { allVertices: mesh && !hands && layer === this.decoder.depth - 1 }), { keepImage: hands });
+			decoded = result.image;
 			pose = result.pose;
 			const boxes = this.heads.handBoxes(result.handTokens);
 			pose.hand_box = boxes.boxes;
 			pose.hand_logits = boxes.logits;
-			if (hands) pose = await this.poseHands(img, features, pose, { view, rays, condition, mesh });
+			if (hands) pose = await this.poseHands(img, image, features, pose, { view, rays, condition, mesh, decoded });
 		} finally {
-			features.dispose();
+			features?.dispose();
+			decoded?.dispose();
+			image.dispose();
 		}
 		pose.bbox = box;
 		pose.camera = cam;
@@ -102,11 +114,18 @@ export class Sam3dBody {
 		return pose;
 	}
 
-	// One hand crop through the backbone and the hand decoder; `mirror` cuts
-	// it from the image mirrored left to right.
-	async poseHand(img, box, cam, mirror = false) {
-		const input = handInputs(img, box, cam, { mirror });
-		const features = await this.encoder.encode(input.pixels, SIZE, SIZE);
+	// One hand crop through the backbone and the hand decoder; `image` is
+	// img's bytes on the GPU, `mirror` cuts the crop from it mirrored left to
+	// right.
+	async poseHand(img, image, box, cam, mirror = false) {
+		const input = handInputs(box, cam);
+		const pixels = warpCropGpu(image, img, input.crop.affine, { mirror });
+		let features;
+		try {
+			features = await this.encoder.encode(pixels, SIZE, SIZE);
+		} finally {
+			pixels.dispose();
+		}
 		try {
 			const result = await this.handDecoder.run(features, input.rays, input.condition, (token) => this.handHeads.decode(token, input.view));
 			return { pose: result.pose, crop: input.crop };
@@ -117,17 +136,18 @@ export class Sam3dBody {
 
 	// The hands of `body` (the body pass's pose on `features`), and the body
 	// again with them (hands.js).
-	async poseHands(img, features, body, { view, rays, condition, mesh }) {
+	// `decoded` is the body decoder's prepared image side of these features.
+	async poseHands(img, image, features, body, { view, rays, condition, mesh, decoded }) {
 		const [leftBox, rightBox] = handBoxes(body.hand_box, view.crop);
 		const W = img.width;
-		const left = await this.poseHand(img, [W - leftBox[2] - 1, leftBox[1], W - leftBox[0] - 1, leftBox[3]], view.cam, true);
+		const left = await this.poseHand(img, image, [W - leftBox[2] - 1, leftBox[1], W - leftBox[0] - 1, leftBox[3]], view.cam, true);
 		unmirrorLeft(left.pose, this.heads);
-		const right = await this.poseHand(img, rightBox, view.cam);
+		const right = await this.poseHand(img, image, rightBox, view.cam);
 		const check = checkHands(body, left.pose, right.pose, [left.crop, right.crop], W, this.jointRotation);
 		const prompts = handPrompts(body, check, view);
 		let prompted = body;
 		if (prompts.length) {
-			const result = await this.decoder.run(features, rays, condition, (token) => this.heads.decode(token, view), { prompts, prev: previousEstimate(body) });
+			const result = await this.decoder.run(features, rays, condition, (token) => this.heads.decode(token, view), { prompts, prev: previousEstimate(body), image: decoded });
 			prompted = result.pose;
 		}
 		const out = mergeHands(this.heads, prompted, left.pose, right.pose, check, view, this.jointRotation, { allVertices: mesh });

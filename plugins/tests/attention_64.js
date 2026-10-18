@@ -20,7 +20,7 @@ const read = (t, n) => new Float32Array(t.buffer.readBytes(0, n * 4).buffer);
 
 const HD = 64;
 function run(name, q, k, v, out, heads, seq) {
-	if (name === 'flash_attention_64') dispatch(name, [q, k, v, out], [groups(seq, 128), heads], pc('uuf', heads, seq, 1 / Math.sqrt(HD)));
+	if (name === 'flash_attention_64') dispatch(name, [q, k, v, out], [groups(seq, 64), heads], pc('uuf', heads, seq, 1 / Math.sqrt(HD)));
 	else dispatch(name, [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', HD, heads, seq, 1 / Math.sqrt(HD)), false, flashDefines(HD));
 }
 

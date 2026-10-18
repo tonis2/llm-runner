@@ -1,63 +1,57 @@
-// Flash attention for head_dim 64 without matrix cores: one thread a query
-// row, its Q (pre-scaled) and output in registers, so a row's softmax needs no
-// reductions and a 32-key tile takes two barriers. The K and V tiles sit in
-// shared memory, which every thread of the workgroup reads at the same address
-// (a broadcast). Keys go 8 at a time: their scores, one rescale of the
-// output, then their V rows. Non-causal; written out unrolled (by
-// tools/kernels/gen_flash_attention_64.py) so Q and the output stay in registers.
+// Flash attention for head_dim 64 without matrix cores. A query row is split
+// over 4 threads (16 dimensions each) and a thread has 2 rows, its
+// share of Q (pre-scaled) and of the output in registers; a K or V value read
+// from shared memory feeds all 2 rows. A step of 2 keys: partial scores,
+// summed across the 4 threads through shared memory (double-buffered, one
+// barrier), the online softmax (each thread keeps its rows' running max and
+// sum), the V rows. Non-causal; written out unrolled by
+// tools/kernels/gen_flash_attention_64.py.
 // Q, K, V: [heads, seq, 64]. Output: [seq, heads * 64].
-// Dispatch: (ceil(seq/128), heads).
+// Dispatch: (ceil(seq/64), heads).
 float4 q[];
 float4 k[];
 float4 v[];
 float output[];
 struct Push @pushconstant { uint n_heads; uint seq_len; float scale; }
 Push pc;
-shared float4 ks[512];      // [32 keys][16]
+shared float4 ks[512];
 shared float4 vs[512];
+shared float sc[1024];
 struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
 fn void main(ComputeIn input) @compute @threads(128, 1, 1)
 {
     uint t = input.lid.x;
+    uint half_ = t % 4u;
+    uint pair = t / 4u;
     uint head = input.gid.y;
-    uint row = input.gid.x * 128u + t;
     uint S = pc.seq_len;
     uint base = head * S * 16u;
-    uint qi = base + min(row, S - 1u) * 16u;
-    float4 q0 = q[qi + 0u] * pc.scale;
-    float4 q1 = q[qi + 1u] * pc.scale;
-    float4 q2 = q[qi + 2u] * pc.scale;
-    float4 q3 = q[qi + 3u] * pc.scale;
-    float4 q4 = q[qi + 4u] * pc.scale;
-    float4 q5 = q[qi + 5u] * pc.scale;
-    float4 q6 = q[qi + 6u] * pc.scale;
-    float4 q7 = q[qi + 7u] * pc.scale;
-    float4 q8 = q[qi + 8u] * pc.scale;
-    float4 q9 = q[qi + 9u] * pc.scale;
-    float4 q10 = q[qi + 10u] * pc.scale;
-    float4 q11 = q[qi + 11u] * pc.scale;
-    float4 q12 = q[qi + 12u] * pc.scale;
-    float4 q13 = q[qi + 13u] * pc.scale;
-    float4 q14 = q[qi + 14u] * pc.scale;
-    float4 q15 = q[qi + 15u] * pc.scale;
-    float4 o0 = float4(0.0);
-    float4 o1 = float4(0.0);
-    float4 o2 = float4(0.0);
-    float4 o3 = float4(0.0);
-    float4 o4 = float4(0.0);
-    float4 o5 = float4(0.0);
-    float4 o6 = float4(0.0);
-    float4 o7 = float4(0.0);
-    float4 o8 = float4(0.0);
-    float4 o9 = float4(0.0);
-    float4 o10 = float4(0.0);
-    float4 o11 = float4(0.0);
-    float4 o12 = float4(0.0);
-    float4 o13 = float4(0.0);
-    float4 o14 = float4(0.0);
-    float4 o15 = float4(0.0);
-    float m = -1.0e30;
-    float l = 0.0;
+    uint h0 = half_ * 4u;
+    uint row0 = input.gid.x * 64u + 0u * 32u + pair;
+    uint qi0 = base + min(row0, S - 1u) * 16u + h0;
+    float4 q0_0 = q[qi0 + 0u] * pc.scale;
+    float4 q0_1 = q[qi0 + 1u] * pc.scale;
+    float4 q0_2 = q[qi0 + 2u] * pc.scale;
+    float4 q0_3 = q[qi0 + 3u] * pc.scale;
+    float4 o0_0 = float4(0.0);
+    float4 o0_1 = float4(0.0);
+    float4 o0_2 = float4(0.0);
+    float4 o0_3 = float4(0.0);
+    float m0 = -1.0e30;
+    float l0 = 0.0;
+    uint row1 = input.gid.x * 64u + 1u * 32u + pair;
+    uint qi1 = base + min(row1, S - 1u) * 16u + h0;
+    float4 q1_0 = q[qi1 + 0u] * pc.scale;
+    float4 q1_1 = q[qi1 + 1u] * pc.scale;
+    float4 q1_2 = q[qi1 + 2u] * pc.scale;
+    float4 q1_3 = q[qi1 + 3u] * pc.scale;
+    float4 o1_0 = float4(0.0);
+    float4 o1_1 = float4(0.0);
+    float4 o1_2 = float4(0.0);
+    float4 o1_3 = float4(0.0);
+    float m1 = -1.0e30;
+    float l1 = 0.0;
+    uint step = 0u;
     uint tiles = (S + 31u) / 32u;
     for (uint tile = 0u; tile < tiles; tile++) {
         uint k0 = tile * 32u;
@@ -71,126 +65,101 @@ fn void main(ComputeIn input) @compute @threads(128, 1, 1)
         }
         barrier;
         uint valid = min(32u, S - k0);
-        for (uint c = 0u; c < 32u; c += 8u) {
-            uint r0 = (c + 0u) * 16u;
-            float4 a0 = q0 * ks[r0 + 0u] + q1 * ks[r0 + 1u] + q2 * ks[r0 + 2u] + q3 * ks[r0 + 3u] + q4 * ks[r0 + 4u] + q5 * ks[r0 + 5u] + q6 * ks[r0 + 6u] + q7 * ks[r0 + 7u] + q8 * ks[r0 + 8u] + q9 * ks[r0 + 9u] + q10 * ks[r0 + 10u] + q11 * ks[r0 + 11u] + q12 * ks[r0 + 12u] + q13 * ks[r0 + 13u] + q14 * ks[r0 + 14u] + q15 * ks[r0 + 15u];
-            float s0 = c + 0u < valid ? a0.x + a0.y + a0.z + a0.w : -1.0e30;
-            uint r1 = (c + 1u) * 16u;
-            float4 a1 = q0 * ks[r1 + 0u] + q1 * ks[r1 + 1u] + q2 * ks[r1 + 2u] + q3 * ks[r1 + 3u] + q4 * ks[r1 + 4u] + q5 * ks[r1 + 5u] + q6 * ks[r1 + 6u] + q7 * ks[r1 + 7u] + q8 * ks[r1 + 8u] + q9 * ks[r1 + 9u] + q10 * ks[r1 + 10u] + q11 * ks[r1 + 11u] + q12 * ks[r1 + 12u] + q13 * ks[r1 + 13u] + q14 * ks[r1 + 14u] + q15 * ks[r1 + 15u];
-            float s1 = c + 1u < valid ? a1.x + a1.y + a1.z + a1.w : -1.0e30;
-            uint r2 = (c + 2u) * 16u;
-            float4 a2 = q0 * ks[r2 + 0u] + q1 * ks[r2 + 1u] + q2 * ks[r2 + 2u] + q3 * ks[r2 + 3u] + q4 * ks[r2 + 4u] + q5 * ks[r2 + 5u] + q6 * ks[r2 + 6u] + q7 * ks[r2 + 7u] + q8 * ks[r2 + 8u] + q9 * ks[r2 + 9u] + q10 * ks[r2 + 10u] + q11 * ks[r2 + 11u] + q12 * ks[r2 + 12u] + q13 * ks[r2 + 13u] + q14 * ks[r2 + 14u] + q15 * ks[r2 + 15u];
-            float s2 = c + 2u < valid ? a2.x + a2.y + a2.z + a2.w : -1.0e30;
-            uint r3 = (c + 3u) * 16u;
-            float4 a3 = q0 * ks[r3 + 0u] + q1 * ks[r3 + 1u] + q2 * ks[r3 + 2u] + q3 * ks[r3 + 3u] + q4 * ks[r3 + 4u] + q5 * ks[r3 + 5u] + q6 * ks[r3 + 6u] + q7 * ks[r3 + 7u] + q8 * ks[r3 + 8u] + q9 * ks[r3 + 9u] + q10 * ks[r3 + 10u] + q11 * ks[r3 + 11u] + q12 * ks[r3 + 12u] + q13 * ks[r3 + 13u] + q14 * ks[r3 + 14u] + q15 * ks[r3 + 15u];
-            float s3 = c + 3u < valid ? a3.x + a3.y + a3.z + a3.w : -1.0e30;
-            uint r4 = (c + 4u) * 16u;
-            float4 a4 = q0 * ks[r4 + 0u] + q1 * ks[r4 + 1u] + q2 * ks[r4 + 2u] + q3 * ks[r4 + 3u] + q4 * ks[r4 + 4u] + q5 * ks[r4 + 5u] + q6 * ks[r4 + 6u] + q7 * ks[r4 + 7u] + q8 * ks[r4 + 8u] + q9 * ks[r4 + 9u] + q10 * ks[r4 + 10u] + q11 * ks[r4 + 11u] + q12 * ks[r4 + 12u] + q13 * ks[r4 + 13u] + q14 * ks[r4 + 14u] + q15 * ks[r4 + 15u];
-            float s4 = c + 4u < valid ? a4.x + a4.y + a4.z + a4.w : -1.0e30;
-            uint r5 = (c + 5u) * 16u;
-            float4 a5 = q0 * ks[r5 + 0u] + q1 * ks[r5 + 1u] + q2 * ks[r5 + 2u] + q3 * ks[r5 + 3u] + q4 * ks[r5 + 4u] + q5 * ks[r5 + 5u] + q6 * ks[r5 + 6u] + q7 * ks[r5 + 7u] + q8 * ks[r5 + 8u] + q9 * ks[r5 + 9u] + q10 * ks[r5 + 10u] + q11 * ks[r5 + 11u] + q12 * ks[r5 + 12u] + q13 * ks[r5 + 13u] + q14 * ks[r5 + 14u] + q15 * ks[r5 + 15u];
-            float s5 = c + 5u < valid ? a5.x + a5.y + a5.z + a5.w : -1.0e30;
-            uint r6 = (c + 6u) * 16u;
-            float4 a6 = q0 * ks[r6 + 0u] + q1 * ks[r6 + 1u] + q2 * ks[r6 + 2u] + q3 * ks[r6 + 3u] + q4 * ks[r6 + 4u] + q5 * ks[r6 + 5u] + q6 * ks[r6 + 6u] + q7 * ks[r6 + 7u] + q8 * ks[r6 + 8u] + q9 * ks[r6 + 9u] + q10 * ks[r6 + 10u] + q11 * ks[r6 + 11u] + q12 * ks[r6 + 12u] + q13 * ks[r6 + 13u] + q14 * ks[r6 + 14u] + q15 * ks[r6 + 15u];
-            float s6 = c + 6u < valid ? a6.x + a6.y + a6.z + a6.w : -1.0e30;
-            uint r7 = (c + 7u) * 16u;
-            float4 a7 = q0 * ks[r7 + 0u] + q1 * ks[r7 + 1u] + q2 * ks[r7 + 2u] + q3 * ks[r7 + 3u] + q4 * ks[r7 + 4u] + q5 * ks[r7 + 5u] + q6 * ks[r7 + 6u] + q7 * ks[r7 + 7u] + q8 * ks[r7 + 8u] + q9 * ks[r7 + 9u] + q10 * ks[r7 + 10u] + q11 * ks[r7 + 11u] + q12 * ks[r7 + 12u] + q13 * ks[r7 + 13u] + q14 * ks[r7 + 14u] + q15 * ks[r7 + 15u];
-            float s7 = c + 7u < valid ? a7.x + a7.y + a7.z + a7.w : -1.0e30;
-            float mx = max(m, max(max(max(s0, s1), max(s2, s3)), max(max(s4, s5), max(s6, s7))));
-            float r = exp(m - mx);
-            float p0 = exp(s0 - mx);
-            float p1 = exp(s1 - mx);
-            float p2 = exp(s2 - mx);
-            float p3 = exp(s3 - mx);
-            float p4 = exp(s4 - mx);
-            float p5 = exp(s5 - mx);
-            float p6 = exp(s6 - mx);
-            float p7 = exp(s7 - mx);
-            l = l * r + (((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)));
-            m = mx;
-            o0 = o0 * r + p0 * vs[r0 + 0u] + p1 * vs[r1 + 0u] + p2 * vs[r2 + 0u] + p3 * vs[r3 + 0u] + p4 * vs[r4 + 0u] + p5 * vs[r5 + 0u] + p6 * vs[r6 + 0u] + p7 * vs[r7 + 0u];
-            o1 = o1 * r + p0 * vs[r0 + 1u] + p1 * vs[r1 + 1u] + p2 * vs[r2 + 1u] + p3 * vs[r3 + 1u] + p4 * vs[r4 + 1u] + p5 * vs[r5 + 1u] + p6 * vs[r6 + 1u] + p7 * vs[r7 + 1u];
-            o2 = o2 * r + p0 * vs[r0 + 2u] + p1 * vs[r1 + 2u] + p2 * vs[r2 + 2u] + p3 * vs[r3 + 2u] + p4 * vs[r4 + 2u] + p5 * vs[r5 + 2u] + p6 * vs[r6 + 2u] + p7 * vs[r7 + 2u];
-            o3 = o3 * r + p0 * vs[r0 + 3u] + p1 * vs[r1 + 3u] + p2 * vs[r2 + 3u] + p3 * vs[r3 + 3u] + p4 * vs[r4 + 3u] + p5 * vs[r5 + 3u] + p6 * vs[r6 + 3u] + p7 * vs[r7 + 3u];
-            o4 = o4 * r + p0 * vs[r0 + 4u] + p1 * vs[r1 + 4u] + p2 * vs[r2 + 4u] + p3 * vs[r3 + 4u] + p4 * vs[r4 + 4u] + p5 * vs[r5 + 4u] + p6 * vs[r6 + 4u] + p7 * vs[r7 + 4u];
-            o5 = o5 * r + p0 * vs[r0 + 5u] + p1 * vs[r1 + 5u] + p2 * vs[r2 + 5u] + p3 * vs[r3 + 5u] + p4 * vs[r4 + 5u] + p5 * vs[r5 + 5u] + p6 * vs[r6 + 5u] + p7 * vs[r7 + 5u];
-            o6 = o6 * r + p0 * vs[r0 + 6u] + p1 * vs[r1 + 6u] + p2 * vs[r2 + 6u] + p3 * vs[r3 + 6u] + p4 * vs[r4 + 6u] + p5 * vs[r5 + 6u] + p6 * vs[r6 + 6u] + p7 * vs[r7 + 6u];
-            o7 = o7 * r + p0 * vs[r0 + 7u] + p1 * vs[r1 + 7u] + p2 * vs[r2 + 7u] + p3 * vs[r3 + 7u] + p4 * vs[r4 + 7u] + p5 * vs[r5 + 7u] + p6 * vs[r6 + 7u] + p7 * vs[r7 + 7u];
-            o8 = o8 * r + p0 * vs[r0 + 8u] + p1 * vs[r1 + 8u] + p2 * vs[r2 + 8u] + p3 * vs[r3 + 8u] + p4 * vs[r4 + 8u] + p5 * vs[r5 + 8u] + p6 * vs[r6 + 8u] + p7 * vs[r7 + 8u];
-            o9 = o9 * r + p0 * vs[r0 + 9u] + p1 * vs[r1 + 9u] + p2 * vs[r2 + 9u] + p3 * vs[r3 + 9u] + p4 * vs[r4 + 9u] + p5 * vs[r5 + 9u] + p6 * vs[r6 + 9u] + p7 * vs[r7 + 9u];
-            o10 = o10 * r + p0 * vs[r0 + 10u] + p1 * vs[r1 + 10u] + p2 * vs[r2 + 10u] + p3 * vs[r3 + 10u] + p4 * vs[r4 + 10u] + p5 * vs[r5 + 10u] + p6 * vs[r6 + 10u] + p7 * vs[r7 + 10u];
-            o11 = o11 * r + p0 * vs[r0 + 11u] + p1 * vs[r1 + 11u] + p2 * vs[r2 + 11u] + p3 * vs[r3 + 11u] + p4 * vs[r4 + 11u] + p5 * vs[r5 + 11u] + p6 * vs[r6 + 11u] + p7 * vs[r7 + 11u];
-            o12 = o12 * r + p0 * vs[r0 + 12u] + p1 * vs[r1 + 12u] + p2 * vs[r2 + 12u] + p3 * vs[r3 + 12u] + p4 * vs[r4 + 12u] + p5 * vs[r5 + 12u] + p6 * vs[r6 + 12u] + p7 * vs[r7 + 12u];
-            o13 = o13 * r + p0 * vs[r0 + 13u] + p1 * vs[r1 + 13u] + p2 * vs[r2 + 13u] + p3 * vs[r3 + 13u] + p4 * vs[r4 + 13u] + p5 * vs[r5 + 13u] + p6 * vs[r6 + 13u] + p7 * vs[r7 + 13u];
-            o14 = o14 * r + p0 * vs[r0 + 14u] + p1 * vs[r1 + 14u] + p2 * vs[r2 + 14u] + p3 * vs[r3 + 14u] + p4 * vs[r4 + 14u] + p5 * vs[r5 + 14u] + p6 * vs[r6 + 14u] + p7 * vs[r7 + 14u];
-            o15 = o15 * r + p0 * vs[r0 + 15u] + p1 * vs[r1 + 15u] + p2 * vs[r2 + 15u] + p3 * vs[r3 + 15u] + p4 * vs[r4 + 15u] + p5 * vs[r5 + 15u] + p6 * vs[r6 + 15u] + p7 * vs[r7 + 15u];
+        for (uint c = 0u; c < 32u; c += 2u) {
+            uint buf = (step & 1u) * 512u;
+            step = step + 1u;
+            uint r0 = (c + 0u) * 16u + h0;
+            uint r1 = (c + 1u) * 16u + h0;
+            float4 a0_0 = float4(0.0);
+            float4 a1_0 = float4(0.0);
+            { float4 kk = ks[r0 + 0u]; a0_0 = a0_0 + q0_0 * kk; a1_0 = a1_0 + q1_0 * kk; }
+            { float4 kk = ks[r0 + 1u]; a0_0 = a0_0 + q0_1 * kk; a1_0 = a1_0 + q1_1 * kk; }
+            { float4 kk = ks[r0 + 2u]; a0_0 = a0_0 + q0_2 * kk; a1_0 = a1_0 + q1_2 * kk; }
+            { float4 kk = ks[r0 + 3u]; a0_0 = a0_0 + q0_3 * kk; a1_0 = a1_0 + q1_3 * kk; }
+            sc[buf + (t * 2u + 0u) * 2u + 0u] = a0_0.x + a0_0.y + a0_0.z + a0_0.w;
+            sc[buf + (t * 2u + 1u) * 2u + 0u] = a1_0.x + a1_0.y + a1_0.z + a1_0.w;
+            float4 a0_1 = float4(0.0);
+            float4 a1_1 = float4(0.0);
+            { float4 kk = ks[r1 + 0u]; a0_1 = a0_1 + q0_0 * kk; a1_1 = a1_1 + q1_0 * kk; }
+            { float4 kk = ks[r1 + 1u]; a0_1 = a0_1 + q0_1 * kk; a1_1 = a1_1 + q1_1 * kk; }
+            { float4 kk = ks[r1 + 2u]; a0_1 = a0_1 + q0_2 * kk; a1_1 = a1_1 + q1_2 * kk; }
+            { float4 kk = ks[r1 + 3u]; a0_1 = a0_1 + q0_3 * kk; a1_1 = a1_1 + q1_3 * kk; }
+            sc[buf + (t * 2u + 0u) * 2u + 1u] = a0_1.x + a0_1.y + a0_1.z + a0_1.w;
+            sc[buf + (t * 2u + 1u) * 2u + 1u] = a1_1.x + a1_1.y + a1_1.z + a1_1.w;
+            barrier;
+            uint lo = buf + (pair * 4u) * 4u;
+            float s0_0 = c + 0u < valid ? sc[lo + 0u] + sc[lo + 4u] + sc[lo + 8u] + sc[lo + 12u] : -1.0e30;
+            float s0_1 = c + 1u < valid ? sc[lo + 1u] + sc[lo + 5u] + sc[lo + 9u] + sc[lo + 13u] : -1.0e30;
+            float mx0 = max(m0, max(s0_0, s0_1));
+            float rr0 = exp(m0 - mx0);
+            float p0_0 = exp(s0_0 - mx0);
+            float p0_1 = exp(s0_1 - mx0);
+            l0 = l0 * rr0 + (p0_0 + p0_1);
+            m0 = mx0;
+            float s1_0 = c + 0u < valid ? sc[lo + 2u] + sc[lo + 6u] + sc[lo + 10u] + sc[lo + 14u] : -1.0e30;
+            float s1_1 = c + 1u < valid ? sc[lo + 3u] + sc[lo + 7u] + sc[lo + 11u] + sc[lo + 15u] : -1.0e30;
+            float mx1 = max(m1, max(s1_0, s1_1));
+            float rr1 = exp(m1 - mx1);
+            float p1_0 = exp(s1_0 - mx1);
+            float p1_1 = exp(s1_1 - mx1);
+            l1 = l1 * rr1 + (p1_0 + p1_1);
+            m1 = mx1;
+            o0_0 = o0_0 * rr0;
+            o1_0 = o1_0 * rr1;
+            { float4 vv = vs[r0 + 0u]; o0_0 = o0_0 + p0_0 * vv; o1_0 = o1_0 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 0u]; o0_0 = o0_0 + p0_1 * vv; o1_0 = o1_0 + p1_1 * vv; }
+            o0_1 = o0_1 * rr0;
+            o1_1 = o1_1 * rr1;
+            { float4 vv = vs[r0 + 1u]; o0_1 = o0_1 + p0_0 * vv; o1_1 = o1_1 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 1u]; o0_1 = o0_1 + p0_1 * vv; o1_1 = o1_1 + p1_1 * vv; }
+            o0_2 = o0_2 * rr0;
+            o1_2 = o1_2 * rr1;
+            { float4 vv = vs[r0 + 2u]; o0_2 = o0_2 + p0_0 * vv; o1_2 = o1_2 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 2u]; o0_2 = o0_2 + p0_1 * vv; o1_2 = o1_2 + p1_1 * vv; }
+            o0_3 = o0_3 * rr0;
+            o1_3 = o1_3 * rr1;
+            { float4 vv = vs[r0 + 3u]; o0_3 = o0_3 + p0_0 * vv; o1_3 = o1_3 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 3u]; o0_3 = o0_3 + p0_1 * vv; o1_3 = o1_3 + p1_1 * vv; }
         }
     }
-    if (row >= S) return;
-    float inv = 1.0 / l;
-    uint ob = row * pc.n_heads * 64u + head * 64u;
-    output[ob + 0u] = o0.x * inv;
-    output[ob + 1u] = o0.y * inv;
-    output[ob + 2u] = o0.z * inv;
-    output[ob + 3u] = o0.w * inv;
-    output[ob + 4u] = o1.x * inv;
-    output[ob + 5u] = o1.y * inv;
-    output[ob + 6u] = o1.z * inv;
-    output[ob + 7u] = o1.w * inv;
-    output[ob + 8u] = o2.x * inv;
-    output[ob + 9u] = o2.y * inv;
-    output[ob + 10u] = o2.z * inv;
-    output[ob + 11u] = o2.w * inv;
-    output[ob + 12u] = o3.x * inv;
-    output[ob + 13u] = o3.y * inv;
-    output[ob + 14u] = o3.z * inv;
-    output[ob + 15u] = o3.w * inv;
-    output[ob + 16u] = o4.x * inv;
-    output[ob + 17u] = o4.y * inv;
-    output[ob + 18u] = o4.z * inv;
-    output[ob + 19u] = o4.w * inv;
-    output[ob + 20u] = o5.x * inv;
-    output[ob + 21u] = o5.y * inv;
-    output[ob + 22u] = o5.z * inv;
-    output[ob + 23u] = o5.w * inv;
-    output[ob + 24u] = o6.x * inv;
-    output[ob + 25u] = o6.y * inv;
-    output[ob + 26u] = o6.z * inv;
-    output[ob + 27u] = o6.w * inv;
-    output[ob + 28u] = o7.x * inv;
-    output[ob + 29u] = o7.y * inv;
-    output[ob + 30u] = o7.z * inv;
-    output[ob + 31u] = o7.w * inv;
-    output[ob + 32u] = o8.x * inv;
-    output[ob + 33u] = o8.y * inv;
-    output[ob + 34u] = o8.z * inv;
-    output[ob + 35u] = o8.w * inv;
-    output[ob + 36u] = o9.x * inv;
-    output[ob + 37u] = o9.y * inv;
-    output[ob + 38u] = o9.z * inv;
-    output[ob + 39u] = o9.w * inv;
-    output[ob + 40u] = o10.x * inv;
-    output[ob + 41u] = o10.y * inv;
-    output[ob + 42u] = o10.z * inv;
-    output[ob + 43u] = o10.w * inv;
-    output[ob + 44u] = o11.x * inv;
-    output[ob + 45u] = o11.y * inv;
-    output[ob + 46u] = o11.z * inv;
-    output[ob + 47u] = o11.w * inv;
-    output[ob + 48u] = o12.x * inv;
-    output[ob + 49u] = o12.y * inv;
-    output[ob + 50u] = o12.z * inv;
-    output[ob + 51u] = o12.w * inv;
-    output[ob + 52u] = o13.x * inv;
-    output[ob + 53u] = o13.y * inv;
-    output[ob + 54u] = o13.z * inv;
-    output[ob + 55u] = o13.w * inv;
-    output[ob + 56u] = o14.x * inv;
-    output[ob + 57u] = o14.y * inv;
-    output[ob + 58u] = o14.z * inv;
-    output[ob + 59u] = o14.w * inv;
-    output[ob + 60u] = o15.x * inv;
-    output[ob + 61u] = o15.y * inv;
-    output[ob + 62u] = o15.z * inv;
-    output[ob + 63u] = o15.w * inv;
+    if (row0 < S) {
+        float inv0 = 1.0 / l0;
+        uint ob0 = row0 * pc.n_heads * 64u + head * 64u + half_ * 16u;
+        output[ob0 + 0u] = o0_0.x * inv0;
+        output[ob0 + 1u] = o0_0.y * inv0;
+        output[ob0 + 2u] = o0_0.z * inv0;
+        output[ob0 + 3u] = o0_0.w * inv0;
+        output[ob0 + 4u] = o0_1.x * inv0;
+        output[ob0 + 5u] = o0_1.y * inv0;
+        output[ob0 + 6u] = o0_1.z * inv0;
+        output[ob0 + 7u] = o0_1.w * inv0;
+        output[ob0 + 8u] = o0_2.x * inv0;
+        output[ob0 + 9u] = o0_2.y * inv0;
+        output[ob0 + 10u] = o0_2.z * inv0;
+        output[ob0 + 11u] = o0_2.w * inv0;
+        output[ob0 + 12u] = o0_3.x * inv0;
+        output[ob0 + 13u] = o0_3.y * inv0;
+        output[ob0 + 14u] = o0_3.z * inv0;
+        output[ob0 + 15u] = o0_3.w * inv0;
+    }
+    if (row1 < S) {
+        float inv1 = 1.0 / l1;
+        uint ob1 = row1 * pc.n_heads * 64u + head * 64u + half_ * 16u;
+        output[ob1 + 0u] = o1_0.x * inv1;
+        output[ob1 + 1u] = o1_0.y * inv1;
+        output[ob1 + 2u] = o1_0.z * inv1;
+        output[ob1 + 3u] = o1_0.w * inv1;
+        output[ob1 + 4u] = o1_1.x * inv1;
+        output[ob1 + 5u] = o1_1.y * inv1;
+        output[ob1 + 6u] = o1_1.z * inv1;
+        output[ob1 + 7u] = o1_1.w * inv1;
+        output[ob1 + 8u] = o1_2.x * inv1;
+        output[ob1 + 9u] = o1_2.y * inv1;
+        output[ob1 + 10u] = o1_2.z * inv1;
+        output[ob1 + 11u] = o1_2.w * inv1;
+        output[ob1 + 12u] = o1_3.x * inv1;
+        output[ob1 + 13u] = o1_3.y * inv1;
+        output[ob1 + 14u] = o1_3.z * inv1;
+        output[ob1 + 15u] = o1_3.w * inv1;
+    }
 }

@@ -131,7 +131,7 @@ if (only.has('hands')) {
 	const dec = new BodyDecoder(m, { linear: cfg.decoder ?? 'f32', hand: true });
 	await dec.load();
 	for (const [name, pass, mirror] of [['left', leftPass, true], ['right', rightPass, false]]) {
-		const input = handInputs(img, pass.batch.bbox, cam, { mirror });
+		const input = handInputs(pass.batch.bbox, cam);
 		await decodeAll(dec, handHeads, floats(`features_${name === 'left' ? 'lhand' : 'rhand'}.bin`), input.view, input.rays, input.condition, pass.layers, `${name} hand`);
 	}
 	dec.dispose();

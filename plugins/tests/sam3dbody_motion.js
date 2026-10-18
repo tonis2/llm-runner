@@ -10,11 +10,15 @@
 // 4. A clip of a standing pose stands on y = 0 with both feet down.
 // 5. A camera tilted down sees a person walking up to it sink: the floor is
 //    levelled, and the feet are on it at both ends.
+// 6. Hands the hand decoder's answer was not used for keep the last accepted
+//    frame's finger angles, the frames before the first the first's; with a
+//    hand stride, gaps it could have made are blended.
 import { llm } from '../lib/llm.js';
 import { forward, mul, axisAngle } from '../kimodo/rotation.js';
 import { MHR, JOINTS, MODEL_PARAMS } from '../sam3dbody/mhr.js';
 import { MotionSkeleton, PROPORTIONS } from '../sam3dbody/skeleton.js';
 import { assembleMotion } from '../sam3dbody/motion.js';
+import { holdHands } from '../sam3dbody/frames.js';
 import { cleanUpMotion } from '../kimodo/cleanup.js';
 import { motionBvh } from '../lib/bvh.js';
 
@@ -138,6 +142,24 @@ function worst(a, b) {
 	const head = posAt(47)[clip.skeleton.index('c_head')];
 	const head0 = posAt(0)[clip.skeleton.index('c_head')];
 	check(Math.abs(head[1] - head0[1]) < 0.005, `head height steady (${head0[1].toFixed(3)} to ${head[1].toFixed(3)} m)`);
+}
+
+// 6. Held hands.
+{
+	const used = [[false, true], [true, true], [false, true], [false, false], [true, false]];
+	const posed = used.map((hands, f) => ({ hands, params: Float64Array.from({ length: 6 }, (_, i) => f * 10 + i) }));
+	const held = holdHands(posed, [[0, 1], [2, 3]]);
+	const got = posed.map((r) => Array.from(r.params.slice(0, 4)));
+	const want = [[10, 11, 2, 3], [10, 11, 12, 13], [10, 11, 22, 23], [10, 11, 22, 23], [40, 41, 22, 23]];
+	check(JSON.stringify(got) === JSON.stringify(want) && held[0].held === 3 && held[1].held === 2, `hands held from the last accepted frame (${held.map((h) => h.held).join(', ')} held)`);
+	check(posed.every((r, f) => r.params[4] === f * 10 + 4), 'other parameters untouched');
+	// Stride 2: one frame between accepted ones is blended, two are held.
+	const used2 = [true, false, true, false, false, true];
+	const posed2 = used2.map((u, f) => ({ hands: [u, false], params: Float64Array.from({ length: 2 }, (_, i) => (u ? f * 10 + i : 999)) }));
+	const c = holdHands(posed2, [[0, 1], []], { stride: 2 });
+	const got2 = posed2.map((r) => Array.from(r.params));
+	const want2 = [[0, 1], [10, 11], [20, 21], [20, 21], [20, 21], [50, 51]];
+	check(JSON.stringify(got2) === JSON.stringify(want2) && c[0].blended === 1 && c[0].held === 2, `hand stride 2: a one-frame gap blended, a two-frame gap held (${c[0].blended} blended, ${c[0].held} held)`);
 }
 
 mhr.close();

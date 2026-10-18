@@ -41,15 +41,15 @@ export function framesJson(clip, posed) {
 		keypoints_2d: Array.from({ length: p.keypoints_2d.length / 2 }, (_, k) => [round(p.keypoints_2d[k * 2], 2), round(p.keypoints_2d[k * 2 + 1], 2)]),
 		in_crop: round(p.in_crop, 3),
 		contacts: Array.from(clip.contacts.subarray(f * 4, f * 4 + 4)),
-		...(p.hands ? { hands_used: p.hands } : {}),
+		...(p.hands ? { hands_used: p.hands, hand_pass: p.hand_pass } : {}),
 		mhr_model_params: Array.from(p.params, (v) => round(v, 7)),
 	}));
 	const head = Object.entries(doc).map(([k, v]) => ` ${JSON.stringify(k)}: ${JSON.stringify(v)}`);
 	return `{\n${head.join(',\n')},\n "poses": [\n${poses.map((p) => `  ${JSON.stringify(p)}`).join(',\n')}\n ]\n}\n`;
 }
 
-// framesJson's text back: the clip's fps, and the posed frames as frames.js
-// gave them.
+// framesJson's text back: the clip's fps, the posed frames as frames.js gave
+// them, and the hand_stride they were posed with.
 export function readPosed(text) {
 	const doc = JSON.parse(text);
 	const posed = doc.poses.map((p, f) => {
@@ -62,8 +62,11 @@ export function readPosed(text) {
 			cam_t: p.camera_translation,
 			keypoints_2d: Float64Array.from(p.keypoints_2d.flat()),
 			in_crop: p.in_crop,
-			...(p.hands_used ? { hands: p.hands_used } : {}),
+			...(p.hands_used ? { hands: p.hands_used, hand_pass: p.hand_pass ?? true } : {}),
 		};
 	});
-	return { fps: doc.fps, posed };
+	// hand_stride: the spacing of the frames that had hand passes.
+	const passes = posed.map((p, f) => (p.hand_pass ? f : -1)).filter((f) => f >= 0);
+	const handStride = passes.length > 1 ? passes[1] - passes[0] : 1;
+	return { fps: doc.fps, posed, handStride };
 }

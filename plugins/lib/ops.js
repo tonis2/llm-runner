@@ -176,8 +176,8 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 		return;
 	}
 	if (hd === 64 && !matrixCores) {
-		// A query row a thread, in registers: no reductions between keys.
-		dispatch('flash_attention_64', [q, k, v, out], [groups(seq, 128), heads], pc('uuf', heads, seq, 1 / Math.sqrt(hd)));
+		// Each row split over 4 threads, 2 rows a thread, in registers.
+		dispatch('flash_attention_64', [q, k, v, out], [groups(seq, 64), heads], pc('uuf', heads, seq, 1 / Math.sqrt(hd)));
 		return;
 	}
 	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)), false, flashDefines(hd));
@@ -220,6 +220,13 @@ export function vaeAttention(q, k, v, out, channels, spatial, start = 0, count =
 
 export function timestepEmbed(out, dim, timestep) {
 	dispatch('timestep_embed', [out], [groups(dim, 256)], pc('uf', dim, timestep));
+}
+// A crop warped out of an 8-bit image (warp_crop.shady): `image` its bytes,
+// `geo` and `wts` the positions (sam3dbody/crop.js cropGeometry), out [3,
+// size, size], normalised by `norm` { mean, std } (per channel) or the bytes.
+export function warpCrop(image, geo, wts, out, size, channels, norm = null) {
+	const m = norm?.mean ?? [0, 0, 0], s = norm?.std ?? [1, 1, 1];
+	dispatch('warp_crop', [image, geo, wts, out], [groups(size * size, 256)], pc('uuuffffff', size, channels, norm ? 1 : 0, ...m, ...s));
 }
 export function patchify(latent, patches, channels, height, width, patchSize = 1) {
 	dispatch('patchify', [latent, patches], [groups(channels * height * width, 256)], pc('uuuu', channels, height, width, patchSize));

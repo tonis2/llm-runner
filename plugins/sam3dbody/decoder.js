@@ -45,6 +45,13 @@ function disposeAll(v) {
 	if (typeof v === 'object') for (const x of Object.values(v)) disposeAll(x);
 }
 
+// W [out, in] row-major with each row padded with zeros to 4 columns.
+function padColumns(W, inDim) {
+	const rows = W.length / inDim, out = new Float32Array(rows * 4);
+	for (let r = 0; r < rows; r++) for (let i = 0; i < inDim; i++) out[r * 4 + i] = W[r * inDim + i];
+	return out;
+}
+
 // x @ W^T + b on the host, W [out, in] row-major.
 function hostLinear(W, b, x, out, inDim) {
 	const y = new Float32Array(out);
@@ -125,8 +132,6 @@ export class BodyDecoder {
 			invalidPoint: m.floats('prompt_encoder.invalid_point_embed.weight'),
 			notAPoint: m.floats('prompt_encoder.not_a_point_embed.weight'),
 			points: new Map(),
-			pos2d: { w: floats('keypoint_posemb_linear.layers.0.0.weight'), b: floats('keypoint_posemb_linear.layers.0.0.bias') },
-			pos3d: { w: floats('keypoint3d_posemb_linear.layers.0.0.weight'), b: floats('keypoint3d_posemb_linear.layers.0.0.bias') },
 			initPose: floats('init_pose.weight'), initCamera: floats('init_camera.weight'),
 			// The learned tokens: hand boxes and keypoints.
 			handBox: m.floats('hand_box_embedding.weight'),
@@ -138,6 +143,9 @@ export class BodyDecoder {
 			rayNormW: f('ray_cond_emb.norm.weight'), rayNormB: f('ray_cond_emb.norm.bias'),
 			pe: upload(pe),
 			normW: f('decoder.norm_final.weight'), normB: f('decoder.norm_final.bias'),
+			// The posemb FFNs' first layers take 2 or 3 inputs: padded to 4.
+			pos2d0W: upload(padColumns(floats('keypoint_posemb_linear.layers.0.0.weight'), 2)), pos2d0B: f('keypoint_posemb_linear.layers.0.0.bias'),
+			pos3d0W: upload(padColumns(floats('keypoint3d_posemb_linear.layers.0.0.weight'), 3)), pos3d0B: f('keypoint3d_posemb_linear.layers.0.0.bias'),
 			pos2dW: w('keypoint_posemb_linear.layers.1.weight'), pos2dB: f('keypoint_posemb_linear.layers.1.bias'),
 			pos3dW: w('keypoint3d_posemb_linear.layers.1.weight'), pos3dB: f('keypoint3d_posemb_linear.layers.1.bias'),
 			featW: w('keypoint_feat_linear.weight'), featB: f('keypoint_feat_linear.bias'),
@@ -228,31 +236,26 @@ export class BodyDecoder {
 	// up to the hand-box ones after the final norm and `handTokens` those two
 	// [2, dim]; `stopAfter` (a layer) returns the raw tokens [144 + P, dim]
 	// after it instead.
-	async run(features, rays, condition, onLayer, { stopAfter = -1, contextOut = null, prompts = null, prev = null } = {}) {
+	//
+	// `image` is what prepareImage made of these features and rays, to use
+	// again (a second pass over the same crop); without one run makes its own
+	// and, with `keepImage`, returns it as `image` for the caller to dispose.
+	async run(features, rays, condition, onLayer, { stopAfter = -1, contextOut = null, prompts = null, prev = null, image = null, keepImage = false } = {}) {
 		const points = prompts?.length ? prompts : [[0, 0, -2]];
 		const at = layout(points.length);
 		const D = this.dim, C = this.context, A = this.inner, T = at.tokens, N = GRID * GRID, g = this.g, h = this.host;
+		const own = !image;
+		if (own) image = this.prepareImage(features, rays, { contextOut });
 		const a = {
 			at,
-			tok: f32(N * C), cat: f32(N * (C + 99)), raw: f32(N * C), ctx: f32(N * C), ctxT: f32(C * N, [N, C]),
-			ctxN: f32(N * C), ctxK: f32(N * C), k: f32(N * A), v: f32(N * A),
 			x: f32(T * D), pe: f32(T * D), pen: f32(T * D), h: f32(T * D), qk: f32(T * D),
 			q: f32(T * A), sk: f32(T * A), sv: f32(T * A), o: f32(T * A), y: f32(T * D),
 			f: f32(T * this.mlp), out: f32(T * D),
-			rays: upload(rays),
-			kpIn: f32(KEYPOINTS * D), mask: f32(KEYPOINTS * D), sample: f32(KEYPOINTS * N), sampled: f32(KEYPOINTS * C),
+			kp2: f32(KEYPOINTS * 4), kp3: f32(KEYPOINTS * 4), kp2H: f32(KEYPOINTS * D), kp3H: f32(KEYPOINTS * D), mask: f32(KEYPOINTS * D), sample: f32(KEYPOINTS * N), sampled: f32(KEYPOINTS * C),
 		};
+		a.image = image;
+		let kept = false;
 		try {
-			// Image tokens, token-major [N, C].
-			op.transposeChannelSpatial(features, a.tok, C, N, 0);
-			op.biasAdd(a.tok, g.noMask, N * C, C);
-			op.concatRows(a.tok, a.rays, a.cat, N, C, 99);
-			op.matmul(g.rayConv, a.cat, a.raw, C, C + 99, N);
-			op.layerNormAffine(a.raw, g.rayNormW, g.rayNormB, a.ctx, C, N, EPS);
-			// Channel-first as well: a matmul weight for sampling under keypoints.
-			op.transposeChannelSpatial(a.ctx, a.ctxT, C, N, 1);
-			if (contextOut) copy(a.ctx, contextOut, N * C * 4);
-
 			const first = this.firstTokens(condition, prev, points);
 			const x = new Float32Array(T * D), pe = new Float32Array(T * D);
 			x.set(first.tokens);
@@ -278,6 +281,7 @@ export class BodyDecoder {
 				if (l === this.depth - 1) {
 					const tokens = new Float32Array(a.out.buffer.readBytes(0, at.kp2d * D * 4).buffer);
 					last = { tokens, handTokens: tokens.subarray(at.hands * D, (at.hands + 2) * D), pose: await onLayer(token, l) };
+					if (own && keepImage) { last.image = image; kept = true; }
 					break;
 				}
 				const pose = await onLayer(token, l);
@@ -287,13 +291,54 @@ export class BodyDecoder {
 			return last;
 		} finally {
 			submit();
+			a.image = null;
 			disposeAll(a);
+			if (own && !kept) image.dispose();
 		}
+	}
+
+	// The image side of the decoder, which no token changes: the image tokens
+	// [N, C] (the backbone's features, the no-mask embedding, the ray features,
+	// a 1x1 conv and a LayerNorm2d), channel-first too for sampling under the
+	// keypoints, and each layer's cross-attention keys and values. Returns
+	// { ctxT, k: [layer], v: [layer], dispose() }.
+	prepareImage(features, rays, { contextOut = null } = {}) {
+		const C = this.context, A = this.inner, N = GRID * GRID, g = this.g;
+		const t = { tok: f32(N * C), cat: f32(N * (C + 99)), raw: f32(N * C), ctx: f32(N * C), ctxN: f32(N * C), ctxK: f32(N * C), rays: upload(rays) };
+		const image = {
+			ctxT: f32(C * N, [N, C]),
+			k: this.layers.map(() => f32(N * A)),
+			v: this.layers.map(() => f32(N * A)),
+			dispose() { disposeAll(this.ctxT); this.k.forEach((x) => x.dispose()); this.v.forEach((x) => x.dispose()); },
+		};
+		try {
+			// Image tokens, token-major [N, C].
+			op.transposeChannelSpatial(features, t.tok, C, N, 0);
+			op.biasAdd(t.tok, g.noMask, N * C, C);
+			op.concatRows(t.tok, t.rays, t.cat, N, C, 99);
+			op.matmul(g.rayConv, t.cat, t.raw, C, C + 99, N);
+			op.layerNormAffine(t.raw, g.rayNormW, g.rayNormB, t.ctx, C, N, EPS);
+			// Channel-first as well: a matmul weight for sampling under keypoints.
+			op.transposeChannelSpatial(t.ctx, image.ctxT, C, N, 1);
+			if (contextOut) copy(t.ctx, contextOut, N * C * 4);
+			// Each layer's keys (its image PE added) and values.
+			for (const [l, L] of this.layers.entries()) {
+				op.layerNormAffine(t.ctx, L.ln22W, L.ln22B, t.ctxN, C, N, EPS);
+				copy(t.ctxN, t.ctxK, N * C * 4);
+				op.add(t.ctxK, L.contextPe, N * C);
+				op.linearBiasRows(L.ck, L.ckB, t.ctxK, image.k[l], A, C, N);
+				op.linearBiasRows(L.cv, L.cvB, t.ctxN, image.v[l], A, C, N);
+			}
+		} finally {
+			submit();
+			disposeAll(t);
+		}
+		return image;
 	}
 
 	// One TransformerDecoderLayer over a.x [144 + P, dim] in place.
 	layer(L, l, a, N) {
-		const D = this.dim, C = this.context, A = this.inner, nh = this.heads, T = a.at.tokens;
+		const D = this.dim, A = this.inner, nh = this.heads, T = a.at.tokens;
 		op.layerNormAffine(a.pe, L.pe1W, L.pe1B, a.pen, D, T, EPS);
 		// Self-attention; the first layer leaves the token PEs out of it.
 		op.layerNormAffine(a.x, L.ln1W, L.ln1B, a.h, D, T, EPS);
@@ -312,13 +357,8 @@ export class BodyDecoder {
 		// Cross-attention to the image tokens, their PE on the keys.
 		op.layerNormAffine(a.x, L.ln21W, L.ln21B, a.qk, D, T, EPS);
 		op.add(a.qk, a.pen, T * D);
-		op.layerNormAffine(a.ctx, L.ln22W, L.ln22B, a.ctxN, C, N, EPS);
-		copy(a.ctxN, a.ctxK, N * C * 4);
-		op.add(a.ctxK, L.contextPe, N * C);
 		op.linearBiasRows(L.cq, L.cqB, a.qk, a.q, A, D, T);
-		op.linearBiasRows(L.ck, L.ckB, a.ctxK, a.k, A, C, N);
-		op.linearBiasRows(L.cv, L.cvB, a.ctxN, a.v, A, C, N);
-		op.attentionRows(a.q, a.k, a.v, a.o, nh, HEAD, { lq: T, lk: N });
+		op.attentionRows(a.q, a.image.k[l], a.image.v[l], a.o, nh, HEAD, { lq: T, lk: N });
 		op.linearBiasRows(L.co, L.coB, a.o, a.y, D, A, T);
 		op.add(a.x, a.y, T * D);
 		// MLP.
@@ -333,23 +373,10 @@ export class BodyDecoder {
 	// layers. A 2D keypoint outside the crop or behind the camera gets no PE
 	// and no image feature (its token still gets the feature linear's bias).
 	updateKeypoints(pose, a, N) {
-		const D = this.dim, C = this.context, K = KEYPOINTS, h = this.host, g = this.g;
+		const D = this.dim, C = this.context, K = KEYPOINTS, g = this.g;
 		const rows = (t, first, count) => t.view(first * D * 4, count * D * 4);
 		const kp = pose.pred_keypoints_2d_cropped, depth = pose.pred_keypoints_2d_depth;
 		const valid = new Array(K);
-		// The two posemb FFNs' first layers (2 or 3 inputs) and ReLU here, the
-		// second on the GPU.
-		const firstLayer = (W, b, input, inDim) => {
-			const out = new Float32Array(K * D);
-			for (let k = 0; k < K; k++) {
-				for (let o = 0; o < D; o++) {
-					let s = b[o];
-					for (let i = 0; i < inDim; i++) s += W[o * inDim + i] * input[k * inDim + i];
-					out[k * D + o] = s > 0 ? s : 0;
-				}
-			}
-			return out;
-		};
 		const mask = new Float32Array(K * D);
 		// grid_sample(bilinear, zeros, align_corners=False) of the 32 x 32
 		// tokens at 2 * kp, as one sparse row of weights per keypoint.
@@ -368,22 +395,32 @@ export class BodyDecoder {
 		}
 		const kp3 = pose.pred_keypoints_3d;
 		const pelvis = [0, 1, 2].map((c) => (kp3[9 * 3 + c] + kp3[10 * 3 + c]) / 2);
-		const centred = new Float32Array(K * 3);
-		for (let k = 0; k < K; k++) for (let c = 0; c < 3; c++) centred[k * 3 + c] = kp3[k * 3 + c] - pelvis[c];
+		// The posemb FFNs' inputs, 4 wide: the 2D keypoints in the crop, the 3D
+		// ones about the pelvis.
+		const in2 = new Float32Array(K * 4), in3 = new Float32Array(K * 4);
+		for (let k = 0; k < K; k++) {
+			in2[k * 4] = kp[k * 2];
+			in2[k * 4 + 1] = kp[k * 2 + 1];
+			for (let c = 0; c < 3; c++) in3[k * 4 + c] = kp3[k * 3 + c] - pelvis[c];
+		}
 
-		submit();
+		// The layer before has been submitted and waited for (run reads its
+		// pose token): these buffers are free to write.
 		a.mask.buffer.write(mask);
 		a.sample.buffer.write(sample);
-		a.kpIn.buffer.write(firstLayer(h.pos2d.w, h.pos2d.b, Float32Array.from(kp), 2));
+		a.kp2.buffer.write(in2);
+		a.kp3.buffer.write(in3);
 		const pe2d = rows(a.pe, a.at.kp2d, K), pe3d = rows(a.pe, a.at.kp3d, K);
-		op.linearBiasRows(g.pos2dW, g.pos2dB, a.kpIn, pe2d, D, D, K);
+		op.linearBiasRows(g.pos2d0W, g.pos2d0B, a.kp2, a.kp2H, D, 4, K);
+		op.relu(a.kp2H, K * D);
+		op.linearBiasRows(g.pos2dW, g.pos2dB, a.kp2H, pe2d, D, D, K);
 		op.mul(pe2d, a.mask, K * D);
 		// The features under the keypoints: [K, N] @ ctx [N, C].
-		op.matmul(a.ctxT, a.sample, a.sampled, C, N, K);
+		op.matmul(a.image.ctxT, a.sample, a.sampled, C, N, K);
 		op.linearBiasRows(g.featW, g.featB, a.sampled, a.y, D, C, K);
 		op.add(rows(a.x, a.at.kp2d, K), a.y, K * D);
-		submit();
-		a.kpIn.buffer.write(firstLayer(h.pos3d.w, h.pos3d.b, centred, 3));
-		op.linearBiasRows(g.pos3dW, g.pos3dB, a.kpIn, pe3d, D, D, K);
+		op.linearBiasRows(g.pos3d0W, g.pos3d0B, a.kp3, a.kp3H, D, 4, K);
+		op.relu(a.kp3H, K * D);
+		op.linearBiasRows(g.pos3dW, g.pos3dB, a.kp3H, pe3d, D, D, K);
 	}
 }

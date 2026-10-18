@@ -58,20 +58,25 @@ function inCrop(pose) {
  *
  * Returns a record a frame: { path, size, bbox, camera, params [204],
  * cam_t [3], keypoints_2d [140], in_crop }, and with hands `hands` [left,
- * right], whether each hand decoder's hand was used.
+ * right], whether each hand decoder's hand was used; a hand it was not used
+ * for keeps the finger angles of the last frame it was (holdHands).
  */
-export async function poseFrames(model, paths, { bbox = null, focal = null, hands = false, onFrame = null } = {}) {
+export async function poseFrames(model, paths, { bbox = null, focal = null, hands = false, handStride = 1, onFrame = null } = {}) {
 	const out = [];
 	let box = bbox;
+	const stride = Math.max(1, Math.trunc(handStride));
 	for (let i = 0; i < paths.length; i++) {
 		const t0 = llm.now();
 		const img = llm.image.load(paths[i]);
+		// Hand passes on every `stride`th frame; the others take their fingers
+		// from those (holdHands).
+		const handPass = hands && i % stride === 0;
 		// The first frame without a box is posed once for the box alone: no hands.
 		const search = i === 0 && !bbox;
-		let pose = await model.poseImage(img, { bbox: box, focal, hands: hands && !search, quiet: true });
+		let pose = await model.poseImage(img, { bbox: box, focal, hands: handPass && !search, quiet: true });
 		if (search) {
 			const found = keypointBox(pose.pred_keypoints_2d, img.width, img.height);
-			if (found || hands) pose = await model.poseImage(img, { bbox: found, focal, hands, quiet: true });
+			if (found || handPass) pose = await model.poseImage(img, { bbox: found, focal, hands: handPass, quiet: true });
 		}
 		const record = {
 			path: paths[i],
@@ -83,7 +88,10 @@ export async function poseFrames(model, paths, { bbox = null, focal = null, hand
 			keypoints_2d: Float64Array.from(pose.pred_keypoints_2d),
 			in_crop: inCrop(pose),
 		};
-		if (pose.hands_used) record.hands = pose.hands_used.slice();
+		if (hands) {
+			record.hands = pose.hands_used ? pose.hands_used.slice() : [false, false];
+			record.hand_pass = handPass;
+		}
 		out.push(record);
 		// The next frame's box: around this one's keypoints, or this box again
 		// when they make none.
@@ -91,5 +99,46 @@ export async function poseFrames(model, paths, { bbox = null, focal = null, hand
 		llm.print(`frame ${i + 1}/${paths.length} (${llm.since(t0)})`);
 		await onFrame?.(record, i, paths.length);
 	}
+	if (hands) {
+		const [l, r] = holdHands(out, [model.heads.handLeft, model.heads.handRight], { stride });
+		llm.print(`  hands from neighbouring accepted frames: left ${l.held} held, ${l.blended} blended; right ${r.held} held, ${r.blended} blended; of ${out.length} frames`);
+	}
 	return out;
+}
+
+/**
+ * Each hand's finger angles through the frames the hand decoder's hand was
+ * not used for (`record.hands` [left, right] false: rejected, or no hand pass
+ * there): the body decoder's rough fingers would flicker in and out. A gap
+ * between two accepted frames no longer than `stride` - 1 frames (what
+ * hand_stride skips) is blended linearly between them; a longer one, or one
+ * at either end, keeps the last accepted frame's angles (the first's, before
+ * it). The wrist stays the body decoder's, which still sees the arm. `sides`
+ * are the model-parameter indices of each hand's angles [left, right]. In
+ * place; returns each hand's { held, blended } frame counts.
+ */
+export function holdHands(posed, sides, { stride = 1 } = {}) {
+	return sides.map((idx, s) => {
+		const used = posed.map((r) => !!r.hands?.[s]);
+		const counts = { held: 0, blended: 0 };
+		const first = used.indexOf(true);
+		if (first < 0) return counts;
+		let prev = -1;
+		for (let f = 0; f < posed.length; f++) {
+			if (used[f]) { prev = f; continue; }
+			let next = f + 1;
+			while (next < posed.length && !used[next]) next++;
+			const gap = next - prev - 1;
+			if (prev >= 0 && next < posed.length && gap < stride) {
+				const u = (f - prev) / (next - prev), a = posed[prev].params, b = posed[next].params;
+				for (const i of idx) posed[f].params[i] = a[i] + (b[i] - a[i]) * u;
+				counts.blended++;
+			} else {
+				const from = posed[prev >= 0 ? prev : first].params;
+				for (const i of idx) posed[f].params[i] = from[i];
+				counts.held++;
+			}
+		}
+		return counts;
+	});
 }

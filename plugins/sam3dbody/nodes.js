@@ -68,10 +68,10 @@ defineNodes('sam3dbody', {
 	'sam3dbody.pose_frames': {
 		title: 'Pose video frames',
 		category: 'motion',
-		description: 'A folder of PNG/JPEG frames in name order (ffmpeg -i clip.mp4 frames/%05d.png) to a motion on the MHR skeleton, y up, standing on y = 0. The person is followed from frame to frame; `bbox` is their box in the first frame. `count` 0 is to the end; `smooth` is the smoothing window in frames.',
+		description: 'A folder of PNG/JPEG frames in name order (ffmpeg -i clip.mp4 frames/%05d.png) to a motion on the MHR skeleton, y up, standing on y = 0. The person is followed from frame to frame; `bbox` is their box in the first frame. `count` 0 is to the end; `smooth` is the smoothing window in frames. With a model loaded with hands, `hand_stride` 2 or more runs the hand passes on every so many frames only, the fingers blended between them.',
 		inputs: {
 			model: 'MODEL', frames: 'PATH(dir)', fps: 'FLOAT=24', first: 'INT=0', count: 'INT=0', stride: 'INT=1',
-			bbox: 'STRING=', focal: 'FLOAT=0', smooth: 'INT=7',
+			bbox: 'STRING=', focal: 'FLOAT=0', smooth: 'INT=7', hand_stride: 'INT=1',
 		},
 		outputs: { motion: 'MOTION' },
 		async run(i, ctx) {
@@ -79,7 +79,7 @@ defineNodes('sam3dbody', {
 			let paths = listFrames(i.frames).slice(Math.max(0, i.first)).filter((_, k) => k % stride === 0);
 			if (i.count > 0) paths = paths.slice(0, i.count);
 			const posed = await poseFrames(i.model, paths, {
-				bbox: parseBox(i.bbox), focal: i.focal || null, hands: i.model.hands,
+				bbox: parseBox(i.bbox), focal: i.focal || null, hands: i.model.hands, handStride: i.hand_stride,
 				onFrame: (_, k, n) => ctx?.progress(k + 1, n),
 			});
 			const motion = assembleMotion(i.model.mhr, posed, { fps: i.fps / stride, smooth: i.smooth });
