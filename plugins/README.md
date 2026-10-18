@@ -37,6 +37,7 @@ plugins/
     flux_vae.js        Flux VAE encoder and decoder (Flux 1 and Flux 2 namings)
     taesd.js           TAESD decoder for 16-channel latents (taef1)
     lora.js            LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
+    torch.js           PyTorch checkpoints (.pt/.ckpt zips) read without torch, mapped like safetensors
     latents.js         latent formats ('flux2', 'flux1', 'qwen') and the VAE encode/decode for each
     graph/             node registry, port types, the executor, plugin discovery
     kernels/*.shady    one kernel per file; common.shady is put in front of each
@@ -49,6 +50,7 @@ plugins/
                        guide poses (full-body keyframes), rest skeletons in skeletons/
   unimate/             UniMate text-to-motion for any skeleton: the rig's own joints, T5 captions,
                        either released flow model (graph or full attention) read straight from its .pt
+  sam3dbody/           SAM 3D Body (video to 3D pose, in progress: the DINOv3 backbone so far; see animation.md)
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
@@ -215,6 +217,7 @@ UniMate repository).
 
 | | |
 |---|---|
+| `openTorch(path)` (`lib/torch.js`) | A PyTorch checkpoint as the same kind of model: its pickle read in JS (nothing in it is run), its stored tensors mapped from the file. F32/F16/BF16 upload; `ints(name)` reads integer ones |
 | `llm.open(path)` | A GGUF or safetensors file, memory-mapped: `.tensors`, `.metadata`, `.meta(key)`, `.shape(name)` (GGUF order), `.type(name)` |
 | `model.upload(name, as)` | A `Tensor` on the GPU. `as` is `'raw'` (file bytes), `'f32'` (dequantised or widened), `'conv'` (f32, laid out `[kh, kw, in, out]`), `'q8'` (requantised to Q8_0), or `'auto'` (raw for the types matmul reads natively, otherwise f32). The bytes go from the mapping straight to VRAM in 64 MB pieces. |
 | `model.floats(name)` | A small tensor on the host, as a Float32Array |
@@ -223,6 +226,7 @@ UniMate repository).
 | `llm.randomNormal(n, seed)` | The same noise the C3 pipelines drew for a seed |
 | `image.load / decode / savePng / encodePng / cropTo / fit16 / resize / toTensor / fromTensor` | Images as `{ width, height, channels, pixels }` |
 | `llm.readText / readBytes / writeBytes / exists / base64Encode / base64Decode` | Files |
+| `__llm.readRange(path, offset, length) / fileSize(path)` | Part of a large file without reading it all |
 | `__llm.listDir / makeDir / homeDir` | Directories: `[{ name, dir }]`, make with parents, the home directory |
 | `llm.print(...)`, `llm.now()`, `llm.since(t0)` | Progress |
 

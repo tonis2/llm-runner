@@ -81,6 +81,8 @@ fn void install(three::JsRuntime* runtime)
 	runtime.bind(host, "now", &js_now, 0);
 	runtime.bind(host, "readText", &js_read_text, 1);
 	runtime.bind(host, "readBytes", &js_read_bytes, 1);
+	runtime.bind(host, "readRange", &js_read_range, 3);
+	runtime.bind(host, "fileSize", &js_file_size, 1);
 	runtime.bind(host, "writeBytes", &js_write_bytes, 2);
 	runtime.bind(host, "exists", &js_exists, 1);
 	runtime.bind(host, "listDir", &js_list_dir, 1);
@@ -89,7 +91,7 @@ fn void install(three::JsRuntime* runtime)
 	runtime.bind(host, "base64Encode", &js_base64_encode, 1);
 	runtime.bind(host, "base64Decode", &js_base64_decode, 1);
 
-	runtime.bind(host, "modelOpen", &js_model_open, 1);
+	runtime.bind(host, "modelOpen", &js_model_open, 2);
 	runtime.bind(host, "modelClose", &js_model_close, 1);
 	runtime.bind(host, "modelArray", &js_model_array, 2);
 	runtime.bind(host, "tensorUpload", &js_tensor_upload, 3);
@@ -232,6 +234,55 @@ fn void js_read_bytes(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::
 	*out = byte_array(&js, data.ptr, data.len);
 }
 
+<*
+ `readRange(path, offset, length)` - `length` bytes of a file from `offset`, for
+ the small parts of a large one: a zip's directory, a checkpoint's pickle.
+*>
+fn void js_read_range(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	String path = @text(&js, argc, args, 0);
+	long offset = (long)three::arg_number(&js, argc, args, 1);
+	usz length = (usz)three::arg_number(&js, argc, args, 2);
+	File? f = file::open(path, "rb");
+	if (catch err = f)
+	{
+		*out = js.raise(string::tformat("could not open %s: %s", path, err));
+		return;
+	}
+	defer (void)f.close();
+	char[] data = mem::new_array(char, (sz)length);
+	defer mem::free(data);
+	usz got = 0;
+	if (catch err = f.seek(offset))
+	{
+		*out = js.raise(string::tformat("could not seek %s to %d: %s", path, offset, err));
+		return;
+	}
+	while (got < length)
+	{
+		sz? n = f.read(data[got..]);
+		if (catch err = n)
+		{
+			*out = js.raise(string::tformat("could not read %s: %s", path, err));
+			return;
+		}
+		if (n == 0) break;
+		got += (usz)n;
+	}
+	*out = byte_array(&js, data.ptr, got);
+}
+
+<*
+ `fileSize(path)` - the size of a file in bytes, or -1 when it cannot be read.
+*>
+fn void js_file_size(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	long size = file::get_size(@text(&js, argc, args, 0)) ?? -1;
+	*out = qjs::number_value((double)size);
+}
+
 fn void js_write_bytes(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
 {
 	qjs::Context js = qjs::wrap(ctx);
@@ -332,7 +383,9 @@ fn void js_base64_decode(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qj
 // --- Models ----------------------------------------------------------------------
 
 <*
- `modelOpen(path)` - map a GGUF or safetensors file and describe it.
+ `modelOpen(path, table?)` - map a GGUF or safetensors file and describe it.
+ With `table`, a safetensors-style JSON header whose offsets count from the
+ file's start, any file whose tensors lie in it uncompressed is read that way.
 
  Answers `{ handle, format, metadata, tensors }`. `tensors` is a list of
  `{ name, type, shape, bytes }`: for GGUF `type` is the GGML type number and
@@ -347,8 +400,21 @@ fn void js_model_open(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::
 	String path = @text(&js, argc, args, 0);
 
 	ModelSlot slot;
-	bool gguf = path.ends_with(".gguf");
-	if (gguf)
+	// A tensor table the caller read itself (a PyTorch checkpoint, see
+	// plugins/lib/torch.js), in safetensors' header form with file offsets.
+	String table = argc >= 2 ? @text(&js, argc, args, 1) : "";
+	bool gguf = table.len == 0 && path.ends_with(".gguf");
+	if (table.len > 0)
+	{
+		llm::SafetensorsFile? st = llm::table_open(path, table);
+		if (catch err = st)
+		{
+			*out = js.raise(string::tformat("could not map %s with the tensor table given: %s", path, err));
+			return;
+		}
+		slot = { .is_gguf = false, .live = true, .st = st };
+	}
+	else if (gguf)
 	{
 		mmap::FileMmap? mm = file::mmap_open(path, "rb");
 		if (catch err = mm)

@@ -77,8 +77,28 @@ fn SafetensorsFile? safetensors_open(String path) {
         return FILE_NOT_FOUND~;
     }
 
-    // Parse JSON header using std library parser
     String header_str = (String)data[8 .. 8 + (usz)header_len - 1];
+    return from_header(mm, header_str, &data[8 + (usz)header_len]);
+}
+
+<*
+ A tensor table over a file that is not safetensors: `header` is written the way
+ a safetensors header is (name -> { dtype, shape, data_offsets }), with the
+ offsets counted from the start of the file. A PyTorch checkpoint is a zip whose
+ tensors are stored entries; `plugins/lib/torch.js` reads its pickle and
+ describes them this way, and the bytes are then read like any other mapping.
+*>
+fn SafetensorsFile? table_open(String path, String header) {
+    mmap::FileMmap mm = file::mmap_open(path, "rb")!;
+    defer catch (void)mm.destroy();
+    return from_header(mm, header, mm.bytes().ptr);
+}
+
+<*
+ The tensor table out of a header, over a mapping the caller has opened; on a
+ failure the caller still owns the mapping.
+*>
+fn SafetensorsFile? from_header(mmap::FileMmap mm, String header_str, char* data_base) @local {
     Object* root = json::parse(mem, header_str)!;
     defer catch root.free();
 
@@ -162,9 +182,6 @@ fn SafetensorsFile? safetensors_open(String path) {
     };
 
     root.free();
-
-    char* data_base = &data[8 + (usz)header_len];
-
 
     return {
         .tensors = tensors,
