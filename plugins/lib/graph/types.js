@@ -13,6 +13,11 @@
 //   VAE           { kind, format, path }
 //   LORA          [{ path, strength }]  adapters, in the order they are folded in
 //   REFERENCES    [{ w, h, latent }]  encoded reference images (Flux kontext)
+//   POSE          a person's pose in one image: SAM 3D Body's outputs by its
+//                 own names (pred_keypoints_2d, mhr_model_params, pred_cam_t, ...)
+//   MOTION        { skeleton { names, parents, offsets }, fps, frames,
+//                 rotations Float32Array [frames, J, 4] parent-local xyzw,
+//                 root Float32Array [frames, 3] metres, y up, contacts?, ... }
 //
 // Primitives are node settings - a widget in the editor, a param in a graph
 // file - and can be wired from another node's output too.
@@ -31,7 +36,7 @@
 // or as an object { type, default, optional, options, kind, min, max, multiline, many }.
 
 export const TYPES = [
-	'IMAGE', 'LATENT', 'CONDITIONING', 'MODEL', 'TEXT_ENCODER', 'VAE', 'LORA', 'REFERENCES',
+	'IMAGE', 'LATENT', 'CONDITIONING', 'MODEL', 'TEXT_ENCODER', 'VAE', 'LORA', 'REFERENCES', 'POSE', 'MOTION',
 	'STRING', 'INT', 'FLOAT', 'BOOL', 'ENUM', 'PATH', 'ANY',
 ];
 

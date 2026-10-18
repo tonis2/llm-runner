@@ -43,7 +43,7 @@ export function writeText(path, text) {
 	llm.writeBytes(path, utf8(text));
 }
 
-function utf8(text) {
+export function utf8(text) {
 	const bytes = [];
 	for (const ch of text) {
 		const c = ch.codePointAt(0);

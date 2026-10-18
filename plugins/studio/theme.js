@@ -30,6 +30,8 @@ export const TYPE_COLOR = {
 	VAE: [1.0, 0.43, 0.43],
 	LORA: [0.49, 0.86, 0.55],
 	REFERENCES: [0.30, 0.82, 0.88],
+	POSE: [0.95, 0.55, 0.25],
+	MOTION: [0.75, 0.45, 0.95],
 	ANY: [0.8, 0.8, 0.8],
 };
 export const PRIMITIVE_COLOR = [0.60, 0.60, 0.62];

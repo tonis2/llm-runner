@@ -38,7 +38,8 @@ const ADMM_ITERATIONS = 100;
 const CONTACT_THRESHOLD = 0.5;
 const ROOT_MARGIN = 0.04;
 // How far above the rest pose's lowest point the feet are held; upstream lifts
-// SOMA's higher because the model sets it lower to the floor.
+// SOMA's higher because the model sets it lower to the floor. A skeleton may
+// say its own (`aboveGround`).
 const ABOVE_GROUND = { soma30: 0.02 };
 const DEFAULT_ABOVE_GROUND = 0.007;
 // Two-bone IK bends the middle joint toward this point in its own frame: elbows
@@ -428,8 +429,9 @@ function effectorJoints(skeleton) {
 		skeleton.parents.forEach((p, j) => { if (p === foot) found = j; });
 		return found;
 	};
-	out.LeftToe = toe(out.LeftFoot);
-	out.RightToe = toe(out.RightFoot);
+	// The toe is the foot's effector chain's next joint, or its last child.
+	out.LeftToe = index.get(skeleton.effectors.LeftFoot[1]) ?? toe(out.LeftFoot);
+	out.RightToe = index.get(skeleton.effectors.RightFoot[1]) ?? toe(out.RightFoot);
 	return out;
 }
 
@@ -485,7 +487,7 @@ export function cleanUpMotion({ skeleton, key, frames, rotations, root, contacts
 	// and toe sit.
 	const rest = forward(skeleton, () => IDENTITY, [0, 0, 0]).positions;
 	const lowest = Math.min(...rest.map((p) => p[1]));
-	const lift = -lowest + (ABOVE_GROUND[key] ?? DEFAULT_ABOVE_GROUND);
+	const lift = -lowest + (skeleton.aboveGround ?? ABOVE_GROUND[key] ?? DEFAULT_ABOVE_GROUND);
 	// A foot keyed on its own is left to its key, not planted.
 	const touching = (limb, channel) => Float64Array.from({ length: N }, (_, f) => (limbKeyed[limb][f] ? 0 : contacts[4 * f + channel]));
 	// The ankle is down when the heel or the toe is.

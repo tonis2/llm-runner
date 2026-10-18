@@ -50,7 +50,7 @@ plugins/
                        guide poses (full-body keyframes), rest skeletons in skeletons/
   unimate/             UniMate text-to-motion for any skeleton: the rig's own joints, T5 captions,
                        either released flow model (graph or full attention) read straight from its .pt
-  sam3dbody/           SAM 3D Body (video to 3D pose, in progress: the DINOv3 backbone so far; see animation.md)
+  sam3dbody/           SAM 3D Body: an image to a posed MHR rig; video frames to a motion (GLB, BVH)
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
@@ -118,6 +118,7 @@ Port types (`lib/graph/types.js`):
 | `LATENT` | `{ format, data, channels, h, w }`. A VAE decodes only its own `format` (`lib/latents.js`), so taef1 can stand in for the Flux 1 VAE and a Flux 2 latent is refused by it. |
 | `CONDITIONING` | `{ family, tensor, n, dim }`, the text encoder's hidden states on the GPU. A sampler takes only its own `family`. |
 | `MODEL`, `TEXT_ENCODER`, `VAE`, `LORA`, `REFERENCES` | loaders' handles; `LORA` is a list of `{ path, strength }` |
+| `POSE`, `MOTION` | SAM 3D Body's pose of one image; a clip on a skeleton (`{ skeleton, fps, frames, rotations, root }`, y up, metres) |
 | `STRING`, `INT`, `FLOAT`, `BOOL`, `ENUM(a\|b)`, `PATH(kind)` | settings; `=value` is the default, `?` optional, `*` multi-line |
 
 `+` after a type (`LORA+?`) lets an input take any number of wires. The node
@@ -179,6 +180,33 @@ beside it) is only read as a GGUF, from `LocalAI-io/Llama-3-Kimodo-GGML`: it is
 Llama-3-8B with LLM2Vec's adapters merged and quantized, not part of NVIDIA's
 release.
 
+## SAM 3D Body's weights
+
+```
+hf download facebook/sam-3d-body-dinov3 --local-dir sam-3d-body-dinov3    # gated: accept the license first
+llm-runner sam3dbody model=sam-3d-body-dinov3 input=person.jpg output=pose.json preview=pose.png
+
+ffmpeg -i clip.mp4 frames/%05d.png
+llm-runner sam3dbody model=sam-3d-body-dinov3 frames=frames fps=24 glb=motion.glb bvh=motion.bvh
+```
+
+`model=` is the downloaded folder as it is: `model.ckpt` (the network, read
+straight out of the PyTorch zip) and `assets/mhr_model.pt` (the MHR rig, a
+TorchScript file read the same way). Nothing is converted and the plugin
+carries none of either. The weights are Meta's, released under the SAM License
+the gated download asks you to accept; the MHR rig is Apache-2.0. The plugin
+writes motion made with them, so what you do with that motion is under the
+same license's terms.
+
+A frame takes about 8 s on an Apple M5 (the q8 DINOv3 backbone is 6.9 s of
+it). A clip is the MHR skeleton's 126
+joints, y up, metres, its proportions held to their median over the clip and
+standing on y = 0, the camera taken as fixed; `graph/templates/sam3dbody-motion.json`
+is the same as nodes. `tests/sam3dbody_golden.js` checks every stage of one
+image against the reference (`tools/sam3dbody/golden.py` writes its numbers),
+and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
+own kinematics.
+
 ## UniMate's weights
 
 ```
@@ -208,8 +236,7 @@ head, or it would move tail first. The clip comes back in the rig's own space
 and facing, the root at its rest position, with `extras.facing = "as-is"` so
 crig does not turn it again when it reads it.
 
-`tests/unimate_golden.js`, `tests/t5_golden.js` and `tests/unimate_names.js`
-compare against the reference implementation's numbers, which
+`tests/t5_golden.js` and `tests/unimate_names.js` compare against the reference implementation's numbers, which
 `tools/unimate/unimate_golden.py` writes (it needs PyTorch and a clone of the
 UniMate repository).
 

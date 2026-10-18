@@ -139,6 +139,7 @@ const STORAGES = {
 	FloatStorage: ['F32', 4], DoubleStorage: ['F64', 8], HalfStorage: ['F16', 2], BFloat16Storage: ['BF16', 2],
 	LongStorage: ['I64', 8], IntStorage: ['I32', 4], ShortStorage: ['I16', 2], CharStorage: ['I8', 1],
 	ByteStorage: ['U8', 1], BoolStorage: ['BOOL', 1],
+	UInt16Storage: ['U16', 2], UInt32Storage: ['U32', 4], UInt64Storage: ['U64', 8],
 };
 
 // A tensor as the pickle describes it: a view of a storage. `storage` is
@@ -360,8 +361,8 @@ export function readTorch(path) {
 // tensors; by default a top-level `state_dict` if there is one (Lightning,
 // most training scripts), else the whole value. Tensors the host cannot read
 // as they lie (not contiguous, or of an integer type) are left out of the
-// table; `model.torch` keeps every one, and `model.ints(name)` reads an
-// integer tensor's values.
+// table; `model.torch` keeps every one, `model.ints(name)` reads an
+// integer tensor's values and `model.pickle` is the whole unpickled value.
 export function openTorch(path, { select = null } = {}) {
 	const { value, entries, root, reader } = readTorch(path);
 	const holder = select ? select(value) : (value instanceof Map && value.has('state_dict') ? value.get('state_dict') : value);
@@ -385,6 +386,8 @@ export function openTorch(path, { select = null } = {}) {
 	model.format = 'torch';
 	model.torch = all;
 	model.skipped = skipped;
+	// The unpickled value itself, for what is not a tensor (names, settings).
+	model.pickle = value;
 	model.ints = (name) => {
 		const t = all.get(name);
 		if (!t) throw new Error(`${path} has no tensor named ${name}`);
@@ -398,11 +401,25 @@ export function openTorch(path, { select = null } = {}) {
 				case 'I32': out[i] = dv.getInt32(i * 4, true); break;
 				case 'I16': out[i] = dv.getInt16(i * 2, true); break;
 				case 'I8': out[i] = dv.getInt8(i); break;
+				case 'U64': out[i] = Number(dv.getBigUint64(i * 8, true)); break;
+				case 'U32': out[i] = dv.getUint32(i * 4, true); break;
+				case 'U16': out[i] = dv.getUint16(i * 2, true); break;
 				case 'U8': case 'BOOL': out[i] = raw[i]; break;
 				default: throw new Error(`${name} is ${t.dtype}; read it with floats()`);
 			}
 		}
 		return out;
+	};
+	// Elements `first` .. `first + count` of a float32 tensor, read from the
+	// file and nothing else: rows of a matrix too large to want whole.
+	model.floatRange = (name, first, count) => {
+		const t = all.get(name);
+		if (!t) throw new Error(`${path} has no tensor named ${name}`);
+		if (t.dtype !== 'F32' || !t.contiguous) throw new Error(`${path}: ${name} is not contiguous float32`);
+		if (first < 0 || first + count > t.elements) throw new Error(`${name}: elements ${first}..${first + count} of ${t.elements}`);
+		const [start] = where(t);
+		const raw = reader.read(start + first * 4, count * 4);
+		return new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + count * 4));
 	};
 	return model;
 }
