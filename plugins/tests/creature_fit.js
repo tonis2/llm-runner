@@ -3,7 +3,7 @@
 // time it takes. No GPU.
 //
 //   llm-runner tests/creature_fit.js rig=rig.glb tracks=tracks.json request=request.json \
-//       [iterations=1500] [check=true] [out=fit.json] [save=dir]
+//       [iterations=1500] [pitch=8] [check=true] [out=fit.json] [save=dir]
 //
 // `tracks` is track.js's output (tests/creature_track.js out=), `request` the
 // JSON with its `markers`; `out` writes the fit's projections beside the
@@ -67,7 +67,7 @@ if (cfg.check ?? true) {
 }
 
 const t0 = llm.now();
-const fit = fitRig(rig, tracks, { markers, iterations: Number(cfg.iterations ?? 1500) });
+const fit = fitRig(rig, tracks, { markers, pitch: Number(cfg.pitch ?? request.pitch ?? 8), iterations: Number(cfg.iterations ?? 1500) });
 llm.print(`  ${tracks.frames} frames, ${rig.names.length} joints in ${llm.since(t0)}`);
 const r = fit.report.reprojection_px;
 if (!(r.median <= Number(cfg.max_median ?? 8))) {

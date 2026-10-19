@@ -24,6 +24,8 @@
 //   floor         each frame's lowest foot on y = 0, and none below it
 //   in place      the root stays put (the camera follows the animal); its
 //                 travel is put back afterwards from the planted feet
+//   limits        the rig's rotation limits (rig.js), firmly by the end:
+//                 Rigsmith's player holds every frame inside them
 //   camera        yaw and pitch once, pitch near `pitch` degrees; its scale and
 //                 aim on screen smooth from frame to frame
 //
@@ -37,7 +39,7 @@ import { bad } from './request.js';
 
 const SIGMA2 = 15 * 15;
 const DEG = Math.PI / 180;
-const W_PLANE = 10, W_MIDLINE = 0.5;
+const W_PLANE = 10, W_FOOT = 0.05, W_MIDLINE = 0.5;
 
 // Row-major R (9 at `o`) from the rotation vector (x, y, z).
 function rodrigues(x, y, z, R, o) {
@@ -59,6 +61,43 @@ function leftJacobianT(x, y, z, g0, g1, g2, out) {
 	out[0] = g0 - a * c0 + b * d0;
 	out[1] = g1 - a * c1 + b * d1;
 	out[2] = g2 - a * c2 + b * d2;
+}
+
+// How far the turn θ is past a joint's limits, as Rigsmith reads them
+// (joint_limits.c3): the turn in the limit's frame F, M = F⁻¹ R F, split into
+// a twist about F's Y (the bone) and a swing across it, each axis's angle
+// past its range the short way round the circle. Σ of the excesses².
+function limitExcess(lim, x, y, z) {
+	const t = Math.hypot(x, y, z), k = t < 1e-12 ? 0.5 : Math.sin(t / 2) / t;
+	const rx = x * k, ry = y * k, rz = z * k, rw = Math.cos(t / 2);
+	const [fx, fy, fz, fw] = lim.frame;
+	// a = R F, then m = F⁻¹ a.
+	const ax = rw * fx + rx * fw + ry * fz - rz * fy, ay = rw * fy - rx * fz + ry * fw + rz * fx;
+	const az = rw * fz + rx * fy - ry * fx + rz * fw, aw = rw * fw - rx * fx - ry * fy - rz * fz;
+	let mx = fw * ax - fx * aw - fy * az + fz * ay, my = fw * ay + fx * az - fy * aw - fz * ax;
+	let mz = fw * az - fx * ay + fy * ax - fz * aw, mw = fw * aw + fx * ax + fy * ay + fz * az;
+	if (mw < 0) { mx = -mx; my = -my; mz = -mz; mw = -mw; }
+	// Twist (0, ty, 0, tw) about Y; swing m twist⁻¹, which has no Y part.
+	const reach = Math.hypot(mw, my), ty = reach > 1e-6 ? my / reach : 0, tw = reach > 1e-6 ? mw / reach : 1;
+	const sx = mx * tw + mz * ty, sz = mz * tw - mx * ty, sw = mw * tw + my * ty;
+	const across = Math.hypot(sx, sz);
+	const scale = across < 1e-8 ? 2 / Math.max(sw, 1e-8) : (2 * Math.atan2(across, sw)) / across;
+	let twist = 2 * Math.atan2(ty, tw);
+	if (twist <= -Math.PI) twist += 2 * Math.PI;
+	let e = 0;
+	for (let i = 0; i < 3; i++) {
+		const r = lim.axes[i];
+		if (!r) continue;
+		const angle = i === 0 ? sx * scale : i === 1 ? twist : sz * scale;
+		if (angle >= r[0] && angle <= r[1]) continue;
+		let along = (angle - r[0]) % (2 * Math.PI);
+		if (along < 0) along += 2 * Math.PI;
+		const span = r[1] - r[0];
+		if (along <= span) continue;
+		const d = Math.min(along - span, 2 * Math.PI - along);
+		e += d * d;
+	}
+	return e;
 }
 
 // Adam over named Float64Arrays, each with its own learning rate.
@@ -86,8 +125,9 @@ class Adam {
 // The problem: the rig, the points and their hypotheses over T frames.
 export class RigFit {
 	// `obs` { T, points: [{ name, joint, marker }], markers: count, x, y, w }
-	// with x, y, w [T, P, H] (y up, w 0 for none).
-	constructor(rig, obs, { pitch = 8, k0 = 1000 } = {}) {
+	// with x, y, w [T, P, H] (y up, w 0 for none). `foot` the feet's share of
+	// the leg plane: firm while the view's yaw is found, loose after.
+	constructor(rig, obs, { pitch = 8, k0 = 1000, foot = W_PLANE } = {}) {
 		const J = rig.names.length;
 		this.rig = rig;
 		this.J = J;
@@ -106,7 +146,7 @@ export class RigFit {
 			for (let d = 0; d < 3; d++) this.offsets[j * 3 + d] = p < 0 ? 0 : rig.positions[j][d] - rig.positions[p][d];
 		}
 		this.rootRest = rig.positions[0].slice();
-		this.prepareStructure();
+		this.prepareStructure(foot);
 
 		// Parameters and their gradients.
 		this.theta = new Float64Array(T * J * 3);
@@ -128,12 +168,19 @@ export class RigFit {
 		this.gPos = new Float64Array(T * J * 3);
 		this.gM = new Float64Array(T * this.M * 3);
 		this.rootTau = new Float64Array(T * 3);   // the root's turn's own share (its frame in the lateral terms)
-		this.weights = { reproj: 1, acc: 2, thetaAcc: 2, twist: 1, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1 };
+		this.weights = { reproj: 1, acc: 2, thetaAcc: 2, twist: 1, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10 };
+		// The limited joints, their frames normalised; an axis whose range is a
+		// whole turn is free.
+		this.limits = (rig.limits ?? []).filter((l) => l.joint > 0).map((l) => {
+			const n = Math.hypot(...l.frame), frame = l.frame.map((v) => v / n);
+			return { joint: l.joint, frame, axes: l.axes.map((r) => (r && r[1] - r[0] < 2 * Math.PI - 1e-6 ? r : null)) };
+		}).filter((l) => l.axes.some(Boolean));
+		this.limitScale = 1;
 	}
 
 	// Which joints the points see, each joint's reach (the farthest rest point
 	// below it), the one-child joints' bone directions and the feet.
-	prepareStructure() {
+	prepareStructure(foot) {
 		const { rig, J } = this;
 		const children = Array.from({ length: J }, () => []);
 		for (let j = 1; j < J; j++) children[this.parents[j]].push(j);
@@ -194,17 +241,18 @@ export class RigFit {
 		// Sideways offsets in the root's frame (x is across the body: rest turns
 		// are identity and the rig faces +Z), which one view does not see: each
 		// leg's joints held at their rest offsets from its hip (a leg swings in
-		// its own plane; the chain from a foot up to where it branches off), and
-		// the middle joints (no side in their names) on the root's midline -
-		// firmly near the root, letting go toward the tail's tip and the head,
-		// whatever curve the model was made in.
+		// its own plane; the chain from a foot up to where it branches off; the
+		// foot itself loosely once the view is known, as it may turn in from a
+		// splayed rest stance), and the middle joints (no side in their names)
+		// on the root's midline - firmly near the root, letting go toward the
+		// tail's tip and the head, whatever curve the model was made in.
 		const lateral = [];
 		for (const leaf of this.footLeaves) {
 			const chain = [leaf];
 			let j = leaf;
 			while (this.parents[j] > 0 && children[this.parents[j]].length === 1) { j = this.parents[j]; chain.push(j); }
 			const hip = j === leaf ? this.parents[leaf] : j;
-			for (const c of chain) if (c !== hip) lateral.push([c, hip, rig.positions[c][0] - rig.positions[hip][0], W_PLANE]);
+			for (const c of chain) if (c !== hip) lateral.push([c, hip, rig.positions[c][0] - rig.positions[hip][0], feet.has(c) ? foot : W_PLANE]);
 		}
 		const side = (n) => /(_L|_R|\.L|\.R|_l|_r|Left|Right|left|right)$/.test(n) || /^(l_|r_|L_|R_|left|right)/.test(n);
 		const along = new Float64Array(J);
@@ -527,7 +575,22 @@ export class RigFit {
 			Object.assign(terms, { heading: w * mean * mean });
 			for (let t = 0; t < T; t++) g.theta[t * J * 3 + 1] += (2 * w * mean) / T;
 		}
-		Object.assign(terms, { twist, rest, chain, thetaAcc: tacc });
+		// Limits, in pixels as the rest are; the excess is cheap, so its
+		// gradient is taken by central differences.
+		let limit = 0;
+		for (const lim of this.limits) {
+			const j = lim.joint, L = Math.max(this.reach[j], 0.05 * this.rig.height) * k0, w = W.limit * this.limitScale * L * L * norm, h = 1e-6;
+			for (let t = 0; t < T; t++) {
+				const o = (t * J + j) * 3, x = theta[o], y = theta[o + 1], z = theta[o + 2];
+				const e = limitExcess(lim, x, y, z);
+				if (e === 0) continue;
+				limit += w * e;
+				g.theta[o] += (w * (limitExcess(lim, x + h, y, z) - limitExcess(lim, x - h, y, z))) / (2 * h);
+				g.theta[o + 1] += (w * (limitExcess(lim, x, y + h, z) - limitExcess(lim, x, y - h, z))) / (2 * h);
+				g.theta[o + 2] += (w * (limitExcess(lim, x, y, z + h) - limitExcess(lim, x, y, z - h))) / (2 * h);
+			}
+		}
+		Object.assign(terms, { twist, rest, chain, thetaAcc: tacc, limit });
 	}
 
 	cameraPriors(terms) {
@@ -599,6 +662,9 @@ export class RigFit {
 		let loss = 0;
 		for (let it = 0; it < iterations; it++) {
 			const tau = tau0 * (tau1 / tau0) ** Math.min(1, it / (0.6 * iterations));
+			// The limits come in over the first half: the fit finds the pose the
+			// points ask for, then the nearest one the rig allows.
+			this.limitScale = Math.min(1, it / (0.5 * iterations));
 			loss = this.evaluate(tau);
 			if (it === iterations - 1) break;
 			adam.step(0.5 * (1 + Math.cos((Math.PI * it) / iterations)));
@@ -682,47 +748,76 @@ export function fitRig(rig, tracks, { markers = {}, pitch = 8, iterations = 1500
 	const rest3 = Math.hypot(...[0, 1, 2].map((d) => Math.max(...restPts.map((q) => q[d])) - Math.min(...restPts.map((q) => q[d]))));
 	const k0 = spread(lab) / Math.max(1e-6, rest3) * 1.1;
 
+	// Aim a one-frame fit: the rig's projected centroid on the labels'.
+	const aim = (f, o) => {
+		const c = centroid(o, 0);
+		const proj = f.projections()[0].filter((_, p) => o.w[p] > 0);
+		f.shift[0] = c[0] - proj.reduce((s, q) => s + q[0], 0) / proj.length;
+		f.shift[1] = c[1] - proj.reduce((s, q) => s + q[1], 0) / proj.length;
+	};
+
 	// The first keyframe alone, from rest, over a ring of yaws: which way the
-	// animal faces, and a pose to start every frame from.
-	const keyCentre = centroid(keyObs, 0);
+	// animal faces, and where the markers sit.
+	const keys = [...new Set(tracks.hypotheses.map((h) => h.from))].sort((x, y) => x - y);
+	const initSteps = 400, yaws = 12, total = yaws + keys.length - 1 + iterations / 10;
 	let best = null;
-	const initSteps = 400, yaws = 12;
 	for (let i = 0; i < yaws; i++) {
 		const f = new RigFit(rig, keyObs, { pitch, k0 });
 		f.cam[0] = (i * 2 * Math.PI) / yaws;
-		f.forward();
-		// Aim: the rig's projected centroid on the labels'.
-		const proj = f.projections()[0].filter((_, p) => keyObs.w[p] > 0);
-		const mx = proj.reduce((s, q) => s + q[0], 0) / proj.length, my = proj.reduce((s, q) => s + q[1], 0) / proj.length;
-		f.shift[0] = keyCentre[0] - mx;
-		f.shift[1] = keyCentre[1] - my;
+		aim(f, keyObs);
 		const loss = f.run(initSteps, { tau0: 20, tau1: 20 });
 		const err = f.terms.reproj;
 		if (!best || err < best.err) best = { f, err, loss, yaw: f.cam[0] };
-		onStep?.(i + 1, yaws + iterations / 10);
+		onStep?.(i + 1, total);
 	}
 	llm.print(`  start: frame ${key} alone, yaw ${(best.yaw / DEG).toFixed(0)}° fits best (reprojection ${best.err.toFixed(1)})`);
 
-	// Every frame from that pose, aimed where its points are.
-	const fit = new RigFit(rig, obs, { pitch, k0 });
-	const T = obs.T, J = rig.names.length;
-	const b = best.f;
-	for (let t = 0; t < T; t++) {
-		fit.theta.set(b.theta.subarray(0, J * 3), t * J * 3);
-		fit.root.set(b.root.subarray(0, 3), t * 3);
-		fit.logS[t] = b.logS[0];
-		const c = centroid(obs, t);
-		fit.shift[t * 2] = b.shift[0] + (c ? c[0] - keyCentre[0] : 0);
-		fit.shift[t * 2 + 1] = b.shift[1] + (c ? c[1] - keyCentre[1] : 0);
+	// Every other keyframe alone, from that pose, with that camera and those
+	// markers: a clip that leaves its first pose far behind (arms out, then
+	// down) starts near each of its labelled poses.
+	const solved = [{ key, f: best.f, centre: centroid(keyObs, 0) }];
+	for (const k of keys.slice(1)) {
+		const o = keyframeObservations(obs, tracks, k);
+		const f = new RigFit(rig, o, { pitch, k0 });
+		f.theta.set(best.f.theta);
+		f.root.set(best.f.root);
+		f.logS.set(best.f.logS);
+		f.marks.set(best.f.marks);
+		f.cam.set(best.f.cam);
+		aim(f, o);
+		f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
+		solved.push({ key: k, f, centre: centroid(o, 0) });
+		onStep?.(yaws + solved.length - 1, total);
 	}
-	fit.marks.set(b.marks);
-	fit.cam.set(b.cam);
+	if (solved.length > 1) llm.print(`  keyframes ${keys.join(', ')} alone: reprojection ${solved.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
+
+	// Every frame from the keyframes either side of it, blended by time, aimed
+	// where its points are.
+	const fit = new RigFit(rig, obs, { pitch, k0, foot: W_FOOT });
+	const T = obs.T, J = rig.names.length;
+	const lerp = (x, y, s) => x + (y - x) * s;
+	for (let t = 0; t < T; t++) {
+		let n = 0;
+		while (n + 1 < solved.length && solved[n + 1].key <= t) n++;
+		const a = solved[n], b = solved[Math.min(n + 1, solved.length - 1)];
+		const s = b.key > a.key ? Math.min(1, Math.max(0, (t - a.key) / (b.key - a.key))) : 0;
+		for (let i = 0; i < J * 3; i++) fit.theta[t * J * 3 + i] = lerp(a.f.theta[i], b.f.theta[i], s);
+		for (let d = 0; d < 3; d++) fit.root[t * 3 + d] = lerp(a.f.root[d], b.f.root[d], s);
+		fit.logS[t] = lerp(a.f.logS[0], b.f.logS[0], s);
+		const c = centroid(obs, t);
+		for (let d = 0; d < 2; d++) {
+			const off = lerp(a.f.shift[d] - a.centre[d], b.f.shift[d] - b.centre[d], s);
+			fit.shift[t * 2 + d] = c ? c[d] + off : lerp(a.f.shift[d], b.f.shift[d], s);
+		}
+	}
+	fit.marks.set(best.f.marks);
+	fit.cam.set(best.f.cam);
 	let lastPrint = llm.now();
 	fit.run(iterations, {
-		onStep: (done, total, loss) => {
-			onStep?.(yaws + done / 10, yaws + total / 10);
+		onStep: (done, all, loss) => {
+			onStep?.(yaws + keys.length - 1 + done / 10, total);
 			if (llm.now() - lastPrint > 5000) {
-				llm.print(`  fit ${done}/${total}: loss ${loss.toFixed(2)}, reprojection ${fit.terms.reproj.toFixed(2)}`);
+				llm.print(`  fit ${done}/${all}: loss ${loss.toFixed(2)}, reprojection ${fit.terms.reproj.toFixed(2)}`);
 				lastPrint = llm.now();
 			}
 		},
@@ -749,7 +844,18 @@ export function fitRig(rig, tracks, { markers = {}, pitch = 8, iterations = 1500
 		terms: Object.fromEntries(Object.entries(fit.terms).map(([k, v]) => [k, round(v, 3)])),
 		seconds: round((llm.now() - t0) / 1000, 1),
 	};
-	llm.print(`  fit: reprojection median ${report.reprojection_px.median}px, 90% ${report.reprojection_px.p90}px, ${(report.reprojection_px.over_30 * 100).toFixed(1)}% over 30px; yaw ${report.camera.yaw}°, pitch ${report.camera.pitch}°, in ${report.seconds}s`);
+	if (fit.limits.length) {
+		// How far past the rig's limits the clip goes at worst; Rigsmith plays it held at them.
+		let worst = 0;
+		for (const lim of fit.limits) {
+			for (let t = 0; t < T; t++) {
+				const o = (t * J + lim.joint) * 3;
+				worst = Math.max(worst, Math.sqrt(limitExcess(lim, fit.theta[o], fit.theta[o + 1], fit.theta[o + 2])));
+			}
+		}
+		report.limits = { joints: fit.limits.length, worst_deg: round(worst / DEG, 2) };
+	}
+	llm.print(`  fit: reprojection median ${report.reprojection_px.median}px, 90% ${report.reprojection_px.p90}px, ${(report.reprojection_px.over_30 * 100).toFixed(1)}% over 30px; yaw ${report.camera.yaw}°, pitch ${report.camera.pitch}°${report.limits ? `, at worst ${report.limits.worst_deg}° past a limit` : ''}, in ${report.seconds}s`);
 	return { problem: fit, projections: proj, report };
 }
 

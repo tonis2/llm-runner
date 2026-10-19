@@ -10,7 +10,8 @@ can be built for:
 3. **Fit.** The rig is posed to match the tracks. Per frame it fits the joint
    turns and the root, together with one orthographic camera. Bone lengths are
    the rig's own; unlabelled joints follow their chain; the legs stay in their
-   plane; the feet stay on the floor.
+   plane; the feet stay on the floor; every joint stays inside the rig's
+   rotation limits, which Rigsmith's player enforces on any clip it plays.
 4. **Travel.** The walk's forward movement is recovered from the planted feet.
 
 The backbone stays loaded between requests.
@@ -43,7 +44,7 @@ one request at a time; there is one GPU.
 | `name`       | string | The clip's name. Default `creature`. |
 | `travel`     | bool | Put the walk's travel back on the root. Default true. Without it the animal walks in place. |
 | `iterations` | number | Fit iterations. Default 1500. |
-| `pitch`      | number | The camera's expected downward angle, in degrees. Default 8. |
+| `pitch`      | number | The camera's expected downward angle, in degrees. Default 8. Raise it for a camera that stands close or looks down on the animal (it sees the feet from above); otherwise the fit leans the body to make up the difference. |
 | `outputs`    | string[] | Any of `glb`, `clip`, `bvh`, `animated_glb`, `tracks`. Default `["glb", "clip"]`. |
 
 What each output is:
@@ -66,15 +67,24 @@ The reply looks like this. Files are base64.
 { "name": "walk", "frames": 124, "fps": 24, "joints": ["pelvis", "..."],
   "glb": "<base64>", "clip": { "name": "walk", "keyframes": ["..."] },
   "report": { "reprojection_px": { "median": 6.6, "p90": 27.2, "over_30": 0.087 },
-              "camera": { "yaw": 77.9, "pitch": 8.0 }, "travel": 0.35,
+              "camera": { "yaw": 77.9, "pitch": 8.0 }, "limits": { "joints": 51, "worst_deg": 5.5 },
+              "travel": 0.35,
               "seconds": { "track": 225, "fit": 72, "total": 297 } } }
 ```
+
+`limits` (for a rig that has them) says how far past its rotation limits the
+clip goes at worst, in degrees; Rigsmith plays it held at them.
 
 `reprojection_px` is each tracked point's distance from where the fitted rig
 puts it. Points far off in many frames usually mean one of three things: a
 label on a different part of the body than the joint it names (a marker is the
 fix), a track that swapped legs (add a keyframe there), or a rig whose
 proportions differ from the animal's.
+
+One view sees nothing along its line of sight, so a side or three-quarter
+view of a walk works best: it shows the legs' swing. Head-on, the fit cannot
+tell a limb reaching toward the camera from one hanging back when both draw
+alike, and it may pick the wrong one (arms held forward, say).
 
 Errors come back as a 400 (something wrong in the request: an unknown joint, a
 glb with no skin, and so on) or a 500, with `{"error": "..."}`. The server

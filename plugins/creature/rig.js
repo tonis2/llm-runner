@@ -8,6 +8,14 @@
 // A .glb's own nodes are kept too (`glb`), for writing the clip back onto it:
 // each joint's node, rest local and world turns. Rigsmith's rigs have every
 // rest turn the identity; any other file's are kept as they are.
+//
+// So are the joints' rotation limits (`limits`), as Rigsmith keeps them and
+// its player holds every frame of a clip inside them: per limited joint a
+// frame (model space at rest, its Y along the bone) and a range [lo, hi] per
+// axis (lo = hi when the axis is locked, none when it is free), the turn read
+// in that frame as a swing across the bone (x, z) and a twist about it (y).
+// From a .glb's KHR_physics_rigid_bodies joints (Rigsmith writes one per
+// limited joint, its attachments in that frame), or get_skeleton's limits.
 
 import { llm } from '../lib/llm.js';
 import { bytesOf, bad } from './request.js';
@@ -93,7 +101,21 @@ function fromGlb(bytes) {
 		names: joints.map((n, k) => nodes[n].name ?? `joint${k}`),
 		parents,
 		positions: joints.map((n) => worldOf(n).p),
+		limits: [],
 	};
+	// A limit: an attachment node under the joint linked to one under its
+	// parent, with one-axis angular rows (a cone is not Rigsmith's and is left out).
+	const physics = gltf.extensions?.KHR_physics_rigid_bodies?.physicsJoints ?? [];
+	nodes.forEach((n, i) => {
+		const link = n.extensions?.KHR_physics_rigid_bodies?.joint;
+		const j = index.get(parentOf.get(i));
+		if (!link || j === undefined || parents[j] < 0 || parentOf.get(link.connectedNode) !== joints[parents[j]]) return;
+		const rows = (physics[link.joint]?.limits ?? []).filter((r) => r.angularAxes);
+		if (rows.some((r) => r.angularAxes.length !== 1)) return;
+		const axes = [null, null, null];
+		for (const r of rows) axes[r.angularAxes[0]] = [r.min ?? -Math.PI, r.max ?? Math.PI];
+		if (axes.some(Boolean)) rig.limits.push({ joint: j, frame: worldOf(i).r, axes });
+	});
 	rig.glb = {
 		bytes, gltf, bin,
 		nodes: joints.slice(),
@@ -121,8 +143,77 @@ function ordered(rig) {
 	};
 	if (new Set(out.names).size !== J) throw bad('rig: two joints share a name');
 	if (rig.glb) out.glb = { ...rig.glb, nodes: order.map((j) => rig.glb.nodes[j]), restLocal: order.map((j) => rig.glb.restLocal[j]), restWorld: order.map((j) => rig.glb.restWorld[j]) };
+	out.limits = (rig.limits ?? []).map((l) => ({ ...l, joint: at.get(l.joint) }));
 	const ys = out.positions.map((p) => p[1]);
 	out.height = Math.max(...ys) - Math.min(...ys) || 1;
+	return out;
+}
+
+// Rigsmith's derived limit frame (joint_limit_frame_by_index): Y along the
+// bone - to the named child, the only child, a fork's child that carries on
+// the way the bone came in (the root: the one leading most joints), or from
+// the parent for a leaf - and X the world axis frame_seed picks, made square
+// to it. A finger's roll by its hand is not followed; get_skeleton gives a
+// finger's frame anyway.
+function derivedFrame(rig, j, primary = -1) {
+	const P = rig.positions, J = rig.names.length;
+	const kids = [];
+	for (let c = 0; c < J; c++) if (rig.parents[c] === j && Math.hypot(...P[c].map((v, d) => v - P[j][d])) > 1e-6) kids.push(c);
+	const sub = (a, b) => a.map((v, d) => v - b[d]);
+	let dir;
+	if (primary >= 0) dir = sub(P[primary], P[j]);
+	else if (kids.length === 1) dir = sub(P[kids[0]], P[j]);
+	else if (kids.length > 1) {
+		const p = rig.parents[j];
+		const below = (c) => rig.parents.filter((_, k) => { for (let a = rig.parents[k]; a >= 0; a = rig.parents[a]) if (a === c) return true; return false; }).length;
+		let incoming = p >= 0 ? sub(P[j], P[p]) : null;
+		if (incoming && Math.hypot(...incoming) < 1e-6) incoming = null;
+		let best = -1, score = -Infinity;
+		for (const c of kids) {
+			const e = sub(P[c], P[j]), n = Math.hypot(...e);
+			const s = incoming ? (e[0] * incoming[0] + e[1] * incoming[1] + e[2] * incoming[2]) / (n * Math.hypot(...incoming)) : below(c);
+			if (s > score) { best = c; score = s; }
+		}
+		dir = sub(P[best], P[j]);
+	} else if (rig.parents[j] >= 0) dir = sub(P[j], P[rig.parents[j]]);
+	else return null;
+	const n = Math.hypot(...dir);
+	if (n < 1e-6) return null;
+	const y = dir.map((v) => v / n), [ax, ay, az] = y.map(Math.abs), NEAR = 0.17;
+	let seed;
+	if (ay < NEAR && az < NEAR) seed = [0, 0, 1];
+	else if (ax < NEAR && (ay < NEAR || az < NEAR)) seed = [1, 0, 0];
+	else seed = ax <= ay && ax <= az ? [1, 0, 0] : ay <= az ? [0, 1, 0] : [0, 0, 1];
+	const k = seed[0] * y[0] + seed[1] * y[1] + seed[2] * y[2];
+	let x = seed.map((v, d) => v - y[d] * k);
+	const xn = Math.hypot(...x);
+	x = x.map((v) => v / xn);
+	const z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+	return quatFromColumns(x, y, z);
+}
+
+// The rotation whose matrix has columns x, y, z.
+function quatFromColumns(x, y, z) {
+	const t = x[0] + y[1] + z[2];
+	let q;
+	if (t > 0) { const s = Math.sqrt(t + 1) * 2; q = [(y[2] - z[1]) / s, (z[0] - x[2]) / s, (x[1] - y[0]) / s, s / 4]; }
+	else if (x[0] > y[1] && x[0] > z[2]) { const s = Math.sqrt(1 + x[0] - y[1] - z[2]) * 2; q = [s / 4, (y[0] + x[1]) / s, (z[0] + x[2]) / s, (y[2] - z[1]) / s]; }
+	else if (y[1] > z[2]) { const s = Math.sqrt(1 + y[1] - x[0] - z[2]) * 2; q = [(y[0] + x[1]) / s, s / 4, (z[1] + y[2]) / s, (z[0] - x[2]) / s]; }
+	else { const s = Math.sqrt(1 + z[2] - x[0] - y[1]) * 2; q = [(z[0] + x[2]) / s, (z[1] + y[2]) / s, s / 4, (x[1] - y[0]) / s]; }
+	const n = Math.hypot(...q);
+	return q.map((v) => v / n);
+}
+
+// get_skeleton's dots' limits on `rig` (ordered): a saved frame, or derived.
+function skeletonLimits(dots, rig) {
+	const out = [];
+	for (const dot of dots ?? []) {
+		const L = dot.limits, j = rig.names.indexOf(dot.name);
+		if (!L?.active || j <= 0) continue;
+		const axes = ['x', 'y', 'z'].map((a) => (L[a] ? (L[a].allow ? [L[a].minimum, L[a].maximum] : [L[a].locked, L[a].locked]) : null));
+		const frame = L.frame ?? derivedFrame(rig, j, L.primary_child ? rig.names.indexOf(L.primary_child) : -1);
+		if (frame) out.push({ joint: j, frame, axes });
+	}
 	return out;
 }
 
@@ -142,6 +233,7 @@ export function readRig(value) {
 		throw bad('rig: expected a .glb, { joints: [...] } or { names, parents, positions }');
 	}
 	const out = ordered(rig);
-	llm.print(`  rig: ${out.names.length} joints, root ${out.names[0]}, height ${out.height.toFixed(3)}`);
+	if (Array.isArray(value.dots)) out.limits = skeletonLimits(value.dots, out);
+	llm.print(`  rig: ${out.names.length} joints, root ${out.names[0]}, height ${out.height.toFixed(3)}${out.limits.length ? `, ${out.limits.length} with limits` : ''}`);
 	return out;
 }
