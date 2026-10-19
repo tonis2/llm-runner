@@ -148,6 +148,12 @@ export function setBreather(fn) {
 	lastBreath = llm.now();
 }
 
+// Whether anything takes a breath. Headless nothing does, and a long loop can
+// submit instead of awaiting `breathe()`: every await is a job for the script
+// runtime, which runs at most so many for one request, and a breath that does
+// nothing still costs one.
+export function breathing() { return breather !== null; }
+
 // Weights uploaded one at a time with a breath after each: `spec` is
 // `{ key: () => tensor }`, and the answer is `{ key: tensor }`.
 export async function uploadEach(spec) {

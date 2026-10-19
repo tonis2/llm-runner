@@ -17,6 +17,13 @@
 //   POST /track    { frames, labels, region?, width?, draw? }
 //                  -> { tracks, previews?, report }
 //   POST /fit      { rig, tracks, markers?, ... }  -> as /animate, no GPU
+//   POST /train    { renders, out, joints?, backgrounds?, epochs?, ... }
+//                  -> { finder, report }: a joint finder for one rig, trained
+//                     on Rigsmith's render_poses pictures of it (train.js)
+//   POST /detect   { finder, frames, region?, key_every?, draw? } or
+//                  { finder, views: [{ frames, region? }] }
+//                  -> { tracks, previews?, report }: every joint the finder
+//                     knows, on every frame, with no labels (detect.js)
 //   GET  /info     what is loaded, the routes and the request's fields
 //
 //   rig      a rigged .glb (path, or base64), Rigsmith's get_skeleton answer,
@@ -41,11 +48,14 @@
 //            same instant; the one motion is fitted to all of them (a front
 //            and a side clip: what one cannot see along its line of sight,
 //            the other sees across). tracks come back one per view.
+//   finder   a trained joint finder (/train): a view with neither labels
+//            nor tracks has its joints found on every frame instead
 //
 // Rigsmith runs it in-process as a job (llm::pipeline::Job): the job's
 // config is the same request plus `model`, the clip comes back as the job's
 // outputs `glb`, `clip.json`, `tracks.json` and `animated.glb` (whichever
-// `outputs` names), and progress as "  step N/M, ..." lines.
+// `outputs` names), and progress as "  step N/M, ..." lines. `task: "train"`
+// or `"detect"` runs /train's or /detect's request instead.
 
 import { llm } from '../lib/llm.js';
 import { utf8 } from '../lib/graph/plugins.js';
@@ -55,9 +65,11 @@ import { frameSource, readLabels, drawTracks, bad } from './request.js';
 import { readRig } from './rig.js';
 import { fitRig } from './fit.js';
 import { fittedMotion, clipGlb, clipBvh, clipJson, animatedGlb } from './output.js';
+import { Finder } from './detect.js';
+import { trainFinder } from './train.js';
 
 const OUTPUTS = ['glb', 'clip', 'bvh', 'animated_glb', 'tracks'];
-let backbone = null, tracker = null, modelPath = null;
+let backbone = null, tracker = null, modelPath = null, finder = null;
 
 async function ensureBackbone(config) {
 	const path = config.model;
@@ -101,6 +113,40 @@ async function track(request, config, step, labels) {
 	return { frames, tracks };
 }
 
+// The finder at `path`, loaded once and kept until another is asked for.
+function finderAt(path) {
+	if (!path || typeof path !== 'string') throw bad('finder: the path of a trained joint finder (.safetensors, from POST /train)');
+	if (finder && finder.path !== path) {
+		finder.dispose();
+		finder = null;
+	}
+	if (!finder) finder = Finder.load(path);
+	return finder;
+}
+
+// One view's joints found by the request's finder: { frames, tracks }.
+async function detect(request, view, config, step) {
+	await ensureBackbone(config);
+	const f = finderAt(request.finder);
+	const frames = frameSource(view.frames);
+	const tracks = await f.detect(backbone.encoder, frames, {
+		region: list(view.region, 4, 'region'), keyEvery: Number(request.key_every ?? 6),
+		onFrame: (k, n) => step?.(k, n, 'finding joints'),
+	});
+	return { frames, tracks };
+}
+
+async function train(request, config) {
+	await ensureBackbone(config);
+	// A finder being rewritten is not the one in memory any more.
+	if (finder && finder.path === request.out) {
+		finder.dispose();
+		finder = null;
+	}
+	const report = await trainFinder(backbone.encoder, request, stepper());
+	return { finder: request.out, report };
+}
+
 // The request's views: its `views`, or the request itself as the one view.
 function viewsOf(request) {
 	if (request.views === undefined) return [request];
@@ -130,6 +176,10 @@ export async function animate(request, config = {}) {
 				if (typeof tracks === 'string') tracks = JSON.parse(tracks.trim().startsWith('{') ? tracks : llm.readText(tracks));
 				if (!Array.isArray(tracks?.hypotheses) || !Array.isArray(tracks.points)) throw bad('tracks: a /track reply\'s tracks ({ points, frames, hypotheses })');
 				for (const p of tracks.points) if (!rig.names.includes(p) && !(p in markers)) throw bad(`tracks: "${p}" is neither one of the rig's joints nor a marker (joints: ${rig.names.join(', ')})`);
+			} else if (!view.labels && request.finder) {
+				tracks = (await detect(request, view, config, (k, n, what) => step(i * n + k, views.length * n, what))).tracks;
+				for (const p of tracks.points) if (!rig.names.includes(p)) throw bad(`finder: it finds "${p}", which is not one of this rig's joints (trained on another rig?)`);
+				trackSeconds += tracks.seconds;
 			} else {
 				const { labels } = readLabels({ ...view, markers }, rig.names);
 				tracks = (await track(view, config, (k, n, what) => step(i * n + k, views.length * n, what), labels)).tracks;
@@ -167,6 +217,24 @@ export async function animate(request, config = {}) {
 	return { reply, files };
 }
 
+// /detect: the tracks of each view (one view's alone when there are no views).
+async function detectReply(request, config) {
+	const step = stepper(), views = viewsOf(request), out = [];
+	let seconds = 0;
+	for (const [i, view] of views.entries()) {
+		if (!view?.frames) throw bad(`${views.length > 1 ? `views[${i}]: ` : ''}frames: a folder of frames, or a list of images`);
+		const { frames, tracks } = await detect(request, view, config, (k, n, what) => step(i * n + k, views.length * n, what));
+		seconds += tracks.seconds;
+		const one = { tracks };
+		const draw = view.draw ?? request.draw;
+		if (Array.isArray(draw)) one.previews = draw.map((k) => ({ frame: k, png: llm.base64Encode(drawTracks(frames, tracks, Number(k))) }));
+		out.push(one);
+	}
+	const report = { seconds: Math.round(seconds * 10) / 10, finder: finder.path, joints: finder.joints.length };
+	if (request.views === undefined) return { ...out[0], report };
+	return { tracks: out.map((o) => o.tracks), previews: out.map((o) => o.previews ?? []), report };
+}
+
 const json = (status, value) => llm.respond(status, 'application/json', JSON.stringify(value));
 
 const INFO = {
@@ -175,6 +243,8 @@ const INFO = {
 		'POST /animate': 'rig, frames, labels -> the clip (glb, clip, bvh, animated_glb, tracks as asked) and a report',
 		'POST /track': 'frames, labels -> tracks (and previews: base64 PNGs of the frames in `draw`)',
 		'POST /fit': 'rig, tracks -> as /animate, without the GPU',
+		'POST /train': 'renders (render_poses folders), out -> a joint finder for that rig, and a report',
+		'POST /detect': 'finder, frames (or views) -> tracks of every joint the finder knows (and previews: base64 PNGs of the frames in `draw`)',
 		'GET /info': 'this',
 	},
 	request: {
@@ -189,6 +259,8 @@ const INFO = {
 		iterations: 'fit iterations (1500)',
 		pitch: 'the camera\'s expected downward angle in degrees (8)',
 		views: '[{ frames, labels, region?, width?, pitch? } or { tracks, pitch? }]: the same moments from other cameras, fitted together',
+		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
+		key_every: 'with a finder: a keyframe for the fit to start from every so many frames (6)',
 		outputs: `any of ${OUTPUTS.join(', ')} (["glb", "clip"])`,
 	},
 };
@@ -207,8 +279,8 @@ llm.plugin({
 				json(200, { ...INFO, model: modelPath, loaded: !!backbone });
 				return;
 			}
-			if (req.method !== 'POST' || !['/animate', '/track', '/fit'].includes(path)) {
-				json(404, { error: 'POST /animate, /track or /fit; GET /info' });
+			if (req.method !== 'POST' || !['/animate', '/track', '/fit', '/train', '/detect'].includes(path)) {
+				json(404, { error: 'POST /animate, /track, /fit, /train or /detect; GET /info' });
 				return;
 			}
 			let body;
@@ -227,6 +299,14 @@ llm.plugin({
 				json(200, reply);
 				return;
 			}
+			if (path === '/train') {
+				json(200, await train(body, config));
+				return;
+			}
+			if (path === '/detect') {
+				json(200, await detectReply(body, config));
+				return;
+			}
 			if (path === '/fit' && viewsOf(body).some((v) => !v?.tracks)) throw bad('tracks: /fit wants the tracks a /track reply gave (in every view)');
 			json(200, (await animate(body, config)).reply);
 		} catch (e) {
@@ -237,6 +317,12 @@ llm.plugin({
 
 	// In-process (Rigsmith's job): the request is the config.
 	async generate(config) {
+		if (config.task === 'train') return train(config, config);
+		if (config.task === 'detect') {
+			const reply = await detectReply(config, config);
+			if (llm.canOutput()) llm.output('tracks.json', utf8(JSON.stringify(reply.tracks)));
+			return reply;
+		}
 		const { reply, files } = await animate(config, config);
 		if (!llm.canOutput()) return reply;
 		for (const [name, bytes] of Object.entries(files)) llm.output(name, bytes);

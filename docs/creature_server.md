@@ -140,6 +140,116 @@ early.
 of `/animate`'s fields. It returns `/animate`'s reply in about a minute, with
 no GPU work.
 
+### A trained finder: no labels
+
+Labels and tracking are where a fit usually goes wrong: a track drifts or
+swaps legs, and a keyframe misses the joints a view hides. A **finder** does
+without them. It is a joint detector made for one rig, the way the "train
+DINO on the character's own mesh" method does it:
+
+1. **Draw the rig.** Rigsmith's `render_poses` MCP tool draws the rigged
+   model in thousands of random poses inside its own joint limits. Each pose
+   is drawn from the cameras you give (front and side, say), jittered, on a
+   transparent background, and every joint's pixel is written beside each
+   picture. The labels cost nothing, and every one is exact.
+2. **Train.** `POST /train` lays each picture over a background with jittered
+   colours, encodes it with DINOv3, and fits a small head on the patch
+   features. The head scores each patch for each joint, and its softmax over
+   the picture is fitted to a Gaussian at the joint's pixel.
+3. **Find.** `POST /detect` runs the finder over a clip's frames and returns
+   every joint on every frame, in `/track`'s format. Or give `/animate` a
+   `finder` and views with no labels: it finds the joints in each view, then
+   fits as usual.
+
+The finder only knows the rig it was trained on, and the joints it was trained
+on: by default every joint whose bone is at least 4% of the rig's height.
+Fingers are too small for 16-pixel patches.
+
+#### Drawing the training set
+
+`render_poses` is hidden from Rigsmith's tool list; call it by name (or
+`crig.ops.renderPoses` from `run_script`). One call draws `count` poses from
+index `first`. The same seed and index always draw the same picture, so a set
+is drawn a few hundred poses at a time:
+
+```sh
+for first in 0 500 1000 1500; do
+  curl -s -X POST http://127.0.0.1:8808/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,
+    "method":"tools/call","params":{"name":"render_poses","arguments":{"out":"/data/zidane_renders",
+    "count":500,"first":'$first',"cameras":[{"name":"front","yaw":0},{"name":"left","yaw":90},{"name":"right","yaw":-90}]}}}'
+done
+```
+
+| Argument | Default | Notes |
+|----------|---------|-------|
+| `out` | | The folder; made when missing. |
+| `count`, `first`, `seed` | 100, 0, 1 | Which poses this call draws. |
+| `size` | 448 | Square pictures, a multiple of 16. |
+| `cameras` | front (yaw 0), side (yaw 90) | `{ name, yaw, pitch? (8), distance? (4), yaw_jitter? (15), pitch_jitter? (8) }`. Yaw is in degrees from in front of the rig (0 looks at its face, 90 at its left side). `distance` is in rig sizes, and only sets how strong the perspective is: the picture is zoomed to the framing. |
+| `fill` | [0.45, 0.75] | The share of the picture the joints' box fills, along its longer side. |
+| `shift`, `spread`, `heading`, `tilt` | 0.08, 20, 30, 10 | Framing offset; the turn of a joint with no limits; the root's turn and tip, in degrees. |
+| `blur` | 0.3 | The share of pictures motion-blurred. |
+| `motion`, `fps` | false, 24 | Draw an exam instead (below). |
+
+Each call writes `poses_<first>.json`: the joints, their parents and rest
+positions; for each picture its file, its camera and every joint's pixel and
+depth; and every pose's joint turns. The document is not touched.
+
+#### `POST /train`
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `renders` | string or string[] | `render_poses` folders. |
+| `out` | string | Where to write the finder, a `.safetensors`. |
+| `joints` | string[] | The joints to find. Default: those big enough to see. |
+| `backgrounds` | string | A folder of images to crop backgrounds from, alongside made-up ones. |
+| `epochs` | number | Passes over the pictures. Default 40. |
+| `rank`, `hidden` | number | The PCA's size and the head's hidden width. Defaults 384 and 256. |
+| `batch`, `lr`, `sigma` | number | 32 pictures a step; Adam's rate 0.001; the target Gaussian's width in patches, 1. |
+| `holdout`, `seed`, `limit` | number | The share held out to score (0.05); the seed (1); a cap on the pictures used. |
+
+The reply is `{ finder, report }`. The report gives `held_out_px`, the
+distance from each held-out picture's joints to where the finder puts them
+(`median`, `mean`, `p90`, and `within`, the share inside `near` pixels). It
+also gives `worst_joints` and the loss over the epochs. Encoding the pictures
+takes most of the time, about a quarter of a second each. The head itself
+trains in a minute or two. The request blocks until training is done, so
+run it with no client timeout.
+
+#### `POST /detect`
+
+`{ finder, frames, region?, key_every?, draw? }`, or `{ finder, views: [{
+frames, region? }] }`, returns `{ tracks, previews?, report }`. The tracks
+are a list when `views` is given.
+
+Each frame is looked at twice. The first look is at the whole frame (or
+`region`), to find the figure. The second is a square crop around the joints
+the first look found, framed the way the training pictures were, with the
+crop's centre and size smoothed over the clip. A joint's score is how much of
+its heatmap lies near its peak. A second peak far from the first is kept as a
+second hypothesis, and the fit takes whichever one its motion agrees with: a
+left knee's heatmap often lights the right knee too. A keyframe falls every
+`key_every` frames (6); the fit starts from those.
+
+With `finder` in an `/animate` request, every view without `labels` or
+`tracks` is found this way.
+
+#### The exam
+
+`render_poses` with `"motion": true` draws one smooth movement inside the
+limits, one frame per index, from cameras held still. Its true turns are in
+the JSON. `tests/creature_exam.js` lays the frames over a background, finds
+the joints, fits the rig and grades it:
+
+```sh
+./build/llm-runner tests/creature_exam.js model=sam-3d-body-dinov3 rig=zidane.glb \
+    finder=zidane.finder.safetensors exam=/data/zidane_exam
+```
+
+It reports how far the found joints are from the drawn ones, in pixels, and
+how far each bone's direction is from the truth's in the root's frame, in
+degrees.
+
 ### `GET /info`
 
 Returns what is loaded, the routes, and the request's fields.

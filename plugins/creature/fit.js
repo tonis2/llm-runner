@@ -723,7 +723,9 @@ export function observations(rig, tracks, markers = {}, { frames = tracks.frames
 	return { T, H, points, markers: marked.length, x, y, w };
 }
 
-// One frame's observations: the labels of keyframe `k` alone.
+// One frame's observations: the labels of keyframe `k` alone, weighted by
+// their scores as the whole clip's are (a label's is 1, a found joint's how
+// sure the finder was).
 function keyframeObservations(obs, tracks, k) {
 	const P = obs.points.length;
 	const x = new Float64Array(P), y = new Float64Array(P), w = new Float64Array(P);
@@ -732,7 +734,7 @@ function keyframeObservations(obs, tracks, k) {
 	for (let p = 0; p < P; p++) {
 		const q = tracks.hypotheses[h].tracks[row][p];
 		if (!q) continue;
-		x[p] = q[0]; y[p] = -q[1]; w[p] = 1;
+		x[p] = q[0]; y[p] = -q[1]; w[p] = Math.min(1, Math.max(0.05, ((tracks.hypotheses[h].scores[row][p] ?? 1) - 0.2) / 0.4));
 	}
 	return { T: 1, H: 1, points: obs.points, markers: obs.markers, x, y, w };
 }

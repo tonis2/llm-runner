@@ -1,0 +1,13 @@
+// The gradient through max(x, 0), in place: d where the output a is above
+// zero, 0 elsewhere.
+float d[];
+float a[];
+struct Push @pushconstant { uint n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    if (a[i] <= 0.0) d[i] = 0.0;
+}

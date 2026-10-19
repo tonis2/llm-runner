@@ -1,0 +1,85 @@
+// A heatmap's loss and gradient: each (image, joint)'s scores over the image's
+// n patches softmaxed, against a Gaussian of width sigma (in patches) about
+// the joint's grid position, one workgroup per (image, joint). Scores and
+// gradient are [images * n, joints] (a patch's joints in a row); target is
+// [images * joints, 4] = grid x, grid y, weight, unused, a weight of 0 for a
+// joint the image does not have. The gradient is weight * scale * (p - t),
+// the loss -weight * sum t log p.
+float s[];
+float g[];
+float target[];
+float loss[];
+struct Push @pushconstant { uint n; uint joints; uint gw; uint groups; float sigma; float scale; }
+Push pc;
+shared float red[256];
+shared float red2[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint wg = input.gid.x;
+    uint gi = input.lid.x;
+    if (wg >= pc.groups) return;
+    uint image = wg / pc.joints;
+    uint j = wg % pc.joints;
+    uint base = image * pc.n * pc.joints + j;
+    float w = target[wg * 4u + 2u];
+    if (w <= 0.0) {
+        for (uint i = gi; i < pc.n; i += 256u) g[base + i * pc.joints] = 0.0;
+        if (gi == 0u) loss[wg] = 0.0;
+        return;
+    }
+    float tx = target[wg * 4u];
+    float ty = target[wg * 4u + 1u];
+    float k = 0.5 / (pc.sigma * pc.sigma);
+
+    float m = -3.0e38;
+    for (uint i = gi; i < pc.n; i += 256u) m = max(m, s[base + i * pc.joints]);
+    red[gi] = m;
+    barrier;
+    for (uint r = 128u; r > 0u; r >>= 1u) {
+        if (gi < r) red[gi] = max(red[gi], red[gi + r]);
+        barrier;
+    }
+    m = red[0];
+    barrier;
+
+    float z = 0.0;
+    float zt = 0.0;
+    for (uint i = gi; i < pc.n; i += 256u) {
+        z += exp(s[base + i * pc.joints] - m);
+        float dx = float(i % pc.gw) - tx;
+        float dy = float(i / pc.gw) - ty;
+        zt += exp(-(dx * dx + dy * dy) * k);
+    }
+    red[gi] = z;
+    red2[gi] = zt;
+    barrier;
+    for (uint r = 128u; r > 0u; r >>= 1u) {
+        if (gi < r) {
+            red[gi] += red[gi + r];
+            red2[gi] += red2[gi + r];
+        }
+        barrier;
+    }
+    z = red[0];
+    zt = max(red2[0], 1.0e-30);
+    float lz = log(z);
+    barrier;
+
+    float part = 0.0;
+    for (uint i = gi; i < pc.n; i += 256u) {
+        float v = s[base + i * pc.joints] - m;
+        float dx = float(i % pc.gw) - tx;
+        float dy = float(i / pc.gw) - ty;
+        float t = exp(-(dx * dx + dy * dy) * k) / zt;
+        g[base + i * pc.joints] = w * pc.scale * (exp(v - lz) - t);
+        part -= t * (v - lz);
+    }
+    red[gi] = part;
+    barrier;
+    for (uint r = 128u; r > 0u; r >>= 1u) {
+        if (gi < r) red[gi] += red[gi + r];
+        barrier;
+    }
+    if (gi == 0u) loss[wg] = w * red[0];
+}

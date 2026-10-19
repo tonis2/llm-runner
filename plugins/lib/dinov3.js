@@ -16,7 +16,7 @@
 
 import { llm, f32 } from './llm.js';
 import * as op from './ops.js';
-import { submit, copy, breathe, uploadEach } from './gpu.js';
+import { submit, copy, breathe, breathing, uploadEach } from './gpu.js';
 
 export const PATCH = 16;
 const HEAD = 64;
@@ -181,7 +181,8 @@ export class DinoV3 {
 					copy(a.h, all, n * D * 4);
 					return all;
 				}
-				await breathe(true);
+				if (breathing()) await breathe(true);
+				else submit();
 			}
 			op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
 			const out = tokens ? f32(D * N, [D, N]) : f32(D * N, [gw, gh, D]);

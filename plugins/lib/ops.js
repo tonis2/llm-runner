@@ -314,6 +314,14 @@ export function flashAttentionScalar(q, k, v, out, heads, seq, hd, scale = 1 / M
 }
 export function gelu(x, n) { dispatch('gelu', [x], [groups(n, 256)], pc('u', n)); }
 export function relu(x, n) { dispatch('relu', [x], [groups(n, 256)], pc('u', n)); }
+// d *= (a > 0): the gradient back through relu, a being its output.
+export function reluGrad(d, a, n) { dispatch('relu_grad', [d, a], [groups(n, 256)], pc('u', n)); }
+// Heatmaps' loss and gradient: scores [images * n, joints] softmaxed over each
+// image's n patches against Gaussians about target [images * joints, 4]
+// (grid x, grid y, weight, -), the gradient into g and each one's loss.
+export function spatialSoftmaxXent(s, g, target, loss, images, n, joints, gw, sigma, scale) {
+	dispatch('spatial_softmax_xent', [s, g, target, loss], [images * joints], pc('uuuuff', n, joints, gw, images * joints, sigma, scale));
+}
 // tanh(x / 3) * 3 in place.
 export function tanhClamp(x, n) { dispatch('tanh_clamp', [x], [groups(n, 256)], pc('u', n)); }
 // Bilinear resize with align_corners = True.
