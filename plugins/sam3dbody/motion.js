@@ -10,7 +10,7 @@
 // towards it sinks or climbs: the floor is fitted as a plane under the feet
 // over the whole clip, and the clip turned about the camera to stand it level.
 
-import { forward, between, rotate, mul } from '../kimodo/rotation.js';
+import { forward, between, rotate, mul, axisAngle } from '../kimodo/rotation.js';
 import { MotionSkeleton, clipProportions } from './skeleton.js';
 
 // Contacts: a foot joint within this of its standing height, moving slower
@@ -117,17 +117,30 @@ function floorPlane(points) {
  *   frames   [{ params (model parameters [204]), cam_t [3] }], one a video frame
  *   fps      the video's frame rate
  *   smooth   the smoothing window in frames (odd; 1 or 0 for none)
+ *   facing   'forward' turns the clip about +y so the figure faces +z on
+ *            average, as the rigs it is put on do; 'camera' keeps the facing it
+ *            had to the camera
  *
  * Returns { skeleton, fps, frames, rotations Float32Array [frames, J, 4],
  * root Float32Array [frames, 3], contacts Float32Array [frames, 4] (left heel,
  * left toe, right heel, right toe), camera [3] (where the camera
  * is), cameraRotation [x, y, z, w] }.
  */
-export function assembleMotion(mhr, frames, { fps = 24, smooth = 7 } = {}) {
+export function assembleMotion(mhr, frames, { fps = 24, smooth = 7, facing = 'forward' } = {}) {
 	const N = frames.length;
 	if (N === 0) throw new Error('no frames to make a motion of');
 	const skeleton = new MotionSkeleton(mhr, clipProportions(frames.map((f) => f.params)));
-	const J = skeleton.jointCount;
+	const { rotations, root } = poseRows(skeleton, frames);
+	smoothMotion(rotations, root, N, skeleton.jointCount, smooth);
+	const clip = finishMotion(skeleton, rotations, root, fps, levelFloor(skeleton, rotations, root, N));
+	if (facing !== 'camera') faceForward(clip);
+	return clip;
+}
+
+// Each frame's parent-local turns [N, J, 4] and the pelvis' path [N, 3] on
+// `skeleton`, in SAM 3D Body's camera frame turned y up.
+export function poseRows(skeleton, frames) {
+	const N = frames.length, J = skeleton.jointCount;
 	const rotations = new Float64Array(N * J * 4);
 	const root = new Float64Array(N * 3);
 	frames.forEach((fr, f) => {
@@ -139,26 +152,42 @@ export function assembleMotion(mhr, frames, { fps = 24, smooth = 7 } = {}) {
 		root[f * 3 + 1] = r[1] - t[1];
 		root[f * 3 + 2] = r[2] - t[2];
 	});
+	return { rotations, root };
+}
+
+export function smoothMotion(rotations, root, N, J, smooth) {
 	continuous(rotations, N, J);
 	smoothRows(rotations, N, J * 4, smooth);
 	normalizeAll(rotations);
 	smoothRows(root, N, 3, smooth);
+}
 
-	// The feet, every frame, and at rest standing on y = 0.
+// Each frame's foot joints (ankles and balls) where they stand, the joints, and
+// how high each stands at rest over y = 0.
+export function footPositions(skeleton, rotations, root, N) {
+	const J = skeleton.jointCount;
 	const feet = ['l_foot', 'l_ball', 'r_foot', 'r_ball'].map((n) => skeleton.index(n));
 	const pose = (f) => forward(skeleton, (j) => Array.from(rotations.subarray((f * J + j) * 4, (f * J + j + 1) * 4)), [root[f * 3], root[f * 3 + 1], root[f * 3 + 2]]).positions;
 	const rest = forward(skeleton, () => [0, 0, 0, 1], skeleton.restRoot).positions;
 	const standing = feet.map((j) => rest[j][1]);
 	const positions = Array.from({ length: N }, (_, f) => { const p = pose(f); return feet.map((j) => p[j]); });
-
 	// Where the floor is under each frame: under its lowest foot joint, less how
-	// high that joint stands. The plane through them, turned level: the root's
-	// path and turn and the feet turn about the camera, at the origin.
+	// high that joint stands.
 	const under = positions.map((p) => {
 		let best = 0;
 		p.forEach((q, i) => { if (q[1] - standing[i] < p[best][1] - standing[best]) best = i; });
 		return [p[best][0], p[best][1] - standing[best], p[best][2]];
 	});
+	return { feet, standing, positions, under, level: [0, 0, 0, 1] };
+}
+
+// The floor plane under the feet, turned level: the root's path and turn and
+// the feet turn about the camera, at the origin. Returns footPositions'
+// answer, levelled, with the turn as `level`.
+export function levelFloor(skeleton, rotations, root, N) {
+	const J = skeleton.jointCount;
+	const stood = footPositions(skeleton, rotations, root, N);
+	const { positions, under } = stood;
 	const { a, b } = floorPlane(under);
 	let level = between([-a, 1, -b], [0, 1, 0]);
 	const tilt = 2 * Math.acos(Math.min(1, level[3]));
@@ -171,6 +200,53 @@ export function assembleMotion(mhr, frames, { fps = 24, smooth = 7 } = {}) {
 		positions[f] = positions[f].map((q) => rotate(level, q));
 		under[f] = rotate(level, under[f]);
 	}
+	stood.level = level;
+	return stood;
+}
+
+// Where the figure faces in each frame (radians about +y, 0 at +z): across its
+// hips, left (+x at rest) to right.
+export function headings(skeleton, rotations, N) {
+	const J = skeleton.jointCount;
+	const l = skeleton.offsets[skeleton.index('l_upleg')], r = skeleton.offsets[skeleton.index('r_upleg')];
+	const across = [l[0] - r[0], l[1] - r[1], l[2] - r[2]];
+	return Array.from({ length: N }, (_, f) => {
+		const o = f * J * 4;
+		const x = rotate(Array.from(rotations.subarray(o, o + 4)), across);
+		// Facing is across x up: (x, ., z) x (0, 1, 0) = (-z, ., x).
+		return Math.atan2(-x[2], x[0]);
+	});
+}
+
+// The mean of angles, round the circle.
+export function meanAngle(angles) {
+	let s = 0, c = 0;
+	for (const a of angles) { s += Math.sin(a); c += Math.cos(a); }
+	return Math.atan2(s, c);
+}
+
+// The clip turned about +y through the origin (under the first frame's pelvis)
+// so the figure faces +z on average: the root's turn and path, and the camera.
+export function faceForward(clip) {
+	const { skeleton, frames: N, rotations, root } = clip;
+	const J = skeleton.jointCount;
+	const turn = axisAngle([0, 1, 0], -meanAngle(headings(skeleton, rotations, N)));
+	for (let f = 0; f < N; f++) {
+		const o = f * J * 4;
+		rotations.set(mul(turn, Array.from(rotations.subarray(o, o + 4))), o);
+		root.set(rotate(turn, [root[f * 3], root[f * 3 + 1], root[f * 3 + 2]]), f * 3);
+	}
+	clip.camera = rotate(turn, clip.camera);
+	clip.cameraRotation = mul(turn, clip.cameraRotation);
+	return clip;
+}
+
+// The clip from levelled turns and path: stood on the floor with the first
+// frame's pelvis over the origin, and each foot's contacts. `stood` is
+// footPositions' (or levelFloor's) answer for them.
+export function finishMotion(skeleton, rotations, root, fps, stood) {
+	const N = root.length / 3;
+	const { feet, standing, positions, under, level } = stood;
 
 	// The floor: under the lowest of the frames' lowest foot joints.
 	const floor = percentile(under.map((p) => p[1]), FLOOR_PERCENTILE);

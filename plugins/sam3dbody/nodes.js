@@ -4,6 +4,7 @@
 //   sam3dbody.load -> MODEL
 //   sam3dbody.pose_image (MODEL, IMAGE) -> POSE, sam3dbody.draw_pose -> IMAGE
 //   sam3dbody.pose_frames (MODEL, frames folder) -> MOTION
+//   sam3dbody.fuse_views (MOTION front, MOTION side) -> MOTION
 //   motion.clean_up, motion.save_glb, motion.save_bvh, motion.save_frames
 
 import { llm } from '../lib/llm.js';
@@ -15,6 +16,7 @@ import { Sam3dBody } from './pose.js';
 import { drawPreview } from './keypoints.js';
 import { listFrames, poseFrames } from './frames.js';
 import { assembleMotion } from './motion.js';
+import { fuseViews } from './fuse.js';
 import { clipGlb, clipBvh, framesJson } from './output.js';
 
 // '' or 'x1,y1,x2,y2' to null or four numbers.
@@ -71,7 +73,7 @@ defineNodes('sam3dbody', {
 		description: 'A folder of PNG/JPEG frames in name order (ffmpeg -i clip.mp4 frames/%05d.png) to a motion on the MHR skeleton, y up, standing on y = 0. The person is followed from frame to frame; `bbox` is their box in the first frame. `count` 0 is to the end; `smooth` is the smoothing window in frames. With a model loaded with hands, `hand_stride` 2 or more runs the hand passes on every so many frames only, the fingers blended between them.',
 		inputs: {
 			model: 'MODEL', frames: 'PATH(dir)', fps: 'FLOAT=24', first: 'INT=0', count: 'INT=0', stride: 'INT=1',
-			bbox: 'STRING=', focal: 'FLOAT=0', smooth: 'INT=7', hand_stride: 'INT=1',
+			bbox: 'STRING=', focal: 'FLOAT=0', smooth: 'INT=7', hand_stride: 'INT=1', facing: 'ENUM(forward|camera)=forward',
 		},
 		outputs: { motion: 'MOTION' },
 		async run(i, ctx) {
@@ -82,9 +84,25 @@ defineNodes('sam3dbody', {
 				bbox: parseBox(i.bbox), focal: i.focal || null, hands: i.model.hands, handStride: i.hand_stride,
 				onFrame: (_, k, n) => ctx?.progress(k + 1, n),
 			});
-			const motion = assembleMotion(i.model.mhr, posed, { fps: i.fps / stride, smooth: i.smooth });
+			const motion = assembleMotion(i.model.mhr, posed, { fps: i.fps / stride, smooth: i.smooth, facing: i.facing });
 			motion.posed = posed;
+			motion.smooth = i.smooth;
 			motion.name = i.frames.replace(/\/+$/, '').split('/').pop() || 'capture';
+			return { motion };
+		},
+	},
+
+	'sam3dbody.fuse_views': {
+		title: 'Fuse two cameras',
+		category: 'motion',
+		description: 'Two motions posed from the same moments, one filmed from the front and one from the side (frame N of each the same instant), as one: a lean to the side and the feet\'s spacing from the front camera, a lean forward and the arms\' swing from the side one. `facing` forward turns it to face +z.',
+		inputs: { front: 'MOTION', side: 'MOTION', facing: 'ENUM(forward|camera)=forward' },
+		outputs: { motion: 'MOTION' },
+		run({ front, side, facing }) {
+			if (!front.posed || !side.posed) throw new Error('both motions have to be posed from frames (sam3dbody.pose_frames)');
+			const motion = fuseViews(front.skeleton.mhr, front.posed, side.posed, { fps: front.fps, smooth: front.smooth ?? 7, facing });
+			motion.posed = front.posed.slice(0, motion.frames);
+			motion.name = front.name;
 			return { motion };
 		},
 	},

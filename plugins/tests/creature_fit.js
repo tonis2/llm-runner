@@ -24,42 +24,45 @@ const markers = request.markers ?? {};
 let failures = 0;
 
 // A small problem at a random state; every parameter group's gradient against
-// central differences at a few entries.
+// central differences at a few entries. Once with the one view, once with it
+// twice (the second through another camera, its markers shared).
 if (cfg.check ?? true) {
-	const obs = observations(rig, tracks, markers);
+	const marked = [];
+	const obs = observations(rig, tracks, markers, { marked });
 	const T = 6, P = obs.points.length, H = obs.H;
 	const small = { ...obs, T, x: obs.x.slice(0, T * P * H), y: obs.y.slice(0, T * P * H), w: obs.w.slice(0, T * P * H) };
-	const f = new RigFit(rig, small, { k0: 1200 });
 	let seed = 1;
 	const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
-	for (let i = 0; i < f.theta.length; i++) f.theta[i] = 0.4 * rnd();
-	for (let i = 0; i < f.root.length; i++) f.root[i] += 0.02 * rnd();
-	for (let i = 0; i < f.marks.length; i++) f.marks[i] = 0.03 * rnd();
-	for (let t = 0; t < T; t++) { f.logS[t] += 0.05 * rnd(); f.shift[t * 2] = 600 + 30 * rnd(); f.shift[t * 2 + 1] = -500 + 30 * rnd(); }
-	f.cam[0] = 1.2;
-	f.cam[1] = 0.2;
-	const tau = 40;
-	f.evaluate(tau);
-	const grads = Object.fromEntries(Object.entries(f.g).map(([k, v]) => [k, Float64Array.from(v)]));
-	const params = { theta: f.theta, root: f.root, marks: f.marks, logS: f.logS, shift: f.shift, cam: f.cam };
 	let worst = 0;
-	for (const [name, arr] of Object.entries(params)) {
-		const eps = name === 'shift' ? 1e-3 : name === 'root' || name === 'marks' ? 1e-6 : 1e-6;
-		for (let n = 0; n < Math.min(8, arr.length); n++) {
-			const i = Math.floor(((rnd() + 1) / 2) * arr.length) % arr.length;
-			const keep = arr[i];
-			arr[i] = keep + eps;
-			const up = f.evaluate(tau);
-			arr[i] = keep - eps;
-			const down = f.evaluate(tau);
-			arr[i] = keep;
-			const num = (up - down) / (2 * eps), ana = grads[name][i];
-			const rel = Math.abs(num - ana) / Math.max(1e-6, Math.abs(num) + Math.abs(ana));
-			if (rel > worst) worst = rel;
-			if (rel > 1e-4 && Math.abs(num - ana) > 1e-6) llm.print(`  ${name}[${i}]: analytic ${ana.toExponential(4)}, numeric ${num.toExponential(4)} (rel ${rel.toExponential(2)})`);
+	for (const views of [[small], [small, small]]) {
+		const f = new RigFit(rig, views, { k0: 1200, pitch: views.map((_, v) => 8 + 4 * v) });
+		for (let i = 0; i < f.theta.length; i++) f.theta[i] = 0.4 * rnd();
+		for (let i = 0; i < f.root.length; i++) f.root[i] += 0.02 * rnd();
+		for (let i = 0; i < f.marks.length; i++) f.marks[i] = 0.03 * rnd();
+		for (let i = 0; i < f.logS.length; i++) { f.logS[i] += 0.05 * rnd(); f.shift[i * 2] = 600 + 30 * rnd(); f.shift[i * 2 + 1] = -500 + 30 * rnd(); }
+		for (let v = 0; v < views.length; v++) { f.cam[2 * v] = 1.2 - 1.6 * v; f.cam[2 * v + 1] = 0.2 + 0.1 * v; }
+		const tau = 40;
+		f.evaluate(tau);
+		const grads = Object.fromEntries(Object.entries(f.g).map(([k, v]) => [k, Float64Array.from(v)]));
+		const params = { theta: f.theta, root: f.root, marks: f.marks, logS: f.logS, shift: f.shift, cam: f.cam };
+		for (const [name, arr] of Object.entries(params)) {
+			const eps = name === 'shift' ? 1e-3 : 1e-6;
+			for (let n = 0; n < Math.min(8, arr.length); n++) {
+				const i = Math.floor(((rnd() + 1) / 2) * arr.length) % arr.length;
+				const keep = arr[i];
+				arr[i] = keep + eps;
+				const up = f.evaluate(tau);
+				arr[i] = keep - eps;
+				const down = f.evaluate(tau);
+				arr[i] = keep;
+				const num = (up - down) / (2 * eps), ana = grads[name][i];
+				const rel = Math.abs(num - ana) / Math.max(1e-6, Math.abs(num) + Math.abs(ana));
+				if (rel > worst) worst = rel;
+				if (rel > 1e-4 && Math.abs(num - ana) > 1e-6) llm.print(`  ${views.length} view(s), ${name}[${i}]: analytic ${ana.toExponential(4)}, numeric ${num.toExponential(4)} (rel ${rel.toExponential(2)})`);
+			}
 		}
 	}
-	llm.print(`  gradient check: worst relative difference ${worst.toExponential(2)}`);
+	llm.print(`  gradient check (one view and two): worst relative difference ${worst.toExponential(2)}`);
 	if (!(worst < 1e-4)) {
 		llm.print('FAIL: gradients');
 		failures++;

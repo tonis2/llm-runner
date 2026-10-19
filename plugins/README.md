@@ -223,6 +223,25 @@ image against the reference (`tools/sam3dbody/golden.py` writes its numbers),
 (`tools/sam3dbody/golden_hands.py`), and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
 own kinematics.
 
+A clip faces +z on average (`facing=forward`, the default), as the rigs it is
+put on do; `facing=camera` keeps the way the person faced the camera. One camera
+guesses along its line of sight: filmed from the side, a walk leans sideways and
+spreads its feet; from the front, it leans forward. Two cameras of the same
+moments fix that:
+
+```
+llm-runner sam3dbody model=sam-3d-body-dinov3 frames=front/ side=side/ fps=24 hands=true \
+    glb=walk.glb output=front.json side_output=side.json
+llm-runner sam3dbody model=sam-3d-body-dinov3 posed=front.json side_posed=side.json glb=walk.glb
+```
+
+Frame N of `frames` and `side` must be the same instant. Each bone is taken from
+where both cameras draw it (the planes through each camera's line of sight and
+the bone as drawn, crossed), so a lean to the side and the feet's spacing come
+from the front camera and a lean forward and the arms' swing from the side one.
+`sam3dbody.fuse_views` is the same as a node, and `tests/sam3dbody_fuse.js`
+checks it against a known walk.
+
 ## Creature
 
 ```

@@ -29,6 +29,12 @@
 //   camera        yaw and pitch once, pitch near `pitch` degrees; its scale and
 //                 aim on screen smooth from frame to frame
 //
+// Views: clips of the same moments from other cameras (a front and a side,
+// frame N of each the same instant) each bring their own camera and points,
+// and all of them project the one motion. What one view cannot see along its
+// line of sight (an arm swinging toward it or hanging back) the other sees
+// across.
+//
 // Gradients: a turn δ of joint a's rotation vector θ turns everything below a
 // about it by ω = G_parent J_l(θ) δ in the world, moving a point x by
 // ω × (x - p_a), so dL/dθ_a = J_l(θ)ᵀ G_parentᵀ Σ (x - p_a) × dL/dx over the
@@ -37,9 +43,9 @@
 import { llm } from '../lib/llm.js';
 import { bad } from './request.js';
 
-const SIGMA2 = 15 * 15;
 const DEG = Math.PI / 180;
 const W_PLANE = 10, W_FOOT = 0.05, W_MIDLINE = 0.5;
+const WIDE = 100;
 
 // Row-major R (9 at `o`) from the rotation vector (x, y, z).
 function rodrigues(x, y, z, R, o) {
@@ -122,21 +128,31 @@ class Adam {
 	}
 }
 
-// The problem: the rig, the points and their hypotheses over T frames.
+// The problem: the rig, the points and their hypotheses over T frames, seen
+// by one camera or several.
 export class RigFit {
-	// `obs` { T, points: [{ name, joint, marker }], markers: count, x, y, w }
-	// with x, y, w [T, P, H] (y up, w 0 for none). `foot` the feet's share of
-	// the leg plane: firm while the view's yaw is found, loose after.
-	constructor(rig, obs, { pitch = 8, k0 = 1000, foot = W_PLANE } = {}) {
-		const J = rig.names.length;
+	// `views` one obs or a list, each { T, points: [{ name, joint, marker }],
+	// markers: count, x, y, w } with x, y, w [T, P, H] (y up, w 0 for none),
+	// the markers numbered across all of them. `pitch` degrees, one for every
+	// view or each its own. `foot` the feet's share of the leg plane: firm while
+	// the view's yaw is found, loose after. `sigma` the reprojection's
+	// robust scale in pixels: tracks stray, exact labels may be trusted wider.
+	constructor(rig, views, { pitch = 8, k0 = 1000, foot = W_PLANE, sigma = 15 } = {}) {
+		views = Array.isArray(views) ? views : [views];
+		const J = rig.names.length, V = views.length;
 		this.rig = rig;
 		this.J = J;
-		this.T = obs.T;
-		this.P = obs.points.length;
-		this.H = obs.H;
-		this.M = obs.markers;
-		this.obs = obs;
-		this.pitchPrior = pitch * DEG;
+		this.T = views[0].T;
+		this.V = V;
+		this.views = views;
+		this.M = Math.max(...views.map((o) => o.markers));
+		// Every point once (a view's points are each one name; two views may share
+		// one), and the joint each marker sits on.
+		this.points = [...new Map(views.flatMap((o) => o.points).map((p) => [p.name, p])).values()];
+		this.markerJoint = new Int32Array(this.M);
+		for (const p of this.points) if (p.marker >= 0) this.markerJoint[p.marker] = p.joint;
+		this.pitchPriors = views.map((_, v) => (Array.isArray(pitch) ? pitch[v] : pitch) * DEG);
+		this.sigma2 = sigma * sigma;
 		this.k0 = k0;
 		const T = this.T;
 		this.parents = Int32Array.from(rig.parents);
@@ -153,12 +169,15 @@ export class RigFit {
 		this.root = new Float64Array(T * 3);
 		for (let t = 0; t < T; t++) this.root.set(this.rootRest, t * 3);
 		this.marks = new Float64Array(this.M * 3);
-		this.logS = new Float64Array(T).fill(Math.log(k0));
-		this.shift = new Float64Array(T * 2);
-		this.cam = new Float64Array([0, this.pitchPrior]);   // yaw, pitch
+		// Each view's camera: its scale and aim per frame, its yaw and pitch (view
+		// v's at v T, v T 2 and 2 v).
+		this.logS = new Float64Array(V * T).fill(Math.log(k0));
+		this.shift = new Float64Array(V * T * 2);
+		this.cam = new Float64Array(2 * V);
+		for (let v = 0; v < V; v++) this.cam[2 * v + 1] = this.pitchPriors[v];
 		this.g = {
 			theta: new Float64Array(T * J * 3), root: new Float64Array(T * 3), marks: new Float64Array(this.M * 3),
-			logS: new Float64Array(T), shift: new Float64Array(T * 2), cam: new Float64Array(2),
+			logS: new Float64Array(V * T), shift: new Float64Array(V * T * 2), cam: new Float64Array(2 * V),
 		};
 		// Forward kinematics' results.
 		this.R = new Float64Array(T * J * 9);
@@ -190,7 +209,7 @@ export class RigFit {
 		// marker of its own alone (its fitted offset trades with the turn: a jaw
 		// with one point on it), 0 with none (a hand nobody labelled).
 		const below = new Int32Array(J), own = new Int32Array(J);
-		for (const p of this.obs.points) {
+		for (const p of this.points) {
 			if (p.marker >= 0) own[p.joint]++;
 			else if (p.joint > 0) below[this.parents[p.joint]]++;
 		}
@@ -285,9 +304,8 @@ export class RigFit {
 					pos[o3 + r] = pos[q3 + r] + g0 * offsets[j * 3] + g1 * offsets[j * 3 + 1] + g2 * offsets[j * 3 + 2];
 				}
 			}
-			for (const p of this.obs.points) {
-				if (p.marker < 0) continue;
-				const g9 = (t * J + p.joint) * 9, j3 = (t * J + p.joint) * 3, m3 = p.marker * 3, x3 = (t * this.M + p.marker) * 3;
+			for (let m = 0; m < this.M; m++) {
+				const j = this.markerJoint[m], g9 = (t * J + j) * 9, j3 = (t * J + j) * 3, m3 = m * 3, x3 = (t * this.M + m) * 3;
 				for (let r = 0; r < 3; r++) {
 					this.mpos[x3 + r] = pos[j3 + r] + G[g9 + r * 3] * this.marks[m3] + G[g9 + r * 3 + 1] * this.marks[m3 + 1] + G[g9 + r * 3 + 2] * this.marks[m3 + 2];
 				}
@@ -302,62 +320,66 @@ export class RigFit {
 
 	// The loss, and its gradient into this.g. `tau` the soft-min's temperature.
 	evaluate(tau) {
-		const { T, J, P, H, obs, g, k0 } = this, W = this.weights;
+		const { T, J, g, k0, sigma2 } = this, W = this.weights;
 		this.forward();
 		for (const a of Object.values(g)) a.fill(0);
 		this.gPos.fill(0);
 		this.gM.fill(0);
 		this.rootTau.fill(0);
 		const terms = {};
-		const yaw = this.cam[0], pitch = this.cam[1];
-		const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
-		const r0 = [cy, 0, sy], r1 = [sp * sy, cp, -sp * cy];
-		const dy0 = [-sy, 0, cy], dy1 = [sp * cy, 0, sp * sy], dp1 = [cp * sy, -sp, -cp * cy];
 
-		// Reprojection.
+		// Reprojection, each view through its own camera.
 		let reproj = 0, count = 0;
-		const norm = 1 / (T * P);
-		const a = new Float64Array(H), e2 = new Float64Array(H);
-		for (let t = 0; t < T; t++) {
-			const s = Math.exp(this.logS[t]), sx = this.shift[t * 2], syy = this.shift[t * 2 + 1];
-			for (let pi = 0; pi < P; pi++) {
-				const p = obs.points[pi];
-				const [X, o, gX] = this.where(t, p);
-				const x0 = X[o], x1 = X[o + 1], x2 = X[o + 2];
-				const q0 = r0[0] * x0 + r0[2] * x2, q1 = r1[0] * x0 + r1[1] * x1 + r1[2] * x2;
-				const u0 = s * q0 + sx, u1 = s * q1 + syy;
-				let best = -Infinity, any = false;
-				const base = (t * P + pi) * H;
-				for (let h = 0; h < H; h++) {
-					const w = obs.w[base + h];
-					if (!(w > 0)) { a[h] = -Infinity; continue; }
-					any = true;
-					const d0 = u0 - obs.x[base + h], d1 = u1 - obs.y[base + h];
-					e2[h] = d0 * d0 + d1 * d1;
-					a[h] = (-SIGMA2 * Math.log1p(e2[h] / SIGMA2)) / tau + Math.log(w);
-					if (a[h] > best) best = a[h];
+		for (let v = 0; v < this.V; v++) {
+			const obs = this.views[v], P = obs.points.length, H = obs.H;
+			const yaw = this.cam[2 * v], pitch = this.cam[2 * v + 1];
+			const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+			const r0 = [cy, 0, sy], r1 = [sp * sy, cp, -sp * cy];
+			const dy0 = [-sy, 0, cy], dy1 = [sp * cy, 0, sp * sy], dp1 = [cp * sy, -sp, -cp * cy];
+			const norm = 1 / (T * P);
+			const a = new Float64Array(H), e2 = new Float64Array(H);
+			for (let t = 0; t < T; t++) {
+				const vt = v * T + t;
+				const s = Math.exp(this.logS[vt]), sx = this.shift[vt * 2], syy = this.shift[vt * 2 + 1];
+				for (let pi = 0; pi < P; pi++) {
+					const p = obs.points[pi];
+					const [X, o, gX] = this.where(t, p);
+					const x0 = X[o], x1 = X[o + 1], x2 = X[o + 2];
+					const q0 = r0[0] * x0 + r0[2] * x2, q1 = r1[0] * x0 + r1[1] * x1 + r1[2] * x2;
+					const u0 = s * q0 + sx, u1 = s * q1 + syy;
+					let best = -Infinity, any = false;
+					const base = (t * P + pi) * H;
+					for (let h = 0; h < H; h++) {
+						const w = obs.w[base + h];
+						if (!(w > 0)) { a[h] = -Infinity; continue; }
+						any = true;
+						const d0 = u0 - obs.x[base + h], d1 = u1 - obs.y[base + h];
+						e2[h] = d0 * d0 + d1 * d1;
+						a[h] = (-sigma2 * Math.log1p(e2[h] / sigma2)) / tau + Math.log(w);
+						if (a[h] > best) best = a[h];
+					}
+					if (!any) continue;
+					let z = 0;
+					for (let h = 0; h < H; h++) if (a[h] > -Infinity) z += Math.exp(a[h] - best);
+					reproj += -tau * (best + Math.log(z)) * norm;
+					count++;
+					let du0 = 0, du1 = 0;
+					for (let h = 0; h < H; h++) {
+						if (a[h] === -Infinity) continue;
+						const wh = Math.exp(a[h] - best) / z;
+						const k = (wh * 2) / (1 + e2[h] / sigma2) * norm * W.reproj;
+						du0 += k * (u0 - obs.x[base + h]);
+						du1 += k * (u1 - obs.y[base + h]);
+					}
+					g.shift[vt * 2] += du0;
+					g.shift[vt * 2 + 1] += du1;
+					g.logS[vt] += du0 * s * q0 + du1 * s * q1;
+					g.cam[2 * v] += s * (du0 * (dy0[0] * x0 + dy0[2] * x2) + du1 * (dy1[0] * x0 + dy1[2] * x2));
+					g.cam[2 * v + 1] += s * du1 * (dp1[0] * x0 + dp1[1] * x1 + dp1[2] * x2);
+					gX[o] += s * (du0 * r0[0] + du1 * r1[0]);
+					gX[o + 1] += s * du1 * r1[1];
+					gX[o + 2] += s * (du0 * r0[2] + du1 * r1[2]);
 				}
-				if (!any) continue;
-				let z = 0;
-				for (let h = 0; h < H; h++) if (a[h] > -Infinity) z += Math.exp(a[h] - best);
-				reproj += -tau * (best + Math.log(z)) * norm;
-				count++;
-				let du0 = 0, du1 = 0;
-				for (let h = 0; h < H; h++) {
-					if (a[h] === -Infinity) continue;
-					const wh = Math.exp(a[h] - best) / z;
-					const k = (wh * 2) / (1 + e2[h] / SIGMA2) * norm * W.reproj;
-					du0 += k * (u0 - obs.x[base + h]);
-					du1 += k * (u1 - obs.y[base + h]);
-				}
-				g.shift[t * 2] += du0;
-				g.shift[t * 2 + 1] += du1;
-				g.logS[t] += du0 * s * q0 + du1 * s * q1;
-				g.cam[0] += s * (du0 * (dy0[0] * x0 + dy0[2] * x2) + du1 * (dy1[0] * x0 + dy1[2] * x2));
-				g.cam[1] += s * du1 * (dp1[0] * x0 + dp1[1] * x1 + dp1[2] * x2);
-				gX[o] += s * (du0 * r0[0] + du1 * r1[0]);
-				gX[o + 1] += s * du1 * r1[1];
-				gX[o + 2] += s * (du0 * r0[2] + du1 * r1[2]);
 			}
 		}
 		terms.reproj = reproj * W.reproj;
@@ -483,14 +505,13 @@ export class RigFit {
 				X[j * 3 + 1] = pos[o + 2] * gPos[o] - pos[o] * gPos[o + 2];
 				X[j * 3 + 2] = pos[o] * gPos[o + 1] - pos[o + 1] * gPos[o];
 			}
-			for (const p of this.obs.points) {
-				if (p.marker < 0) continue;
-				const m = (t * M + p.marker) * 3, j = p.joint, g9 = (t * J + j) * 9;
+			for (let mk = 0; mk < M; mk++) {
+				const m = (t * M + mk) * 3, j = this.markerJoint[mk], g9 = (t * J + j) * 9;
 				const gx = gM[m], gy = gM[m + 1], gz = gM[m + 2], x = mpos[m], y = mpos[m + 1], z = mpos[m + 2];
 				S[j * 3] += gx; S[j * 3 + 1] += gy; S[j * 3 + 2] += gz;
 				X[j * 3] += y * gz - z * gy; X[j * 3 + 1] += z * gx - x * gz; X[j * 3 + 2] += x * gy - y * gx;
 				// The offset, in the joint's frame: Gᵀ g.
-				for (let d = 0; d < 3; d++) g.marks[p.marker * 3 + d] += G[g9 + d] * gx + G[g9 + 3 + d] * gy + G[g9 + 6 + d] * gz;
+				for (let d = 0; d < 3; d++) g.marks[mk * 3 + d] += G[g9 + d] * gx + G[g9 + 3 + d] * gy + G[g9 + 6 + d] * gz;
 			}
 			for (let j = J - 1; j > 0; j--) {
 				const p = parents[j];
@@ -593,15 +614,17 @@ export class RigFit {
 		Object.assign(terms, { twist, rest, chain, thetaAcc: tacc, limit });
 	}
 
+	// Each view's pitch near its prior, its scale and aim smooth.
 	cameraPriors(terms) {
 		const { T, g } = this, W = this.weights;
-		const dp = this.cam[1] - this.pitchPrior;
-		terms.level = W.level * dp * dp;
-		g.cam[1] += 2 * W.level * dp;
-		let follow = 0;
-		if (T > 2) {
-			const cs = (W.follow * 1e6) / (T - 2), ch = W.follow / (T - 2);
-			for (let t = 1; t < T - 1; t++) {
+		let level = 0, follow = 0;
+		for (let v = 0; v < this.V; v++) {
+			const dp = this.cam[2 * v + 1] - this.pitchPriors[v];
+			level += W.level * dp * dp;
+			g.cam[2 * v + 1] += 2 * W.level * dp;
+			if (T <= 2) continue;
+			const cs = (W.follow * 1e6) / (T - 2), ch = W.follow / (T - 2), o = v * T;
+			for (let t = o + 1; t < o + T - 1; t++) {
 				const A = this.logS[t + 1] - 2 * this.logS[t] + this.logS[t - 1];
 				follow += cs * A * A;
 				g.logS[t + 1] += 2 * cs * A; g.logS[t] -= 4 * cs * A; g.logS[t - 1] += 2 * cs * A;
@@ -612,40 +635,36 @@ export class RigFit {
 				}
 			}
 		}
+		terms.level = level;
 		terms.follow = follow;
 	}
 
-	// Projections of every point [T][P][x, y] (y up).
-	projections() {
-		this.forward();
-		const yaw = this.cam[0], pitch = this.cam[1];
+	// World points through view v's camera on frame t: [x, y] (y up) of
+	// `at(i)` = [array, offset] for i < n.
+	project(v, t, n, at) {
+		const yaw = this.cam[2 * v], pitch = this.cam[2 * v + 1];
 		const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
-		const out = [];
-		for (let t = 0; t < this.T; t++) {
-			const s = Math.exp(this.logS[t]), row = [];
-			for (const p of this.obs.points) {
-				const [X, o] = this.where(t, p);
-				row.push([s * (cy * X[o] + sy * X[o + 2]) + this.shift[t * 2], s * (sp * sy * X[o] + cp * X[o + 1] - sp * cy * X[o + 2]) + this.shift[t * 2 + 1]]);
-			}
-			out.push(row);
+		const vt = v * this.T + t, s = Math.exp(this.logS[vt]), row = [];
+		for (let i = 0; i < n; i++) {
+			const [X, o] = at(i);
+			row.push([s * (cy * X[o] + sy * X[o + 2]) + this.shift[vt * 2], s * (sp * sy * X[o] + cp * X[o + 1] - sp * cy * X[o + 2]) + this.shift[vt * 2 + 1]]);
 		}
+		return row;
+	}
+
+	// Projections of view v's points [T][P][x, y] (y up).
+	projections(v = 0) {
+		this.forward();
+		const points = this.views[v].points, out = [];
+		for (let t = 0; t < this.T; t++) out.push(this.project(v, t, points.length, (i) => this.where(t, points[i])));
 		return out;
 	}
 
-	// Every joint's projection [T][J][x, y] (y up).
-	jointProjections() {
+	// Every joint's projection through view v's camera [T][J][x, y] (y up).
+	jointProjections(v = 0) {
 		this.forward();
-		const yaw = this.cam[0], pitch = this.cam[1];
-		const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
 		const out = [];
-		for (let t = 0; t < this.T; t++) {
-			const s = Math.exp(this.logS[t]), row = [];
-			for (let j = 0; j < this.J; j++) {
-				const o = (t * this.J + j) * 3, X = this.pos;
-				row.push([s * (cy * X[o] + sy * X[o + 2]) + this.shift[t * 2], s * (sp * sy * X[o] + cp * X[o + 1] - sp * cy * X[o + 2]) + this.shift[t * 2 + 1]]);
-			}
-			out.push(row);
-		}
+		for (let t = 0; t < this.T; t++) out.push(this.project(v, t, this.J, (j) => [this.pos, (t * this.J + j) * 3]));
 		return out;
 	}
 
@@ -675,21 +694,22 @@ export class RigFit {
 }
 
 // The tracks (track.js) as the fit's observations, and the points as joints
-// and markers of `rig`.
-export function observations(rig, tracks, markers = {}) {
+// and markers of `rig`: the first `frames` of them, the markers numbered in
+// `marked` (shared by the views of one fit, so a marker two views see is one).
+export function observations(rig, tracks, markers = {}, { frames = tracks.frames, marked = [] } = {}) {
 	const joints = new Map(rig.names.map((n, j) => [n, j]));
-	const T = tracks.frames, H = tracks.hypotheses.length, P = tracks.points.length;
-	const marked = [];
+	const T = frames, H = tracks.hypotheses.length, P = tracks.points.length;
 	const points = tracks.points.map((name) => {
 		if (joints.has(name)) return { name, joint: joints.get(name), marker: -1 };
 		if (!(name in markers)) throw bad(`"${name}" is neither one of the rig's joints nor a marker`);
 		if (!joints.has(markers[name])) throw bad(`marker ${name} is on "${markers[name]}", not one of the rig's joints`);
-		marked.push(name);
-		return { name, joint: joints.get(markers[name]), marker: marked.length - 1 };
+		if (!marked.includes(name)) marked.push(name);
+		return { name, joint: joints.get(markers[name]), marker: marked.indexOf(name) };
 	});
 	const x = new Float64Array(T * P * H), y = new Float64Array(T * P * H), w = new Float64Array(T * P * H);
 	tracks.hypotheses.forEach((hyp, h) => {
 		hyp.frames.forEach((f, i) => {
+			if (f >= T) return;
 			for (let p = 0; p < P; p++) {
 				const q = hyp.tracks[i][p];
 				if (!q) continue;
@@ -717,6 +737,12 @@ function keyframeObservations(obs, tracks, k) {
 	return { T: 1, H: 1, points: obs.points, markers: obs.markers, x, y, w };
 }
 
+// One frame's observations: every hypothesis on frame t.
+function frameObservations(obs, t) {
+	const n = obs.points.length * obs.H, at = (a) => a.slice(t * n, (t + 1) * n);
+	return { T: 1, H: obs.H, points: obs.points, markers: obs.markers, x: at(obs.x), y: at(obs.y), w: at(obs.w) };
+}
+
 // The centroid of frame t's observations, weighted.
 function centroid(obs, t) {
 	const P = obs.points.length, H = obs.H;
@@ -728,122 +754,225 @@ function centroid(obs, t) {
 	return sw > 0 ? [sx / sw, sy / sw] : null;
 }
 
-/**
- * Fits `rig` (rig.js) to `tracks` (track.js). Returns { problem (the RigFit,
- * solved), camera { yaw, pitch } in degrees, report }. `iterations` of the
- * whole clip after a search over the first keyframe's yaw; `onStep(done,
- * total)` as it goes.
- */
-export function fitRig(rig, tracks, { markers = {}, pitch = 8, iterations = 1500, onStep = null } = {}) {
-	const t0 = llm.now();
-	const obs = observations(rig, tracks, markers);
-	const key = Math.min(...tracks.hypotheses.map((h) => h.from));
-	const keyObs = keyframeObservations(obs, tracks, key);
-
-	// Pixels per rig unit, roughly: the labels' spread over the rig's.
+// Pixels per rig unit, roughly: one frame's labels' spread over the rig's.
+function pixelsPerUnit(rig, o) {
 	const lab = [];
-	for (let p = 0; p < keyObs.points.length; p++) if (keyObs.w[p] > 0) lab.push([keyObs.x[p], keyObs.y[p]]);
+	for (let p = 0; p < o.points.length; p++) if (o.w[p] > 0) lab.push([o.x[p], o.y[p]]);
 	const spread = (pts) => Math.hypot(Math.max(...pts.map((q) => q[0])) - Math.min(...pts.map((q) => q[0])), Math.max(...pts.map((q) => q[1])) - Math.min(...pts.map((q) => q[1])));
-	const restPts = keyObs.points.filter((p, i) => keyObs.w[i] > 0).map((p) => rig.positions[p.joint]);
+	const restPts = o.points.filter((p, i) => o.w[i] > 0).map((p) => rig.positions[p.joint]);
 	const rest3 = Math.hypot(...[0, 1, 2].map((d) => Math.max(...restPts.map((q) => q[d])) - Math.min(...restPts.map((q) => q[d]))));
-	const k0 = spread(lab) / Math.max(1e-6, rest3) * 1.1;
+	return spread(lab) / Math.max(1e-6, rest3) * 1.1;
+}
 
-	// Aim a one-frame fit: the rig's projected centroid on the labels'.
-	const aim = (f, o) => {
-		const c = centroid(o, 0);
-		const proj = f.projections()[0].filter((_, p) => o.w[p] > 0);
-		f.shift[0] = c[0] - proj.reduce((s, q) => s + q[0], 0) / proj.length;
-		f.shift[1] = c[1] - proj.reduce((s, q) => s + q[1], 0) / proj.length;
-	};
+// Aim view v of a one-frame fit: the rig's projected centroid on its points'.
+function aim(f, v = 0) {
+	const o = f.views[v], H = o.H, c = centroid(o, 0);
+	if (!c) return;
+	const seen = (p) => { for (let h = 0; h < H; h++) if (o.w[p * H + h] > 0) return true; return false; };
+	const proj = f.projections(v)[0].filter((_, p) => seen(p));
+	f.shift[v * 2] = c[0] - proj.reduce((s, q) => s + q[0], 0) / proj.length;
+	f.shift[v * 2 + 1] = c[1] - proj.reduce((s, q) => s + q[1], 0) / proj.length;
+}
+
+// The solved keyframes either side of frame t and how far between: [a, b, s].
+function bracket(solved, t) {
+	let n = 0;
+	while (n + 1 < solved.length && solved[n + 1].key <= t) n++;
+	const a = solved[n], b = solved[Math.min(n + 1, solved.length - 1)];
+	return [a, b, b.key > a.key ? Math.min(1, Math.max(0, (t - a.key) / (b.key - a.key))) : 0];
+}
+
+const lerp = (x, y, s) => x + (y - x) * s;
+
+// The pose of frame t blended from the solved keyframes, into a fit's frame 0.
+function blendPose(f, solved, t) {
+	const [a, b, s] = bracket(solved, t), n = f.J * 3;
+	for (let i = 0; i < n; i++) f.theta[i] = lerp(a.f.theta[i], b.f.theta[i], s);
+	for (let d = 0; d < 3; d++) f.root[d] = lerp(a.f.root[d], b.f.root[d], s);
+	return [a, b, s];
+}
+
+/**
+ * Fits `rig` (rig.js) to `views`: [{ tracks (track.js), pitch? }], frame N of
+ * each the same moment (or one view's tracks alone). Returns { problem (the
+ * RigFit, solved), projections (the first view's), report }. `iterations` of
+ * the whole clip after a search over the first keyframe's yaw (and each other
+ * view's); `onStep(done, total)` as it goes.
+ */
+export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null } = {}) {
+	const t0 = llm.now();
+	if (!Array.isArray(views)) views = [{ tracks: views }];
+	const V = views.length, T = views[0].tracks.frames, J = rig.names.length;
+	const marked = [];
+	const all = views.map((v) => observations(rig, v.tracks, markers, { frames: T, marked }));
+	for (const o of all) o.markers = marked.length;
+	const pitches = views.map((v) => Number(v.pitch ?? pitch));
+	const keysOf = views.map((v) => [...new Set(v.tracks.hypotheses.map((h) => h.from))].filter((k) => k < T).sort((x, y) => x - y));
+	for (const [v, ks] of keysOf.entries()) if (!ks.length) throw bad(`view ${v}: no keyframe within the first view's ${T} frames`);
+	const tracks = views[0].tracks, obs = all[0];
+	const keys = keysOf[0], key = keys[0];
+	const keyObs = keyframeObservations(obs, tracks, key);
+	const k0 = pixelsPerUnit(rig, keyObs);
 
 	// The first keyframe alone, from rest, over a ring of yaws: which way the
 	// animal faces, and where the markers sit.
-	const keys = [...new Set(tracks.hypotheses.map((h) => h.from))].sort((x, y) => x - y);
-	const initSteps = 400, yaws = 12, total = yaws + keys.length - 1 + iterations / 10;
+	const allKeys = [...new Set(keysOf.flat())].sort((x, y) => x - y);
+	const initSteps = 400, yaws = 12;
+	const total = V * yaws + keys.length - 1 + (V > 1 ? allKeys.length : 0) + iterations / 10;
+	let done = 0;
 	let best = null;
 	for (let i = 0; i < yaws; i++) {
-		const f = new RigFit(rig, keyObs, { pitch, k0 });
+		const f = new RigFit(rig, keyObs, { pitch: pitches[0], k0 });
 		f.cam[0] = (i * 2 * Math.PI) / yaws;
-		aim(f, keyObs);
+		aim(f);
 		const loss = f.run(initSteps, { tau0: 20, tau1: 20 });
 		const err = f.terms.reproj;
 		if (!best || err < best.err) best = { f, err, loss, yaw: f.cam[0] };
-		onStep?.(i + 1, total);
+		onStep?.(++done, total);
 	}
 	llm.print(`  start: frame ${key} alone, yaw ${(best.yaw / DEG).toFixed(0)}° fits best (reprojection ${best.err.toFixed(1)})`);
 
 	// Every other keyframe alone, from that pose, with that camera and those
 	// markers: a clip that leaves its first pose far behind (arms out, then
 	// down) starts near each of its labelled poses.
-	const solved = [{ key, f: best.f, centre: centroid(keyObs, 0) }];
+	let solved = [{ key, f: best.f, centres: [centroid(keyObs, 0)] }];
 	for (const k of keys.slice(1)) {
 		const o = keyframeObservations(obs, tracks, k);
-		const f = new RigFit(rig, o, { pitch, k0 });
+		const f = new RigFit(rig, o, { pitch: pitches[0], k0 });
 		f.theta.set(best.f.theta);
 		f.root.set(best.f.root);
 		f.logS.set(best.f.logS);
 		f.marks.set(best.f.marks);
 		f.cam.set(best.f.cam);
-		aim(f, o);
+		aim(f);
 		f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
-		solved.push({ key: k, f, centre: centroid(o, 0) });
-		onStep?.(yaws + solved.length - 1, total);
+		solved.push({ key: k, f, centres: [centroid(o, 0)] });
+		onStep?.(++done, total);
 	}
 	if (solved.length > 1) llm.print(`  keyframes ${keys.join(', ')} alone: reprojection ${solved.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
 
+	let marks = Float64Array.from(best.f.marks);
+	let cams = [{ cam: Array.from(best.f.cam), logS: null }];
+	// View v's observations on keyframe k: its labels there, or every hypothesis.
+	const at = (v, k) => (keysOf[v].includes(k) ? keyframeObservations(all[v], views[v].tracks, k) : frameObservations(all[v], k));
+	if (V > 1) {
+		// Each other view's camera: its first keyframe over a ring of yaws, solved
+		// with the views placed before it and the pose free, since one view
+		// alone may have a limb the wrong way along its line of sight (a stride
+		// backwards): only the right yaw lets every view fit at once. The best
+		// ring's cameras and markers are kept. Labels are trusted wide here
+		// (WIDE px): a limb the first view put the wrong way along its line of
+		// sight is that far off in another, and must still be pulled round.
+		for (let v = 1; v < V; v++) {
+			const k = keysOf[v][0], os = Array.from({ length: v + 1 }, (_, u) => at(u, k));
+			let bestV = null;
+			for (let i = 0; i < yaws; i++) {
+				const f = new RigFit(rig, os, { pitch: pitches.slice(0, v + 1), k0, sigma: WIDE });
+				const [a, b, s] = blendPose(f, solved, k);
+				f.marks.set(marks);
+				for (let u = 0; u < v; u++) {
+					f.cam[2 * u] = cams[u].cam[0];
+					f.cam[2 * u + 1] = cams[u].cam[1];
+					f.logS[u] = u === 0 ? lerp(a.f.logS[0], b.f.logS[0], s) : cams[u].logS;
+					aim(f, u);
+				}
+				f.logS[v] = Math.log(pixelsPerUnit(rig, os[v]));
+				f.cam[2 * v] = (i * 2 * Math.PI) / yaws;
+				aim(f, v);
+				f.run(initSteps, { tau0: 20, tau1: 20 });
+				if (!bestV || f.terms.reproj < bestV.err) bestV = { f, err: f.terms.reproj };
+				onStep?.(++done, total);
+			}
+			cams = Array.from({ length: v + 1 }, (_, u) => ({ cam: [bestV.f.cam[2 * u], bestV.f.cam[2 * u + 1]], logS: bestV.f.logS[u] }));
+			marks = Float64Array.from(bestV.f.marks);
+			llm.print(`  view ${v}: frame ${k} with the views before it, yaw ${(bestV.f.cam[2 * v] / DEG).toFixed(0)}° fits best (reprojection ${bestV.err.toFixed(1)}; yaws now ${cams.map((c) => (c.cam[0] / DEG).toFixed(0)).join('°, ')}°)`);
+		}
+
+		// Every keyframe of every view again, all views together, the cameras
+		// held, the labels trusted wide: what one view leaves along its line of
+		// sight, another sees.
+		const both = [];
+		for (const k of allKeys) {
+			const os = all.map((_, v) => at(v, k));
+			const f = new RigFit(rig, os, { pitch: pitches, k0, sigma: WIDE });
+			const [a, b, s] = blendPose(f, solved, k);
+			f.marks.set(marks);
+			for (let v = 0; v < V; v++) {
+				f.cam[2 * v] = cams[v].cam[0];
+				f.cam[2 * v + 1] = cams[v].cam[1];
+				f.logS[v] = v === 0 ? lerp(a.f.logS[0], b.f.logS[0], s) : cams[v].logS;
+				aim(f, v);
+			}
+			f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
+			both.push({ key: k, f, centres: os.map((o) => centroid(o, 0)) });
+			onStep?.(++done, total);
+		}
+		llm.print(`  keyframes ${allKeys.join(', ')} in all ${V} views: reprojection ${both.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
+		solved = both;
+	}
+
 	// Every frame from the keyframes either side of it, blended by time, aimed
-	// where its points are.
-	const fit = new RigFit(rig, obs, { pitch, k0, foot: W_FOOT });
-	const T = obs.T, J = rig.names.length;
-	const lerp = (x, y, s) => x + (y - x) * s;
+	// where each view's points are.
+	const fit = new RigFit(rig, all, { pitch: V > 1 ? pitches : pitches[0], k0, foot: W_FOOT });
 	for (let t = 0; t < T; t++) {
-		let n = 0;
-		while (n + 1 < solved.length && solved[n + 1].key <= t) n++;
-		const a = solved[n], b = solved[Math.min(n + 1, solved.length - 1)];
-		const s = b.key > a.key ? Math.min(1, Math.max(0, (t - a.key) / (b.key - a.key))) : 0;
+		const [a, b, s] = bracket(solved, t);
 		for (let i = 0; i < J * 3; i++) fit.theta[t * J * 3 + i] = lerp(a.f.theta[i], b.f.theta[i], s);
 		for (let d = 0; d < 3; d++) fit.root[t * 3 + d] = lerp(a.f.root[d], b.f.root[d], s);
-		fit.logS[t] = lerp(a.f.logS[0], b.f.logS[0], s);
-		const c = centroid(obs, t);
-		for (let d = 0; d < 2; d++) {
-			const off = lerp(a.f.shift[d] - a.centre[d], b.f.shift[d] - b.centre[d], s);
-			fit.shift[t * 2 + d] = c ? c[d] + off : lerp(a.f.shift[d], b.f.shift[d], s);
+		for (let v = 0; v < V; v++) {
+			const vt = v * T + t;
+			fit.logS[vt] = lerp(a.f.logS[v], b.f.logS[v], s);
+			const c = centroid(all[v], t);
+			for (let d = 0; d < 2; d++) {
+				const ofA = a.centres[v] && a.f.shift[v * 2 + d] - a.centres[v][d], ofB = b.centres[v] && b.f.shift[v * 2 + d] - b.centres[v][d];
+				const off = a.centres[v] && b.centres[v] ? lerp(ofA, ofB, s) : a.centres[v] ? ofA : ofB;
+				fit.shift[vt * 2 + d] = c && off !== null ? c[d] + off : lerp(a.f.shift[v * 2 + d], b.f.shift[v * 2 + d], s);
+			}
 		}
 	}
-	fit.marks.set(best.f.marks);
-	fit.cam.set(best.f.cam);
+	fit.marks.set(marks);
+	if (V > 1) for (let v = 0; v < V; v++) { fit.cam[2 * v] = cams[v].cam[0]; fit.cam[2 * v + 1] = cams[v].cam[1]; }
+	else fit.cam.set(best.f.cam);
+	const before = done;
 	let lastPrint = llm.now();
 	fit.run(iterations, {
-		onStep: (done, all, loss) => {
-			onStep?.(yaws + keys.length - 1 + done / 10, total);
+		onStep: (n, of, loss) => {
+			onStep?.(before + n / 10, total);
 			if (llm.now() - lastPrint > 5000) {
-				llm.print(`  fit ${done}/${all}: loss ${loss.toFixed(2)}, reprojection ${fit.terms.reproj.toFixed(2)}`);
+				llm.print(`  fit ${n}/${of}: loss ${loss.toFixed(2)}, reprojection ${fit.terms.reproj.toFixed(2)}`);
 				lastPrint = llm.now();
 			}
 		},
 	});
 
-	// How well it fits: each observed point's distance to its nearest hypothesis.
-	const proj = fit.projections();
-	const errs = [];
-	for (let t = 0; t < T; t++) {
-		for (let p = 0; p < obs.points.length; p++) {
-			let e = Infinity;
-			for (let h = 0; h < obs.H; h++) {
-				const k = (t * obs.points.length + p) * obs.H + h;
-				if (obs.w[k] > 0) e = Math.min(e, Math.hypot(proj[t][p][0] - obs.x[k], proj[t][p][1] - obs.y[k]));
+	// How well it fits: each observed point's distance to its nearest
+	// hypothesis, per view and over all of them.
+	const viewErrors = all.map((o, v) => {
+		const proj = fit.projections(v), errs = [];
+		for (let t = 0; t < T; t++) {
+			for (let p = 0; p < o.points.length; p++) {
+				let e = Infinity;
+				for (let h = 0; h < o.H; h++) {
+					const k = (t * o.points.length + p) * o.H + h;
+					if (o.w[k] > 0) e = Math.min(e, Math.hypot(proj[t][p][0] - o.x[k], proj[t][p][1] - o.y[k]));
+				}
+				if (e < Infinity) errs.push(e);
 			}
-			if (e < Infinity) errs.push(e);
 		}
-	}
-	errs.sort((x, y) => x - y);
-	const q = (f) => errs[Math.min(errs.length - 1, Math.floor(f * errs.length))];
+		return errs;
+	});
+	const stats = (errs) => {
+		errs = errs.slice().sort((x, y) => x - y);
+		const q = (f) => errs[Math.min(errs.length - 1, Math.floor(f * errs.length))];
+		return { median: round(q(0.5), 2), p90: round(q(0.9), 2), over_30: round(errs.filter((e) => e > 30).length / errs.length, 3) };
+	};
+	const camera = (v) => ({ yaw: round(fit.cam[2 * v] / DEG, 2), pitch: round(fit.cam[2 * v + 1] / DEG, 2) });
 	const report = {
-		reprojection_px: { median: round(q(0.5), 2), p90: round(q(0.9), 2), over_30: round(errs.filter((e) => e > 30).length / errs.length, 3) },
-		camera: { yaw: round(fit.cam[0] / DEG, 2), pitch: round(fit.cam[1] / DEG, 2) },
+		reprojection_px: stats(viewErrors.flat()),
+		camera: camera(0),
 		terms: Object.fromEntries(Object.entries(fit.terms).map(([k, v]) => [k, round(v, 3)])),
 		seconds: round((llm.now() - t0) / 1000, 1),
 	};
+	if (V > 1) report.views = viewErrors.map((errs, v) => ({ reprojection_px: stats(errs), camera: camera(v) }));
 	if (fit.limits.length) {
 		// How far past the rig's limits the clip goes at worst; Rigsmith plays it held at them.
 		let worst = 0;
@@ -855,8 +984,9 @@ export function fitRig(rig, tracks, { markers = {}, pitch = 8, iterations = 1500
 		}
 		report.limits = { joints: fit.limits.length, worst_deg: round(worst / DEG, 2) };
 	}
-	llm.print(`  fit: reprojection median ${report.reprojection_px.median}px, 90% ${report.reprojection_px.p90}px, ${(report.reprojection_px.over_30 * 100).toFixed(1)}% over 30px; yaw ${report.camera.yaw}°, pitch ${report.camera.pitch}°${report.limits ? `, at worst ${report.limits.worst_deg}° past a limit` : ''}, in ${report.seconds}s`);
-	return { problem: fit, projections: proj, report };
+	const perView = report.views ? `; ${report.views.map((r, v) => `view ${v} ${r.reprojection_px.median}px at yaw ${r.camera.yaw}°`).join(', ')}` : '';
+	llm.print(`  fit: reprojection median ${report.reprojection_px.median}px, 90% ${report.reprojection_px.p90}px, ${(report.reprojection_px.over_30 * 100).toFixed(1)}% over 30px; yaw ${report.camera.yaw}°, pitch ${report.camera.pitch}°${perView}${report.limits ? `, at worst ${report.limits.worst_deg}° past a limit` : ''}, in ${report.seconds}s`);
+	return { problem: fit, projections: fit.projections(0), report };
 }
 
 const round = (v, d) => Number(v.toFixed(d));

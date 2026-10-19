@@ -11,7 +11,7 @@
 // Requests are JSON, one at a time (docs/creature_server.md):
 //
 //   POST /animate  { rig, frames, labels, markers?, region?, width?, fps?,
-//                    name?, travel?, iterations?, outputs? }
+//                    name?, travel?, iterations?, pitch?, outputs?, views? }
 //                  -> { name, frames, fps, joints, glb?, clip?, bvh?,
 //                       animated_glb?, tracks?, report }
 //   POST /track    { frames, labels, region?, width?, draw? }
@@ -35,6 +35,12 @@
 //            UniMate's clips are), clip (Rigsmith's apply_clip arguments),
 //            bvh, animated_glb (the uploaded .glb with the animation added),
 //            tracks; ["glb", "clip"] by default. Files come back base64.
+//   views    instead of frames/labels/region/width/pitch (or tracks): the
+//            same moments from other cameras, [{ frames, labels, region?,
+//            width?, pitch? } or { tracks, pitch? }], frame N of each the
+//            same instant; the one motion is fitted to all of them (a front
+//            and a side clip: what one cannot see along its line of sight,
+//            the other sees across). tracks come back one per view.
 //
 // Rigsmith runs it in-process as a job (llm::pipeline::Job): the job's
 // config is the same request plus `model`, the clip comes back as the job's
@@ -95,6 +101,13 @@ async function track(request, config, step, labels) {
 	return { frames, tracks };
 }
 
+// The request's views: its `views`, or the request itself as the one view.
+function viewsOf(request) {
+	if (request.views === undefined) return [request];
+	if (!Array.isArray(request.views) || !request.views.length) throw bad('views: a list of views, each { frames, labels } or { tracks }, frame N of each the same moment');
+	return request.views;
+}
+
 // The whole request: tracks (given, or made), the fit, the outputs asked for.
 // Returns { reply (JSON, files in base64), files (name -> bytes) }.
 export async function animate(request, config = {}) {
@@ -106,20 +119,30 @@ export async function animate(request, config = {}) {
 	const name = String(request.name ?? 'creature');
 	const fps = Number(request.fps ?? 24);
 	const step = stepper();
-	let tracks = request.tracks;
 	let trackSeconds = 0;
 	const markers = request.markers ?? {};
-	if (tracks) {
-		if (typeof tracks === 'string') tracks = JSON.parse(tracks.trim().startsWith('{') ? tracks : llm.readText(tracks));
-		if (!Array.isArray(tracks?.hypotheses) || !Array.isArray(tracks.points)) throw bad('tracks: a /track reply\'s tracks ({ points, frames, hypotheses })');
-		for (const p of tracks.points) if (!rig.names.includes(p) && !(p in markers)) throw bad(`tracks: "${p}" is neither one of the rig's joints nor a marker (joints: ${rig.names.join(', ')})`);
-	} else {
-		const { labels } = readLabels(request, rig.names);
-		tracks = (await track(request, config, step, labels)).tracks;
-		trackSeconds = tracks.seconds;
+	const views = viewsOf(request);
+	const fitted = [];
+	for (const [i, view] of views.entries()) {
+		try {
+			let tracks = view.tracks;
+			if (tracks) {
+				if (typeof tracks === 'string') tracks = JSON.parse(tracks.trim().startsWith('{') ? tracks : llm.readText(tracks));
+				if (!Array.isArray(tracks?.hypotheses) || !Array.isArray(tracks.points)) throw bad('tracks: a /track reply\'s tracks ({ points, frames, hypotheses })');
+				for (const p of tracks.points) if (!rig.names.includes(p) && !(p in markers)) throw bad(`tracks: "${p}" is neither one of the rig's joints nor a marker (joints: ${rig.names.join(', ')})`);
+			} else {
+				const { labels } = readLabels({ ...view, markers }, rig.names);
+				tracks = (await track(view, config, (k, n, what) => step(i * n + k, views.length * n, what), labels)).tracks;
+				trackSeconds += tracks.seconds;
+			}
+			fitted.push({ tracks, pitch: Number(view.pitch ?? request.pitch ?? 8) });
+		} catch (e) {
+			if (views.length > 1 && e.status === 400) e.message = `views[${i}]: ${e.message}`;
+			throw e;
+		}
 	}
 	const iterations = Number(request.iterations ?? 1500);
-	const fit = fitRig(rig, tracks, {
+	const fit = fitRig(rig, fitted, {
 		markers, pitch: Number(request.pitch ?? 8), iterations,
 		onStep: (done, total) => step(done, total, 'fitting'),
 	});
@@ -127,7 +150,7 @@ export async function animate(request, config = {}) {
 	const report = {
 		...fit.report,
 		travel: Number(motion.travel.toFixed(4)),
-		seconds: { track: trackSeconds, fit: fit.report.seconds, total: Number(((llm.now() - t0) / 1000).toFixed(1)) },
+		seconds: { track: Number(trackSeconds.toFixed(1)), fit: fit.report.seconds, total: Number(((llm.now() - t0) / 1000).toFixed(1)) },
 	};
 	const reply = { name, frames: motion.frames, fps, joints: rig.names, report };
 	const files = {};
@@ -135,7 +158,7 @@ export async function animate(request, config = {}) {
 	if (outputs.has('clip')) reply.clip = clipJson(motion, name, rig.height);
 	if (outputs.has('bvh')) reply.bvh = clipBvh(motion, Number(request.bvh_scale ?? 100));
 	if (outputs.has('animated_glb')) files['animated.glb'] = animatedGlb(motion, rig, name);
-	if (outputs.has('tracks')) reply.tracks = tracks;
+	if (outputs.has('tracks')) reply.tracks = views.length > 1 ? fitted.map((v) => v.tracks) : fitted[0].tracks;
 	if (files.glb) reply.glb = llm.base64Encode(files.glb);
 	if (files['animated.glb']) reply.animated_glb = llm.base64Encode(files['animated.glb']);
 	if (reply.clip) files['clip.json'] = utf8(JSON.stringify(reply.clip));
@@ -164,6 +187,8 @@ const INFO = {
 		fps: 'frames per second of the clip (24)',
 		travel: 'put the walk back from the planted feet (true)',
 		iterations: 'fit iterations (1500)',
+		pitch: 'the camera\'s expected downward angle in degrees (8)',
+		views: '[{ frames, labels, region?, width?, pitch? } or { tracks, pitch? }]: the same moments from other cameras, fitted together',
 		outputs: `any of ${OUTPUTS.join(', ')} (["glb", "clip"])`,
 	},
 };
@@ -202,7 +227,7 @@ llm.plugin({
 				json(200, reply);
 				return;
 			}
-			if (path === '/fit' && !body.tracks) throw bad('tracks: /fit wants the tracks a /track reply gave');
+			if (path === '/fit' && viewsOf(body).some((v) => !v?.tracks)) throw bad('tracks: /fit wants the tracks a /track reply gave (in every view)');
 			json(200, (await animate(body, config)).reply);
 		} catch (e) {
 			llm.print(`  ${req.method} ${path}: ${e.message}`);

@@ -6,7 +6,8 @@
 //
 //   llm-runner sam3dbody model=sam-3d-body-dinov3 frames=frames/ fps=24 glb=motion.glb \
 //       [bvh=motion.bvh] [output=frames.json] [bbox=...] [first=0] [count=0] [stride=1] \
-//       [hands=false] [hand_stride=1] [smooth=7] [cleanup=true]
+//       [hands=false] [hand_stride=1] [smooth=7] [cleanup=true] [facing=forward] \
+//       [side=side_frames/ side_output=side_frames.json]
 //
 // `model` is the folder downloaded from huggingface.co/facebook/sam-3d-body-dinov3
 // (gated): model.ckpt, and the MHR rig as assets/mhr_model.pt. Without `bbox`
@@ -41,6 +42,15 @@
 // `smooth` or `cleanup` settings in seconds). Run in-process, the clip and that JSON are also handed over as the
 // job's outputs `glb` (as Kimodo's) and `frames.json`.
 //
+// `facing=forward` (the default) turns the clip so the figure faces +z on
+// average, as the rigs it is put on do; `facing=camera` keeps the way it faced
+// the camera. Two cameras: `side` is a folder of the same moments filmed from
+// the side (frame N of each the same instant; `side_bbox` its first box), and
+// the clip takes from each camera what it sees across its picture (fuse.js):
+// a lean to the side and the feet's spacing from `frames`, a lean forward and
+// the arms' swing from `side`. `side_output` writes the side frames' JSON, and
+// `posed` with `side_posed` puts two such runs together without the network.
+//
 // Settings: linear (q8, the backbone's weights; f32), decoder (f32; q8),
 // matrix_cores (true); profile (false: times each kernel on its own, slowly).
 
@@ -54,6 +64,7 @@ import { mhrPath, openWeights } from './weights.js';
 import { KEYPOINT_NAMES, drawPreview } from './keypoints.js';
 import { listFrames, poseFrames, holdHands } from './frames.js';
 import { assembleMotion } from './motion.js';
+import { fuseViews } from './fuse.js';
 import { cleanUpMotion } from '../kimodo/cleanup.js';
 import { clipGlb, clipBvh, framesJson, readPosed } from './output.js';
 
@@ -125,34 +136,47 @@ async function poseClip(model, config, bbox, focal) {
 	const stride = Math.max(1, Math.trunc(Number(config.stride ?? 1)));
 	const first = Math.max(0, Math.trunc(Number(config.first ?? 0)));
 	const count = Math.max(0, Math.trunc(Number(config.count ?? 0)));
-	let paths = listFrames(config.frames).slice(first).filter((_, i) => i % stride === 0);
-	if (count) paths = paths.slice(0, count);
-	llm.print(`  ${paths.length} frames from ${config.frames}`);
-	const posed = await poseFrames(model, paths, { bbox, focal, hands: model.hands, handStride: Number(config.hand_stride ?? 1) });
-	return writeClip(model.mhr, posed, config, fps / stride, config.frames);
+	const pose = async (folder, box) => {
+		let paths = listFrames(folder).slice(first).filter((_, i) => i % stride === 0);
+		if (count) paths = paths.slice(0, count);
+		llm.print(`  ${paths.length} frames from ${folder}`);
+		return poseFrames(model, paths, { bbox: box, focal, hands: model.hands, handStride: Number(config.hand_stride ?? 1) });
+	};
+	const posed = await pose(config.frames, bbox);
+	const side = config.side ? await pose(config.side, parseList(config.side_bbox, 4, 'side_bbox')) : null;
+	return writeClip(model.mhr, posed, config, fps / stride, config.frames, side);
 }
 
 // A clip again from frames a run before posed (its `output` JSON), at that
 // clip's fps unless `fps` says otherwise.
 function reposeClip(config) {
-	const { fps, posed, handStride } = readPosed(llm.readText(config.posed));
-	llm.print(`  ${posed.length} posed frames from ${config.posed}`);
-	if (posed.some((r) => r.hands)) {
-		const m = openWeights(config.model);
-		const [l, r] = holdHands(posed, [m.ints('head_pose.hand_joint_idxs_left'), m.ints('head_pose.hand_joint_idxs_right')], { stride: handStride });
-		m.close();
-		llm.print(`  hands from neighbouring accepted frames: left ${l.held} held, ${l.blended} blended; right ${r.held} held, ${r.blended} blended`);
-	}
+	const read = (path) => {
+		const { fps, posed, handStride } = readPosed(llm.readText(path));
+		llm.print(`  ${posed.length} posed frames from ${path}`);
+		if (posed.some((r) => r.hands)) {
+			const m = openWeights(config.model);
+			const [l, r] = holdHands(posed, [m.ints('head_pose.hand_joint_idxs_left'), m.ints('head_pose.hand_joint_idxs_right')], { stride: handStride });
+			m.close();
+			llm.print(`  hands from neighbouring accepted frames: left ${l.held} held, ${l.blended} blended; right ${r.held} held, ${r.blended} blended`);
+		}
+		return { fps, posed };
+	};
+	const { fps, posed } = read(config.posed);
+	const side = config.side_posed ? read(config.side_posed).posed : null;
 	const mhr = new MHR(mhrPath(config.model));
 	try {
-		return writeClip(mhr, posed, config, Number(config.fps ?? fps), config.posed.replace(/\.json$/, ''));
+		return writeClip(mhr, posed, config, Number(config.fps ?? fps), config.posed.replace(/\.json$/, ''), side);
 	} finally {
 		mhr.close();
 	}
 }
 
-function writeClip(mhr, posed, config, fps, source) {
-	const clip = assembleMotion(mhr, posed, { fps, smooth: Number(config.smooth ?? 7) });
+// `side` the side camera's posed frames, the same instants as `posed`'s, to
+// put together with them (fuse.js); null for one camera.
+function writeClip(mhr, posed, config, fps, source, side = null) {
+	const options = { fps, smooth: Number(config.smooth ?? 7), facing: config.facing ?? 'forward' };
+	const clip = side ? fuseViews(mhr, posed, side, options) : assembleMotion(mhr, posed, options);
+	if (clip.views) llm.print(`  two cameras: the side one a ${(clip.views.cameraTurn * 180 / Math.PI).toFixed(1)} degree turn from the front one`);
 	if (clip.cameraRotation[3] < 1) llm.print(`  floor levelled: the camera looks ${(2 * Math.acos(clip.cameraRotation[3]) * 180 / Math.PI).toFixed(1)} degrees off level`);
 	const cleanup = flag(config.cleanup, true);
 	if (cleanup && clip.frames > 2) {
@@ -169,10 +193,14 @@ function writeClip(mhr, posed, config, fps, source) {
 		writeText(config.bvh, clipBvh(clip));
 		llm.print(`  wrote ${config.bvh}`);
 	}
-	const text = framesJson(clip, posed);
+	const text = framesJson(clip, posed.slice(0, clip.frames));
 	if (config.output) {
 		writeText(config.output, text);
 		llm.print(`  wrote ${config.output}`);
+	}
+	if (side && config.side_output) {
+		writeText(config.side_output, framesJson(clip, side.slice(0, clip.frames)));
+		llm.print(`  wrote ${config.side_output}`);
 	}
 	if (llm.canOutput()) {
 		llm.output('glb', glb);

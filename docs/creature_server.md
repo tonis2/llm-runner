@@ -8,7 +8,8 @@ can be built for:
 2. **Tracking.** DINOv3 (SAM 3D Body's backbone) follows those points through
    the clip on the GPU.
 3. **Fit.** The rig is posed to match the tracks. Per frame it fits the joint
-   turns and the root, together with one orthographic camera. Bone lengths are
+   turns and the root, together with an orthographic camera for each view
+   (one clip, or several of the same moments). Bone lengths are
    the rig's own; unlabelled joints follow their chain; the legs stay in their
    plane; the feet stay on the floor; every joint stays inside the rig's
    rotation limits, which Rigsmith's player enforces on any clip it plays.
@@ -46,6 +47,7 @@ one request at a time; there is one GPU.
 | `iterations` | number | Fit iterations. Default 1500. |
 | `pitch`      | number | The camera's expected downward angle, in degrees. Default 8. Raise it for a camera that stands close or looks down on the animal (it sees the feet from above); otherwise the fit leans the body to make up the difference. |
 | `outputs`    | string[] | Any of `glb`, `clip`, `bvh`, `animated_glb`, `tracks`. Default `["glb", "clip"]`. |
+| `views`      | object[] | Instead of `frames`, `labels`, `region`, `width` and `pitch`: the same moments filmed by several cameras. See [Two views](#two-views). |
 
 What each output is:
 
@@ -84,7 +86,43 @@ proportions differ from the animal's.
 One view sees nothing along its line of sight, so a side or three-quarter
 view of a walk works best: it shows the legs' swing. Head-on, the fit cannot
 tell a limb reaching toward the camera from one hanging back when both draw
-alike, and it may pick the wrong one (arms held forward, say).
+alike, and it may pick the wrong one (arms held forward, say). Two views
+settle it.
+
+### Two views
+
+`views` fits one motion to several clips of the same moments, a front and a
+side say. Each view has its own camera, and every view's points project the
+same pose. What one view leaves along its line of sight, the other sees
+across it.
+
+```json
+{ "rig": "zidane.glb", "fps": 24, "name": "walk",
+  "markers": { "eye_R": "head", "nose": "head", "belt": "hips" },
+  "views": [
+    { "frames": "front/", "labels": { "5": { "head_top": [381, 60], "...": [0, 0] } } },
+    { "frames": "side/",  "labels": { "5": { "head_top": [397, 63], "...": [0, 0] } } } ] }
+```
+
+- **One timeline.** Frame N of each view must be the same instant. Cut and
+  retime the clips first, if need be, so they step together. `frames` as a
+  list of paths may skip or repeat frames to do it. The first view's frame
+  count is the clip's length.
+- **Each view** is `{ frames, labels, region?, width?, pitch? }`, tracked
+  as `/animate` tracks one clip, or `{ tracks, pitch? }` with a `/track`
+  reply's tracks. `pitch` defaults to the request's own. Two views need far
+  less of it than one: the second shows a lean the first would invent, so 8
+  to 10 suits a close front camera that one view alone needed 25 for.
+- **Joint names and `markers`** are shared by every view. Label each view
+  only with what it shows. The side view leaves out the far limbs where they
+  are hidden; the front view leaves out feet that go off the frame.
+- **Labels on the same keyframes** in every view work best.
+- **Label at least one joint on the head** (`head_top`, say), not only
+  markers. A marker's offset is fitted, so eyes and a nose alone cannot tell
+  a head held level from one bowed, and the fit may bow it.
+- **The reply** is as `/animate`'s. `report.views` gives each view's
+  `reprojection_px` and `camera`; the top-level ones pool every view and give
+  the first view's camera. `outputs: ["tracks"]` returns a list, one per view.
 
 Errors come back as a 400 (something wrong in the request: an unknown joint, a
 glb with no skin, and so on) or a 500, with `{"error": "..."}`. The server
