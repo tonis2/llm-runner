@@ -15,7 +15,7 @@
 // metres, the body's own: add `pred_cam_t` to place it in front of the camera.
 
 import { llm } from '../lib/llm.js';
-import { DinoV3 } from './dinov3.js';
+import { DinoV3 } from '../lib/dinov3.js';
 import { openWeights, mhrPath } from './weights.js';
 import { boxToCrop, uploadImage, warpCropGpu, defaultCamera, rayFeatures, cliffCondition, SIZE } from './crop.js';
 import { MHR } from './mhr.js';

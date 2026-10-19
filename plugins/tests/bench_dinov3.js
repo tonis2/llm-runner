@@ -3,7 +3,7 @@
 // download. `llm-runner tests/bench_dinov3.js [linear=q8|f32] [passes=3] [depth=32]`;
 // `profile=true` adds the time by kernel.
 import { llm, f32, Tensor, GGML } from '../lib/llm.js';
-import { DinoV3 } from '../sam3dbody/dinov3.js';
+import { DinoV3 } from '../lib/dinov3.js';
 
 const cfg = globalThis.__llm_config;
 const linear = cfg.linear ?? 'q8';

@@ -8,7 +8,7 @@
 // The weights are written as a bf16 safetensors file first, the checkpoint's
 // own type, and the reference reads the same rounded values.
 import { llm } from '../lib/llm.js';
-import { DinoV3, PATCH } from '../sam3dbody/dinov3.js';
+import { DinoV3, PATCH } from '../lib/dinov3.js';
 
 const cfg = globalThis.__llm_config;
 const linear = cfg.linear ?? 'f32';

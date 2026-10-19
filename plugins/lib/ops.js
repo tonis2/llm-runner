@@ -222,11 +222,11 @@ export function timestepEmbed(out, dim, timestep) {
 	dispatch('timestep_embed', [out], [groups(dim, 256)], pc('uf', dim, timestep));
 }
 // A crop warped out of an 8-bit image (warp_crop.shady): `image` its bytes,
-// `geo` and `wts` the positions (sam3dbody/crop.js cropGeometry), out [3,
-// size, size], normalised by `norm` { mean, std } (per channel) or the bytes.
-export function warpCrop(image, geo, wts, out, size, channels, norm = null) {
+// `geo` and `wts` the positions (lib/warp.js cropGeometry), out [3, height,
+// width], normalised by `norm` { mean, std } (per channel) or the bytes.
+export function warpCrop(image, geo, wts, out, width, height, channels, norm = null) {
 	const m = norm?.mean ?? [0, 0, 0], s = norm?.std ?? [1, 1, 1];
-	dispatch('warp_crop', [image, geo, wts, out], [groups(size * size, 256)], pc('uuuffffff', size, channels, norm ? 1 : 0, ...m, ...s));
+	dispatch('warp_crop', [image, geo, wts, out], [groups(width * height, 256)], pc('uuuuffffff', width, height, channels, norm ? 1 : 0, ...m, ...s));
 }
 export function patchify(latent, patches, channels, height, width, patchSize = 1) {
 	dispatch('patchify', [latent, patches], [groups(channels * height * width, 256)], pc('uuuu', channels, height, width, patchSize));

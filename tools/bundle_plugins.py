@@ -5,7 +5,7 @@ A program that links the library runs pipelines without a plugins folder of its
 own: `pipeline::extract` writes these files out once and points the runtime at
 them. Run this after changing anything under the bundled plugin folders:
 
-    tools/bundle_plugins.py [plugin ...]     # default: kimodo (crig links it; unimate is run from plugins/)
+    tools/bundle_plugins.py [plugin ...]     # default: kimodo creature (Rigsmith links them; unimate is run from plugins/)
 
 `plugins/lib` is always bundled; it is what every plugin imports.
 """
@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGINS = os.path.join(ROOT, "plugins")
 OUT = os.path.join(ROOT, "lib", "pipeline", "bundle.c3")
 
-names = sys.argv[1:] or ["kimodo"]
+names = sys.argv[1:] or ["kimodo", "creature"]
 files = []
 for folder in ["lib"] + names:
     base = os.path.join(PLUGINS, folder)

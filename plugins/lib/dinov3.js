@@ -1,5 +1,6 @@
 // DINOv3's ViT (facebookresearch/dinov3), as SAM 3D Body uses it: an image in,
-// the last block's normed patch tokens out as a [dim, gh, gw] feature map.
+// the last block's normed patch tokens out as a [dim, gh, gw] feature map (or
+// as the tokens [gh * gw, dim], for matching patches against each other).
 //
 // 16-pixel patches, then a CLS token and four storage ("register") tokens in
 // front of them, and no learned position table: every block rotates the patch
@@ -13,9 +14,9 @@
 // `layers/rope_position_encoding.py`; the depth plugin's DINOv2 is the model
 // this one is written after.
 
-import { llm, f32 } from '../lib/llm.js';
-import * as op from '../lib/ops.js';
-import { submit, copy, breathe, uploadEach } from '../lib/gpu.js';
+import { llm, f32 } from './llm.js';
+import * as op from './ops.js';
+import { submit, copy, breathe, uploadEach } from './gpu.js';
 
 export const PATCH = 16;
 const HEAD = 64;
@@ -147,10 +148,11 @@ export class DinoV3 {
 	// `pixels` is [3, H, W], normalised (ImageNet mean and std), the sides
 	// multiples of 16: a Float32Array, or a Tensor already on the GPU (which
 	// stays the caller's). Returns the feature map [dim, H / 16, W / 16] as a
-	// Tensor, which the caller disposes. `stopAfter` (a block index) returns
-	// the tokens [prefix + patches, dim] after that block instead, for
-	// comparing a port stage by stage.
-	async encode(pixels, H, W, { stopAfter = -1 } = {}) {
+	// Tensor, which the caller disposes. `tokens` returns the same patches as
+	// rows [gh * gw, dim] instead; `quiet` leaves out the timing line.
+	// `stopAfter` (a block index) returns the tokens [prefix + patches, dim]
+	// after that block instead, for comparing a port stage by stage.
+	async encode(pixels, H, W, { stopAfter = -1, tokens = false, quiet = false } = {}) {
 		const D = this.dim, F = this.ffn, nh = this.heads, g = this.g;
 		const gh = H / PATCH, gw = W / PATCH, N = gh * gw, pre = this.prefixTokens, n = pre + N;
 		if (!Number.isInteger(gh) || !Number.isInteger(gw)) throw new Error(`DINOv3: ${W}x${H} is not a multiple of ${PATCH}`);
@@ -175,17 +177,18 @@ export class DinoV3 {
 			for (const [l, b] of this.blocks.entries()) {
 				this.block(b, a, n, N, rope);
 				if (l === stopAfter) {
-					const tokens = f32(n * D, [D, n]);
-					copy(a.h, tokens, n * D * 4);
-					return tokens;
+					const all = f32(n * D, [D, n]);
+					copy(a.h, all, n * D * 4);
+					return all;
 				}
 				await breathe(true);
 			}
 			op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
-			const out = f32(D * N, [gw, gh, D]);
-			op.transposeChannelSpatial(rows(a.x, pre, N), out, D, N, 1);
+			const out = tokens ? f32(D * N, [D, N]) : f32(D * N, [gw, gh, D]);
+			if (tokens) copy(a.x, out, N * D * 4, pre * D * 4);
+			else op.transposeChannelSpatial(rows(a.x, pre, N), out, D, N, 1);
 			submit();
-			llm.print(`  DINOv3: ${W}x${H}, ${n} tokens, in ${llm.since(t0)}`);
+			if (!quiet) llm.print(`  DINOv3: ${W}x${H}, ${n} tokens, in ${llm.since(t0)}`);
 			return out;
 		} finally {
 			submit();

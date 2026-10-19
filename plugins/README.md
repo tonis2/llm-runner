@@ -38,6 +38,8 @@ plugins/
     taesd.js           TAESD decoder for 16-channel latents (taef1)
     lora.js            LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
     torch.js           PyTorch checkpoints (.pt/.ckpt zips) read without torch, mapped like safetensors
+    dinov3.js          DINOv3 ViT (SAM 3D Body's backbone): a feature map, or the patch tokens
+    warp.js            crops warped out of an 8-bit image on the GPU, any width and height, normalised
     latents.js         latent formats ('flux2', 'flux1', 'qwen') and the VAE encode/decode for each
     graph/             node registry, port types, the executor, plugin discovery
     kernels/*.shady    one kernel per file; common.shady is put in front of each
@@ -51,6 +53,8 @@ plugins/
   unimate/             UniMate text-to-motion for any skeleton: the rig's own joints, T5 captions,
                        either released flow model (graph or full attention) read straight from its .pt
   sam3dbody/           SAM 3D Body: an image to a posed MHR rig; video frames to a motion (GLB, BVH)
+  creature/            video frames and a rigged .glb to an animation of that rig: DINOv3 point
+                       tracking and a rig fit, as a JSON server or a Rigsmith job
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
@@ -218,6 +222,29 @@ image against the reference (`tools/sam3dbody/golden.py` writes its numbers),
 `tests/sam3dbody_hands.js` the hand passes and their merge
 (`tools/sam3dbody/golden_hands.py`), and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
 own kinematics.
+
+## Creature
+
+```
+llm-runner creature model=sam-3d-body-dinov3 --server --port 7860
+curl -X POST http://127.0.0.1:7860/animate -d '{"rig": "rig.glb", "frames": "frames", "labels": {...}}'
+```
+
+Any animal, any rig: points labelled on a keyframe or two (named after the
+rig's joints, or markers on them) are followed through the frames by DINOv3's
+patch features on the GPU (`creature/track.js`: the features stay on the GPU,
+every point is scored against every patch with one matmul, and only the scores
+come back; about 1.1 s a 1280x720 frame on an RX 7800 XT, the backbone nearly
+all of it), and the rig is fitted to the tracks on the host (`creature/fit.js`:
+forward kinematics with hand-written gradients, a robust choice among the
+tracks from each keyframe, one orthographic camera that follows the animal,
+the legs in their planes and the feet on the floor; about a minute for 124
+frames). The clip comes back as Rigsmith takes clips (rest turns identity,
+facing as-is), as `apply_clip` arguments, as BVH, or on the uploaded .glb
+itself. Routes and fields: `docs/creature_server.md`. Rigsmith can run it
+in-process like Kimodo (it is bundled). `tests/creature_track.js` checks the
+tracker against a track made before, `tests/creature_fit.js` the fit's
+gradients and every output read back.
 
 ## UniMate's weights
 

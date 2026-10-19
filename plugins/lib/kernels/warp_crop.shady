@@ -5,20 +5,21 @@
 // see sam3dbody/crop.js cropGeometry): every column's two source columns and
 // blend, every row's two source rows and blend.
 //
-// Output [3, size, size] float: the byte, or with `normalize` (v / 255 -
+// Output [3, height, width] float: the byte, or with `normalize` (v / 255 -
 // mean) / std per channel.
 //
-// Dispatch (ceil(size * size / 256), 1).
+// Dispatch (ceil(width * height / 256), 1).
 uint8 pixels[];
 int geo[];
 float wts[];
 float output[];
-struct Push @pushconstant { uint size; uint channels; uint normalize; float m0; float m1; float m2; float s0; float s1; float s2; }
+struct Push @pushconstant { uint width; uint height; uint channels; uint normalize; float m0; float m1; float m2; float s0; float s1; float s2; }
 Push pc;
 struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
 
-// geo: [col0 x size, col1 x size, row0 x size, row1 x size], byte offsets of
-// a pixel in a row and of a row in the image, -1 off the image.
+// geo: [col0 x width, col1 x width, row0 x height, row1 x height], byte
+// offsets of a pixel in a row and of a row in the image, -1 off the image;
+// wts: [alpha x width, beta x height].
 fn float tap(int row, int col, uint c)
 {
     if (row < 0 || col < 0) return 0.0;
@@ -36,16 +37,16 @@ fn float to_byte(float v)
 fn void main(ComputeIn input) @compute @threads(256, 1, 1)
 {
     uint i = input.gid.x * 256u + input.lid.x;
-    uint n = pc.size * pc.size;
+    uint n = pc.width * pc.height;
     if (i >= n) return;
-    uint y = i / pc.size;
-    uint x = i % pc.size;
+    uint y = i / pc.width;
+    uint x = i % pc.width;
     int c0 = geo[x];
-    int c1 = geo[pc.size + x];
-    int r0 = geo[2u * pc.size + y];
-    int r1 = geo[3u * pc.size + y];
+    int c1 = geo[pc.width + x];
+    int r0 = geo[2u * pc.width + y];
+    int r1 = geo[2u * pc.width + pc.height + y];
     float alpha = wts[x];
-    float beta = wts[pc.size + y];
+    float beta = wts[pc.width + y];
     for (uint c = 0u; c < 3u; c++) {
         float p00 = tap(r0, c0, c);
         float p01 = tap(r0, c1, c);

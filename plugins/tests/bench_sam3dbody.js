@@ -3,8 +3,8 @@
 //
 //   llm-runner tests/bench_sam3dbody.js model=build/sam-3d-body-dinov3 [image=...] [bbox=x1,y1,x2,y2] [hands=both|true|false]
 //
-// Each stage is timed by wrapping it: the image load, the crop inputs (warp,
-// normalise, rays), each backbone pass, each decoder run (and in it the heads
+// Each stage is timed by wrapping it: the image load, the crop inputs (the
+// GPU warp, rays), each backbone pass, each decoder run (and in it the heads
 // and rig on the host, the rest being the GPU layers and their read-backs),
 // and the hand merge.
 import { llm } from '../lib/llm.js';
@@ -41,19 +41,21 @@ if (sam.handDecoder) {
 	time(sam.handDecoder, 'run', 'hand decoder');
 	time(sam.handHeads, 'decode', '  of which hand heads + rig (host)');
 }
-// The crop helpers are module functions: time them through the objects that
-// call them where we can, and directly here.
-for (const name of ['warpCrop', 'normalize', 'rayFeatures']) {
-	const t0 = llm.now();
-	const c = crop.boxToCrop(bbox);
-	if (name === 'warpCrop') crop.warpCrop(llm.image.load(image), c.affine);
-	if (name === 'normalize') crop.normalize(new Uint8Array(512 * 512 * 3));
-	if (name === 'rayFeatures') crop.rayFeatures(c.affine, crop.defaultCamera(2250, 1500));
-	llm.print(`  ${name} alone: ${(llm.now() - t0).toFixed(0)} ms${name === 'warpCrop' ? ' (with an image load)' : ''}`);
-}
 let t0 = llm.now();
 const img = llm.image.load(image);
 llm.print(`  image load: ${(llm.now() - t0).toFixed(0)} ms (${img.width}x${img.height})`);
+// The crop helpers are module functions: time them through the objects that
+// call them where we can, and directly here, as poseImage runs them (the
+// frame's bytes up, the warp and normalisation on the GPU, waited for).
+const c = crop.boxToCrop(bbox);
+t0 = llm.now();
+const bytes = crop.uploadImage(img);
+crop.warpCropGpu(bytes, img, c.affine).dispose();
+bytes.dispose();
+llm.print(`  upload and warp alone: ${(llm.now() - t0).toFixed(1)} ms`);
+t0 = llm.now();
+crop.rayFeatures(c.affine, crop.defaultCamera(img.width, img.height));
+llm.print(`  rayFeatures alone: ${(llm.now() - t0).toFixed(1)} ms`);
 
 for (const withHands of modes) {
 	await sam.poseImage(img, { bbox, hands: withHands, quiet: true });

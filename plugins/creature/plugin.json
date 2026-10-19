@@ -1,0 +1,6 @@
+{
+	"name": "creature",
+	"version": "0.1",
+	"description": "Video frames and a rigged .glb to an animation of that rig: DINOv3 tracks labelled points, then the rig is fitted to them. A JSON server, and a job Rigsmith can run.",
+	"main": "main.js"
+}

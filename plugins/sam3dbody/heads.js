@@ -185,9 +185,10 @@ class GpuMlps {
 }
 
 export class BodyHeads {
-	// `m` is the open checkpoint, `mhr` an MHR. `gpu` runs the head MLPs and the
-	// keypoint vertices' pose correctives on the GPU (the host is ten times
-	// slower at them); the host path gives the same numbers to float32.
+	// `m` is the open checkpoint, `mhr` an MHR. `gpu` runs the head MLPs (the
+	// hand boxes' too) and the keypoint vertices' rest shape on the GPU (the
+	// host is ten times slower at them); the host path gives the same numbers
+	// to float32.
 	// `hand` makes the hand heads.
 	constructor(m, mhr, { gpu = true, hand = false } = {}) {
 		this.mhr = mhr;
@@ -238,6 +239,7 @@ export class BodyHeads {
 		this.keypointVertices = [...used].sort((a, b) => a - b);
 		if (gpu) {
 			this.gpu = new GpuMlps([this.poseMlp, this.cameraMlp]);
+			if (!hand) this.handGpu = new GpuMlps([this.handBox, this.handCls]);
 			// The body and hand heads skin the same vertices: one list on the GPU.
 			const g = mhr.gpu?.list;
 			if (g && g.length === this.keypointVertices.length && g.every((v, i) => v === this.keypointVertices[i])) this.keypointVertices = g;
@@ -248,7 +250,8 @@ export class BodyHeads {
 
 	dispose() {
 		this.gpu?.dispose();
-		this.gpu = null;
+		this.handGpu?.dispose();
+		this.gpu = this.handGpu = null;
 	}
 
 	// mhr_forward's model parameters [204]: the root translation (none without
@@ -355,8 +358,9 @@ export class BodyHeads {
 		const boxes = [], logits = [];
 		for (let h = 0; h < 2; h++) {
 			const t = tokens.subarray(h * 1024, (h + 1) * 1024);
-			boxes.push(...mlp(this.handBox, t).map((v) => 1 / (1 + Math.exp(-v))));
-			logits.push(...mlp(this.handCls, t));
+			const [box, cls] = this.handGpu ? this.handGpu.run(t) : [mlp(this.handBox, t), mlp(this.handCls, t)];
+			boxes.push(...box.map((v) => 1 / (1 + Math.exp(-v))));
+			logits.push(...cls);
 		}
 		return { boxes, logits };
 	}

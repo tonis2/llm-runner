@@ -11,7 +11,7 @@
 //
 // Ported from diffusers' `transformer_qwenimage21.py`.
 
-import { llm, f32, NATIVE_TYPES } from '../lib/llm.js';
+import { llm, f32, Tensor, NATIVE_TYPES } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
 import { submit, copy, breathe, uploadEach } from '../lib/gpu.js';
 
@@ -80,7 +80,12 @@ export class QwenImageDiT {
 		this.dim = shape('img_in.weight')[1];
 		this.headDim = shape('transformer_blocks.0.attn.norm_q.weight')[0];
 		this.heads = this.dim / this.headDim;
-		this.ffn = shape('transformer_blocks.0.img_mlp.gate_up.weight')[1] / 2;
+		// The SwiGLU MLP's in-projection is fused as `gate_up` ([gate; up]) or
+		// kept as diffusers' module names its halves, `gate_layer` and `proj`.
+		this.fusedMlp = m.has(`${this.p}transformer_blocks.0.img_mlp.gate_up.weight`);
+		this.ffn = this.fusedMlp
+			? shape('transformer_blocks.0.img_mlp.gate_up.weight')[1] / 2
+			: shape('transformer_blocks.0.img_mlp.gate_layer.weight')[1];
 		this.textDim = shape('txt_in.in_layer.weight')[0];
 		this.tDim = shape('time_text_embed.timestep_embedder.linear_1.weight')[0];
 		let n = 0;
@@ -95,6 +100,20 @@ export class QwenImageDiT {
 		// or f16 safetensors) is requantised to Q8_0, as f32 would not fit.
 		const up = (name) => m.upload(p + name, NATIVE_TYPES.has(m.type(p + name)) ? 'raw' : 'q8');
 		const f = (name) => m.upload(p + name, 'f32');
+		// Halves kept apart are joined on the GPU into the one [gate; up] weight.
+		const gateUp = (b) => {
+			if (this.fusedMlp) return up(`${b}img_mlp.gate_up.weight`);
+			const gate = up(`${b}img_mlp.gate_layer.weight`), lin = up(`${b}img_mlp.proj.weight`);
+			if (gate.type !== lin.type) throw new Error(`${b}img_mlp: gate_layer is ${gate.typeName} and proj ${lin.typeName}`);
+			const fused = new Tensor(three.compute.bytes(gate.bytes + lin.bytes), gate.type,
+				[gate.shape[0], gate.shape[1] + lin.shape[1]], `${b}img_mlp.gate_up.weight`);
+			copy(gate, fused, gate.bytes);
+			copy(lin, fused, lin.bytes, 0, gate.bytes);
+			submit();
+			gate.dispose();
+			lin.dispose();
+			return fused;
+		};
 		this.blocks = [];
 		for (let l = 0; l < this.nLayers; l++) {
 			const b = `transformer_blocks.${l}.`;
@@ -105,7 +124,7 @@ export class QwenImageDiT {
 				out: () => up(`${b}attn.to_out.0.weight`),
 				qNorm: () => f(`${b}attn.norm_q.weight`),
 				kNorm: () => f(`${b}attn.norm_k.weight`),
-				gateUp: () => up(`${b}img_mlp.gate_up.weight`),
+				gateUp: () => gateUp(b),
 				down: () => up(`${b}img_mlp.out.weight`),
 			}));
 		}

@@ -17,7 +17,7 @@
 //   pose      the whole image: our crop, our backbone, our decoder
 import { llm, f32 } from '../lib/llm.js';
 import { useMatrixCores } from '../lib/ops.js';
-import { DinoV3 } from '../sam3dbody/dinov3.js';
+import { DinoV3 } from '../lib/dinov3.js';
 import { openWeights, mhrPath } from '../sam3dbody/weights.js';
 import { boxToCrop, warpCrop, normalize, defaultCamera, rayFeatures, cliffCondition } from '../sam3dbody/crop.js';
 import { MHR } from '../sam3dbody/mhr.js';

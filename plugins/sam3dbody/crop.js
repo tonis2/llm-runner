@@ -11,13 +11,13 @@
 //     backbone's 32 x 32 grid and Fourier-encoded to 99 channels;
 //   - the CLIFF condition: the box centre and size over the focal length.
 
-import { f32 as f32Tensor } from '../lib/llm.js';
-import * as op from '../lib/ops.js';
-import { submit } from '../lib/gpu.js';
+import { cropGeometry, uploadImage, warpCropGpu as warpGpu, IMAGENET } from '../lib/warp.js';
+
+export { cropGeometry, uploadImage };
 
 export const SIZE = 512;
-const MEAN = [0.485, 0.456, 0.406];
-const STD = [0.229, 0.224, 0.225];
+const MEAN = IMAGENET.mean;
+const STD = IMAGENET.std;
 
 const f32 = Math.fround;
 
@@ -50,46 +50,11 @@ export function defaultCamera(width, height) {
 	return [f, f, width / 2, height / 2];
 }
 
-// cv2.warpAffine(img, M, (size, size), INTER_LINEAR), BORDER_CONSTANT 0, for
-// an M of scale and translation only, as OpenCV 5 (and 4.11 on) computes it:
-// the inverse map in double, each pixel's source position and the bilinear
-// blend in float32 with fused multiply-adds, rounded to nearest-even. (Older
+// cv2.warpAffine(img, M, (size, size), INTER_LINEAR), BORDER_CONSTANT 0: the
+// positions are lib/warp.js's cropGeometry, OpenCV 5's (and 4.11 on). (Older
 // OpenCV cut positions to 1/32 pixel in fixed point; its crops differ by one
-// level here and there.)
-//
-// The positions first: an M with no shear moves columns and rows apart, so a
-// column's two source columns and blend are the same in every row, and a
-// row's in every column. `geo` holds byte offsets [col0, col1, row0, row1] x
-// size (-1 off the image), `wts` [alpha, beta] x size. `mirror` reads the
-// image mirrored left to right (`img[:, ::-1]`) without making it.
-export function cropGeometry(img, affine, { size = SIZE, mirror = false } = {}) {
-	const { width, height, channels } = img;
-	// cv2's invertAffineTransform, M having no shear.
-	const [a, , tx, , d, ty] = affine;
-	const D = 1 / (a * d);
-	const M = [d * D, -(d * D) * tx, a * D, -(a * D) * ty];
-	const m0 = f32(M[0]), m3 = f32(M[2]);
-	const geo = new Int32Array(4 * size), wts = new Float32Array(2 * size);
-	const column = (x) => (x < 0 || x >= width ? -1 : (mirror ? width - 1 - x : x) * channels);
-	const row = (y) => (y < 0 || y >= height ? -1 : y * width * channels);
-	for (let i = 0; i < size; i++) {
-		// A product of two float32s is exact in a double: one rounding, an fma.
-		const sx = f32(m0 * i + f32(M[1]));
-		const ix = Math.floor(sx);
-		wts[i] = sx - ix;
-		geo[i] = column(ix);
-		geo[size + i] = column(ix + 1);
-		const sy = f32(m3 * i + f32(M[3]));
-		const iy = Math.floor(sy);
-		wts[size + i] = sy - iy;
-		geo[2 * size + i] = row(iy);
-		geo[3 * size + i] = row(iy + 1);
-	}
-	return { geo, wts, size };
-}
-
-// The warp on the host: RGB bytes [size, size, 3]. `img` is { width, height,
-// channels, pixels }.
+// level here and there.) The warp on the host: RGB bytes [size, size, 3].
+// `img` is { width, height, channels, pixels }.
 export function warpCrop(img, affine, { size = SIZE, mirror = false } = {}) {
 	const { geo, wts } = cropGeometry(img, affine, { size, mirror });
 	const pixels = img.pixels;
@@ -114,30 +79,12 @@ export function warpCrop(img, affine, { size = SIZE, mirror = false } = {}) {
 	return out;
 }
 
-// The image's bytes on the GPU, once a frame, for warpCropGpu.
-export function uploadImage(img) {
-	const bytes = img.pixels;
-	const words = Math.ceil(bytes.length / 4);
-	const t = f32Tensor(words);
-	const padded = new Uint8Array(words * 4);
-	padded.set(bytes);
-	t.buffer.write(padded);
-	return t;
-}
-
-// The warp on the GPU from uploadImage's tensor: [3, size, size] floats,
-// normalised for the backbone (normalize's numbers, to a float32 rounding),
-// or with `normalize` false the bytes. Returns a Tensor the caller disposes.
+// The warp on the GPU from lib/warp.js's uploadImage tensor: [3, size, size]
+// floats, normalised for the backbone (normalize's numbers, to a float32
+// rounding), or with `normalize` false the bytes. Returns a Tensor the caller
+// disposes.
 export function warpCropGpu(image, img, affine, { size = SIZE, mirror = false, normalize: norm = true } = {}) {
-	const { geo, wts } = cropGeometry(img, affine, { size, mirror });
-	const g = f32Tensor(geo.length), w = f32Tensor(wts.length), out = f32Tensor(3 * size * size);
-	g.buffer.write(geo);
-	w.buffer.write(wts);
-	op.warpCrop(image, g, w, out, size, img.channels, norm ? { mean: MEAN, std: STD } : null);
-	submit();
-	g.dispose();
-	w.dispose();
-	return out;
+	return warpGpu(image, img, affine, { size, mirror, norm: norm ? IMAGENET : null });
 }
 
 // ToTensor and data_preprocess: [3, size, size], ImageNet mean and std.

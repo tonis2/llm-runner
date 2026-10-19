@@ -7,7 +7,7 @@ import std::net;
 faultdef BAD_REQUEST, REQUEST_TOO_LARGE, READ_ERROR;
 
 const usz MAX_HEADER_BYTES = 16 * 1024;          // 16 KiB headers cap
-const usz MAX_BODY_BYTES   = 64 * 1024 * 1024;   // 64 MiB body cap (base64 PNG fits)
+const usz MAX_BODY_BYTES   = 512 * 1024 * 1024;  // 512 MiB body cap (a clip of base64 frames fits)
 
 struct HttpRequest
 {

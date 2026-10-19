@@ -2,7 +2,8 @@
 // Apache-2.0) has it: 127 joints, 18439 vertices, 45 identity blend shapes and
 // a pose-corrective MLP. Ported from that file's own code (pymomentum's
 // `torch/character.py`, `skel_state.py`, `quaternion.py`, `mhr/mhr.py`), on
-// the host in float64.
+// the host in float64, but for the rest shape's large products, which go to
+// the GPU in float32 (see offload and correctives).
 //
 //   model parameters [204]  (3 root translation, 3 root rotation, 130 body
 //                            and hand angles, 68 scales)
@@ -18,7 +19,8 @@
 // The skin can be computed for some vertices only (`vertices`): the keypoints
 // SAM 3D Body feeds back between decoder layers read about 500 of them, and
 // the corrective MLP's output layer (3000 x 55317, 660 MB) is read a row per
-// vertex coordinate that is wanted.
+// vertex coordinate that is wanted: those 500's once, onto the GPU; the whole
+// mesh's a chunk at a time.
 
 import { llm, f32 } from '../lib/llm.js';
 import { openTorch } from '../lib/torch.js';
@@ -134,32 +136,96 @@ export class MHR {
 
 	close() {
 		this.m.close();
-		if (this.gpu) for (const t of [this.gpu.w, this.gpu.x, this.gpu.y]) t.dispose();
+		if (this.gpu) for (const t of [this.gpu.w1, this.gpu.w, this.gpu.feat, this.gpu.x, this.gpu.y]) t.dispose();
 		this.gpu = null;
 	}
 
-	// The corrective output rows of `vertices` on the GPU, for a vertex list
-	// that is skinned again and again (each decoder layer's keypoints): one
-	// matrix-vector product there instead of 9000 multiply-adds a vertex here.
-	// `forward` uses it when it is given this same list.
+	// The rest shape of `vertices` on the GPU, for a vertex list that is
+	// skinned again and again (each decoder layer's keypoints): the corrective
+	// MLP, its sparse first layer made dense, and each vertex coordinate's
+	// output row with its identity blend shapes and base shape as further
+	// columns (the input ending in the identity and a 1). One pass there in
+	// place of 9000 multiply-adds a vertex here. `forward` uses it when it is
+	// given this same list.
 	offload(vertices) {
-		const H = this.hidden, n = vertices.length;
-		const w = new Float32Array(3 * n * H);
-		vertices.forEach((v, i) => w.set(this.correctiveRows(v), 3 * i * H));
-		const t = f32(w.length, [H, 3 * n]);
-		t.buffer.write(w);
-		this.gpu = { list: vertices, w: t, x: f32(H), y: f32(3 * n) };
+		const H = this.hidden, F = (JOINTS - 2) * 6, n = vertices.length, V = this.vertexCount, cols = H + IDENTITY + 1;
+		const w = new Float32Array(3 * n * cols);
+		vertices.forEach((v, i) => {
+			const rows = this.correctiveRows(v);
+			for (let k = 0; k < 3; k++) {
+				const r = (3 * i + k) * cols;
+				w.set(rows.subarray(k * H, (k + 1) * H), r);
+				for (let c = 0; c < IDENTITY; c++) w[r + H + c] = this.shapeVectors[(c * V + v) * 3 + k];
+				w[r + H + IDENTITY] = this.baseShape[v * 3 + k];
+			}
+		});
+		const w1 = new Float32Array(H * F);
+		this.w1.forEach((row, u) => { for (let i = 0; i < row.length; i += 2) w1[u * F + row[i]] += row[i + 1]; });
+		const up = (data, shape) => { const t = f32(data.length, shape); t.buffer.write(data); return t; };
+		this.gpu = { list: vertices, w1: up(w1, [F, H]), w: up(w, [cols, 3 * n]), feat: f32(F), x: f32(cols), y: f32(3 * n) };
 	}
 
-	// Each vertex's corrective offset [3 * count] from the hidden layer.
+	// The offloaded list's rest positions [3 * count] from the corrective
+	// features and the identity.
+	restOnGpu(feat, identity) {
+		const g = this.gpu, H = this.hidden, cols = H + IDENTITY + 1, n = g.list.length;
+		const tail = new Float32Array(IDENTITY + 1);
+		for (let c = 0; c < IDENTITY; c++) tail[c] = identity[c];
+		tail[IDENTITY] = 1;
+		g.feat.buffer.write(Float32Array.from(feat));
+		g.x.buffer.write(tail, H * 4);
+		const hidden = g.x.view(0, H * 4);
+		op.matmul(g.w1, g.feat, hidden, H, feat.length, 1);
+		op.relu(hidden, H);
+		op.matmul(g.w, g.x, g.y, 3 * n, cols, 1);
+		submit();
+		return new Float32Array(g.y.buffer.readBytes(0, n * 12).buffer);
+	}
+
+	// The rest positions [3 * count] of `list` before correctives: the base
+	// shape and the identity blend.
+	restShape(list, identity) {
+		const V = this.vertexCount, out = new Float64Array(list.length * 3);
+		list.forEach((v, n) => {
+			for (let k = 0; k < 3; k++) {
+				let s = this.baseShape[v * 3 + k];
+				for (let i = 0; i < IDENTITY; i++) s += identity[i] * this.shapeVectors[(i * V + v) * 3 + k];
+				out[n * 3 + k] = s;
+			}
+		});
+		return out;
+	}
+
+	// Each vertex's corrective offset [3 * count] from the hidden layer. A long
+	// list (the mesh) goes to the GPU a chunk of output rows at a time, read
+	// and not kept: all of them are 660 MB.
 	correctives(hidden, list) {
 		const H = this.hidden, out = new Float64Array(list.length * 3);
-		const g = this.gpu;
-		if (g && g.list === list) {
-			g.x.buffer.write(Float32Array.from(hidden));
-			op.matmul(g.w, g.x, g.y, 3 * list.length, H, 1);
-			submit();
-			out.set(new Float32Array(g.y.buffer.readBytes(0, list.length * 12).buffer));
+		if (list.length >= 2048) {
+			const CHUNK = 4096;
+			const x = f32(H), w = f32(3 * CHUNK * H, [H, 3 * CHUNK]), y = f32(3 * CHUNK);
+			try {
+				x.buffer.write(Float32Array.from(hidden));
+				const rows = new Float32Array(3 * CHUNK * H);
+				for (let s = 0; s < list.length; s += CHUNK) {
+					const n = Math.min(CHUNK, list.length - s);
+					// A run of consecutive vertices is one read.
+					for (let i = 0; i < n;) {
+						let j = i + 1;
+						while (j < n && list[s + j] === list[s + j - 1] + 1) j++;
+						rows.set(this.m.floatRange(CORRECTIVE_W2, 3 * list[s + i] * H, 3 * (j - i) * H), 3 * i * H);
+						i = j;
+					}
+					w.buffer.write(rows.subarray(0, 3 * n * H));
+					op.matmul(w, x, y, 3 * n, H, 1);
+					submit();
+					out.set(new Float32Array(y.buffer.readBytes(0, n * 12).buffer), 3 * s);
+				}
+			} finally {
+				x.dispose();
+				w.dispose();
+				y.dispose();
+			}
 			return out;
 		}
 		list.forEach((v, n) => {
@@ -215,9 +281,9 @@ export class MHR {
 		return out;
 	}
 
-	// The corrective MLP's hidden layer, [3000], from the joint parameters:
-	// joints 2.. as 6D rotations less the identity's, sparse layer, ReLU.
-	correctiveHidden(jp) {
+	// The corrective MLP's input [750] from the joint parameters: joints 2..
+	// as 6D rotations less the identity's.
+	correctiveFeatures(jp) {
 		const feat = new Float64Array((JOINTS - 2) * 6);
 		for (let j = 2; j < JOINTS; j++) {
 			const d = sixDFromXyz(jp[j * 7 + 3], jp[j * 7 + 4], jp[j * 7 + 5]);
@@ -225,6 +291,12 @@ export class MHR {
 			d[4] -= 1;
 			feat.set(d, (j - 2) * 6);
 		}
+		return feat;
+	}
+
+	// The corrective MLP's hidden layer, [3000]: the sparse layer, ReLU.
+	correctiveHidden(jp) {
+		const feat = this.correctiveFeatures(jp);
 		const h = new Float64Array(this.hidden);
 		for (let u = 0; u < this.hidden; u++) {
 			const row = this.w1[u];
@@ -243,32 +315,36 @@ export class MHR {
 		const skel = this.skeleton(jp);
 		const joints = new Float64Array(JOINTS * 3);
 		skel.forEach((g, j) => { for (let k = 0; k < 3; k++) joints[j * 3 + k] = g.t[k] / 100; });
-		// Each joint's state times its inverse bind pose: what skinning applies.
-		const bound = skel.map((g, j) => {
+		// Each joint's state times its inverse bind pose, what skinning applies,
+		// as its scaled rotation matrix and translation [12].
+		const bound = new Float64Array(JOINTS * 12);
+		skel.forEach((g, j) => {
 			const b = this.inverseBind.subarray(j * 8, j * 8 + 8);
-			return compose(g.t, g.q, g.s, [b[0], b[1], b[2]], [b[3], b[4], b[5], b[6]], b[7]);
+			const c = compose(g.t, g.q, g.s, [b[0], b[1], b[2]], [b[3], b[4], b[5], b[6]], b[7]);
+			const R = quatToMatrix(qnormalize(c.q));
+			for (let i = 0; i < 9; i++) bound[j * 12 + i] = c.s * R[i];
+			bound.set(c.t, j * 12 + 9);
 		});
-		for (const b of bound) b.q = qnormalize(b.q);
 		const list = vertices ?? Array.from({ length: this.vertexCount }, (_, i) => i);
-		const offsets = correctives ? this.correctives(this.correctiveHidden(jp), list) : null;
-		const V = this.vertexCount, out = new Float64Array(list.length * 3);
-		for (let n = 0; n < list.length; n++) {
-			const v = list[n];
-			const rest = [0, 0, 0];
-			for (let k = 0; k < 3; k++) {
-				let s = this.baseShape[v * 3 + k];
-				for (let i = 0; i < IDENTITY; i++) s += identity[i] * this.shapeVectors[(i * V + v) * 3 + k];
-				rest[k] = s;
+		let rest;
+		if (correctives && this.gpu?.list === list) rest = this.restOnGpu(this.correctiveFeatures(jp), identity);
+		else {
+			rest = this.restShape(list, identity);
+			if (correctives) {
+				const offsets = this.correctives(this.correctiveHidden(jp), list);
+				for (let i = 0; i < rest.length; i++) rest[i] += offsets[i];
 			}
-			if (offsets) for (let k = 0; k < 3; k++) rest[k] += offsets[n * 3 + k];
-			const sk = this.skin[v];
+		}
+		const out = new Float64Array(list.length * 3);
+		for (let n = 0; n < list.length; n++) {
+			const rx = rest[n * 3], ry = rest[n * 3 + 1], rz = rest[n * 3 + 2];
+			const sk = this.skin[list[n]];
 			let x = 0, y = 0, z = 0;
 			for (let i = 0; i < sk.length; i += 2) {
-				const b = bound[sk[i]], w = sk[i + 1];
-				const r = rotate(b.q, [b.s * rest[0], b.s * rest[1], b.s * rest[2]]);
-				x += w * (b.t[0] + r[0]);
-				y += w * (b.t[1] + r[1]);
-				z += w * (b.t[2] + r[2]);
+				const b = sk[i] * 12, w = sk[i + 1];
+				x += w * (bound[b] * rx + bound[b + 1] * ry + bound[b + 2] * rz + bound[b + 9]);
+				y += w * (bound[b + 3] * rx + bound[b + 4] * ry + bound[b + 5] * rz + bound[b + 10]);
+				z += w * (bound[b + 6] * rx + bound[b + 7] * ry + bound[b + 8] * rz + bound[b + 11]);
 			}
 			out[n * 3] = x / 100;
 			out[n * 3 + 1] = y / 100;

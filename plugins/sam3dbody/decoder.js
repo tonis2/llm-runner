@@ -52,17 +52,6 @@ function padColumns(W, inDim) {
 	return out;
 }
 
-// x @ W^T + b on the host, W [out, in] row-major.
-function hostLinear(W, b, x, out, inDim) {
-	const y = new Float32Array(out);
-	for (let o = 0; o < out; o++) {
-		let s = b ? b[o] : 0;
-		for (let i = 0; i < inDim; i++) s += W[o * inDim + i] * x[i];
-		y[o] = s;
-	}
-	return y;
-}
-
 // The prompt encoder's PositionEmbeddingRandom over points in [0, 1]^2:
 // sin and cos of 2 pi (2p - 1) @ G, G [2, half].
 function randomFourier(G, half, x, y) {
@@ -125,9 +114,8 @@ export class BodyDecoder {
 		}
 		// Host-side pieces of the token set-up and the keypoint updates.
 		this.host = {
-			init: { w: floats('init_to_token_mhr.weight'), b: floats('init_to_token_mhr.bias'), in: m.shape(n('init_to_token_mhr.weight'))[0] },
-			prev: { w: floats('prev_to_token_mhr.weight'), b: floats('prev_to_token_mhr.bias'), in: m.shape(n('prev_to_token_mhr.weight'))[0] },
-			promptW: m.floats('prompt_to_token.weight'), promptB: m.floats('prompt_to_token.bias'),
+			initIn: m.shape(n('init_to_token_mhr.weight'))[0], prevIn: m.shape(n('prev_to_token_mhr.weight'))[0],
+			promptIn: m.shape('prompt_to_token.weight')[0],
 			promptG: m.floats('prompt_encoder.pe_layer.positional_encoding_gaussian_matrix'),
 			invalidPoint: m.floats('prompt_encoder.invalid_point_embed.weight'),
 			notAPoint: m.floats('prompt_encoder.not_a_point_embed.weight'),
@@ -143,6 +131,11 @@ export class BodyDecoder {
 			rayNormW: f('ray_cond_emb.norm.weight'), rayNormB: f('ray_cond_emb.norm.bias'),
 			pe: upload(pe),
 			normW: f('decoder.norm_final.weight'), normB: f('decoder.norm_final.bias'),
+			// The host-made tokens' linears: a couple of million multiply-adds,
+			// slow on the host.
+			initW: f('init_to_token_mhr.weight'), initB: f('init_to_token_mhr.bias'),
+			prevW: f('prev_to_token_mhr.weight'), prevB: f('prev_to_token_mhr.bias'),
+			promptW: m.upload('prompt_to_token.weight', 'f32'), promptB: m.upload('prompt_to_token.bias', 'f32'),
 			// The posemb FFNs' first layers take 2 or 3 inputs: padded to 4.
 			pos2d0W: upload(padColumns(floats('keypoint_posemb_linear.layers.0.0.weight'), 2)), pos2d0B: f('keypoint_posemb_linear.layers.0.0.bias'),
 			pos3d0W: upload(padColumns(floats('keypoint3d_posemb_linear.layers.0.0.weight'), 3)), pos3d0B: f('keypoint3d_posemb_linear.layers.0.0.bias'),
@@ -203,25 +196,26 @@ export class BodyDecoder {
 		return e;
 	}
 
-	// The tokens the host makes and their PEs, [2 + P, dim] each: the pose
-	// token (no PE), the previous estimate, the prompt points. `condition` is
-	// the CLIFF [3], `prev` the previous estimate [522] or null, `prompts` the
-	// points.
-	firstTokens(condition, prev, prompts) {
-		const h = this.host, D = this.dim;
-		const init = [...condition, ...h.initPose, ...h.initCamera];
-		const tokens = new Float32Array((2 + prompts.length) * D), pe = new Float32Array(tokens.length);
-		tokens.set(hostLinear(h.init.w, h.init.b, init, D, h.init.in));
-		const p = hostLinear(h.prev.w, h.prev.b, prev ?? init.slice(3), D, h.prev.in);
-		tokens.set(p, D);
-		pe.set(p, D);
-		prompts.forEach((point, i) => {
-			const e = this.promptEmbedding(point);
-			const t = hostLinear(h.promptW, h.promptB, e, D, e.length);
-			tokens.set(t, (2 + i) * D);
-			pe.set(t, (2 + i) * D);
-		});
-		return { tokens, pe };
+	// The tokens made from the inputs, into rows 0 .. 2 + P of a.x, and their
+	// PEs into a.pe's: the pose token (no PE), the previous estimate, the
+	// prompt points (each its own PE). `condition` is the CLIFF [3], `prev` the
+	// previous estimate [522] or null, `prompts` the points. Returns the input
+	// Tensors, to dispose once the work is done.
+	firstTokens(a, condition, prev, prompts) {
+		const h = this.host, g = this.g, D = this.dim, P = prompts.length;
+		const rows = (t, first, count) => t.view(first * D * 4, count * D * 4);
+		const init = new Float32Array(h.initIn);
+		init.set(condition);
+		init.set(h.initPose, 3);
+		init.set(h.initCamera, 3 + h.initPose.length);
+		const points = new Float32Array(P * h.promptIn);
+		prompts.forEach((point, i) => points.set(this.promptEmbedding(point), i * h.promptIn));
+		const t = { init: upload(init), prev: upload(prev ?? init.slice(3)), points: upload(points) };
+		op.linearBiasRows(g.initW, g.initB, t.init, rows(a.x, 0, 1), D, h.initIn, 1);
+		op.linearBiasRows(g.prevW, g.prevB, t.prev, rows(a.x, 1, 1), D, h.prevIn, 1);
+		op.linearBiasRows(g.promptW, g.promptB, t.points, rows(a.x, 2, P), D, h.promptIn, P);
+		copy(a.x, a.pe, (1 + P) * D * 4, D * 4, D * 4);
+		return t;
 	}
 
 	// `features` is the backbone's Tensor [1280, 32 * 32] (channel-first),
@@ -256,15 +250,14 @@ export class BodyDecoder {
 		a.image = image;
 		let kept = false;
 		try {
-			const first = this.firstTokens(condition, prev, points);
-			const x = new Float32Array(T * D), pe = new Float32Array(T * D);
-			x.set(first.tokens);
+			// The learned tokens from the host, then the rest on the GPU.
+			const x = new Float32Array(T * D);
 			x.set(h.handBox, at.hands * D);
 			x.set(h.keypoints, at.kp2d * D);
 			x.set(h.keypoints3d, at.kp3d * D);
-			pe.set(first.pe);
 			a.x.buffer.write(x);
-			a.pe.buffer.write(pe);
+			a.pe.buffer.write(new Float32Array(T * D));
+			a.first = this.firstTokens(a, condition, prev, points);
 
 			let last = null;
 			for (const [l, L] of this.layers.entries()) {
