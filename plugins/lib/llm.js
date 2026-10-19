@@ -202,6 +202,8 @@ export const llm = {
 		globalThis.__llm_job_output(name, bytes instanceof Uint8Array ? bytes : asBytes(bytes));
 	},
 	exists(path) { return H.exists(path); },
+	// A directory's entries, [{ name, dir }], sorted by name (none when it is missing).
+	listDir(path) { return H.listDir(path); },
 	makeDir(path) { H.makeDir(path); },
 	base64Encode(bytes) { return H.base64Encode(bytes); },
 	base64Decode(text) { return H.base64Decode(text); },

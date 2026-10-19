@@ -4,7 +4,7 @@
 
 import { llm, f32, image } from '../lib/llm.js';
 import { submit, copy, profileReset, profileReport } from '../lib/gpu.js';
-import { eulerStep, add, scale } from '../lib/ops.js';
+import { eulerStep, cfgCombine } from '../lib/ops.js';
 import { TextEncoder } from '../lib/qwen3.js';
 import { Qwen3Vision } from '../lib/qwen3_vision.js';
 import { makeLatent, encodeImage } from '../lib/latents.js';
@@ -201,7 +201,7 @@ defineNodes('qwenimage', {
 	'qwenimage.sample': {
 		title: 'Qwen-Image sampler',
 		category: 'sampling',
-		description: 'Flow-matching Euler steps (40 is what Qwen recommends), with true CFG when cfg > 1 (against the empty prompt when no negative is wired in). With a latent it is img2img. A prompt with images needs the VAE to encode them; a width or height of 0 then takes the last image\'s.',
+		description: 'Flow-matching Euler steps (40 is what Qwen recommends), with true CFG when cfg > 1 (against the empty prompt when no negative is wired in). `cfg_rescale` keeps each guided token at the length of the prompt\'s own prediction, which lets a high cfg steer harder without burning; off, guidance is plain linear, as diffusers\' Qwen-Image 2.1 pipeline runs it. With a latent it is img2img. A prompt with images needs the VAE to encode them; a width or height of 0 then takes the last image\'s.',
 		inputs: {
 			positive: 'CONDITIONING',
 			negative: 'CONDITIONING?',
@@ -213,10 +213,11 @@ defineNodes('qwenimage', {
 			steps: 'INT=40',
 			seed: 'INT=42',
 			cfg: 'FLOAT=1',
+			cfg_rescale: 'BOOL=true',
 			strength: 'FLOAT=0.6',
 		},
 		outputs: { latent: 'LATENT(qwen)' },
-		async run({ positive, negative, model, vae, latent: init, width, height, steps, seed, cfg, strength }, ctx) {
+		async run({ positive, negative, model, vae, latent: init, width, height, steps, seed, cfg, cfg_rescale, strength }, ctx) {
 			for (const c of [positive, negative]) {
 				if (c && c.family !== 'qwenimage') throw new Error(`qwenimage.sample needs Qwen-Image prompts, not ${c.family}`);
 			}
@@ -282,15 +283,10 @@ defineNodes('qwenimage', {
 					for (let s = 0; s < n; s++) {
 						const ts = llm.now();
 						if (useCfg) {
-							// v = uncond + cfg * (cond - uncond), on the GPU.
 							await dit.forward(cond, sched[s]);
 							copy(dit.a.velocity, condV, count * 4);
 							await dit.forward(uncond, sched[s]);
-							scale(dit.a.velocity, count, -1);
-							add(condV, dit.a.velocity, count);
-							scale(condV, count, cfg);
-							scale(dit.a.velocity, count, -1);
-							add(dit.a.velocity, condV, count);
+							cfgCombine(condV, dit.a.velocity, dit.channels, latentH * latentW, cfg, cfg_rescale);
 						} else {
 							await dit.forward(cond, sched[s]);
 						}

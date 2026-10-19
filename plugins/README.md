@@ -37,6 +37,7 @@ plugins/
     flux_vae.js        Flux VAE encoder and decoder (Flux 1 and Flux 2 namings)
     taesd.js           TAESD decoder for 16-channel latents (taef1)
     lora.js            LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
+    torch.js           PyTorch checkpoints (.pt/.ckpt zips) read without torch, mapped like safetensors
     latents.js         latent formats ('flux2', 'flux1', 'qwen') and the VAE encode/decode for each
     graph/             node registry, port types, the executor, plugin discovery
     kernels/*.shady    one kernel per file; common.shady is put in front of each
@@ -49,6 +50,7 @@ plugins/
                        guide poses (full-body keyframes), rest skeletons in skeletons/
   unimate/             UniMate text-to-motion for any skeleton: the rig's own joints, T5 captions,
                        either released flow model (graph or full attention) read straight from its .pt
+  sam3dbody/           SAM 3D Body: an image to a posed MHR rig; video frames to a motion (GLB, BVH)
   graph/               runs a graph file with every plugin's nodes; templates/
   tests/               matrix-core kernels against the float32 ones, benchmarks
 ```
@@ -116,6 +118,7 @@ Port types (`lib/graph/types.js`):
 | `LATENT` | `{ format, data, channels, h, w }`. A VAE decodes only its own `format` (`lib/latents.js`), so taef1 can stand in for the Flux 1 VAE and a Flux 2 latent is refused by it. |
 | `CONDITIONING` | `{ family, tensor, n, dim }`, the text encoder's hidden states on the GPU. A sampler takes only its own `family`. |
 | `MODEL`, `TEXT_ENCODER`, `VAE`, `LORA`, `REFERENCES` | loaders' handles; `LORA` is a list of `{ path, strength }` |
+| `POSE`, `MOTION` | SAM 3D Body's pose of one image; a clip on a skeleton (`{ skeleton, fps, frames, rotations, root }`, y up, metres) |
 | `STRING`, `INT`, `FLOAT`, `BOOL`, `ENUM(a\|b)`, `PATH(kind)` | settings; `=value` is the default, `?` optional, `*` multi-line |
 
 `+` after a type (`LORA+?`) lets an input take any number of wires. The node
@@ -177,6 +180,45 @@ beside it) is only read as a GGUF, from `LocalAI-io/Llama-3-Kimodo-GGML`: it is
 Llama-3-8B with LLM2Vec's adapters merged and quantized, not part of NVIDIA's
 release.
 
+## SAM 3D Body's weights
+
+```
+hf download facebook/sam-3d-body-dinov3 --local-dir sam-3d-body-dinov3    # gated: accept the license first
+llm-runner sam3dbody model=sam-3d-body-dinov3 input=person.jpg output=pose.json preview=pose.png
+
+ffmpeg -i clip.mp4 frames/%05d.png
+llm-runner sam3dbody model=sam-3d-body-dinov3 frames=frames fps=24 glb=motion.glb bvh=motion.bvh
+```
+
+`model=` is the downloaded folder as it is: `model.ckpt` (the network, read
+straight out of the PyTorch zip) and `assets/mhr_model.pt` (the MHR rig, a
+TorchScript file read the same way). Nothing is converted and the plugin
+carries none of either. The weights are Meta's, released under the SAM License
+the gated download asks you to accept; the MHR rig is Apache-2.0. The plugin
+writes motion made with them, so what you do with that motion is under the
+same license's terms.
+
+A frame takes about 3.6 s on an Apple M5 (the q8 DINOv3 backbone is 3.05 s of
+it). The camera may look up or down: the floor is fitted as a plane under the
+feet over the whole clip and levelled, and the turn is kept as the camera's
+rotation in the .glb's extras and the frames JSON. `hands=true` poses the
+hands as SAM 3D Body's full inference does: a crop around each hand through the
+backbone and the hand decoder (the left one mirrored, the decoder knowing only
+right hands), the good ones' wrists and the elbows as prompts to the body
+decoder again, and their finger angles and wrist turns put in. It takes about
+10.5 s a frame (three backbone passes). A hand the checks turn down keeps the
+fingers of the last frame it passed; `hand_stride=2` runs the hand passes on
+every second frame only, the fingers blended between them. `posed=frames.json` (a
+run's `output`) makes the clip again from the posed frames in seconds, to try
+other `smooth` or `cleanup` settings. A clip is the MHR skeleton's 126
+joints, y up, metres, its proportions held to their median over the clip and
+standing on y = 0, the camera taken as fixed; `graph/templates/sam3dbody-motion.json`
+is the same as nodes. `tests/sam3dbody_golden.js` checks every stage of one
+image against the reference (`tools/sam3dbody/golden.py` writes its numbers),
+`tests/sam3dbody_hands.js` the hand passes and their merge
+(`tools/sam3dbody/golden_hands.py`), and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
+own kinematics.
+
 ## UniMate's weights
 
 ```
@@ -206,8 +248,7 @@ head, or it would move tail first. The clip comes back in the rig's own space
 and facing, the root at its rest position, with `extras.facing = "as-is"` so
 crig does not turn it again when it reads it.
 
-`tests/unimate_golden.js`, `tests/t5_golden.js` and `tests/unimate_names.js`
-compare against the reference implementation's numbers, which
+`tests/t5_golden.js` and `tests/unimate_names.js` compare against the reference implementation's numbers, which
 `tools/unimate/unimate_golden.py` writes (it needs PyTorch and a clone of the
 UniMate repository).
 
@@ -215,6 +256,7 @@ UniMate repository).
 
 | | |
 |---|---|
+| `openTorch(path)` (`lib/torch.js`) | A PyTorch checkpoint as the same kind of model: its pickle read in JS (nothing in it is run), its stored tensors mapped from the file. F32/F16/BF16 upload; `ints(name)` reads integer ones |
 | `llm.open(path)` | A GGUF or safetensors file, memory-mapped: `.tensors`, `.metadata`, `.meta(key)`, `.shape(name)` (GGUF order), `.type(name)` |
 | `model.upload(name, as)` | A `Tensor` on the GPU. `as` is `'raw'` (file bytes), `'f32'` (dequantised or widened), `'conv'` (f32, laid out `[kh, kw, in, out]`), `'q8'` (requantised to Q8_0), or `'auto'` (raw for the types matmul reads natively, otherwise f32). The bytes go from the mapping straight to VRAM in 64 MB pieces. |
 | `model.floats(name)` | A small tensor on the host, as a Float32Array |
@@ -223,6 +265,7 @@ UniMate repository).
 | `llm.randomNormal(n, seed)` | The same noise the C3 pipelines drew for a seed |
 | `image.load / decode / savePng / encodePng / cropTo / fit16 / resize / toTensor / fromTensor` | Images as `{ width, height, channels, pixels }` |
 | `llm.readText / readBytes / writeBytes / exists / base64Encode / base64Decode` | Files |
+| `__llm.readRange(path, offset, length) / fileSize(path)` | Part of a large file without reading it all |
 | `__llm.listDir / makeDir / homeDir` | Directories: `[{ name, dir }]`, make with parents, the home directory |
 | `llm.print(...)`, `llm.now()`, `llm.since(t0)` | Progress |
 

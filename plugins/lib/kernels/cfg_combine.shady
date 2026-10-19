@@ -1,0 +1,32 @@
+// Classifier-free guidance on [C, H*W] velocities: v = u + s * (c - u), with v
+// holding u coming in. With `rescale`, each pixel's channel vector is then
+// scaled back to the length of c's, as diffusers' Qwen-Image pipelines do, so a
+// large s turns the prediction rather than lengthening it. A thread per pixel;
+// consecutive threads read consecutive pixels of a channel.
+float cond[];
+float v[];
+struct Push @pushconstant { uint channels; uint spatial; float s; uint rescale; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint p = input.id.x;
+    if (p >= pc.spatial) return;
+    float cc = 0.0;
+    float gg = 0.0;
+    for (uint k = 0u; k < pc.channels; k++) {
+        uint i = k * pc.spatial + p;
+        float c = cond[i];
+        float u = v[i];
+        float g = u + pc.s * (c - u);
+        cc += c * c;
+        gg += g * g;
+        v[i] = g;
+    }
+    if (pc.rescale == 0u || gg <= 0.0) return;
+    float r = sqrt(cc / gg);
+    for (uint k = 0u; k < pc.channels; k++) {
+        uint i = k * pc.spatial + p;
+        v[i] = v[i] * r;
+    }
+}

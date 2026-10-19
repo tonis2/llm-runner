@@ -1,0 +1,165 @@
+// Flash attention for head_dim 64 without matrix cores. A query row is split
+// over 4 threads (16 dimensions each) and a thread has 2 rows, its
+// share of Q (pre-scaled) and of the output in registers; a K or V value read
+// from shared memory feeds all 2 rows. A step of 2 keys: partial scores,
+// summed across the 4 threads through shared memory (double-buffered, one
+// barrier), the online softmax (each thread keeps its rows' running max and
+// sum), the V rows. Non-causal; written out unrolled by
+// tools/kernels/gen_flash_attention_64.py.
+// Q, K, V: [heads, seq, 64]. Output: [seq, heads * 64].
+// Dispatch: (ceil(seq/64), heads).
+float4 q[];
+float4 k[];
+float4 v[];
+float output[];
+struct Push @pushconstant { uint n_heads; uint seq_len; float scale; }
+Push pc;
+shared float4 ks[512];
+shared float4 vs[512];
+shared float sc[1024];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(128, 1, 1)
+{
+    uint t = input.lid.x;
+    uint half_ = t % 4u;
+    uint pair = t / 4u;
+    uint head = input.gid.y;
+    uint S = pc.seq_len;
+    uint base = head * S * 16u;
+    uint h0 = half_ * 4u;
+    uint row0 = input.gid.x * 64u + 0u * 32u + pair;
+    uint qi0 = base + min(row0, S - 1u) * 16u + h0;
+    float4 q0_0 = q[qi0 + 0u] * pc.scale;
+    float4 q0_1 = q[qi0 + 1u] * pc.scale;
+    float4 q0_2 = q[qi0 + 2u] * pc.scale;
+    float4 q0_3 = q[qi0 + 3u] * pc.scale;
+    float4 o0_0 = float4(0.0);
+    float4 o0_1 = float4(0.0);
+    float4 o0_2 = float4(0.0);
+    float4 o0_3 = float4(0.0);
+    float m0 = -1.0e30;
+    float l0 = 0.0;
+    uint row1 = input.gid.x * 64u + 1u * 32u + pair;
+    uint qi1 = base + min(row1, S - 1u) * 16u + h0;
+    float4 q1_0 = q[qi1 + 0u] * pc.scale;
+    float4 q1_1 = q[qi1 + 1u] * pc.scale;
+    float4 q1_2 = q[qi1 + 2u] * pc.scale;
+    float4 q1_3 = q[qi1 + 3u] * pc.scale;
+    float4 o1_0 = float4(0.0);
+    float4 o1_1 = float4(0.0);
+    float4 o1_2 = float4(0.0);
+    float4 o1_3 = float4(0.0);
+    float m1 = -1.0e30;
+    float l1 = 0.0;
+    uint step = 0u;
+    uint tiles = (S + 31u) / 32u;
+    for (uint tile = 0u; tile < tiles; tile++) {
+        uint k0 = tile * 32u;
+        barrier;
+        for (uint i = 0u; i < 4u; i++) {
+            uint f = t + i * 128u;
+            uint key = k0 + f / 16u;
+            uint at = base + key * 16u + f % 16u;
+            ks[f] = key < S ? k[at] : float4(0.0);
+            vs[f] = key < S ? v[at] : float4(0.0);
+        }
+        barrier;
+        uint valid = min(32u, S - k0);
+        for (uint c = 0u; c < 32u; c += 2u) {
+            uint buf = (step & 1u) * 512u;
+            step = step + 1u;
+            uint r0 = (c + 0u) * 16u + h0;
+            uint r1 = (c + 1u) * 16u + h0;
+            float4 a0_0 = float4(0.0);
+            float4 a1_0 = float4(0.0);
+            { float4 kk = ks[r0 + 0u]; a0_0 = a0_0 + q0_0 * kk; a1_0 = a1_0 + q1_0 * kk; }
+            { float4 kk = ks[r0 + 1u]; a0_0 = a0_0 + q0_1 * kk; a1_0 = a1_0 + q1_1 * kk; }
+            { float4 kk = ks[r0 + 2u]; a0_0 = a0_0 + q0_2 * kk; a1_0 = a1_0 + q1_2 * kk; }
+            { float4 kk = ks[r0 + 3u]; a0_0 = a0_0 + q0_3 * kk; a1_0 = a1_0 + q1_3 * kk; }
+            sc[buf + (t * 2u + 0u) * 2u + 0u] = a0_0.x + a0_0.y + a0_0.z + a0_0.w;
+            sc[buf + (t * 2u + 1u) * 2u + 0u] = a1_0.x + a1_0.y + a1_0.z + a1_0.w;
+            float4 a0_1 = float4(0.0);
+            float4 a1_1 = float4(0.0);
+            { float4 kk = ks[r1 + 0u]; a0_1 = a0_1 + q0_0 * kk; a1_1 = a1_1 + q1_0 * kk; }
+            { float4 kk = ks[r1 + 1u]; a0_1 = a0_1 + q0_1 * kk; a1_1 = a1_1 + q1_1 * kk; }
+            { float4 kk = ks[r1 + 2u]; a0_1 = a0_1 + q0_2 * kk; a1_1 = a1_1 + q1_2 * kk; }
+            { float4 kk = ks[r1 + 3u]; a0_1 = a0_1 + q0_3 * kk; a1_1 = a1_1 + q1_3 * kk; }
+            sc[buf + (t * 2u + 0u) * 2u + 1u] = a0_1.x + a0_1.y + a0_1.z + a0_1.w;
+            sc[buf + (t * 2u + 1u) * 2u + 1u] = a1_1.x + a1_1.y + a1_1.z + a1_1.w;
+            barrier;
+            uint lo = buf + (pair * 4u) * 4u;
+            float s0_0 = c + 0u < valid ? sc[lo + 0u] + sc[lo + 4u] + sc[lo + 8u] + sc[lo + 12u] : -1.0e30;
+            float s0_1 = c + 1u < valid ? sc[lo + 1u] + sc[lo + 5u] + sc[lo + 9u] + sc[lo + 13u] : -1.0e30;
+            float mx0 = max(m0, max(s0_0, s0_1));
+            float rr0 = exp(m0 - mx0);
+            float p0_0 = exp(s0_0 - mx0);
+            float p0_1 = exp(s0_1 - mx0);
+            l0 = l0 * rr0 + (p0_0 + p0_1);
+            m0 = mx0;
+            float s1_0 = c + 0u < valid ? sc[lo + 2u] + sc[lo + 6u] + sc[lo + 10u] + sc[lo + 14u] : -1.0e30;
+            float s1_1 = c + 1u < valid ? sc[lo + 3u] + sc[lo + 7u] + sc[lo + 11u] + sc[lo + 15u] : -1.0e30;
+            float mx1 = max(m1, max(s1_0, s1_1));
+            float rr1 = exp(m1 - mx1);
+            float p1_0 = exp(s1_0 - mx1);
+            float p1_1 = exp(s1_1 - mx1);
+            l1 = l1 * rr1 + (p1_0 + p1_1);
+            m1 = mx1;
+            o0_0 = o0_0 * rr0;
+            o1_0 = o1_0 * rr1;
+            { float4 vv = vs[r0 + 0u]; o0_0 = o0_0 + p0_0 * vv; o1_0 = o1_0 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 0u]; o0_0 = o0_0 + p0_1 * vv; o1_0 = o1_0 + p1_1 * vv; }
+            o0_1 = o0_1 * rr0;
+            o1_1 = o1_1 * rr1;
+            { float4 vv = vs[r0 + 1u]; o0_1 = o0_1 + p0_0 * vv; o1_1 = o1_1 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 1u]; o0_1 = o0_1 + p0_1 * vv; o1_1 = o1_1 + p1_1 * vv; }
+            o0_2 = o0_2 * rr0;
+            o1_2 = o1_2 * rr1;
+            { float4 vv = vs[r0 + 2u]; o0_2 = o0_2 + p0_0 * vv; o1_2 = o1_2 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 2u]; o0_2 = o0_2 + p0_1 * vv; o1_2 = o1_2 + p1_1 * vv; }
+            o0_3 = o0_3 * rr0;
+            o1_3 = o1_3 * rr1;
+            { float4 vv = vs[r0 + 3u]; o0_3 = o0_3 + p0_0 * vv; o1_3 = o1_3 + p1_0 * vv; }
+            { float4 vv = vs[r1 + 3u]; o0_3 = o0_3 + p0_1 * vv; o1_3 = o1_3 + p1_1 * vv; }
+        }
+    }
+    if (row0 < S) {
+        float inv0 = 1.0 / l0;
+        uint ob0 = row0 * pc.n_heads * 64u + head * 64u + half_ * 16u;
+        output[ob0 + 0u] = o0_0.x * inv0;
+        output[ob0 + 1u] = o0_0.y * inv0;
+        output[ob0 + 2u] = o0_0.z * inv0;
+        output[ob0 + 3u] = o0_0.w * inv0;
+        output[ob0 + 4u] = o0_1.x * inv0;
+        output[ob0 + 5u] = o0_1.y * inv0;
+        output[ob0 + 6u] = o0_1.z * inv0;
+        output[ob0 + 7u] = o0_1.w * inv0;
+        output[ob0 + 8u] = o0_2.x * inv0;
+        output[ob0 + 9u] = o0_2.y * inv0;
+        output[ob0 + 10u] = o0_2.z * inv0;
+        output[ob0 + 11u] = o0_2.w * inv0;
+        output[ob0 + 12u] = o0_3.x * inv0;
+        output[ob0 + 13u] = o0_3.y * inv0;
+        output[ob0 + 14u] = o0_3.z * inv0;
+        output[ob0 + 15u] = o0_3.w * inv0;
+    }
+    if (row1 < S) {
+        float inv1 = 1.0 / l1;
+        uint ob1 = row1 * pc.n_heads * 64u + head * 64u + half_ * 16u;
+        output[ob1 + 0u] = o1_0.x * inv1;
+        output[ob1 + 1u] = o1_0.y * inv1;
+        output[ob1 + 2u] = o1_0.z * inv1;
+        output[ob1 + 3u] = o1_0.w * inv1;
+        output[ob1 + 4u] = o1_1.x * inv1;
+        output[ob1 + 5u] = o1_1.y * inv1;
+        output[ob1 + 6u] = o1_1.z * inv1;
+        output[ob1 + 7u] = o1_1.w * inv1;
+        output[ob1 + 8u] = o1_2.x * inv1;
+        output[ob1 + 9u] = o1_2.y * inv1;
+        output[ob1 + 10u] = o1_2.z * inv1;
+        output[ob1 + 11u] = o1_2.w * inv1;
+        output[ob1 + 12u] = o1_3.x * inv1;
+        output[ob1 + 13u] = o1_3.y * inv1;
+        output[ob1 + 14u] = o1_3.z * inv1;
+        output[ob1 + 15u] = o1_3.w * inv1;
+    }
+}

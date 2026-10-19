@@ -1,0 +1,10 @@
+{
+	"nodes": [
+		{"id": "model", "type": "sam3dbody.load", "params": {"path": "sam-3d-body-dinov3"}},
+		{"id": "pose", "type": "sam3dbody.pose_frames", "params": {"model": {"from": "model.model"}, "frames": "frames", "fps": 24, "smooth": 7}},
+		{"id": "clean", "type": "motion.clean_up", "params": {"motion": {"from": "pose.motion"}}},
+		{"id": "glb", "type": "motion.save_glb", "params": {"motion": {"from": "clean.motion"}, "path": "output/motion.glb"}},
+		{"id": "bvh", "type": "motion.save_bvh", "params": {"motion": {"from": "clean.motion"}, "path": "output/motion.bvh"}},
+		{"id": "frames", "type": "motion.save_frames", "params": {"motion": {"from": "pose.motion"}, "path": "output/frames.json"}}
+	]
+}

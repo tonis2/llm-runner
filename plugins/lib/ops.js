@@ -37,6 +37,10 @@ export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = fa
 		case GGML.Q8_0:
 			if (matrixCores && !exact && seq >= 16) {
 				dispatch('matmul_q8_coop', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
+			} else if (seq >= 64) {
+				// Without matrix cores: an 8x8 patch a thread, half the shared-memory
+				// reads per multiply-add of the 4x4 kernel.
+				dispatch('matmul_q8_8x8', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
 			} else {
 				dispatch('matmul_q8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
 			}
@@ -171,6 +175,11 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 		flashAttentionSplit(q, null, null, k, v, out, heads, seq, 0, seq);
 		return;
 	}
+	if (hd === 64 && !matrixCores) {
+		// Each row split over 4 threads, 2 rows a thread, in registers.
+		dispatch('flash_attention_64', [q, k, v, out], [groups(seq, 64), heads], pc('uuf', heads, seq, 1 / Math.sqrt(hd)));
+		return;
+	}
 	dispatch('flash_attention', [q, k, v, out], [groups(seq, 16), heads], pc('uuuf', hd, heads, seq, 1 / Math.sqrt(hd)), false, flashDefines(hd));
 }
 // Q [heads, qLen, 128] over the keys of a cached prefix (k1, v1: [heads, l1,
@@ -212,6 +221,13 @@ export function vaeAttention(q, k, v, out, channels, spatial, start = 0, count =
 export function timestepEmbed(out, dim, timestep) {
 	dispatch('timestep_embed', [out], [groups(dim, 256)], pc('uf', dim, timestep));
 }
+// A crop warped out of an 8-bit image (warp_crop.shady): `image` its bytes,
+// `geo` and `wts` the positions (sam3dbody/crop.js cropGeometry), out [3,
+// size, size], normalised by `norm` { mean, std } (per channel) or the bytes.
+export function warpCrop(image, geo, wts, out, size, channels, norm = null) {
+	const m = norm?.mean ?? [0, 0, 0], s = norm?.std ?? [1, 1, 1];
+	dispatch('warp_crop', [image, geo, wts, out], [groups(size * size, 256)], pc('uuuffffff', size, channels, norm ? 1 : 0, ...m, ...s));
+}
 export function patchify(latent, patches, channels, height, width, patchSize = 1) {
 	dispatch('patchify', [latent, patches], [groups(channels * height * width, 256)], pc('uuuu', channels, height, width, patchSize));
 }
@@ -220,6 +236,12 @@ export function unpatchify(patches, latent, channels, height, width, patchSize =
 }
 export function eulerStep(x, v, n, dt) {
 	dispatch('flow_euler_step', [x, v], [groups(n, 256)], pc('uf', n, dt));
+}
+// Guidance on [channels, spatial] velocities: v (the unconditional one coming
+// in) = v + s * (cond - v), and with `rescale` each pixel's channel vector put
+// back to cond's length.
+export function cfgCombine(cond, v, channels, spatial, s, rescale) {
+	dispatch('cfg_combine', [cond, v], [groups(spatial, 256)], pc('uufu', channels, spatial, s, rescale ? 1 : 0));
 }
 export function concatRows(a, b, out, rows, aCols, bCols) {
 	dispatch('concat_rows', [a, b, out], [groups(rows * (aCols + bCols), 256)], pc('uuu', rows, aCols, bCols));
