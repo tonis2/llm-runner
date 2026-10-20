@@ -70,9 +70,13 @@ export function readLabels(request, joints = null) {
 	const markers = { ...(request.markers ?? {}) };
 	if (joints) {
 		const known = new Set(joints);
-		for (const [m, j] of Object.entries(markers)) {
+		for (const [m, spec] of Object.entries(markers)) {
+			const j = markerJoint(spec);
 			if (!known.has(j)) throw bad(`markers: ${m} is on "${j}", which is not one of the rig's joints (${joints.join(', ')})`);
 			if (known.has(m)) throw bad(`markers: ${m} is a joint's name; a marker needs a name of its own`);
+			if (typeof spec === 'object' && !(Array.isArray(spec.offset) && spec.offset.length === 3 && spec.offset.every(Number.isFinite))) {
+				throw bad(`markers: ${m} wants { joint, offset: [x, y, z] } (its place from the joint at rest, in model units), or the joint's name alone`);
+			}
 		}
 		for (const points of Object.values(labels)) {
 			for (const name of Object.keys(points)) {
@@ -82,6 +86,10 @@ export function readLabels(request, joints = null) {
 	}
 	return { labels, markers };
 }
+
+// The joint a marker is on: `"<joint>"` (its offset fitted) or `{ joint, offset }`
+// (its offset known: a point of the mesh, from the joint at rest).
+export const markerJoint = (spec) => (spec && typeof spec === 'object' ? spec.joint : spec);
 
 const COLOURS = { L: [230, 40, 40], R: [40, 90, 230], M: [250, 210, 0] };
 const side = (name) => (/(_L|_l|\.L|Left|left)$/.test(name) || name.startsWith('l_') ? 'L' : /(_R|_r|\.R|Right|right)$/.test(name) || name.startsWith('r_') ? 'R' : 'M');

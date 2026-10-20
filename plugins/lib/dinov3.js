@@ -151,8 +151,12 @@ export class DinoV3 {
 	// Tensor, which the caller disposes. `tokens` returns the same patches as
 	// rows [gh * gw, dim] instead; `quiet` leaves out the timing line.
 	// `stopAfter` (a block index) returns the tokens [prefix + patches, dim]
-	// after that block instead, for comparing a port stage by stage.
-	async encode(pixels, H, W, { stopAfter = -1, tokens = false, quiet = false } = {}) {
+	// after that block instead, for comparing a port stage by stage. `layers`
+	// (block indices, with `tokens`) lays those blocks' patches beside the last
+	// one's, each through the final norm: rows [gh * gw, dim * (layers + 1)],
+	// the earlier blocks first. A middle block knows better where things are,
+	// the last what they are.
+	async encode(pixels, H, W, { stopAfter = -1, tokens = false, quiet = false, layers = null } = {}) {
 		const D = this.dim, F = this.ffn, nh = this.heads, g = this.g;
 		const gh = H / PATCH, gw = W / PATCH, N = gh * gw, pre = this.prefixTokens, n = pre + N;
 		if (!Number.isInteger(gh) || !Number.isInteger(gw)) throw new Error(`DINOv3: ${W}x${H} is not a multiple of ${PATCH}`);
@@ -166,6 +170,8 @@ export class DinoV3 {
 		};
 		const rope = this.ropeTables(gh, gw);
 		const rows = (t, first, count) => t.view(first * D * 4, count * D * 4);
+		const extra = tokens && layers?.length ? layers : null, wide = D * ((extra?.length ?? 0) + 1);
+		const out = tokens ? f32(wide * N, [wide, N]) : f32(D * N, [gw, gh, D]);
 		try {
 			// Prefix tokens, then the patches' embeddings after them.
 			copy(g.prefix, a.h, pre * D * 4);
@@ -177,20 +183,29 @@ export class DinoV3 {
 			for (const [l, b] of this.blocks.entries()) {
 				this.block(b, a, n, N, rope);
 				if (l === stopAfter) {
+					out.dispose();
 					const all = f32(n * D, [D, n]);
 					copy(a.h, all, n * D * 4);
 					return all;
+				}
+				const at = extra ? extra.indexOf(l) : -1;
+				if (at >= 0) {
+					op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
+					op.copyRows(rows(a.x, pre, N), out, N, D, wide, at * D);
 				}
 				if (breathing()) await breathe(true);
 				else submit();
 			}
 			op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
-			const out = tokens ? f32(D * N, [D, N]) : f32(D * N, [gw, gh, D]);
-			if (tokens) copy(a.x, out, N * D * 4, pre * D * 4);
+			if (extra) op.copyRows(rows(a.x, pre, N), out, N, D, wide, extra.length * D);
+			else if (tokens) copy(a.x, out, N * D * 4, pre * D * 4);
 			else op.transposeChannelSpatial(rows(a.x, pre, N), out, D, N, 1);
 			submit();
 			if (!quiet) llm.print(`  DINOv3: ${W}x${H}, ${n} tokens, in ${llm.since(t0)}`);
 			return out;
+		} catch (e) {
+			out.dispose();
+			throw e;
 		} finally {
 			submit();
 			disposeAll(a);

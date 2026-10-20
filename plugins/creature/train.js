@@ -21,7 +21,14 @@
 //
 // Joints: those given, or every joint whose bone from its parent is at least
 // 4% of the rig's height (and the root): fingers and zero-length twist bones
-// are too small for 16-pixel patches to tell apart.
+// are too small for 16-pixel patches to tell apart. Then the set's landmarks,
+// points of the mesh (render_poses' `landmarks`), unless `landmarks: false`: a
+// joint sits inside the body, where nothing marks it, but a nose or a heel
+// shows, and shows which way the head or the foot is turned. A joint is learnt
+// everywhere, as the body round it says where it is; a landmark where the
+// picture shows it, and where it does not (a nose seen from behind) its heatmap
+// is taught to be flat, at `hidden_weight` (0.3): it lights nothing, so its
+// score is low, and the fit hardly listens to it.
 
 import { llm, f32 } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
@@ -32,6 +39,8 @@ import { Head, saveFinder, peaks } from './detect.js';
 import { bad } from './request.js';
 
 const IMAGE = /\.(png|jpe?g)$/i;
+// A target's width (patches) that makes its heatmap flat: a hidden landmark's.
+const FLAT = 1000;
 
 function upload(data) {
 	const t = f32(data.length);
@@ -68,10 +77,12 @@ export function readRenders(folders) {
 		for (const e of sets) {
 			const set = JSON.parse(llm.readText(`${dir}/${e.name}`));
 			if (set.motion) throw bad(`renders: ${dir}/${e.name} is an exam (motion); train on random poses`);
-			if (!head) head = { joints: set.joints, parents: set.parents, rest: set.rest, size: set.size, height: set.height, fill: set.fill ?? [0.45, 0.75] };
+			const landmarks = set.landmarks ?? [];
+			if (!head) head = { joints: set.joints, parents: set.parents, rest: set.rest, size: set.size, height: set.height, fill: set.fill ?? [0.45, 0.75], landmarks };
 			if (set.joints.join() !== head.joints.join()) throw bad(`renders: ${dir}/${e.name} is another rig's (its joints differ from the first set's)`);
 			if (set.size !== head.size) throw bad(`renders: ${dir}/${e.name} is ${set.size} pixels; the first set is ${head.size}`);
-			for (const im of set.images) images.push({ path: `${dir}/${im.file}`, points: im.points, camera: im.camera });
+			if (landmarks.map((m) => m.name).join() !== head.landmarks.map((m) => m.name).join()) throw bad(`renders: ${dir}/${e.name} follows other landmarks than the first set (draw every set with the same "landmarks")`);
+			for (const im of set.images) images.push({ path: `${dir}/${im.file}`, points: im.points, marks: im.marks ?? [], camera: im.camera });
 		}
 	}
 	if (!images.length) throw bad('renders: no pictures');
@@ -123,7 +134,7 @@ export class Backdrops {
 	// One made-up background, size x size x 3.
 	made() {
 		const S = this.size, r = this.random, px = new Uint8Array(S * S * 3);
-		const kind = r.int(4);
+		const kind = r.int(5);
 		if (kind === 0) {
 			// Flat, with a slight gradient.
 			const a = this.colour(), b = a.map((v) => Math.max(0, Math.min(255, v + r.between(-40, 40))));
@@ -141,6 +152,15 @@ export class Backdrops {
 			for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
 				const col = (Math.floor(x / t) + Math.floor(y / t)) % 2 ? a : b;
 				for (let c = 0; c < 3; c++) px[(y * S + x) * 3 + c] = col[c];
+			}
+		} else if (kind === 4) {
+			// A studio: a pale wall going a little darker toward a pale floor, the
+			// way a turntable or a generated clip is shot.
+			const tone = r.between(170, 250), tint = [0, 1, 2].map(() => r.between(-12, 12)), horizon = r.between(0.45, 0.9) * S;
+			const floor = r.between(0.75, 0.95);
+			for (let y = 0; y < S; y++) {
+				const shade = y < horizon ? 1 - (0.08 * y) / horizon : floor * (0.9 + (0.1 * (y - horizon)) / Math.max(1, S - horizon));
+				for (let x = 0; x < S; x++) for (let c = 0; c < 3; c++) px[(y * S + x) * 3 + c] = Math.max(0, Math.min(255, (tone + tint[c]) * shade));
 			}
 		} else {
 			// A soft colour field: a coarse random grid, smoothly blown up.
@@ -218,7 +238,7 @@ export function composite(render, backdrop, random, noise) {
 // The top `rank` directions of the tokens' variance, whitened: the projection
 // [rank, D] and its bias [rank] (P x + c, the mean taken off). `raw` is the
 // tokens [N, D] of some pictures, on the GPU.
-async function principal(raw, N, D, rank, random, iterations = 10) {
+export async function principal(raw, N, D, rank, random, iterations = 10) {
 	const ones = upload(new Float32Array(N).fill(1));
 	const gram = upload(new Float32Array(D * D)), sums = upload(new Float32Array(D));
 	const xt = f32(N * D), part = f32(D * D), partSum = f32(D);
@@ -260,58 +280,77 @@ async function principal(raw, N, D, rank, random, iterations = 10) {
 }
 
 // `rank` orthonormal rows spanning the top of symmetric `cov` [D, D]: subspace
-// iteration, Q <- orth(Q Cov), orthonormalised by Cholesky (Q = L^-1 Z for
-// Z Z^T = L L^T), the products on the GPU.
+// iteration, Q <- orth(Q Cov), the product on the GPU and the orthonormalising
+// on the host in float64 (orthonormalRows): its Gram matrix squares the spread
+// of the variances, which a middle block's features (or noise) take past
+// float32's precision.
 async function subspace(cov, D, rank, random, iterations) {
 	const C = upload(cov);
-	const start = new Float32Array(rank * D);
+	const start = new Float64Array(rank * D);
 	for (let i = 0; i < start.length; i++) start[i] = random() - 0.5;
-	const q = upload(start), z = f32(rank * D), zt = f32(rank * D), gram = f32(rank * rank), inv = f32(rank * rank);
+	const q = f32(rank * D), z = f32(rank * D);
 	try {
-		for (let it = 0; it <= iterations; it++) {
-			// The first pass orthonormalises the random start alone.
-			if (it > 0) op.matmul(C, q, z, D, D, rank);
-			else copy(q, z, rank * D * 4);
-			op.matmul(z, z, gram, rank, D, rank);
+		q.buffer.write(Float32Array.from(orthonormalRows(start, rank, D)));
+		for (let it = 0; it < iterations; it++) {
+			op.matmul(C, q, z, D, D, rank);
 			submit();
-			inv.buffer.write(choleskyInverse(readFloats(gram, rank * rank), rank));
-			op.transposeChannelSpatial(z, zt, D, rank, 1);
-			op.matmul(zt, inv, q, D, rank, rank);
-			submit();
+			q.buffer.write(Float32Array.from(orthonormalRows(Float64Array.from(readFloats(z, rank * D)), rank, D)));
 			if (breathing()) await breathe();
 		}
 		op.matmul(C, q, z, D, D, rank);
 		submit();
 		return { q: readFloats(q, rank * D), z: readFloats(z, rank * D) };
 	} finally {
-		for (const t of [C, q, z, zt, gram, inv]) t.dispose();
+		for (const t of [C, q, z]) t.dispose();
 	}
 }
 
-// L^-1 for the Cholesky factor of symmetric positive `g` [n, n] (a little
-// added to the diagonal, for directions with next to no variance).
-function choleskyInverse(g, n) {
-	let trace = 0;
-	for (let i = 0; i < n; i++) trace += g[i * n + i];
-	const eps = (1e-9 * trace) / n + 1e-30;
-	const L = new Float64Array(n * n);
-	for (let i = 0; i < n; i++) {
-		for (let j = 0; j <= i; j++) {
-			let s = g[i * n + j] + (i === j ? eps : 0);
-			for (let k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
-			L[i * n + j] = i === j ? Math.sqrt(Math.max(s, eps)) : s / L[j * n + j];
-		}
-	}
-	const inv = new Float64Array(n * n);
-	for (let i = 0; i < n; i++) {
-		inv[i * n + i] = 1 / L[i * n + i];
-		for (let j = 0; j < i; j++) {
+// The rows of Z [n, D] made orthonormal, spanning the same space: Cholesky QR
+// twice over (Q = L^-1 Z for Z Z^T = L L^T, then again on Q), in float64, each
+// row brought to unit length first (rows of very different lengths square to
+// a Gram matrix past float64's precision), a little added to the diagonal for
+// rows with next to nothing left of their own.
+export function orthonormalRows(Z, n, D) {
+	for (let pass = 0; pass < 2; pass++) {
+		for (let i = 0; i < n; i++) {
+			const zi = Z.subarray(i * D, (i + 1) * D);
 			let s = 0;
-			for (let k = j; k < i; k++) s += L[i * n + k] * inv[k * n + j];
-			inv[i * n + j] = -s / L[i * n + i];
+			for (let d = 0; d < D; d++) s += zi[d] * zi[d];
+			const inv = s > 0 ? 1 / Math.sqrt(s) : 0;
+			for (let d = 0; d < D; d++) zi[d] *= inv;
+		}
+		const L = new Float64Array(n * n);
+		let trace = 0;
+		for (let i = 0; i < n; i++) {
+			const zi = Z.subarray(i * D, (i + 1) * D);
+			for (let j = 0; j <= i; j++) {
+				const zj = Z.subarray(j * D, (j + 1) * D);
+				let s = 0;
+				for (let d = 0; d < D; d++) s += zi[d] * zj[d];
+				L[i * n + j] = s;
+			}
+			trace += L[i * n + i];
+		}
+		const eps = (1e-12 * trace) / n + 1e-300;
+		for (let i = 0; i < n; i++) {
+			for (let j = 0; j <= i; j++) {
+				let s = L[i * n + j] + (i === j ? eps : 0);
+				for (let k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
+				L[i * n + j] = i === j ? Math.sqrt(Math.max(s, eps)) : s / L[j * n + j];
+			}
+		}
+		// Forward substitution, row by row: Q_i = (Z_i - sum_k<i L_ik Q_k) / L_ii.
+		for (let i = 0; i < n; i++) {
+			const zi = Z.subarray(i * D, (i + 1) * D);
+			for (let k = 0; k < i; k++) {
+				const l = L[i * n + k], zk = Z.subarray(k * D, (k + 1) * D);
+				for (let d = 0; d < D; d++) zi[d] -= l * zk[d];
+			}
+			const inv = 1 / L[i * n + i];
+			for (let d = 0; d < D; d++) zi[d] *= inv;
 		}
 	}
-	return Float32Array.from(inv);
+	return Z;
 }
 
 // Adam over Float32Arrays (the head is small; the host keeps the master copy).
@@ -339,7 +378,7 @@ class Adam {
 
 /**
  * Trains a finder on `request.renders` and writes it to `request.out`.
- * Options: joints, backgrounds, rank (384), hidden (256), epochs (40),
+ * Options: joints, landmarks (true), hidden_weight (0.3), layers ([]), backgrounds, rank (384), hidden (256), epochs (40),
  * batch (32), lr (0.001), sigma (1, patches), holdout (0.05), seed (1),
  * limit (pictures at most). Returns the report.
  */
@@ -349,13 +388,18 @@ export async function trainFinder(encoder, request, step = null) {
 	if (!request.out) throw bad('out: where to write the finder (.safetensors)');
 	const set = readRenders(request.renders);
 	const chosen = chooseJoints(set, request.joints ?? null);
-	const names = chosen.map((j) => set.joints[j]);
-	const S = set.size, G = S / PATCH, N = G * G, D = encoder.dim, J = chosen.length;
+	const landmarks = request.landmarks === false ? [] : set.landmarks;
+	const names = [...chosen.map((j) => set.joints[j]), ...landmarks.map((m) => m.name)];
+	// Blocks laid beside the last one's patches (dinov3.js `layers`): none by default.
+	const layers = (request.layers ?? []).map(Number);
+	if (layers.some((l) => !Number.isInteger(l) || l < 0 || l >= encoder.depth - 1)) throw bad(`layers: block indices from 0 to ${encoder.depth - 2}`);
+	const S = set.size, G = S / PATCH, N = G * G, D = encoder.dim * (layers.length + 1), J = names.length;
 	const rank = Number(request.rank ?? 384), hidden = Number(request.hidden ?? 256);
 	const epochs = Number(request.epochs ?? 40), B = Number(request.batch ?? 32), sigma = Number(request.sigma ?? 1);
 	if (S % PATCH) throw bad(`renders: ${S} pixels is not a multiple of ${PATCH}`);
 	if (!(rank >= 16 && rank <= D)) throw bad(`rank: 16 to ${D}`);
 	const random = generator(Number(request.seed ?? 1));
+	const hiddenWeight = Number(request.hidden_weight ?? 0.3);
 
 	// The pictures, shuffled, a twentieth held out.
 	const images = set.images.slice();
@@ -364,7 +408,7 @@ export async function trainFinder(encoder, request, step = null) {
 	const held = Math.max(1, Math.round(images.length * Number(request.holdout ?? 0.05)));
 	const M = images.length, train = M - held;
 	if (train < B) throw bad(`renders: ${M} pictures, too few for batches of ${B}`);
-	llm.print(`  finder: ${M} pictures (${held} held out) of ${S}x${S}, ${J} of ${set.joints.length} joints: ${names.join(', ')}`);
+	llm.print(`  finder: ${M} pictures (${held} held out) of ${S}x${S}, ${chosen.length} of ${set.joints.length} joints and ${landmarks.length} landmarks: ${names.join(', ')}`);
 
 	// 1. Every picture through the backbone; each one's labels in its crop
 	// ([image, joint, (grid x, grid y, weight, -)]).
@@ -394,18 +438,25 @@ export async function trainFinder(encoder, request, step = null) {
 			const cx = S / 2 + random.between(-0.06, 0.06) * S, cy = S / 2 + random.between(-0.06, 0.06) * S;
 			const box = [cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2];
 			const affine = boxAffine(box, S, S);
-			chosen.forEach((j, n) => {
-				// Rigsmith's pixels are counted from the left edge, the warp's from the first centre.
-				const x = affine[0] * (im.points[j][0] - 0.5) + affine[2], y = affine[4] * (im.points[j][1] - 0.5) + affine[5];
+			// Each point: a joint's, or a landmark's (learnt only where it shows).
+			const point = (n) => (n < chosen.length ? im.points[chosen[n]] : im.marks[n - chosen.length]);
+			for (let n = 0; n < J; n++) {
+				const p = point(n);
 				const o = (i * J + n) * 4;
+				if (!p) { targets[o + 2] = 0; continue; }
+				// Rigsmith's pixels are counted from the left edge, the warp's from the first centre.
+				const x = affine[0] * (p[0] - 0.5) + affine[2], y = affine[4] * (p[1] - 0.5) + affine[5];
 				targets[o] = (x - (PATCH - 1) / 2) / PATCH;
 				targets[o + 1] = (y - (PATCH - 1) / 2) / PATCH;
-				targets[o + 2] = x >= 0 && y >= 0 && x < S && y < S && im.points[j][2] > 0 ? 1 : 0;
-			});
+				const inside = x >= 0 && y >= 0 && x < S && y < S;
+				if (n < chosen.length) targets[o + 2] = inside && p[2] > 0 ? 1 : 0;
+				else if (inside && p[3] === 1) targets[o + 2] = 1;
+				else { targets[o] = targets[o + 1] = G / 2; targets[o + 2] = hiddenWeight; targets[o + 3] = FLAT; }
+			}
 			const image = uploadImage(picture);
 			const input = warpCropGpu(image, picture, affine, { width: S, height: S });
 			image.dispose();
-			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true });
+			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
 			input.dispose();
 			if (!head) {
 				raw.push(tokens);
@@ -479,12 +530,12 @@ export async function trainFinder(encoder, request, step = null) {
 			lossSum = 0;
 			lossCount = 0;
 			if (epoch % 5 === 4 || epoch === epochs - 1) {
-				const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S });
+				const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S, landmarksFrom: chosen.length });
 				history.push({ epoch: epoch + 1, loss: round(mean, 3), held_out_px: v.median });
 				llm.print(`  epoch ${epoch + 1}/${epochs}: loss ${mean.toFixed(3)}, held out: median ${v.median.toFixed(1)}px, ${(v.within * 100).toFixed(0)}% within ${v.near}px`);
 			}
 		}
-		const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S }, true);
+		const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S, landmarksFrom: chosen.length });
 		for (const t of Object.values(g)) t.dispose();
 
 		const report = {
@@ -492,11 +543,15 @@ export async function trainFinder(encoder, request, step = null) {
 			pca_variance_kept: round(kept, 3),
 			held_out_px: { median: round(v.median, 2), mean: round(v.mean, 2), p90: round(v.p90, 2), within: round(v.within, 3), near: v.near },
 			worst_joints: v.perJoint.map((e, n) => ({ joint: names[n], px: round(e, 1) })).sort((a, b) => b.px - a.px).slice(0, 8),
+			// How sure the finder is of a landmark the picture shows, and of one it
+			// hides (median scores): far apart, the fit can tell them apart.
+			...(landmarks.length ? { landmark_score: { seen: round(v.seenScore, 3), hidden: round(v.hiddenScore, 3) } } : {}),
 			history,
 			seconds: { encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1) },
 		};
 		saveFinder(request.out, { pca: host.pca, pca_bias: host.pca_bias, w1: host.w1, b1: host.b1, w2: host.w2, b2: host.b2 }, {
-			joints: names, size: S, dim: D, rank, hidden, sigma, fill: set.fill, report,
+			joints: names, size: S, dim: D, layers, rank, hidden, sigma, fill: set.fill, report,
+			landmarks: landmarks.map((m) => ({ name: m.name, joint: m.joint, offset: m.offset })),
 		});
 		llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px, in ${report.seconds.total}s`);
 		return report;
@@ -551,8 +606,8 @@ export function headGradients(head, g, { B, N, J, G, rank, hidden, sigma }) {
 
 // The held-out pictures [from, to) scored as the finder would: each joint's
 // peak against its label, in pixels.
-function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidden, S }) {
-	const errs = [], perJoint = new Float64Array(J), perCount = new Float64Array(J);
+function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidden, S, landmarksFrom = J }) {
+	const errs = [], perJoint = new Float64Array(J), perCount = new Float64Array(J), seen = [], hid = [];
 	for (let b0 = from; b0 < to; b0 += B) {
 		const n = Math.min(B, to - b0);
 		for (let b = 0; b < n; b++) {
@@ -569,6 +624,9 @@ function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidd
 				const o = ((b0 + b) * J + j) * 4;
 				if (!(targets[o + 2] > 0)) continue;
 				const [p] = peaks(one, j, J, G, G, { second: 2 });
+				if (j >= landmarksFrom) (targets[o + 3] > 0 ? hid : seen).push(p.mass);
+				// A hidden landmark's flat target has no place to be found at.
+				if (targets[o + 3] > 0) continue;
 				const e = Math.hypot(p.at[0] - targets[o], p.at[1] - targets[o + 1]) * PATCH;
 				errs.push(e);
 				perJoint[j] += e;
@@ -578,10 +636,12 @@ function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidd
 	}
 	errs.sort((a, b) => a - b);
 	const q = (f) => errs[Math.min(errs.length - 1, Math.floor(f * errs.length))] ?? 0;
+	const mid = (a) => (a.length ? a.slice().sort((x, y) => x - y)[a.length >> 1] : 0);
 	const near = Math.round(S * 0.025);
 	return {
 		median: q(0.5), p90: q(0.9), mean: errs.reduce((a, b) => a + b, 0) / Math.max(1, errs.length),
 		within: errs.filter((e) => e <= near).length / Math.max(1, errs.length), near,
 		perJoint: Array.from(perJoint, (v, j) => v / Math.max(1, perCount[j])),
+		seenScore: mid(seen), hiddenScore: mid(hid),
 	};
 }

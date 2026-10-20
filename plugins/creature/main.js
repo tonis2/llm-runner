@@ -11,7 +11,9 @@
 // Requests are JSON, one at a time (docs/creature_server.md):
 //
 //   POST /animate  { rig, frames, labels, markers?, region?, width?, fps?,
-//                    name?, travel?, iterations?, pitch?, outputs?, views? }
+//                    name?, travel?, travel_smooth?, iterations?, pitch?,
+//                    outputs?, views?, finder?, key_every?, flip?, landmarks?,
+//                    weights?, sigma?, confidence? }
 //                  -> { name, frames, fps, joints, glb?, clip?, bvh?,
 //                       animated_glb?, tracks?, report }
 //   POST /track    { frames, labels, region?, width?, draw? }
@@ -20,7 +22,7 @@
 //   POST /train    { renders, out, joints?, backgrounds?, epochs?, ... }
 //                  -> { finder, report }: a joint finder for one rig, trained
 //                     on Rigsmith's render_poses pictures of it (train.js)
-//   POST /detect   { finder, frames, region?, key_every?, draw? } or
+//   POST /detect   { finder, frames, region?, key_every?, flip?, draw? } or
 //                  { finder, views: [{ frames, region? }] }
 //                  -> { tracks, previews?, report }: every joint the finder
 //                     knows, on every frame, with no labels (detect.js)
@@ -33,7 +35,9 @@
 //   labels   { "<frame>": { "<joint or marker>": [x, y] } }, frame pixels;
 //            one keyframe or more, points missing from a keyframe allowed
 //   markers  { "<label>": "<joint>" }: a point on a joint's segment, its
-//            offset fitted (an eye on the head, the skin over a thigh)
+//            offset fitted (an eye on the head, the skin over a thigh); or
+//            { "<label>": { joint, offset } }, its offset known (a point of
+//            the mesh, from the joint at rest)
 //   region   [x1, y1, x2, y2]: the part of every frame to look at (the
 //            animal and room to move); the whole frame without one
 //   width    the region resized to this many pixels wide for the backbone,
@@ -49,7 +53,14 @@
 //            and a side clip: what one cannot see along its line of sight,
 //            the other sees across). tracks come back one per view.
 //   finder   a trained joint finder (/train): a view with neither labels
-//            nor tracks has its joints found on every frame instead
+//            nor tracks has its joints found on every frame instead; the
+//            points of the mesh it finds (landmarks) are markers with known
+//            offsets
+//   weights  { "<term>": weight } over the fit's defaults (fit.js
+//            DEFAULT_WEIGHTS), to tune it without code
+//   sigma    the reprojection's robust scale in pixels (15)
+//   confidence  how a found point's score weighs its pull, weight^confidence;
+//            2 for a finder's tracks, 0 (all pull fully) for labels and tracks
 //
 // Rigsmith runs it in-process as a job (llm::pipeline::Job): the job's
 // config is the same request plus `model`, the clip comes back as the job's
@@ -63,12 +74,31 @@ import { loadBackbone } from './backbone.js';
 import { Tracker } from './track.js';
 import { frameSource, readLabels, drawTracks, bad } from './request.js';
 import { readRig } from './rig.js';
-import { fitRig } from './fit.js';
+import { fitRig, DEFAULT_WEIGHTS } from './fit.js';
 import { fittedMotion, clipGlb, clipBvh, clipJson, animatedGlb } from './output.js';
-import { Finder } from './detect.js';
+import { Finder, fittedLandmarks } from './detect.js';
 import { trainFinder } from './train.js';
 
 const OUTPUTS = ['glb', 'clip', 'bvh', 'animated_glb', 'tracks'];
+
+// The request's fit settings, checked: { weights, sigma, confidence }.
+function fitSettings(request) {
+	const weights = request.weights ?? null;
+	if (weights !== null) {
+		if (typeof weights !== 'object' || Array.isArray(weights)) throw bad(`weights: { "<term>": number }, terms ${Object.keys(DEFAULT_WEIGHTS).join(', ')}`);
+		for (const [k, v] of Object.entries(weights)) {
+			if (!(k in DEFAULT_WEIGHTS)) throw bad(`weights: "${k}" is not one of the fit's terms (${Object.keys(DEFAULT_WEIGHTS).join(', ')})`);
+			if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw bad(`weights: ${k} is ${JSON.stringify(v)}; it is a number of 0 or more`);
+		}
+	}
+	const number = (key, fallback, least) => {
+		if (request[key] === undefined || request[key] === null) return fallback;
+		const v = Number(request[key]);
+		if (!Number.isFinite(v) || v < least) throw bad(`${key}: ${JSON.stringify(request[key])} is not a number of ${least} or more`);
+		return v;
+	};
+	return { weights, sigma: number('sigma', 15, 0.5), confidence: number('confidence', null, 0) };
+}
 let backbone = null, tracker = null, modelPath = null, finder = null;
 
 async function ensureBackbone(config) {
@@ -130,7 +160,7 @@ async function detect(request, view, config, step) {
 	const f = finderAt(request.finder);
 	const frames = frameSource(view.frames);
 	const tracks = await f.detect(backbone.encoder, frames, {
-		region: list(view.region, 4, 'region'), keyEvery: Number(request.key_every ?? 6),
+		region: list(view.region, 4, 'region'), keyEvery: Number(request.key_every ?? 6), flip: request.flip !== false,
 		onFrame: (k, n) => step?.(k, n, 'finding joints'),
 	});
 	return { frames, tracks };
@@ -145,6 +175,17 @@ async function train(request, config) {
 	}
 	const report = await trainFinder(backbone.encoder, request, stepper());
 	return { finder: request.out, report };
+}
+
+// `tracks` without the points named in `drop` (landmarks a request leaves out).
+function withoutPoints(tracks, drop) {
+	if (!drop.size) return tracks;
+	const keep = tracks.points.map((n, p) => (drop.has(n) ? -1 : p)).filter((p) => p >= 0);
+	const pick = (row) => (row ? keep.map((p) => row[p]) : row);
+	return {
+		...tracks, points: keep.map((p) => tracks.points[p]),
+		hypotheses: tracks.hypotheses.map((h) => ({ ...h, tracks: h.tracks.map(pick), scores: h.scores.map(pick) })),
+	};
 }
 
 // The request's views: its `views`, or the request itself as the one view.
@@ -162,11 +203,27 @@ export async function animate(request, config = {}) {
 	for (const o of outputs) if (!OUTPUTS.includes(o)) throw bad(`outputs: "${o}" is not one of ${OUTPUTS.join(', ')}`);
 	const rig = readRig(request.rig);
 	if (outputs.has('animated_glb') && !rig.glb) throw bad('outputs: animated_glb needs the rig as a .glb');
+	fitSettings(request);
 	const name = String(request.name ?? 'creature');
 	const fps = Number(request.fps ?? 24);
 	const step = stepper();
 	let trackSeconds = 0;
-	const markers = request.markers ?? {};
+	const markers = { ...(request.markers ?? {}) };
+	// A finder's landmarks: points of the mesh, markers whose offsets are known.
+	// By default all but a mirror pair on one joint (fittedLandmarks);
+	// `landmarks` false for none, true for every one, or a list of those to use.
+	const unused = new Set();
+	if (request.finder) {
+		const all = finderAt(request.finder).landmarks;
+		const use = request.landmarks ?? fittedLandmarks(all).map((m) => m.name);
+		if (use !== true && use !== false && !Array.isArray(use)) throw bad('landmarks: true (all the finder\'s), false, or a list of their names');
+		if (Array.isArray(use)) for (const n of use) if (!all.some((m) => m.name === n)) throw bad(`landmarks: the finder has no "${n}" (it has ${all.map((m) => m.name).join(', ') || 'none'})`);
+		for (const m of all) {
+			if (use === false || (Array.isArray(use) && !use.includes(m.name))) { unused.add(m.name); continue; }
+			if (!rig.names.includes(m.joint)) throw bad(`finder: its landmark ${m.name} rides "${m.joint}", which is not one of this rig's joints (trained on another rig?)`);
+			markers[m.name] ??= { joint: m.joint, offset: m.offset };
+		}
+	}
 	const views = viewsOf(request);
 	const fitted = [];
 	for (const [i, view] of views.entries()) {
@@ -175,10 +232,11 @@ export async function animate(request, config = {}) {
 			if (tracks) {
 				if (typeof tracks === 'string') tracks = JSON.parse(tracks.trim().startsWith('{') ? tracks : llm.readText(tracks));
 				if (!Array.isArray(tracks?.hypotheses) || !Array.isArray(tracks.points)) throw bad('tracks: a /track reply\'s tracks ({ points, frames, hypotheses })');
+				tracks = withoutPoints(tracks, unused);
 				for (const p of tracks.points) if (!rig.names.includes(p) && !(p in markers)) throw bad(`tracks: "${p}" is neither one of the rig's joints nor a marker (joints: ${rig.names.join(', ')})`);
 			} else if (!view.labels && request.finder) {
-				tracks = (await detect(request, view, config, (k, n, what) => step(i * n + k, views.length * n, what))).tracks;
-				for (const p of tracks.points) if (!rig.names.includes(p)) throw bad(`finder: it finds "${p}", which is not one of this rig's joints (trained on another rig?)`);
+				tracks = withoutPoints((await detect(request, view, config, (k, n, what) => step(i * n + k, views.length * n, what))).tracks, unused);
+				for (const p of tracks.points) if (!rig.names.includes(p) && !(p in markers)) throw bad(`finder: it finds "${p}", which is not one of this rig's joints (trained on another rig?)`);
 				trackSeconds += tracks.seconds;
 			} else {
 				const { labels } = readLabels({ ...view, markers }, rig.names);
@@ -193,10 +251,10 @@ export async function animate(request, config = {}) {
 	}
 	const iterations = Number(request.iterations ?? 1500);
 	const fit = fitRig(rig, fitted, {
-		markers, pitch: Number(request.pitch ?? 8), iterations,
+		markers, pitch: Number(request.pitch ?? 8), iterations, ...fitSettings(request),
 		onStep: (done, total) => step(done, total, 'fitting'),
 	});
-	const motion = fittedMotion(fit, rig, { fps, travel: request.travel ?? true });
+	const motion = fittedMotion(fit, rig, { fps, travel: request.travel ?? true, smooth: Number(request.travel_smooth ?? 25) });
 	const report = {
 		...fit.report,
 		travel: Number(motion.travel.toFixed(4)),
@@ -251,16 +309,22 @@ const INFO = {
 		rig: 'a rigged .glb (path or base64), Rigsmith get_skeleton JSON, or { names, parents, positions }',
 		frames: 'a folder of PNG/JPEG frames, or a list of image paths / base64 images',
 		labels: '{ "<frame>": { "<joint or marker>": [x, y] } } in frame pixels',
-		markers: '{ "<label>": "<joint>" } points on a joint\'s segment, offsets fitted',
+		markers: '{ "<label>": "<joint>" } points on a joint\'s segment, offsets fitted; or { "<label>": { joint, offset } }, offsets known',
 		region: '[x1, y1, x2, y2] in frame pixels (optional)',
 		width: 'backbone input width, multiple of 16 (1280)',
 		fps: 'frames per second of the clip (24)',
 		travel: 'put the walk back from the planted feet (true)',
+		travel_smooth: 'frames the travel\'s steps are smoothed over, an odd number; 1 for none (25)',
 		iterations: 'fit iterations (1500)',
 		pitch: 'the camera\'s expected downward angle in degrees (8)',
 		views: '[{ frames, labels, region?, width?, pitch? } or { tracks, pitch? }]: the same moments from other cameras, fitted together',
 		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
 		key_every: 'with a finder: a keyframe for the fit to start from every so many frames (6)',
+		flip: 'with a finder: look at each crop mirrored as well, left read as right, and average (true; false to look once)',
+		landmarks: 'with a finder: which of its landmarks (points of the mesh) to fit: true for all, false for none, or a list of names (all but a mirror pair on one joint, such as a head\'s two sides)',
+		weights: `{ "<term>": weight } over the fit's defaults: ${Object.entries(DEFAULT_WEIGHTS).map(([k, v]) => `${k} ${v}`).join(', ')}`,
+		sigma: 'the reprojection\'s robust scale in pixels (15)',
+		confidence: 'how a found point\'s score weighs its pull, weight^confidence (2 for a finder\'s tracks, 0 for labels and tracks)',
 		outputs: `any of ${OUTPUTS.join(', ')} (["glb", "clip"])`,
 	},
 };

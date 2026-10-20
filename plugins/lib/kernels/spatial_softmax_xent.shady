@@ -2,9 +2,11 @@
 // n patches softmaxed, against a Gaussian of width sigma (in patches) about
 // the joint's grid position, one workgroup per (image, joint). Scores and
 // gradient are [images * n, joints] (a patch's joints in a row); target is
-// [images * joints, 4] = grid x, grid y, weight, unused, a weight of 0 for a
-// joint the image does not have. The gradient is weight * scale * (p - t),
-// the loss -weight * sum t log p.
+// [images * joints, 4] = grid x, grid y, weight, width, a weight of 0 for a
+// joint the image does not have; a width over 0 is that target's own in place
+// of sigma (a very wide one is flat: a point the image hides, taught to light
+// nothing). The gradient is weight * scale * (p - t), the loss
+// -weight * sum t log p.
 float s[];
 float g[];
 float target[];
@@ -30,7 +32,9 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     }
     float tx = target[wg * 4u];
     float ty = target[wg * 4u + 1u];
-    float k = 0.5 / (pc.sigma * pc.sigma);
+    float own = target[wg * 4u + 3u];
+    float sigma = own > 0.0 ? own : pc.sigma;
+    float k = 0.5 / (sigma * sigma);
 
     float m = -3.0e38;
     for (uint i = gi; i < pc.n; i += 256u) m = max(m, s[base + i * pc.joints]);

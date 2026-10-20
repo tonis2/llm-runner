@@ -45,10 +45,19 @@ if (cfg.check ?? true) {
 		f.evaluate(tau);
 		const grads = Object.fromEntries(Object.entries(f.g).map(([k, v]) => [k, Float64Array.from(v)]));
 		const params = { theta: f.theta, root: f.root, marks: f.marks, logS: f.logS, shift: f.shift, cam: f.cam };
+		// The turns of every pair the chain links through a branch (a chest and
+		// its neck), on one frame, besides the random entries: few enough that a
+		// random draw would miss them.
+		const branch = [];
+		for (let j = 0; j < f.J; j++) {
+			if (!f.chainBranch[j]) continue;
+			for (const k of [j, f.chainChild[j]]) for (let d = 0; d < 3; d++) branch.push((2 * f.J + k) * 3 + d);
+		}
 		for (const [name, arr] of Object.entries(params)) {
 			const eps = name === 'shift' ? 1e-3 : 1e-6;
-			for (let n = 0; n < Math.min(8, arr.length); n++) {
-				const i = Math.floor(((rnd() + 1) / 2) * arr.length) % arr.length;
+			const extra = name === 'theta' ? branch : [];
+			for (let n = 0; n < Math.min(8, arr.length) + extra.length; n++) {
+				const i = n >= Math.min(8, arr.length) ? extra[n - Math.min(8, arr.length)] : Math.floor(((rnd() + 1) / 2) * arr.length) % arr.length;
 				const keep = arr[i];
 				arr[i] = keep + eps;
 				const up = f.evaluate(tau);

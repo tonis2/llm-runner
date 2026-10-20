@@ -9,20 +9,28 @@
 // The head, per patch: the token [D] through the PCA the trainer found
 // (whitened, [K]), a hidden layer [H] with relu, a score per joint [J]. A
 // joint's scores over the picture's patches, softmaxed, are where it is: the
-// peak, refined over the 3x3 about it, and the mass near the peak as how sure
-// (the trainer fitted the softmax to a Gaussian of `sigma` patches there). The
-// second peak is kept too, as a second hypothesis, when it holds mass of its
-// own: a left leg's heatmap often lights the right leg as well, and the fit
+// peak, placed between patches by the parabola through the log scores about it,
+// and the mass near the peak as how sure (the trainer fitted the softmax to a
+// Gaussian of `sigma` patches there, and a Gaussian's log is that parabola).
+// The second peak is kept too, as a second hypothesis, when it holds mass of
+// its own: a left leg's heatmap often lights the right leg as well, and the fit
 // takes whichever its motion agrees with.
 //
 // Frames are looked at twice: once whole (or `region`), to find the figure,
 // and again cropped square round the joints found then, as the trainer framed
 // its pictures (the joints' box `fill` of the side), the crop's centre and side
-// smoothed over the clip.
+// smoothed over the clip. With `flip`, the crop is looked at mirrored as well,
+// each joint's scores there read as its partner's (left for right), and the
+// two averaged.
 //
 // The finder file is a .safetensors: pca [K, D], pca_bias [K], w1 [H, K],
 // b1 [H], w2 [J, H], b2 [J] in float32, and `finder` in its metadata, JSON:
-// { version, joints, size, dim, rank, hidden, sigma, fill, report }.
+// { version, joints, size, dim, layers?, rank, hidden, sigma, fill, landmarks?, report }.
+// `layers`: the DINOv3 blocks laid beside the last one's patches (dim is the
+// backbone's width times their number plus one).
+// `joints` are the points it finds: the rig's joints, then its landmarks
+// (points of the mesh, [{ name, joint, offset }]: the joint each rides and its
+// place from that joint at rest), which the fit takes as markers.
 
 import { llm, f32 } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
@@ -126,8 +134,15 @@ export function saveFinder(path, weights, meta) {
 }
 
 // A joint's best peaks in its scores (column j of [N, J]) over a gw x gh grid:
-// [{ at: [gx, gy], mass }], the best first, a second one at least 3 patches
-// away when it holds `second` of the mass or more.
+// [{ at: [gx, gy], mass }], the best first, a second one (a peak of its own) at
+// least 3 patches away when it holds `second` of the mass or more.
+//
+// A peak's place between patches: along x, the parabola through the log scores
+// left of, at and right of it, summed over its row and the rows either side
+// (each row of a Gaussian's log is the same parabola, so the sum is too, with a
+// third of the noise); along y the same over columns. A centroid of the
+// probabilities would pull it toward the patch's centre, and a joint moving
+// across patches would jump.
 export function peaks(scores, j, J, gw, gh, { second = 0.15 } = {}) {
 	const N = gw * gh;
 	let m = -Infinity;
@@ -136,17 +151,43 @@ export function peaks(scores, j, J, gw, gh, { second = 0.15 } = {}) {
 	let z = 0;
 	for (let n = 0; n < N; n++) { p[n] = Math.exp(scores[n * J + j] - m); z += p[n]; }
 	for (let n = 0; n < N; n++) p[n] /= z;
+	const s = (x, y) => scores[(y * gw + x) * J + j];
+	// Along one axis: the parabola's vertex from the summed differences.
+	const vertex = (num, den) => (den > 1e-6 ? Math.max(-0.5, Math.min(0.5, num / (2 * den))) : 0);
 	const around = (b, r) => {
 		const bx = b % gw, by = Math.floor(b / gw);
-		let sw = 0, sx = 0, sy = 0, mass = 0;
+		let mass = 0;
 		for (let y = Math.max(0, by - 2); y <= Math.min(gh - 1, by + 2); y++) {
 			for (let x = Math.max(0, bx - 2); x <= Math.min(gw - 1, bx + 2); x++) {
-				const w = p[y * gw + x];
-				if (Math.abs(x - bx) <= 1 && Math.abs(y - by) <= 1) { sw += w; sx += w * x; sy += w * y; }
-				if ((x - bx) ** 2 + (y - by) ** 2 <= r * r) mass += w;
+				if ((x - bx) ** 2 + (y - by) ** 2 <= r * r) mass += p[y * gw + x];
 			}
 		}
-		return { at: [sx / sw, sy / sw], mass };
+		let dx = 0, dy = 0;
+		if (bx > 0 && bx < gw - 1) {
+			let num = 0, den = 0;
+			for (let y = Math.max(0, by - 1); y <= Math.min(gh - 1, by + 1); y++) {
+				const l = s(bx - 1, y), c = s(bx, y), q = s(bx + 1, y);
+				num += q - l; den += 2 * c - l - q;
+			}
+			dx = vertex(num, den);
+		}
+		if (by > 0 && by < gh - 1) {
+			let num = 0, den = 0;
+			for (let x = Math.max(0, bx - 1); x <= Math.min(gw - 1, bx + 1); x++) {
+				const u = s(x, by - 1), c = s(x, by), d = s(x, by + 1);
+				num += d - u; den += 2 * c - u - d;
+			}
+			dy = vertex(num, den);
+		}
+		return { at: [bx + dx, by + dy], mass };
+	};
+	// Whether patch n is at least as likely as every patch round it.
+	const crest = (n) => {
+		const nx = n % gw, ny = Math.floor(n / gw);
+		for (let y = Math.max(0, ny - 1); y <= Math.min(gh - 1, ny + 1); y++) {
+			for (let x = Math.max(0, nx - 1); x <= Math.min(gw - 1, nx + 1); x++) if (p[y * gw + x] > p[n]) return false;
+		}
+		return true;
 	};
 	let best = 0;
 	for (let n = 1; n < N; n++) if (p[n] > p[best]) best = n;
@@ -155,13 +196,34 @@ export function peaks(scores, j, J, gw, gh, { second = 0.15 } = {}) {
 	let next = -1;
 	for (let n = 0; n < N; n++) {
 		if ((n % gw - bx) ** 2 + (Math.floor(n / gw) - by) ** 2 < 9) continue;
-		if (next < 0 || p[n] > p[next]) next = n;
+		if ((next < 0 || p[n] > p[next]) && crest(n)) next = n;
 	}
 	if (next >= 0) {
 		const q = around(next, 2);
 		if (q.mass >= second) out.push(q);
 	}
 	return out;
+}
+
+// The point's name on the body's other side: thigh_L and thigh_R, head.left
+// and head.right, LeftArm and RightArm; a point on the middle is its own.
+export function partner(name) {
+	const swap = { L: 'R', R: 'L', l: 'r', r: 'l' };
+	let n = name.replace(/\.(left|right)$/, (_, s) => (s === 'left' ? '.right' : '.left'));
+	n = n.replace(/([_.])([LRlr])(?=$|\.)/, (_, sep, s) => sep + swap[s]);
+	n = n.replace(/^(l_|r_|L_|R_)/, (p) => ({ l_: 'r_', r_: 'l_', L_: 'R_', R_: 'L_' })[p]);
+	return n.replace(/Left|Right/, (s) => (s === 'Left' ? 'Right' : 'Left'));
+}
+
+// The landmarks a fit takes by default: all but a mirror pair on one joint (a
+// head's two sides), whose pictures are each other's mirror image, so that a
+// finder takes one for the other; a pair on two joints (the heels) is told
+// apart by the legs it hangs from.
+export function fittedLandmarks(landmarks) {
+	return landmarks.filter((m) => {
+		const p = partner(m.name);
+		return p === m.name || !landmarks.some((o) => o.name === p && o.joint === m.joint);
+	});
 }
 
 // A square box of side `side` about (cx, cy).
@@ -194,6 +256,9 @@ export class Finder {
 		this.joints = meta.joints;
 		this.size = meta.size;
 		this.fill = meta.fill ?? [0.45, 0.75];
+		this.landmarks = meta.landmarks ?? [];
+		// Each point's partner on the other side, for looking mirrored.
+		this.mirror = this.joints.map((n) => { const k = this.joints.indexOf(partner(n)); return k < 0 ? this.joints.indexOf(n) : k; });
 	}
 
 	static load(path) {
@@ -221,21 +286,40 @@ export class Finder {
 	}
 
 	// Every joint in `box` (frame pixels, square) of `img`: per joint its peaks
-	// in frame pixels, [{ at: [x, y], score }].
-	async findIn(encoder, img, box) {
+	// in frame pixels, [{ at: [x, y], score }]. `flip`: looked at mirrored too.
+	async findIn(encoder, img, box, { flip = false } = {}) {
 		const S = this.size, G = S / PATCH, N = G * G, J = this.joints.length;
-		if (encoder.dim !== this.meta.dim) throw bad(`finder: trained on a ${this.meta.dim}-wide backbone, the loaded one is ${encoder.dim}`);
+		const layers = this.meta.layers ?? [];
+		if (encoder.dim * (layers.length + 1) !== this.meta.dim) throw bad(`finder: trained on ${this.meta.dim}-wide features, the loaded backbone gives ${encoder.dim * (layers.length + 1)}`);
 		const affine = boxAffine(box, S, S);
 		const image = uploadImage(img);
-		const input = warpCropGpu(image, img, affine, { width: S, height: S });
-		image.dispose();
-		const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true });
-		input.dispose();
+		const look = async (m, mirror) => {
+			const input = warpCropGpu(image, img, m, { width: S, height: S, mirror });
+			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
+			input.dispose();
+			try {
+				return this.head.scores(tokens, N);
+			} finally {
+				tokens.dispose();
+			}
+		};
 		let scores;
 		try {
-			scores = this.head.scores(tokens, N);
+			scores = await look(affine, false);
+			if (flip) {
+				// The mirrored image through the crop that puts column i where the
+				// crop's column S - 1 - i was: patch column gx is the crop's G - 1 - gx.
+				const [a, , tx, , d, ty] = affine;
+				const mirrored = await look([a, 0, S - 1 - tx - a * (img.width - 1), 0, d, ty], true);
+				for (let gy = 0; gy < G; gy++) {
+					for (let gx = 0; gx < G; gx++) {
+						const n = gy * G + gx, m = gy * G + (G - 1 - gx);
+						for (let j = 0; j < J; j++) scores[n * J + j] = (scores[n * J + j] + mirrored[m * J + this.mirror[j]]) / 2;
+					}
+				}
+			}
 		} finally {
-			tokens.dispose();
+			image.dispose();
 		}
 		const [a, , tx, , d, ty] = affine;
 		const toFrame = ([gx, gy]) => [(gx * PATCH + (PATCH - 1) / 2 - tx) / a, (gy * PATCH + (PATCH - 1) / 2 - ty) / d];
@@ -260,12 +344,12 @@ export class Finder {
 	 * a keyframe every `keyEvery` frames (the fit starts from those). `every`:
 	 * the first, whole-frame look on every so many frames only.
 	 */
-	async detect(encoder, frames, { region = null, keyEvery = 6, every = 3, onFrame = null } = {}) {
+	async detect(encoder, frames, { region = null, keyEvery = 6, every = 3, flip = false, onFrame = null } = {}) {
 		const count = frames.count, t0 = llm.now();
 		const first = frames.image(0);
 		const whole = region ?? [0, 0, first.width, first.height];
 		const wide = square((whole[0] + whole[2]) / 2, (whole[1] + whole[3]) / 2, Math.max(whole[2] - whole[0], whole[3] - whole[1]));
-		const looks = Math.ceil(count / every) + count;
+		const looks = Math.ceil(count / every) + count * (flip ? 2 : 1);
 		let done = 0;
 
 		// The figure, frame by frame: where its joints are when the frame is
@@ -279,15 +363,18 @@ export class Finder {
 		}
 		if (!side.some((v) => v !== null)) throw bad('finder: found no figure in the frames (is it the rig the finder was trained on? give region)');
 		const fillMid = (this.fill[0] + this.fill[1]) / 2;
-		const scx = smoothed(cx, 2), scy = smoothed(cy, 2), sside = smoothed(side, 4);
+		// Smoothed long: the box follows the toes up and down every step, and a crop
+		// that does slides the patches against the head and the hips.
+		const scx = smoothed(cx, 6), scy = smoothed(cy, 6), sside = smoothed(side, 12);
 
 		// Then each frame cropped round it.
 		const J = this.joints.length, found = [], boxes = [];
 		for (let k = 0; k < count; k++) {
 			const box = square(scx[k], scy[k], Math.max(32, sside[k] / fillMid));
 			boxes.push(box.map((v) => Math.round(v * 10) / 10));
-			found.push(await this.findIn(encoder, frames.image(k), box));
-			onFrame?.(++done, looks);
+			found.push(await this.findIn(encoder, frames.image(k), box, { flip }));
+			done += flip ? 2 : 1;
+			onFrame?.(done, looks);
 			if (breathing()) await breathe();
 		}
 

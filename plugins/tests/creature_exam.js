@@ -4,7 +4,8 @@
 //   llm-runner tests/creature_exam.js model=sam-3d-body-dinov3 rig=rig.glb \
 //       finder=rig.finder.safetensors exam=exam/ [backgrounds=frames/] \
 //       [iterations=1500] [place_pct=6] [found_px=12] [tracks_out=t.json | tracks_in=t.json]
-//       [weights='{"lateral":0}']
+//       [weights='{"lateral":0}'] [noise=side:15] [chain=hips,spine,...,head]
+//       [chain_deg=10] [head_deg=12] [wobble=2] [flip=false] [landmarks=all|none|a,b,...]
 //
 // `exam` is Rigsmith's render_poses with motion: one smooth movement inside
 // the rig's limits, from two cameras held still (or more). Each camera's
@@ -20,6 +21,18 @@
 //    root's frame. Passes when the world's median is under `place_pct` and
 //    the finding's median under `found_px`.
 //
+// 3. The turns a viewer sees, along `chain` (the root to the head by default):
+//    - each joint's turn against its parent, against the truth's (median over
+//      the frames, the worst joint of the chain graded under `chain_deg`);
+//    - the head's turn in the root's frame (under `head_deg`): the fit's world
+//      may turn about the vertical as a whole, which nobody sees;
+//    - wobble: how far each joint strays from its own mean turn, against how far
+//      the truth's does, (fit + 2°) / (truth + 2°), under `wobble`;
+//    - jitter: the change of each joint's frame-to-frame turn, against the
+//      truth's, under max(1.5 × the truth's, 0.5°).
+//    A fold (the chest bent one way, the neck and head the other) passes the
+//    joint places but not these.
+//
 //    Printed beside it: each bone's direction against the truth's in degrees,
 //    in the root's frame and in the world, and how far the root's own up and
 //    forward are from the truth's. Short bones (a finger's root, a toe's tip)
@@ -27,12 +40,18 @@
 //    pinned by its joints, so these say where the fit goes wrong rather than
 //    how wrong the clip looks.
 //
+// A finder's landmarks (points of the mesh) are graded as found where the exam
+// drew them in sight (render the exam with the same "landmarks"), and fitted as
+// markers with known offsets, as /animate does.
+//
 // `tracks_out` keeps what the finder found, and `tracks_in` fits that again
-// without the GPU, for trying the fit.
+// without the GPU, for trying the fit. `noise=<camera>:<px>` adds seeded noise
+// of that many pixels to one camera's tracks before the fit (after the finding
+// is graded): a real video's side view is found less well than renders are.
 import { llm } from '../lib/llm.js';
 import { utf8 } from '../lib/graph/plugins.js';
 import { loadBackbone } from '../creature/backbone.js';
-import { Finder } from '../creature/detect.js';
+import { Finder, fittedLandmarks } from '../creature/detect.js';
 import { generator, Backdrops, composite } from '../creature/train.js';
 import { readRig, qmul, qrotate, qconj } from '../creature/rig.js';
 import { fitRig } from '../creature/fit.js';
@@ -72,14 +91,17 @@ for (let c = 0; c < cameras; c++) {
 		const backdrop = backdrops.next();
 		const pictures = views[c].map((im) => composite(llm.image.load(`${dir}/${im.file}`), backdrop, random, noise));
 		const frames = { count: T, image: (k) => pictures[k] };
-		tracks = await finder.detect(backbone.encoder, frames, {});
+		tracks = await finder.detect(backbone.encoder, frames, { flip: cfg.flip !== false && cfg.flip !== 'false' });
 	}
 	fitted.push({ tracks, pitch: views[c][0].pitch });
 	for (const h of tracks.hypotheses.filter((h) => h.frames.length < T || tracks.hypotheses.length === 1)) {
 		h.frames.forEach((k, i) => {
 			tracks.points.forEach((name, p) => {
-				const q = h.tracks[i][p], truth = views[c][k].points[exam.joints.indexOf(name)];
-				if (q) foundErr.push(Math.hypot(q[0] - (truth[0] - 0.5), q[1] - (truth[1] - 0.5)));
+				const q = h.tracks[i][p], im = views[c][k], j = exam.joints.indexOf(name);
+				// A joint where it was drawn; a landmark where it was drawn in sight.
+				const m = j < 0 ? (exam.landmarks ?? []).findIndex((l) => l.name === name) : -1;
+				const truth = j >= 0 ? im.points[j] : m >= 0 && im.marks?.[m]?.[3] === 1 ? im.marks[m] : null;
+				if (q && truth) foundErr.push(Math.hypot(q[0] - (truth[0] - 0.5), q[1] - (truth[1] - 0.5)));
 			});
 		});
 	}
@@ -91,7 +113,30 @@ const foundPx = pct(foundErr, 0.5);
 llm.print(`  found: median ${foundPx.toFixed(1)}px, 90% ${pct(foundErr, 0.9).toFixed(1)}px of ${exam.size}px pictures`);
 
 // 2. The fit, and every bone against the truth in the root's frame.
-const fit = fitRig(rig, fitted, { iterations: Number(cfg.iterations ?? 1500), weights: typeof cfg.weights === 'string' ? JSON.parse(cfg.weights) : cfg.weights ?? null });
+if (cfg.noise) {
+	const [camera, px] = String(cfg.noise).split(':');
+	const c = exam.cameras.findIndex((k) => k.name === camera);
+	if (c < 0 || !(Number(px) >= 0)) throw new Error(`noise=${cfg.noise}: wants <camera>:<pixels>, a camera of ${exam.cameras.map((k) => k.name).join(', ')}`);
+	const gauss = generator(29);
+	const normal = () => Math.sqrt(-2 * Math.log(1 - gauss())) * Math.cos(2 * Math.PI * gauss());
+	for (const h of fitted[c].tracks.hypotheses) for (const row of h.tracks) for (const q of row) if (q) { q[0] += normal() * Number(px); q[1] += normal() * Number(px); }
+	llm.print(`  noise: ${px}px on the ${camera} camera's tracks`);
+}
+// The finder's landmarks the fit takes: as /animate takes them (all but a mirror
+// pair on one joint), `landmarks=all`, `landmarks=none`, or those listed.
+const named = String(cfg.landmarks ?? '');
+const used = cfg.landmarks === undefined ? fittedLandmarks(finder.landmarks) : named === 'all' ? finder.landmarks : named === 'none' ? [] : finder.landmarks.filter((m) => named.split(',').includes(m.name));
+const markers = Object.fromEntries(used.map((m) => [m.name, { joint: m.joint, offset: m.offset }]));
+if (finder.landmarks.length) llm.print(`  landmarks fitted: ${used.map((m) => m.name).join(', ') || 'none'}`);
+const dropped = new Set(finder.landmarks.filter((m) => !used.includes(m)).map((m) => m.name));
+if (dropped.size) {
+	for (const f of fitted) {
+		const t = f.tracks, keep = t.points.map((n, p) => (dropped.has(n) ? -1 : p)).filter((p) => p >= 0);
+		const pick = (row) => (row ? keep.map((p) => row[p]) : row);
+		f.tracks = { ...t, points: keep.map((p) => t.points[p]), hypotheses: t.hypotheses.map((h) => ({ ...h, tracks: h.tracks.map(pick), scores: h.scores.map(pick) })) };
+	}
+}
+const fit = fitRig(rig, fitted, { markers, iterations: Number(cfg.iterations ?? 1500), weights: typeof cfg.weights === 'string' ? JSON.parse(cfg.weights) : cfg.weights ?? null });
 const p = fit.problem;
 p.forward();
 const J = rig.names.length;
@@ -154,8 +199,85 @@ llm.print(`  joints from the root: median ${median(placeErr).toFixed(1)}% of the
 llm.print(`  in the world: median ${median(worldErr).toFixed(1)} deg a seen bone; the root's up ${median(rootUp).toFixed(1)} deg off, its forward ${median(rootAhead).toFixed(1)} deg`);
 llm.print(`  worst: ${bones.filter((b) => b.seen).sort((a, b) => b.deg - a.deg).slice(0, 8).map((b) => `${b.joint} ${b.deg.toFixed(0)}`).join(', ')}`);
 
+// 3. The turns along the chain.
+const matOf = (q) => {
+	const [x, y, z, w] = q;
+	return [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), 2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), 2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)];
+};
+// Aᵀ B, A B (row-major 3×3).
+const tmul = (A, B) => [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => A[r] * B[c] + A[3 + r] * B[3 + c] + A[6 + r] * B[6 + c]));
+const mul = (A, B) => [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c]));
+const turnDeg = (A, B) => { const M = tmul(A, B); return Math.acos(Math.max(-1, Math.min(1, (M[0] + M[4] + M[8] - 1) / 2))) * DEG; };
+// The rotation vector of R (axis times angle), in degrees.
+function logDeg(R) {
+	const a = Math.acos(Math.max(-1, Math.min(1, (R[0] + R[4] + R[8] - 1) / 2)));
+	const v = [R[7] - R[5], R[2] - R[6], R[3] - R[1]];
+	const s = Math.sin(a);
+	if (s < 1e-6) return a < 1 ? v.map((x) => (x / 2) * DEG) : [0, 0, 0].map((_, k) => Math.sqrt(Math.max(0, (R[k * 4] + 1) / 2)) * a * DEG);
+	return v.map((x) => (x * a) / (2 * s) * DEG);
+}
+// Turns over the clip: their spread about their own mean, and the median change
+// of the frame-to-frame turn.
+function spreadDeg(Rs) {
+	let mean = Rs[0];
+	for (let it = 0; it < 3; it++) {
+		const m = [0, 0, 0];
+		for (const R of Rs) logDeg(tmul(mean, R)).forEach((x, k) => (m[k] += x / Rs.length));
+		const a = Math.hypot(...m) / DEG;
+		const n = a > 1e-9 ? m.map((x) => x / DEG / a) : [1, 0, 0];
+		const q = [n[0] * Math.sin(a / 2), n[1] * Math.sin(a / 2), n[2] * Math.sin(a / 2), Math.cos(a / 2)];
+		mean = mul(mean, matOf(q));
+	}
+	return Math.sqrt(Rs.reduce((s, R) => s + turnDeg(mean, R) ** 2, 0) / Rs.length);
+}
+function jitterDeg(Rs) {
+	const w = [];
+	for (let t = 1; t < Rs.length; t++) w.push(logDeg(tmul(Rs[t - 1], Rs[t])));
+	const d = [];
+	for (let t = 1; t < w.length; t++) d.push(Math.hypot(w[t][0] - w[t - 1][0], w[t][1] - w[t - 1][1], w[t][2] - w[t - 1][2]));
+	return median(d);
+}
+const chain = cfg.chain ? String(cfg.chain).split(',').map((n) => rig.names.indexOf(n.trim())) : (() => {
+	let j = rig.names.indexOf('head');
+	if (j < 0) j = [...seen].map((n) => rig.names.indexOf(n)).filter((i) => i >= 0).reduce((a, b) => (rig.positions[b][1] > rig.positions[a][1] ? b : a));
+	const path = [];
+	for (; j >= 0; j = rig.parents[j]) path.unshift(j);
+	return path;
+})();
+if (chain.some((j) => j < 0)) throw new Error(`chain=${cfg.chain}: names a joint the rig does not have`);
+const local = (t, j) => p.R.subarray((t * J + j) * 9, (t * J + j) * 9 + 9);
+const world = (t, j) => p.G.subarray((t * J + j) * 9, (t * J + j) * 9 + 9);
+const truthLocal = (t, j) => matOf(poses[t].rotations[truthIndex[j]]);
+const rows = [];
+for (const j of chain.slice(1)) {
+	const err = [], fitTurns = [], truthTurns = [];
+	for (let t = 0; t < T; t++) {
+		const F = Array.from(local(t, j)), R = truthLocal(t, j);
+		err.push(turnDeg(F, R));
+		fitTurns.push(F);
+		truthTurns.push(R);
+	}
+	rows.push({ joint: rig.names[j], deg: median(err), wobble: (spreadDeg(fitTurns) + 2) / (spreadDeg(truthTurns) + 2), spread: spreadDeg(fitTurns), truthSpread: spreadDeg(truthTurns), jitter: jitterDeg(fitTurns), truthJitter: jitterDeg(truthTurns) });
+}
+const headJ = chain[chain.length - 1], rootJ = chain[0];
+const headErr = [];
+for (let t = 0; t < T; t++) {
+	const { W } = truthFrame(t);
+	const truthRel = matOf(qmul(qconj(W[truthIndex[rootJ]]), W[truthIndex[headJ]]));
+	headErr.push(turnDeg(tmul(Array.from(world(t, rootJ)), Array.from(world(t, headJ))), truthRel));
+}
+llm.print(`  the chain ${chain.map((j) => rig.names[j]).join(' > ')}:`);
+for (const r of rows) llm.print(`    ${r.joint.padEnd(14)} turn off ${r.deg.toFixed(1).padStart(5)} deg  spread ${r.spread.toFixed(1)} vs ${r.truthSpread.toFixed(1)} (wobble ${r.wobble.toFixed(2)})  jitter ${r.jitter.toFixed(2)} vs ${r.truthJitter.toFixed(2)}`);
+const chainWorst = Math.max(...rows.map((r) => r.deg)), wobbleWorst = Math.max(...rows.map((r) => r.wobble));
+const jitterBad = rows.filter((r) => r.jitter > Math.max(1.5 * r.truthJitter, 0.5));
+llm.print(`  ${rig.names[headJ]} in the ${rig.names[rootJ]}'s frame: median ${median(headErr).toFixed(1)} deg off, 90% ${pct(headErr.slice().sort((a, b) => a - b), 0.9).toFixed(1)}`);
+
 check(foundPx < Number(cfg.found_px ?? 12), `the finder finds the exam's joints (median ${foundPx.toFixed(1)}px)`);
 check(median(placeErr) < Number(cfg.place_pct ?? 6), `the fit puts the exam's joints back (median ${median(placeErr).toFixed(1)}% of the rig's height from the truth)`);
+check(chainWorst < Number(cfg.chain_deg ?? 10), `the chain's turns follow the truth's (worst joint ${chainWorst.toFixed(1)} deg off)`);
+check(median(headErr) < Number(cfg.head_deg ?? 12), `the ${rig.names[headJ]} turns as the truth's on the ${rig.names[rootJ]} (median ${median(headErr).toFixed(1)} deg off)`);
+check(wobbleWorst < Number(cfg.wobble ?? 2), `the chain wobbles no more than the truth (worst ${wobbleWorst.toFixed(2)}×)`);
+check(!jitterBad.length, `the chain is no shakier than the truth${jitterBad.length ? ` (${jitterBad.map((r) => r.joint).join(', ')} shake)` : ''}`);
 
 finder.dispose();
 backbone?.dispose();

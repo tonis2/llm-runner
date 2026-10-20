@@ -9,12 +9,16 @@
 //   animated glb  the rig's own .glb with the animation added to its nodes
 //
 // The fit holds the root in place (the camera followed the animal); `travel`
-// puts the walk back: the root moves by what a planted foot slides back.
+// puts the walk back: the root moves by what the planted feet slide back. Each
+// foot is planted by degrees (low, near the lowest, sliding back against where
+// the body faces), so the step passes from one foot to the other without a
+// jolt, and the steps are smoothed over `smooth` frames.
 
 import { motionGlb } from '../kimodo/glb.js';
 import { motionBvh } from '../lib/bvh.js';
 import { utf8 } from '../lib/graph/plugins.js';
 import { qmul, qconj, qrotate } from './rig.js';
+import { smoothRows } from '../lib/smooth.js';
 
 const FLOAT = 5126;
 const round = (v, d = 5) => Number(v.toFixed(d));
@@ -31,7 +35,7 @@ function quat(x, y, z) {
  * The fit's motion: { skeleton { names, parents, offsets, restRoot }, fps,
  * frames, rotations [frames, J, 4], root [frames, 3], travel (model units) }.
  */
-export function fittedMotion(fit, rig, { fps = 24, travel = true } = {}) {
+export function fittedMotion(fit, rig, { fps = 24, travel = true, smooth = 25 } = {}) {
 	const p = fit.problem, T = p.T, J = p.J;
 	p.forward();
 	const rotations = new Float32Array(T * J * 4), root = new Float32Array(T * 3);
@@ -49,24 +53,40 @@ export function fittedMotion(fit, rig, { fps = 24, travel = true } = {}) {
 
 	let moved = 0;
 	if (travel && p.footLeaves.length && T > 1) {
-		// Each foot as its leaf and the joint above; planted when low and
-		// sliding back against where the body faces; of two, the lower.
+		// Each foot as its leaf and the joint above. How planted it is: near the
+		// lowest foot's height (within a few hundredths of the rig), low (under a
+		// tenth of it) and sliding back; the step is the planted feet's slide,
+		// weighed by that, and held while none is planted (a run's flight).
 		const feet = p.footLeaves.map((leaf) => [leaf, p.parents[leaf]]);
 		const at = (t, j, d) => p.pos[(t * J + j) * 3 + d];
-		const high = 0.1 * rig.height;
-		let step = [0, 0], sum = [0, 0];
+		const H = rig.height, sig = (x) => 1 / (1 + Math.exp(-x));
+		const steps = new Float64Array(T * 2);
+		let held = [0, 0];
 		for (let t = 1; t < T; t++) {
 			const g = (t * J) * 9;
 			const fx = p.G[g + 2], fz = p.G[g + 8], fn = Math.hypot(fx, fz) || 1;
-			let best = null;
-			for (const [leaf, up] of feet) {
-				const dx = (at(t, leaf, 0) + at(t, up, 0) - at(t - 1, leaf, 0) - at(t - 1, up, 0)) / 2;
-				const dz = (at(t, leaf, 2) + at(t, up, 2) - at(t - 1, leaf, 2) - at(t - 1, up, 2)) / 2;
-				const h = Math.min(at(t, leaf, 1), at(t, up, 1)) - floor;
-				if ((dx * fx + dz * fz) / fn < 0 && h < high && (!best || h < best.h)) best = { dx, dz, h };
+			const moves = feet.map(([leaf, up]) => ({
+				dx: (at(t, leaf, 0) + at(t, up, 0) - at(t - 1, leaf, 0) - at(t - 1, up, 0)) / 2,
+				dz: (at(t, leaf, 2) + at(t, up, 2) - at(t - 1, leaf, 2) - at(t - 1, up, 2)) / 2,
+				h: Math.min(at(t, leaf, 1), at(t, up, 1)) - floor,
+			}));
+			const lowest = Math.min(...moves.map((m) => m.h));
+			let sw = 0, sx = 0, sz = 0;
+			for (const m of moves) {
+				const back = -(m.dx * fx + m.dz * fz) / fn;
+				const c = Math.exp(-(m.h - lowest) / (0.02 * H)) * sig((0.1 * H - m.h) / (0.01 * H)) * sig(back / (0.002 * H));
+				sw += c; sx += c * m.dx; sz += c * m.dz;
 			}
-			if (best) step = [-best.dx, -best.dz];
-			sum = [sum[0] + step[0], sum[1] + step[1]];
+			if (sw > 1e-3) held = [-sx / sw, -sz / sw];
+			steps[t * 2] = held[0];
+			steps[t * 2 + 1] = held[1];
+		}
+		steps[0] = steps[2];
+		steps[1] = steps[3];
+		smoothRows(steps, T, 2, smooth);
+		let sum = [0, 0];
+		for (let t = 1; t < T; t++) {
+			sum = [sum[0] + steps[t * 2], sum[1] + steps[t * 2 + 1]];
 			root[t * 3] += sum[0];
 			root[t * 3 + 2] += sum[1];
 		}
