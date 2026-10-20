@@ -212,9 +212,19 @@ The reply is `{ finder, report }`. The report gives `held_out_px`, the
 distance from each held-out picture's joints to where the finder puts them
 (`median`, `mean`, `p90`, and `within`, the share inside `near` pixels). It
 also gives `worst_joints` and the loss over the epochs. Encoding the pictures
-takes most of the time, about a quarter of a second each. The head itself
-trains in a minute or two. The request blocks until training is done, so
-run it with no client timeout.
+takes most of the time, about 0.3 s each on an RX 7800 XT. The head itself
+trains in a few minutes. The request blocks until training is done (about 25
+minutes for 4500 pictures), so run it with no client timeout.
+
+What to expect, from a 70-joint humanoid with a tail (4500 pictures, front,
+left and right cameras, 40 joints found):
+- Held out: a median of 7.5 px on 448-pixel pictures. The worst joints are
+  the finger roots, where the hands are mistaken for each other.
+- An exam from two cameras: joints found a median of 6 px from where they
+  were drawn, and fitted a median of 4% of the rig's height from the truth.
+- A real two-camera walk: the same body lean and foot spacing as SAM 3D
+  Body's two-view fusion gives for that clip, within a degree and a
+  centimetre.
 
 #### `POST /detect`
 
@@ -246,9 +256,15 @@ the joints, fits the rig and grades it:
     finder=zidane.finder.safetensors exam=/data/zidane_exam
 ```
 
-It reports how far the found joints are from the drawn ones, in pixels, and
-how far each bone's direction is from the truth's in the root's frame, in
-degrees.
+It reports two things:
+- how far the found joints are from the drawn ones, in pixels;
+- how far each fitted joint is from the truth, measured from the root as a
+  share of the rig's height. It passes under 12 px and 6%.
+
+Bone directions in degrees are printed too. Short bones (a finger's root, a
+toe's tip) turn tens of degrees on a few pixels, so those numbers show where
+the fit goes wrong rather than how wrong the clip looks. `tracks_out=` keeps
+what was found, and `tracks_in=` fits it again without the GPU.
 
 ### `GET /info`
 

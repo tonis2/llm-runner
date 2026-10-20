@@ -137,7 +137,7 @@ export class RigFit {
 	// view or each its own. `foot` the feet's share of the leg plane: firm while
 	// the view's yaw is found, loose after. `sigma` the reprojection's
 	// robust scale in pixels: tracks stray, exact labels may be trusted wider.
-	constructor(rig, views, { pitch = 8, k0 = 1000, foot = W_PLANE, sigma = 15 } = {}) {
+	constructor(rig, views, { pitch = 8, k0 = 1000, foot = W_PLANE, sigma = 15, weights = null } = {}) {
 		views = Array.isArray(views) ? views : [views];
 		const J = rig.names.length, V = views.length;
 		this.rig = rig;
@@ -187,7 +187,7 @@ export class RigFit {
 		this.gPos = new Float64Array(T * J * 3);
 		this.gM = new Float64Array(T * this.M * 3);
 		this.rootTau = new Float64Array(T * 3);   // the root's turn's own share (its frame in the lateral terms)
-		this.weights = { reproj: 1, acc: 2, thetaAcc: 2, twist: 1, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10 };
+		this.weights = { reproj: 1, acc: 2, thetaAcc: 2, twist: 1, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10, ...weights };
 		// The limited joints, their frames normalised; an axis whose range is a
 		// whole turn is free.
 		this.limits = (rig.limits ?? []).filter((l) => l.joint > 0).map((l) => {
@@ -801,7 +801,7 @@ function blendPose(f, solved, t) {
  * the whole clip after a search over the first keyframe's yaw (and each other
  * view's); `onStep(done, total)` as it goes.
  */
-export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null } = {}) {
+export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null } = {}) {
 	const t0 = llm.now();
 	if (!Array.isArray(views)) views = [{ tracks: views }];
 	const V = views.length, T = views[0].tracks.frames, J = rig.names.length;
@@ -824,7 +824,7 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 	let done = 0;
 	let best = null;
 	for (let i = 0; i < yaws; i++) {
-		const f = new RigFit(rig, keyObs, { pitch: pitches[0], k0 });
+		const f = new RigFit(rig, keyObs, { pitch: pitches[0], k0, weights });
 		f.cam[0] = (i * 2 * Math.PI) / yaws;
 		aim(f);
 		const loss = f.run(initSteps, { tau0: 20, tau1: 20 });
@@ -840,7 +840,7 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 	let solved = [{ key, f: best.f, centres: [centroid(keyObs, 0)] }];
 	for (const k of keys.slice(1)) {
 		const o = keyframeObservations(obs, tracks, k);
-		const f = new RigFit(rig, o, { pitch: pitches[0], k0 });
+		const f = new RigFit(rig, o, { pitch: pitches[0], k0, weights });
 		f.theta.set(best.f.theta);
 		f.root.set(best.f.root);
 		f.logS.set(best.f.logS);
@@ -869,7 +869,7 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 			const k = keysOf[v][0], os = Array.from({ length: v + 1 }, (_, u) => at(u, k));
 			let bestV = null;
 			for (let i = 0; i < yaws; i++) {
-				const f = new RigFit(rig, os, { pitch: pitches.slice(0, v + 1), k0, sigma: WIDE });
+				const f = new RigFit(rig, os, { pitch: pitches.slice(0, v + 1), k0, sigma: WIDE, weights });
 				const [a, b, s] = blendPose(f, solved, k);
 				f.marks.set(marks);
 				for (let u = 0; u < v; u++) {
@@ -896,7 +896,7 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 		const both = [];
 		for (const k of allKeys) {
 			const os = all.map((_, v) => at(v, k));
-			const f = new RigFit(rig, os, { pitch: pitches, k0, sigma: WIDE });
+			const f = new RigFit(rig, os, { pitch: pitches, k0, sigma: WIDE, weights });
 			const [a, b, s] = blendPose(f, solved, k);
 			f.marks.set(marks);
 			for (let v = 0; v < V; v++) {
@@ -915,7 +915,7 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 
 	// Every frame from the keyframes either side of it, blended by time, aimed
 	// where each view's points are.
-	const fit = new RigFit(rig, all, { pitch: V > 1 ? pitches : pitches[0], k0, foot: W_FOOT });
+	const fit = new RigFit(rig, all, { pitch: V > 1 ? pitches : pitches[0], k0, foot: W_FOOT, weights });
 	for (let t = 0; t < T; t++) {
 		const [a, b, s] = bracket(solved, t);
 		for (let i = 0; i < J * 3; i++) fit.theta[t * J * 3 + i] = lerp(a.f.theta[i], b.f.theta[i], s);
