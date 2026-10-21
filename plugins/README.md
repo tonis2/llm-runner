@@ -165,14 +165,14 @@ trusted code: they read and write files and run kernels on the GPU.
 `model=` takes NVIDIA's release as it is downloaded — no conversion:
 
 ```
-huggingface-cli download nvidia/Kimodo-SOMA-RP-v1.1 model.safetensors --local-dir Kimodo-SOMA-RP-v1.1
-llm-runner kimodo model=Kimodo-SOMA-RP-v1.1 text_model=Llama-3-Kimodo-Q8_0.gguf prompt="a person waves"
+huggingface-cli download nvidia/Kimodo-SOMA-RP-v1.2 model.safetensors --local-dir Kimodo-SOMA-RP-v1.2
+llm-runner kimodo model=Kimodo-SOMA-RP-v1.2 text_model=Llama-3-Kimodo-Q8_0.gguf prompt="a person waves"
 ```
 
 `model=` is the folder or its `.safetensors`, under any name. The motion
 statistics (the release's `stats/motion/`, six small `.npy` files) are carried
 by the plugin for the models it recognises (`kimodo/stats.js`, currently
-Kimodo-SOMA-RP-v1.1, licensed by NVIDIA Corporation under the NVIDIA Open Model
+Kimodo-SOMA-RP-v1.1 and v1.2, licensed by NVIDIA Corporation under the NVIDIA Open Model
 License, `kimodo/NVIDIA-LICENSE.txt`), so for those the weights file is the
 whole download; for any other, put `stats/motion/` beside the weights, which is
 also read first when it is there. `config.yaml` is

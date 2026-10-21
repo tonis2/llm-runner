@@ -4,19 +4,24 @@
 // the release's stats/motion/{global_root,local_root,body}/{mean,std}.npy,
 // written out as numbers, so the .safetensors is the only download.
 //
-// A model is recognised by `fingerprint`: FNV-1a (32-bit) over the float32
-// bytes of root_model.output_linear.bias and then body_model.output_linear.bias.
-// Weights that match none of these need stats/motion/ beside them.
+// A model is recognised by its `fingerprint` in `models`: FNV-1a (32-bit) over
+// the float32 bytes of root_model.output_linear.bias and then
+// body_model.output_linear.bias. Releases trained on the same data share one
+// set of statistics. Weights that match none of these need stats/motion/
+// beside them.
 //
 // Licensed by NVIDIA Corporation under the NVIDIA Open Model License
 // (NVIDIA-LICENSE.txt beside this file; NOTICE.txt).
 //
-// Generated from huggingface.co/nvidia/Kimodo-SOMA-RP-v1.1.
+// Generated from huggingface.co/nvidia/Kimodo-SOMA-RP-v1.1; v1.2's .npy files
+// are the same bytes.
 
 export const KNOWN_STATS = [
 	{
-		name: 'Kimodo-SOMA-RP-v1.1',
-		fingerprint: '524f7762',
+		models: [
+			{ name: 'Kimodo-SOMA-RP-v1.1', fingerprint: '524f7762' },
+			{ name: 'Kimodo-SOMA-RP-v1.2', fingerprint: '81018ef5' },
+		],
 		globalMean: [0.004111838927004873, 0.9306212905410333, 0.00016111313885628828, -0.00012825174297690725, 0.0004943913734391799],
 		globalStd: [1.4547986066033511, 0.1732659140957635, 1.4642333908131662, 0.7071319020343809, 0.7070814747853515],
 		localMean: [1.4260418404676708e-05, -0.0002269335193062295, -0.0001386226508586951, 0.9306212905410333],

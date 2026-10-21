@@ -5,7 +5,9 @@
 // hyperparameters as `kimodo.*` metadata.
 //
 // NVIDIA's release (huggingface.co/nvidia/Kimodo-*) is the same weights,
-// byte for byte, as model.safetensors, with the motion statistics beside it:
+// byte for byte, as model.safetensors, with the motion statistics beside it.
+// The tensors are named under `denoiser.backbone.` up to v1.1 and without it
+// from v1.2 on:
 //
 //   model.safetensors                       the two stages, float32
 //   stats/motion/{global_root,local_root,body}/{mean,std}.npy
@@ -78,12 +80,12 @@ function openRelease(path) {
 	if (!llm.exists(weights)) throw new Error(`${weights} does not exist`);
 
 	const m = llm.open(weights);
-	const prefix = 'denoiser.backbone.';
-	const root = `${prefix}root_model.`;
-	if (!m.has(`${root}input_linear.weight`)) {
+	const prefix = ['denoiser.backbone.', ''].find((p) => m.has(`${p}root_model.input_linear.weight`));
+	if (prefix === undefined) {
 		m.close();
 		throw new Error(`${weights} is not a Kimodo motion model`);
 	}
+	const root = `${prefix}root_model.`;
 	// The motion's width is what the two stages write: the root stage the
 	// global root, the body stage the rest.
 	const motionDim = m.shape(`${root}output_linear.weight`)[1] + m.shape(`${prefix}body_model.output_linear.weight`)[1];
@@ -142,12 +144,13 @@ function releaseStats(dir, m, prefix, weights) {
 		return stats;
 	}
 	const fingerprint = weightsFingerprint(m, prefix);
-	const known = KNOWN_STATS.find((k) => k.fingerprint === fingerprint);
+	let model;
+	const known = KNOWN_STATS.find((k) => (model = k.models.find((n) => n.fingerprint === fingerprint)));
 	if (!known) {
 		throw new Error(`${weights} is not a Kimodo model this plugin carries the motion statistics for `
 			+ `(fingerprint ${fingerprint}): put the stats/motion/ folder from its Hugging Face page beside it`);
 	}
-	llm.print(`  [kimodo motion] statistics of ${known.name}, carried by the plugin`);
+	llm.print(`  [kimodo motion] statistics of ${model.name}, carried by the plugin`);
 	const stats = {};
 	for (const [key] of STAT_PARTS) {
 		stats[`${key}Mean`] = Float32Array.from(known[`${key}Mean`]);
