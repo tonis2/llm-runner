@@ -12,9 +12,11 @@
 // puts the walk back: the root moves by what the planted feet slide back. Each
 // foot is planted by degrees (low, near the lowest, sliding back against where
 // the body faces), so the step passes from one foot to the other without a
-// jolt, and the steps are smoothed over `smooth` frames.
+// jolt, and the steps are smoothed over `smooth` frames. With known cameras (a
+// studio clip) the root already moves as the cameras saw it, on their floor:
+// it is kept as fitted, and `travel` is the length of its path.
 
-import { motionGlb } from '../kimodo/glb.js';
+import { motionGlb } from '../lib/motion/glb.js';
 import { motionBvh } from '../lib/bvh.js';
 import { utf8 } from '../lib/graph/plugins.js';
 import { qmul, qconj, qrotate } from './rig.js';
@@ -46,12 +48,16 @@ export function fittedMotion(fit, rig, { fps = 24, travel = true, smooth = 25 } 
 		}
 		root.set(p.root.subarray(t * 3, t * 3 + 3), t * 3);
 	}
-	// The floor: the clip's lowest foot point on y = 0.
-	let floor = Infinity;
-	for (let t = 0; t < T; t++) for (const f of p.feet) floor = Math.min(floor, p.pos[(t * J + f) * 3 + 1]);
+	let moved = 0;
+	if (p.knownCameras) {
+		for (let t = 1; t < T; t++) moved += Math.hypot(root[t * 3] - root[t * 3 - 3], root[t * 3 + 2] - root[t * 3 - 1]);
+		travel = false;
+	}
+	// The floor: the clip's lowest foot point on y = 0 (the cameras' own, when known).
+	let floor = p.knownCameras ? 0 : Infinity;
+	for (let t = 0; t < T && !p.knownCameras; t++) for (const f of p.feet) floor = Math.min(floor, p.pos[(t * J + f) * 3 + 1]);
 	if (Number.isFinite(floor)) for (let t = 0; t < T; t++) root[t * 3 + 1] -= floor;
 
-	let moved = 0;
 	if (travel && p.footLeaves.length && T > 1) {
 		// Each foot as its leaf and the joint above. How planted it is: near the
 		// lowest foot's height (within a few hundredths of the rig), low (under a

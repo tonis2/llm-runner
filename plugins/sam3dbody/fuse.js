@@ -15,7 +15,7 @@
 // is first turned about +y onto the front one's facing (its camera stands about
 // a quarter turn round), each view stood level on its own floor.
 
-import { forward, between, rotate, mul, conjugate, unit, slerp, normalized, fromAxes, cross, dot, add, scaled, axisAngle } from '../kimodo/rotation.js';
+import { forward, between, rotate, mul, conjugate, unit, slerp, normalized, fromAxes, cross, dot, add, scaled, axisAngle } from '../lib/motion/rotation.js';
 import { MotionSkeleton, clipProportions } from './skeleton.js';
 import { poseRows, smoothMotion, levelFloor, footPositions, finishMotion, faceForward, headings, meanAngle } from './motion.js';
 

@@ -46,10 +46,10 @@ import { KimodoTextEncoder } from './encoder.js';
 import { KimodoDenoiser } from './denoiser.js';
 import { decodeMotion } from './motion.js';
 import { writeText } from '../lib/graph/plugins.js';
-import { writeMotionGlb, motionGlb } from './glb.js';
+import { writeMotionGlb, motionGlb } from '../lib/motion/glb.js';
 import { SKELETONS } from './skeletons.js';
 import { restPositions, placePoses, encodePoses } from './poses.js';
-import { canCleanUp, cleanUpMotion } from './cleanup.js';
+import { canCleanUp, cleanUpMotion } from '../lib/motion/cleanup.js';
 
 function compare(a, b) {
 	let dot = 0, na = 0, nb = 0, maxDiff = 0;

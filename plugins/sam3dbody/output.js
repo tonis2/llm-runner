@@ -3,7 +3,7 @@
 // camera, camera translation, 2D keypoints and foot contacts, for an overlay,
 // and its MHR model parameters, to make the clip again from (`readPosed`).
 
-import { motionGlb } from '../kimodo/glb.js';
+import { motionGlb } from '../lib/motion/glb.js';
 import { motionBvh } from '../lib/bvh.js';
 import { KEYPOINT_NAMES } from './keypoints.js';
 

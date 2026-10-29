@@ -10,7 +10,7 @@
 // towards it sinks or climbs: the floor is fitted as a plane under the feet
 // over the whole clip, and the clip turned about the camera to stand it level.
 
-import { forward, between, rotate, mul, axisAngle } from '../kimodo/rotation.js';
+import { forward, between, rotate, mul, axisAngle } from '../lib/motion/rotation.js';
 import { MotionSkeleton, clipProportions } from './skeleton.js';
 import { smoothRows } from '../lib/smooth.js';
 

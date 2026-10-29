@@ -65,7 +65,7 @@ import { KEYPOINT_NAMES, drawPreview } from './keypoints.js';
 import { listFrames, poseFrames, holdHands } from './frames.js';
 import { assembleMotion } from './motion.js';
 import { fuseViews } from './fuse.js';
-import { cleanUpMotion } from '../kimodo/cleanup.js';
+import { cleanUpMotion } from '../lib/motion/cleanup.js';
 import { clipGlb, clipBvh, framesJson, readPosed } from './output.js';
 
 const round = (v, d = 5) => Number(v.toFixed(d));

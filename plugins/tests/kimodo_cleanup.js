@@ -5,8 +5,8 @@
 import { llm } from '../lib/llm.js';
 import { SKELETONS } from '../kimodo/skeletons.js';
 import { restPositions, placePoses, globalTurns, encodePoses } from '../kimodo/poses.js';
-import { cleanUpMotion } from '../kimodo/cleanup.js';
-import { forward, axisAngle, mul, rotate, sub, length, IDENTITY } from '../kimodo/rotation.js';
+import { cleanUpMotion } from '../lib/motion/cleanup.js';
+import { forward, axisAngle, mul, rotate, sub, length, IDENTITY } from '../lib/motion/rotation.js';
 
 const sk = SKELETONS.soma30;
 const J = sk.parents.length;

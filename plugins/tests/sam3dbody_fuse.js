@@ -14,7 +14,7 @@
 //    90 degrees round, and the clip faces +z. One camera's clip faces +z too
 //    unless `facing` is 'camera'.
 import { llm } from '../lib/llm.js';
-import { forward, between, rotate, mul, conjugate, unit, normalized } from '../kimodo/rotation.js';
+import { forward, between, rotate, mul, conjugate, unit, normalized } from '../lib/motion/rotation.js';
 import { MHR, MODEL_PARAMS } from '../sam3dbody/mhr.js';
 import { MotionSkeleton } from '../sam3dbody/skeleton.js';
 import { assembleMotion, headings, meanAngle } from '../sam3dbody/motion.js';

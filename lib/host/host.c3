@@ -38,6 +38,13 @@ import std::collections::list;
 import std::time::clock;
 import std::encoding::base64;
 
+<*
+ Which set of host verbs this is. `plugins/lib/lib.json` says which it needs
+ (`host`); raise this when a verb is added or changes, so a newer lib is
+ refused with a reason instead of failing on a missing verb.
+*>
+const int API = 1;
+
 // --- Handle tables ---------------------------------------------------------------
 
 struct ModelSlot

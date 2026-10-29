@@ -150,6 +150,7 @@ class Adam {
 		this.t++;
 		const c1 = 1 - 0.9 ** this.t, c2 = 1 - 0.999 ** this.t;
 		for (const g of this.groups) {
+			if (!g.lr) continue;
 			const { value, grad, m, v } = g, lr = g.lr * scale;
 			for (let i = 0; i < value.length; i++) {
 				const d = grad[i];
@@ -171,8 +172,9 @@ export class RigFit {
 	// the view's yaw is found, loose after. `sigma` the reprojection's
 	// robust scale in pixels: tracks stray, exact labels may be trusted wider.
 	// `fixed`: per marker, its offset when it is known (a point of the mesh) and
-	// held, or null to fit it.
-	constructor(rig, views, { pitch = 8, k0 = 1000, foot = W_PLANE, sigma = 15, weights = null, fixed = null } = {}) {
+	// held, or null to fit it. `cameras`: per view { yaw, pitch, logS, shift
+	// [x, y] } when they are known (a studio clip's), set and held.
+	constructor(rig, views, { pitch = 8, k0 = 1000, foot = W_PLANE, sigma = 15, weights = null, fixed = null, cameras = null } = {}) {
 		views = Array.isArray(views) ? views : [views];
 		const J = rig.names.length, V = views.length;
 		this.rig = rig;
@@ -213,6 +215,16 @@ export class RigFit {
 		this.shift = new Float64Array(V * T * 2);
 		this.cam = new Float64Array(2 * V);
 		for (let v = 0; v < V; v++) this.cam[2 * v + 1] = this.pitchPriors[v];
+		this.knownCameras = !!cameras;
+		if (cameras) {
+			for (let v = 0; v < V; v++) {
+				const c = cameras[v];
+				this.cam[2 * v] = c.yaw;
+				this.cam[2 * v + 1] = this.pitchPriors[v] = c.pitch;
+				this.logS.fill(c.logS, v * T, (v + 1) * T);
+				for (let t = v * T; t < (v + 1) * T; t++) { this.shift[t * 2] = c.shift[0]; this.shift[t * 2 + 1] = c.shift[1]; }
+			}
+		}
 		this.g = {
 			theta: new Float64Array(T * J * 3), root: new Float64Array(T * 3), marks: new Float64Array(this.M * 3),
 			logS: new Float64Array(V * T), shift: new Float64Array(V * T * 2), cam: new Float64Array(2 * V),
@@ -752,9 +764,9 @@ export class RigFit {
 			{ value: this.theta, grad: this.g.theta, lr: lr.theta ?? 0.01 },
 			{ value: this.root, grad: this.g.root, lr: lr.root ?? 1 / k0 },
 			{ value: this.marks, grad: this.g.marks, lr: lr.marks ?? 1 / k0 },
-			{ value: this.logS, grad: this.g.logS, lr: lr.logS ?? 0.002 },
-			{ value: this.shift, grad: this.g.shift, lr: lr.shift ?? 1 },
-			{ value: this.cam, grad: this.g.cam, lr: lr.cam ?? 0.003 },
+			{ value: this.logS, grad: this.g.logS, lr: this.knownCameras ? 0 : lr.logS ?? 0.002 },
+			{ value: this.shift, grad: this.g.shift, lr: this.knownCameras ? 0 : lr.shift ?? 1 },
+			{ value: this.cam, grad: this.g.cam, lr: this.knownCameras ? 0 : lr.cam ?? 0.003 },
 		]);
 		let loss = 0;
 		for (let it = 0; it < iterations; it++) {
@@ -859,6 +871,43 @@ function aim(f, v = 0) {
 	f.shift[v * 2 + 1] = c[1] - proj.reduce((s, q) => s + q[1], 0) / proj.length;
 }
 
+// Move the root of a one-frame fit with known cameras so its points' centre
+// lands on theirs in every view, by least squares: what aim() does to a
+// searched camera's shift, done to the rig instead.
+function placeRoot(f) {
+	const A = new Float64Array(9), b = new Float64Array(3);
+	for (let v = 0; v < f.V; v++) {
+		const o = f.views[v], H = o.H, c = centroid(o, 0);
+		if (!c) continue;
+		const seen = (p) => { for (let h = 0; h < H; h++) if (o.w[p * H + h] > 0) return true; return false; };
+		const proj = f.projections(v)[0].filter((_, p) => seen(p));
+		if (!proj.length) continue;
+		const yaw = f.cam[2 * v], pitch = f.cam[2 * v + 1], s = Math.exp(f.logS[v * f.T]);
+		const rows = [
+			[s * Math.cos(yaw), 0, s * Math.sin(yaw)],
+			[s * Math.sin(pitch) * Math.sin(yaw), s * Math.cos(pitch), -s * Math.sin(pitch) * Math.cos(yaw)],
+		];
+		const miss = [0, 1].map((d) => c[d] - proj.reduce((sum, q) => sum + q[d], 0) / proj.length);
+		rows.forEach((r, d) => {
+			for (let i = 0; i < 3; i++) {
+				b[i] += r[i] * miss[d];
+				for (let k = 0; k < 3; k++) A[i * 3 + k] += r[i] * r[k];
+			}
+		});
+	}
+	// Along a line no view sees (one view's depth), stay put.
+	const ridge = 1e-6 * (A[0] + A[4] + A[8] + 1e-12);
+	for (let i = 0; i < 3; i++) A[i * 4] += ridge;
+	const det3 = (m) => m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+	const D = det3(A);
+	if (!(Math.abs(D) > 0)) return;
+	for (let i = 0; i < 3; i++) {
+		const M = Float64Array.from(A);
+		for (let r = 0; r < 3; r++) M[r * 3 + i] = b[r];
+		f.root[i] += det3(M) / D;
+	}
+}
+
 // The solved keyframes either side of frame t and how far between: [a, b, s].
 function bracket(solved, t) {
 	let n = 0;
@@ -886,11 +935,13 @@ function startFrom(f, from) {
 }
 
 /**
- * Fits `rig` (rig.js) to `views`: [{ tracks (track.js), pitch? }], frame N of
- * each the same moment (or one view's tracks alone). Returns { problem (the
- * RigFit, solved), projections (the first view's), report }. `iterations` of
- * the whole clip after a search over the first keyframe's yaw (and each other
- * view's); `onStep(done, total)` as it goes.
+ * Fits `rig` (rig.js) to `views`: [{ tracks (track.js), pitch?, camera? }],
+ * frame N of each the same moment (or one view's tracks alone). Returns {
+ * problem (the RigFit, solved), projections (the first view's), report }.
+ * `iterations` of the whole clip after a search over the first keyframe's yaw
+ * (and each other view's), or, with every view's `camera` given (studio.js:
+ * a studio clip's, held), after each keyframe alone in all the views;
+ * `onStep(done, total)` as it goes.
  */
 export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, confidence = null } = {}) {
 	const t0 = llm.now();
@@ -907,132 +958,167 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 	const tracks = views[0].tracks, obs = all[0];
 	const keys = keysOf[0], key = keys[0];
 	const keyObs = keyframeObservations(obs, tracks, key);
-	const k0 = pixelsPerUnit(rig, keyObs);
+	// Known cameras (a studio clip's): nothing to search for, and the root moves
+	// in the world as the cameras saw it, so the priors that stand in for a
+	// following camera (in place, heading, the floor at the lowest foot) are off.
+	const cameras = views.every((v) => v.camera) ? views.map((v) => v.camera) : null;
+	if (cameras) weights = { inPlace: 0, heading: 0, floor: 0, ...weights };
+	const k0 = cameras ? Math.exp(cameras[0].logS) : pixelsPerUnit(rig, keyObs);
 
-	// The first keyframe alone, from rest, over a ring of yaws: which way the
-	// animal faces, and where the markers sit.
 	const allKeys = [...new Set(keysOf.flat())].sort((x, y) => x - y);
 	const initSteps = 400, yaws = 12;
-	const total = V * yaws + keys.length - 1 + (V > 1 ? allKeys.length : 0) + iterations / 10;
-	let done = 0;
-	let best = null;
-	for (let i = 0; i < yaws; i++) {
-		const f = new RigFit(rig, keyObs, { pitch: pitches[0], k0, sigma, weights, fixed });
-		f.cam[0] = (i * 2 * Math.PI) / yaws;
-		aim(f);
-		const loss = f.run(initSteps, { tau0: 20, tau1: 20 });
-		const err = f.terms.reproj;
-		if (!best || err < best.err) best = { f, err, loss, yaw: f.cam[0] };
-		onStep?.(++done, total);
-	}
-	llm.print(`  start: frame ${key} alone, yaw ${(best.yaw / DEG).toFixed(0)}° fits best (reprojection ${best.err.toFixed(1)})`);
-
-	// Every other keyframe alone, in order, with that camera and those markers,
-	// from the first's pose and from the keyframe's before it, the better kept:
-	// a clip that leaves its first pose far behind (arms out, then down) starts
-	// near each of its poses, and a pose that is a fold of the one before it (a
-	// chest bent one way and the neck the other, which a short bone's error
-	// along itself asks for) does not win against carrying on.
-	let solved = [{ key, f: best.f, centres: [centroid(keyObs, 0)] }];
-	for (const k of keys.slice(1)) {
-		const o = keyframeObservations(obs, tracks, k);
-		let kept = null;
-		for (const from of [best.f, solved[solved.length - 1].f]) {
-			if (kept && from === best.f) continue;
-			const f = new RigFit(rig, o, { pitch: pitches[0], k0, sigma, weights, fixed });
-			startFrom(f, from);
-			f.marks.set(best.f.marks);
-			f.cam.set(best.f.cam);
-			aim(f);
-			const loss = f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
-			if (!kept || loss < kept.loss) kept = { f, loss };
-		}
-		solved.push({ key: k, f: kept.f, centres: [centroid(o, 0)] });
-		onStep?.(++done, total);
-	}
-	if (solved.length > 1) llm.print(`  keyframes ${keys.join(', ')} alone: reprojection ${solved.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
-
-	let marks = Float64Array.from(best.f.marks);
-	let cams = [{ cam: Array.from(best.f.cam), logS: null }];
 	// View v's observations on keyframe k: its labels there, or every hypothesis.
 	const at = (v, k) => (keysOf[v].includes(k) ? keyframeObservations(all[v], views[v].tracks, k) : frameObservations(all[v], k));
-	let lastSearch;
-	if (V > 1) {
-		// Each other view's camera: its first keyframe over a ring of yaws, solved
-		// with the views placed before it and the pose free, since one view
-		// alone may have a limb the wrong way along its line of sight (a stride
-		// backwards): only the right yaw lets every view fit at once. The best
-		// ring's cameras and markers are kept. Labels are trusted wide here
-		// (WIDE px): a limb the first view put the wrong way along its line of
-		// sight is that far off in another, and must still be pulled round.
-		for (let v = 1; v < V; v++) {
-			const k = keysOf[v][0], os = Array.from({ length: v + 1 }, (_, u) => at(u, k));
-			let bestV = null;
-			for (let i = 0; i < yaws; i++) {
-				const f = new RigFit(rig, os, { pitch: pitches.slice(0, v + 1), k0, sigma: WIDE, weights, fixed });
-				const [a, b, s] = blendPose(f, solved, k);
-				f.marks.set(marks);
-				for (let u = 0; u < v; u++) {
-					f.cam[2 * u] = cams[u].cam[0];
-					f.cam[2 * u + 1] = cams[u].cam[1];
-					f.logS[u] = u === 0 ? lerp(a.f.logS[0], b.f.logS[0], s) : cams[u].logS;
-					aim(f, u);
-				}
-				f.logS[v] = Math.log(pixelsPerUnit(rig, os[v]));
-				f.cam[2 * v] = (i * 2 * Math.PI) / yaws;
-				aim(f, v);
-				f.run(initSteps, { tau0: 20, tau1: 20 });
-				if (!bestV || f.terms.reproj < bestV.err) bestV = { f, err: f.terms.reproj };
-				onStep?.(++done, total);
-			}
-			cams = Array.from({ length: v + 1 }, (_, u) => ({ cam: [bestV.f.cam[2 * u], bestV.f.cam[2 * u + 1]], logS: bestV.f.logS[u] }));
-			marks = Float64Array.from(bestV.f.marks);
-			if (v === V - 1 && k === allKeys[0]) lastSearch = bestV.f;
-			llm.print(`  view ${v}: frame ${k} with the views before it, yaw ${(bestV.f.cam[2 * v] / DEG).toFixed(0)}° fits best (reprojection ${bestV.err.toFixed(1)}; yaws now ${cams.map((c) => (c.cam[0] / DEG).toFixed(0)).join('°, ')}°)`);
-		}
-
-		// Every keyframe of every view again, all views together, the cameras
-		// held, the labels trusted wide: what one view leaves along its line of
-		// sight, another sees.
-		// Each from the one-view keyframes blended, and from the keyframe before
-		// it in all the views (the first from the last camera search's pose),
-		// the better kept.
-		const both = [];
-		let before = lastSearch;
+	let total, done = 0, best = null, solved, marks, cams;
+	if (cameras) {
+		// Each keyframe in every view, in time order, from rest placed where its
+		// points are and from the keyframe before it, the better kept. Labels are
+		// trusted wide (WIDE px), as below: a limb one view puts the wrong way
+		// along its line of sight must still be pulled round by the other.
+		total = allKeys.length + iterations / 10;
+		solved = [];
+		let before = null;
 		for (const k of allKeys) {
 			const os = all.map((_, v) => at(v, k));
 			let kept = null;
-			for (const from of [null, before]) {
-				if (from === undefined) continue;
-				const f = new RigFit(rig, os, { pitch: pitches, k0, sigma: WIDE, weights, fixed });
-				const [a, b, s] = blendPose(f, solved, k);
-				f.marks.set(marks);
-				for (let v = 0; v < V; v++) {
-					f.cam[2 * v] = cams[v].cam[0];
-					f.cam[2 * v + 1] = cams[v].cam[1];
-					f.logS[v] = v === 0 ? lerp(a.f.logS[0], b.f.logS[0], s) : cams[v].logS;
+			for (const from of before ? [null, before] : [null]) {
+				const f = new RigFit(rig, os, { pitch: pitches, k0, sigma: WIDE, weights, fixed, cameras });
+				if (from) {
+					f.theta.set(from.theta.subarray(0, J * 3));
+					f.root.set(from.root.subarray(0, 3));
+					f.marks.set(from.marks);
+				} else {
+					placeRoot(f);
 				}
-				if (from) startFrom(f, from);
-				for (let v = 0; v < V; v++) aim(f, v);
-				const loss = f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
+				const loss = f.run(initSteps, { tau0: 20, tau1: 20 });
 				if (!kept || loss < kept.loss) kept = { f, loss };
 			}
 			before = kept.f;
-			both.push({ key: k, f: kept.f, centres: os.map((o) => centroid(o, 0)) });
+			solved.push({ key: k, f: kept.f });
 			onStep?.(++done, total);
 		}
-		llm.print(`  keyframes ${allKeys.join(', ')} in all ${V} views: reprojection ${both.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
-		solved = both;
+		marks = Float64Array.from(before.marks);
+		llm.print(`  known cameras (yaws ${cameras.map((c) => (c.yaw / DEG).toFixed(1)).join('°, ')}°): keyframes ${allKeys.join(', ')} in all ${V} views, reprojection ${solved.map((x) => x.f.terms.reproj.toFixed(1)).join(', ')}`);
+	} else {
+	// The first keyframe alone, from rest, over a ring of yaws: which way the
+	// animal faces, and where the markers sit.
+	total = V * yaws + keys.length - 1 + (V > 1 ? allKeys.length : 0) + iterations / 10;
+		for (let i = 0; i < yaws; i++) {
+			const f = new RigFit(rig, keyObs, { pitch: pitches[0], k0, sigma, weights, fixed });
+			f.cam[0] = (i * 2 * Math.PI) / yaws;
+			aim(f);
+			const loss = f.run(initSteps, { tau0: 20, tau1: 20 });
+			const err = f.terms.reproj;
+			if (!best || err < best.err) best = { f, err, loss, yaw: f.cam[0] };
+			onStep?.(++done, total);
+		}
+		llm.print(`  start: frame ${key} alone, yaw ${(best.yaw / DEG).toFixed(0)}° fits best (reprojection ${best.err.toFixed(1)})`);
+
+		// Every other keyframe alone, in order, with that camera and those markers,
+		// from the first's pose and from the keyframe's before it, the better kept:
+		// a clip that leaves its first pose far behind (arms out, then down) starts
+		// near each of its poses, and a pose that is a fold of the one before it (a
+		// chest bent one way and the neck the other, which a short bone's error
+		// along itself asks for) does not win against carrying on.
+		solved = [{ key, f: best.f, centres: [centroid(keyObs, 0)] }];
+		for (const k of keys.slice(1)) {
+			const o = keyframeObservations(obs, tracks, k);
+			let kept = null;
+			for (const from of [best.f, solved[solved.length - 1].f]) {
+				if (kept && from === best.f) continue;
+				const f = new RigFit(rig, o, { pitch: pitches[0], k0, sigma, weights, fixed });
+				startFrom(f, from);
+				f.marks.set(best.f.marks);
+				f.cam.set(best.f.cam);
+				aim(f);
+				const loss = f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
+				if (!kept || loss < kept.loss) kept = { f, loss };
+			}
+			solved.push({ key: k, f: kept.f, centres: [centroid(o, 0)] });
+			onStep?.(++done, total);
+		}
+		if (solved.length > 1) llm.print(`  keyframes ${keys.join(', ')} alone: reprojection ${solved.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
+
+		marks = Float64Array.from(best.f.marks);
+		cams = [{ cam: Array.from(best.f.cam), logS: null }];
+		let lastSearch;
+		if (V > 1) {
+			// Each other view's camera: its first keyframe over a ring of yaws, solved
+			// with the views placed before it and the pose free, since one view
+			// alone may have a limb the wrong way along its line of sight (a stride
+			// backwards): only the right yaw lets every view fit at once. The best
+			// ring's cameras and markers are kept. Labels are trusted wide here
+			// (WIDE px): a limb the first view put the wrong way along its line of
+			// sight is that far off in another, and must still be pulled round.
+			for (let v = 1; v < V; v++) {
+				const k = keysOf[v][0], os = Array.from({ length: v + 1 }, (_, u) => at(u, k));
+				let bestV = null;
+				for (let i = 0; i < yaws; i++) {
+					const f = new RigFit(rig, os, { pitch: pitches.slice(0, v + 1), k0, sigma: WIDE, weights, fixed });
+					const [a, b, s] = blendPose(f, solved, k);
+					f.marks.set(marks);
+					for (let u = 0; u < v; u++) {
+						f.cam[2 * u] = cams[u].cam[0];
+						f.cam[2 * u + 1] = cams[u].cam[1];
+						f.logS[u] = u === 0 ? lerp(a.f.logS[0], b.f.logS[0], s) : cams[u].logS;
+						aim(f, u);
+					}
+					f.logS[v] = Math.log(pixelsPerUnit(rig, os[v]));
+					f.cam[2 * v] = (i * 2 * Math.PI) / yaws;
+					aim(f, v);
+					f.run(initSteps, { tau0: 20, tau1: 20 });
+					if (!bestV || f.terms.reproj < bestV.err) bestV = { f, err: f.terms.reproj };
+					onStep?.(++done, total);
+				}
+				cams = Array.from({ length: v + 1 }, (_, u) => ({ cam: [bestV.f.cam[2 * u], bestV.f.cam[2 * u + 1]], logS: bestV.f.logS[u] }));
+				marks = Float64Array.from(bestV.f.marks);
+				if (v === V - 1 && k === allKeys[0]) lastSearch = bestV.f;
+				llm.print(`  view ${v}: frame ${k} with the views before it, yaw ${(bestV.f.cam[2 * v] / DEG).toFixed(0)}° fits best (reprojection ${bestV.err.toFixed(1)}; yaws now ${cams.map((c) => (c.cam[0] / DEG).toFixed(0)).join('°, ')}°)`);
+			}
+
+			// Every keyframe of every view again, all views together, the cameras
+			// held, the labels trusted wide: what one view leaves along its line of
+			// sight, another sees.
+			// Each from the one-view keyframes blended, and from the keyframe before
+			// it in all the views (the first from the last camera search's pose),
+			// the better kept.
+			const both = [];
+			let before = lastSearch;
+			for (const k of allKeys) {
+				const os = all.map((_, v) => at(v, k));
+				let kept = null;
+				for (const from of [null, before]) {
+					if (from === undefined) continue;
+					const f = new RigFit(rig, os, { pitch: pitches, k0, sigma: WIDE, weights, fixed });
+					const [a, b, s] = blendPose(f, solved, k);
+					f.marks.set(marks);
+					for (let v = 0; v < V; v++) {
+						f.cam[2 * v] = cams[v].cam[0];
+						f.cam[2 * v + 1] = cams[v].cam[1];
+						f.logS[v] = v === 0 ? lerp(a.f.logS[0], b.f.logS[0], s) : cams[v].logS;
+					}
+					if (from) startFrom(f, from);
+					for (let v = 0; v < V; v++) aim(f, v);
+					const loss = f.run(initSteps, { tau0: 20, tau1: 20, lr: { cam: 0, marks: 0 } });
+					if (!kept || loss < kept.loss) kept = { f, loss };
+				}
+				before = kept.f;
+				both.push({ key: k, f: kept.f, centres: os.map((o) => centroid(o, 0)) });
+				onStep?.(++done, total);
+			}
+			llm.print(`  keyframes ${allKeys.join(', ')} in all ${V} views: reprojection ${both.map((s) => s.f.terms.reproj.toFixed(1)).join(', ')}`);
+			solved = both;
+		}
 	}
 
 	// Every frame from the keyframes either side of it, blended by time, aimed
 	// where each view's points are.
-	const fit = new RigFit(rig, all, { pitch: V > 1 ? pitches : pitches[0], k0, foot: W_FOOT, sigma, weights, fixed });
+	const fit = new RigFit(rig, all, { pitch: V > 1 ? pitches : pitches[0], k0, foot: W_FOOT, sigma, weights, fixed, cameras });
 	for (let t = 0; t < T; t++) {
 		const [a, b, s] = bracket(solved, t);
 		for (let j = 0; j < J; j++) slerpTurn(a.f.theta, j * 3, b.f.theta, j * 3, s, fit.theta, (t * J + j) * 3);
 		for (let d = 0; d < 3; d++) fit.root[t * 3 + d] = lerp(a.f.root[d], b.f.root[d], s);
-		for (let v = 0; v < V; v++) {
+		for (let v = 0; v < V && !cameras; v++) {
 			const vt = v * T + t;
 			fit.logS[vt] = lerp(a.f.logS[v], b.f.logS[v], s);
 			const c = centroid(all[v], t);
@@ -1044,7 +1130,8 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 		}
 	}
 	fit.marks.set(marks);
-	if (V > 1) for (let v = 0; v < V; v++) { fit.cam[2 * v] = cams[v].cam[0]; fit.cam[2 * v + 1] = cams[v].cam[1]; }
+	if (cameras) { /* set and held by the constructor */ }
+	else if (V > 1) for (let v = 0; v < V; v++) { fit.cam[2 * v] = cams[v].cam[0]; fit.cam[2 * v + 1] = cams[v].cam[1]; }
 	else fit.cam.set(best.f.cam);
 	const before = done;
 	let lastPrint = llm.now();

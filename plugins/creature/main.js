@@ -12,8 +12,8 @@
 //
 //   POST /animate  { rig, frames, labels, markers?, region?, width?, fps?,
 //                    name?, travel?, travel_smooth?, iterations?, pitch?,
-//                    outputs?, views?, finder?, key_every?, flip?, landmarks?,
-//                    weights?, sigma?, confidence? }
+//                    outputs?, views?, studio?, finder?, key_every?, flip?,
+//                    landmarks?, weights?, sigma?, confidence? }
 //                  -> { name, frames, fps, joints, glb?, clip?, bvh?,
 //                       animated_glb?, tracks?, report }
 //   POST /track    { frames, labels, region?, width?, draw? }
@@ -52,6 +52,11 @@
 //            same instant; the one motion is fitted to all of them (a front
 //            and a side clip: what one cannot see along its line of sight,
 //            the other sees across). tracks come back one per view.
+//   studio   Rigsmith render_studio's studio.json: `frames` are a clip made
+//            from its picture, both views side by side in every frame; the
+//            views are cut out by the layout and their cameras are known
+//            (studio.js), so none is searched for and the root moves as the
+//            cameras saw it (no travel from the feet)
 //   finder   a trained joint finder (/train): a view with neither labels
 //            nor tracks has its joints found on every frame instead; the
 //            points of the mesh it finds (landmarks) are markers with known
@@ -78,6 +83,8 @@ import { fitRig, DEFAULT_WEIGHTS } from './fit.js';
 import { fittedMotion, clipGlb, clipBvh, clipJson, animatedGlb } from './output.js';
 import { Finder, fittedLandmarks } from './detect.js';
 import { trainFinder } from './train.js';
+import { readStudio, studioViews, calibrateViews, cropFrames } from './studio.js';
+import { syncViews } from './sync.js';
 
 const OUTPUTS = ['glb', 'clip', 'bvh', 'animated_glb', 'tracks'];
 
@@ -135,7 +142,7 @@ function list(v, n, what) {
 
 async function track(request, config, step, labels) {
 	await ensureBackbone(config);
-	const frames = frameSource(request.frames);
+	const frames = framesOf(request.frames);
 	const region = list(request.region, 4, 'region');
 	const width = Number(request.width ?? 1280);
 	if (!(width >= 16)) throw bad('width: the backbone\'s input width in pixels, a multiple of 16');
@@ -158,7 +165,7 @@ function finderAt(path) {
 async function detect(request, view, config, step) {
 	await ensureBackbone(config);
 	const f = finderAt(request.finder);
-	const frames = frameSource(view.frames);
+	const frames = framesOf(view.frames);
 	const tracks = await f.detect(backbone.encoder, frames, {
 		region: list(view.region, 4, 'region'), keyEvery: Number(request.key_every ?? 6), flip: request.flip !== false,
 		onFrame: (k, n) => step?.(k, n, 'finding joints'),
@@ -188,8 +195,46 @@ function withoutPoints(tracks, drop) {
 	};
 }
 
+// A view's frames: a frame source already (a studio's cut views), or what
+// frameSource reads.
+const framesOf = (spec) => (spec && typeof spec.image === 'function' ? spec : frameSource(spec));
+
+// A studio request's views: its frames cut into the layout's two, each with
+// its camera, put right for the clip by its first frame against the picture
+// it was made from (studio.js calibrateViews). Or tracks found before, with
+// the clip's `size` (or its `frames`, which calibrate as well).
+function studioViewsOf(request) {
+	const layout = readStudio(request.studio);
+	const given = request.views !== undefined;
+	if (given && (!Array.isArray(request.views) || request.views.length !== 2 || !request.views.every((v) => v?.tracks))) throw bad('studio: frames (the clip), or views [{ tracks }, { tracks }] (front, side) with the clip\'s size [width, height] or frames');
+	const frames = request.frames !== undefined ? frameSource(request.frames) : null, first = frames?.image(0);
+	const size = first ? [first.width, first.height] : list(request.size, 2, 'size');
+	if (!size) throw bad('studio: with views and no frames, size [width, height] of the clip');
+	let views = studioViews(layout, size[0], size[1]), calibration = null;
+	const reference = first && request.calibrate !== false ? referenceOf(request) : null;
+	if (reference) {
+		({ views, report: calibration } = calibrateViews(layout, views, reference, first));
+		for (const c of calibration) llm.print(`  studio: ${c.name} view scaled ${c.scale}, moved ${c.shift.join(', ')} px against the picture (figures overlap ${c.overlap[0]} -> ${c.overlap[1]})`);
+	}
+	return views.map((v, i) => ({ ...(given ? request.views[i] : { frames: cropFrames(frames, v.box) }), name: v.name, box: v.box, camera: v.camera, calibration }));
+}
+
+// The picture a studio clip was made from: `reference`, or reference.png
+// beside the studio.json; null when there is none.
+function referenceOf(request) {
+	const path = request.reference ?? (typeof request.studio === 'string' && !request.studio.trim().startsWith('{') ? request.studio.replace(/[^/]*$/, 'reference.png') : null);
+	if (!path) return null;
+	try {
+		return llm.image.load(path);
+	} catch (e) {
+		if (request.reference) throw bad(`reference: ${path} could not be read (${e.message})`);
+		return null;
+	}
+}
+
 // The request's views: its `views`, or the request itself as the one view.
 function viewsOf(request) {
+	if (request.studio !== undefined) return studioViewsOf(request);
 	if (request.views === undefined) return [request];
 	if (!Array.isArray(request.views) || !request.views.length) throw bad('views: a list of views, each { frames, labels } or { tracks }, frame N of each the same moment');
 	return request.views;
@@ -243,11 +288,20 @@ export async function animate(request, config = {}) {
 				tracks = (await track(view, config, (k, n, what) => step(i * n + k, views.length * n, what), labels)).tracks;
 				trackSeconds += tracks.seconds;
 			}
-			fitted.push({ tracks, pitch: Number(view.pitch ?? request.pitch ?? 8) });
+			fitted.push({ tracks, pitch: Number(view.pitch ?? request.pitch ?? 8), camera: view.camera });
 		} catch (e) {
 			if (views.length > 1 && e.status === 400) e.message = `views[${i}]: ${e.message}`;
 			throw e;
 		}
+	}
+	// A studio clip's halves in step: measured, and the front re-timed onto the
+	// side when that brings their heights well closer (sync.js).
+	let sync = null;
+	if (request.studio !== undefined && fitted.length === 2) {
+		const s = syncViews(fitted[0].tracks, fitted[1].tracks, fitted.map((v) => v.camera), { retime: request.sync !== false });
+		fitted[0].tracks = s.front;
+		sync = s.report;
+		if (sync) llm.print(`  sync: heights ${sync.height_gap_px}px apart on average (worst ${sync.worst_gap_px}px), best lag ${sync.best_lag} frames${sync.retimed ? `; front re-timed, up to ${sync.shift_frames} frames (${sync.retime_gap_px}px apart now)` : ''}`);
 	}
 	const iterations = Number(request.iterations ?? 1500);
 	const fit = fitRig(rig, fitted, {
@@ -260,6 +314,8 @@ export async function animate(request, config = {}) {
 		travel: Number(motion.travel.toFixed(4)),
 		seconds: { track: Number(trackSeconds.toFixed(1)), fit: fit.report.seconds, total: Number(((llm.now() - t0) / 1000).toFixed(1)) },
 	};
+	if (request.studio !== undefined) report.studio = { views: views.map((v) => ({ name: v.name, box: v.box })), calibration: views[0].calibration };
+	if (sync) report.sync = sync;
 	const reply = { name, frames: motion.frames, fps, joints: rig.names, report };
 	const files = {};
 	if (outputs.has('glb')) files.glb = clipGlb(motion, name);
@@ -318,6 +374,10 @@ const INFO = {
 		iterations: 'fit iterations (1500)',
 		pitch: 'the camera\'s expected downward angle in degrees (8)',
 		views: '[{ frames, labels, region?, width?, pitch? } or { tracks, pitch? }]: the same moments from other cameras, fitted together',
+		studio: 'Rigsmith render_studio\'s studio.json: frames are a clip of its picture (front and side side by side); the views are cut out by its layout and their cameras known',
+		reference: 'with studio: the picture the clip was made from (reference.png beside the studio.json by default), its first frame laid on it to put the cameras right',
+		calibrate: 'with studio: put the cameras right by the first frame against the reference (true)',
+		sync: 'with studio: re-time the front view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
 		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
 		key_every: 'with a finder: a keyframe for the fit to start from every so many frames (6)',
 		flip: 'with a finder: look at each crop mirrored as well, left read as right, and average (true; false to look once)',

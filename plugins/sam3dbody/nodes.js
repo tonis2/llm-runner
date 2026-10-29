@@ -11,7 +11,7 @@ import { llm } from '../lib/llm.js';
 import * as op from '../lib/ops.js';
 import { defineNodes } from '../lib/graph/registry.js';
 import { writeText } from '../lib/graph/plugins.js';
-import { cleanUpMotion } from '../kimodo/cleanup.js';
+import { cleanUpMotion } from '../lib/motion/cleanup.js';
 import { Sam3dBody } from './pose.js';
 import { drawPreview } from './keypoints.js';
 import { listFrames, poseFrames } from './frames.js';

@@ -3,7 +3,7 @@
 // animation - a rotation channel a joint and a translation channel on the root.
 // No mesh; any tool that reads glTF clips reads this one.
 
-import { llm } from '../lib/llm.js';
+import { llm } from '../llm.js';
 
 const FLOAT = 5126;
 

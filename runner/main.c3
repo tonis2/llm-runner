@@ -15,8 +15,10 @@ llm-runner: one binary, pipelines as JavaScript plugins.
 
  A name is a plugin; a path ending in `.js` is a script run once as a module,
  which is how the kernel checks run. Paths inside the plugin are resolved
- against the plugins root (`--plugins`, default `plugins`), so a plugin imports
- the shared library as `../lib/llm.js`.
+ against the plugins root, so a plugin imports the shared library as
+ `../lib/llm.js`. The root is `--plugins` when given; else `plugins` beside the
+ executable, which is where a release ships it; else `./plugins`, a checkout's.
+ A plugin is read from there when it runs - see `lib/pipeline/plugins.c3`.
 
  `ui` is the one mode with a window: the engine's own frame loop runs
  `studio/main.js` as a game, with the same `__llm` verbs and settings, and a
@@ -28,6 +30,7 @@ module runner;
 import three;
 import vk;
 import llm::host;
+import llm::pipeline;
 import std::io;
 import std::io::file;
 import std::io::path;
@@ -66,7 +69,7 @@ fn void usage()
 
 fn Options? parse_args(String[] args)
 {
-	Options o = { .plugins = "plugins", .bind = "127.0.0.1", .port = 7860, .width = 1600, .height = 1000 };
+	Options o = { .bind = "127.0.0.1", .port = 7860, .width = 1600, .height = 1000 };
 	o.overrides.init(mem, 4);
 	for (usz i = 1; i < args.len; i++)
 	{
@@ -112,7 +115,7 @@ fn Options? parse_args(String[] args)
 		usage();
 		return io::EOF~;
 	}
-	while (o.plugins.len > 1 && o.plugins[^1] == '/') o.plugins = o.plugins[..^2];
+	o.plugins = pipeline::plugins_root(mem, o.plugins, "plugins");
 	return o;
 }
 
@@ -252,6 +255,15 @@ fn int main(String[] args)
 	if (catch parsed) return 1;
 	Options o = parsed;
 	if (o.target == "ui") return run_ui(&o);
+	if (!o.target.ends_with(".js"))
+	{
+		String unfit = pipeline::check_plugin(o.plugins, o.target);
+		if (unfit.len > 0)
+		{
+			io::printfn("llm-runner: %s", unfit);
+			return 1;
+		}
+	}
 
 	vk::Instance instance = three::create_instance(o.validate, headless: true)!!;
 	defer instance.free();

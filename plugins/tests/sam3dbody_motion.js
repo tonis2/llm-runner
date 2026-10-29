@@ -14,12 +14,12 @@
 //    frame's finger angles, the frames before the first the first's; with a
 //    hand stride, gaps it could have made are blended.
 import { llm } from '../lib/llm.js';
-import { forward, mul, axisAngle } from '../kimodo/rotation.js';
+import { forward, mul, axisAngle } from '../lib/motion/rotation.js';
 import { MHR, JOINTS, MODEL_PARAMS } from '../sam3dbody/mhr.js';
 import { MotionSkeleton, PROPORTIONS } from '../sam3dbody/skeleton.js';
 import { assembleMotion } from '../sam3dbody/motion.js';
 import { holdHands } from '../sam3dbody/frames.js';
-import { cleanUpMotion } from '../kimodo/cleanup.js';
+import { cleanUpMotion } from '../lib/motion/cleanup.js';
 import { motionBvh } from '../lib/bvh.js';
 
 const config = globalThis.__llm_config;

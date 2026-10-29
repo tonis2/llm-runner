@@ -36,7 +36,7 @@
 import { llm } from '../lib/llm.js';
 import { profileReport } from '../lib/gpu.js';
 import { T5Encoder, meanPool } from '../lib/t5.js';
-import { writeMotionGlb } from '../kimodo/glb.js';
+import { writeMotionGlb } from '../lib/motion/glb.js';
 import { UniMateCheckpoint } from './checkpoint.js';
 import { UniMateDenoiser } from './denoiser.js';
 import { skeletonCondition } from './skeleton.js';

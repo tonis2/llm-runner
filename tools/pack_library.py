@@ -4,10 +4,11 @@
     tools/pack_library.py [out]              # default: build/llm.c3l
 
 c3c takes a zipped .c3l wherever it takes a library folder, and unpacks it under
-the build directory. The zip holds manifest.json, every source file its
-"sources" globs name, and every file those sources `$embed` (the bundled
-plugins - run tools/bundle_plugins.py first when they changed), at the same
-paths as here so the embeds still resolve. `version.txt` says which commit it
+the build directory. The zip holds manifest.json and every source file its
+"sources" globs name (and anything those sources `$embed`, at the same paths, so
+the embeds still resolve - today nothing). The plugins are not in it: a program
+ships `plugins/lib` beside its executable and reads plugins from that folder at
+run time (`tools/package.py --plugins-only`). `version.txt` says which commit it
 was packed from, and whether the tree had changes then.
 """
 import glob

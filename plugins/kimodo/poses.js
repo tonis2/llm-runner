@@ -38,7 +38,7 @@
 // The rig is taken as facing +Z, Y up - glTF's convention and Kimodo's. A
 // caller whose rig faces elsewhere turns its points about the hips first.
 
-import { IDENTITY, sub, add, length, cross, normalized, mul, conjugate, rotate, between, fromAxes } from './rotation.js';
+import { IDENTITY, sub, add, length, cross, normalized, mul, conjugate, rotate, between, fromAxes } from '../lib/motion/rotation.js';
 
 const scale = (std) => Math.sqrt(std * std + 1e-5);
 

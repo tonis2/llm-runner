@@ -49,6 +49,7 @@ one request at a time; there is one GPU.
 | `pitch`      | number | The camera's expected downward angle, in degrees. Default 8. Raise it for a camera that stands close or looks down on the animal (it sees the feet from above); otherwise the fit leans the body to make up the difference. |
 | `outputs`    | string[] | Any of `glb`, `clip`, `bvh`, `animated_glb`, `tracks`. Default `["glb", "clip"]`. |
 | `views`      | object[] | Instead of `frames`, `labels`, `region`, `width` and `pitch`: the same moments filmed by several cameras. See [Two views](#two-views). |
+| `studio`     | string or object | Rigsmith `render_studio`'s `studio.json`. `frames` are then a clip a video model made from its `reference.png`: the front and the right side side by side in every frame. The views are cut out by the layout and their cameras are known. See [A studio clip](#a-studio-clip). |
 | `finder`     | string | A trained joint finder (`/train`). Views with neither `labels` nor `tracks` have their joints found with it. See [A trained finder](#a-trained-finder-no-labels). |
 | `key_every`  | number | With a finder: a keyframe for the fit to start from every so many frames. Default 6. |
 | `landmarks`  | bool or string[] | With a finder: which of its landmarks to fit: all (true), none (false), or those listed. By default all but a mirror pair on one joint (a head's two sides, from a finder drawn before render_poses stopped drawing them): each is the other's mirror image, and the finder takes one for the other, which tips the head over. |
@@ -131,6 +132,58 @@ across it.
 - **The reply** is as `/animate`'s. `report.views` gives each view's
   `reprojection_px` and `camera`; the top-level ones pool every view and give
   the first view's camera. `outputs: ["tracks"]` returns a list, one per view.
+
+### A studio clip
+
+The cameras of two separate clips have to be fitted, and their two halves
+rarely step together. A **studio clip** avoids both, as
+[anymove](https://github.com/patch-gg/anymove) films its creatures:
+
+1. **The picture.** Rigsmith's hidden MCP tool `render_studio` draws the rig
+   (its rest pose, or a clip's moment such as an idle's first frame) from
+   two level, orthographic cameras side by side: the front on the left, the
+   right side on the right, one scale and one floor row, over a grey wall and
+   a lighter floor band. It writes `reference.png`, `studio.json` (the
+   layout) and `prompt.txt`.
+2. **The clip.** A video model (MiniMax, Seedance) animates `reference.png`
+   from the prompt, the action filled in. Both halves are one generation, so
+   they move together, and the cameras hold still.
+3. **The fit.** Extract the frames (`ffmpeg -i clip.mp4 frames/f_%04d.png`)
+   and send them with the layout and a finder:
+
+```json
+{ "rig": "zidane.glb", "fps": 24, "name": "wave", "finder": "zidane.finder.safetensors",
+  "studio": "studio_stand/studio.json", "frames": "wave_frames/" }
+```
+
+- **The views** are cut out of every frame by the layout (each only its own
+  pixels, so a view's crops never take in the other's figure), scaled with
+  the clip: a 1920 x 1080 clip of a 1280 x 720 picture is fine; a stretched
+  one is refused.
+- **Calibrated.** A video model may draw its first frame a little bigger or
+  moved (MiniMax: 1% bigger, each half 8 px out and 4 px down). Each view's
+  figure in the first frame is laid on `reference.png`'s (beside the
+  studio.json, or `reference`), and its camera scaled and moved to fit;
+  `report.studio.calibration` says by how much and how much closer the
+  figures lie. `calibrate: false` skips it.
+- **The cameras are known**: nothing is searched for. The root moves as the
+  cameras saw it, on their floor, so there is no travel from the feet, and
+  the fit's in-place, heading and floor priors are off (`weights` can still
+  set them). `report.travel` is then the root's path length, and
+  `report.studio` the boxes the views were cut to.
+- **In step?** A joint is at the same height in both halves, so how far
+  apart the two views put the heights says whether the video model played
+  them out of step. `report.sync` gives the mean and worst gap in pixels, the
+  constant lag that agrees best, and how well each foot's height matches
+  between the views (1 when they rise and fall together). When matching the
+  views frame by frame brings the heights at least 15% closer, the front view
+  is re-timed onto the side's (`sync: false` only reports).
+- **Tracks again, no GPU:** `{ studio, views: [{ tracks }, { tracks }], size:
+  [width, height] }` with a reply's two tracks and the clip's size (or
+  `frames` in place of `size`, which calibrates too).
+
+On a MiniMax clip of Zidane waving, the root ended 0.6 cm from where it began
+(fitted cameras: 12 cm of drift) and the neck swayed 18° against 25°.
 
 Errors come back as a 400 (something wrong in the request: an unknown joint, a
 glb with no skin, and so on) or a 500, with `{"error": "..."}`. The server
@@ -352,8 +405,10 @@ identity, +Y up, facing +Z. Today, without any Rigsmith code:
 4. Clean up with Rigsmith's own tools: `pin_feet`, `smooth_clip`, `make_loop`.
 
 Rigsmith can also run the plugin in its own process, the way it runs Kimodo,
-through `llm::pipeline::Job` once `creature` is bundled
-(`tools/bundle_plugins.py`, which bundles kimodo and creature by default).
+through `llm::pipeline::Job`, once `creature` is in its plugins folder (Settings
+› AI › Plugins; see "Installing a plugin" in `plugins/README.md`). The plugin is
+read from that folder when the job starts, so an edit here reaches Rigsmith on
+its next job.
 
 - **Config:** the job's config is the same JSON as an `/animate` request, plus
   `model`.

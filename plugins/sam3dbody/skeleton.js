@@ -15,7 +15,7 @@
 // Joint 0 ('body_world') never moves and is left out: 'root', the pelvis, is
 // the root.
 
-import { mul, conjugate, unit } from '../kimodo/rotation.js';
+import { mul, conjugate, unit } from '../lib/motion/rotation.js';
 import { JOINTS, MODEL_PARAMS } from './mhr.js';
 
 // Model parameters from here on are the body's proportions.

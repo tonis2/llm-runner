@@ -42,6 +42,7 @@ plugins/
     warp.js            crops warped out of an 8-bit image on the GPU, any width and height, normalised
     latents.js         latent formats ('flux2', 'flux1', 'qwen') and the VAE encode/decode for each
     graph/             node registry, port types, the executor, plugin discovery
+    motion/            quaternions, clip cleanup and the GLB writer the motion plugins share
     kernels/*.shady    one kernel per file; common.shady is put in front of each
   core/                nodes every graph uses: image load/save/preview, loaders, VAE
   flux/                Flux 2 Klein: txt2img, img2img, kontext, LoRA/LoKr, server
@@ -60,9 +61,35 @@ plugins/
 ```
 
 Each plugin directory has a `plugin.json` (`name`, `version`, `description`,
-`nodes`, `main`). `nodes` registers the plugin's node types; `main` is its
+`nodes`, `main`, and optionally `requires_lib`). `nodes` registers the plugin's node types; `main` is its
 command-line and server entry, which builds a fixed graph from the config keys
 and runs it.
+
+## Installing a plugin
+
+Plugins are read from disk when they run; nothing is compiled into a binary.
+The plugins folder is `--plugins` when given; else `plugins` beside the
+executable, where a release ships it (`tools/package.py`); else `./plugins`,
+a checkout's. A program that links the `llm` library (Rigsmith) finds it the
+same way, with its own setting first (`lib/pipeline/plugins.c3`).
+
+The folder holds `lib/` and one folder per plugin. To add a plugin, link its
+folder in; it then imports `../lib/llm.js` from the folder's `lib`, wherever the
+plugin itself lives:
+
+```
+ln -s ~/src/my-plugin  dist/plugins/my-plugin     # or Rigsmith: Settings › AI › Plugins › Link plugin folder…
+```
+
+Edits to a linked folder are what the next job runs. Unlinking removes the link
+only, never the folder it points at.
+
+`lib/lib.json` says which `lib` this is (`version`) and which host verbs it
+needs (`host`, checked against `llm::host::API`). A plugin that needs a newer
+`lib` says so with `"requires_lib": n` in its `plugin.json`. A job is refused
+with a sentence saying which is out of date, instead of failing on a missing
+function. Plugins import only `lib/`, never each other: shared code such as the
+motion helpers (`lib/motion/rotation.js`, `glb.js`, `cleanup.js`) lives there.
 
 ## A plugin
 
@@ -261,7 +288,7 @@ the legs in their planes and the feet on the floor; about a minute for 124
 frames). The clip comes back as Rigsmith takes clips (rest turns identity,
 facing as-is), as `apply_clip` arguments, as BVH, or on the uploaded .glb
 itself. Routes and fields: `docs/creature_server.md`. Rigsmith can run it
-in-process like Kimodo (it is bundled). `tests/creature_track.js` checks the
+in-process like Kimodo, from its plugins folder. `tests/creature_track.js` checks the
 tracker against a track made before, `tests/creature_fit.js` the fit's
 gradients and every output read back.
 

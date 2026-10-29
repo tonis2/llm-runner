@@ -17,10 +17,10 @@
  between two breaths: opening a model file and uploading its weights is the long
  one.
 
- **The plugins travel with the library.** The JavaScript and the kernels are
- embedded (`bundle.c3`, written by `tools/bundle_plugins.py`), so a program that
- links `llm.c3l` - a folder or a zip - needs no plugins folder of its own:
- `extract` writes them into one it chooses, and a job runs from there.
+ **The plugins are a folder on disk, not part of the library.** `llm.c3l` is
+ code only. A program ships `plugins/lib` (the host API, its kernels) beside its
+ executable, users link more plugins in, and a job reads the plugin it names
+ when it starts - see `plugins.c3`, and `plugins_root` for where the folder is.
 
  **One job at a time per process.** The `__llm` host verbs keep their open models
  and tokenizers in module globals (`llm::host`), so a second job would share
@@ -44,15 +44,6 @@ import std::time::clock;
 import std::collections::list;
 
 faultdef JOB_BUSY, JOB_NOT_STARTED;
-
-<*
- One file the library carries: its path under the plugins root, and its bytes.
-*>
-struct BundledFile
-{
-	String path;
-	char[] bytes;
-}
 
 enum JobState
 {
@@ -98,38 +89,6 @@ struct Job
 // The job running now: the host verbs have one set of tables.
 Job* active;
 
-<*
- Write the bundled plugin files under `directory`, leaving any already there
- byte for byte. Cheap enough to call before every job.
-*>
-fn void? extract(String directory)
-{
-	foreach (bundled : bundled_files())
-	{
-		@pool()
-		{
-			String target = string::tformat("%s/%s", directory, bundled.path);
-			char[]? held = file::load(tmem, target);
-			if (try held && (String)held == (String)bundled.bytes) continue;
-			sz? slash = target.rindex_of_char('/');
-			if (try slash) (void)path::mkdir((Path)target[:(usz)slash], recursive: true);
-			file::save(target, bundled.bytes)!;
-		};
-	}
-}
-
-<*
- Whether the library carries `plugin`.
-*>
-fn bool bundled(String plugin)
-{
-	foreach (name : BUNDLED_PLUGINS)
-	{
-		if (name == plugin) return true;
-	}
-	return false;
-}
-
 fn String Job.result(&self) => self.state == DONE ? self.outcome.str_view() : "";
 fn String Job.error(&self) => self.state == FAILED ? self.outcome.str_view() : "";
 
@@ -160,9 +119,9 @@ fn void Job.free_outputs(&self)
  @param renderer : `The caller's; its device runs the kernels.`
  @param plugin : `A folder under plugins_root with a main.js.`
  @param config : `A JSON object.`
- @param plugins_root : `Where the plugins are: extract's directory, or a checkout's plugins folder.`
+ @param plugins_root : `The plugins folder (plugins_root()): lib/ and the plugin's folder.`
  @return? JOB_BUSY : `Another job is open in this process.`
- @return? JOB_NOT_STARTED : `The runtime would not open or the plugin would not load; error() says why.`
+ @return? JOB_NOT_STARTED : `The plugin is missing or does not match lib, the runtime would not open, or the plugin would not load; error() says why.`
 *>
 fn void? Job.start(&self, three::Renderer* renderer, String plugin, String config, String plugins_root,
 	LineHook on_line = null, void* line_context = null)
@@ -174,6 +133,14 @@ fn void? Job.start(&self, three::Renderer* renderer, String plugin, String confi
 	*self = { .renderer = renderer, .on_line = on_line, .line_context = line_context };
 	self.outcome.init(mem, 256);
 	self.outputs.init(mem);
+
+	String unfit = check_plugin(plugins_root, plugin);
+	if (unfit.len > 0)
+	{
+		self.state = FAILED;
+		self.outcome.append(unfit);
+		return JOB_NOT_STARTED~;
+	}
 
 	// No scene: a pipeline dispatches kernels and draws nothing.
 	if (catch err = self.runtime.open(null, renderer, memory_limit: 0))
