@@ -85,7 +85,7 @@ fn SafetensorsFile? safetensors_open(String path) {
  A tensor table over a file that is not safetensors: `header` is written the way
  a safetensors header is (name -> { dtype, shape, data_offsets }), with the
  offsets counted from the start of the file. A PyTorch checkpoint is a zip whose
- tensors are stored entries; `plugins/lib/torch.js` reads its pickle and
+ tensors are stored entries; `llm/core/weights/torch.js` reads its pickle and
  describes them this way, and the bytes are then read like any other mapping.
 *>
 fn SafetensorsFile? table_open(String path, String header) {

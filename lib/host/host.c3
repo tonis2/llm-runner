@@ -15,7 +15,7 @@ The `__llm` host object: what a pipeline plugin cannot do in JavaScript.
  script a `three.compute` handle to bind. The script sees the tensor's name,
  type and shape; the bytes go from the page cache to VRAM.
 
- The prelude that makes these verbs readable is `plugins/lib/llm.js`.
+ The prelude that makes these verbs readable is `llm/core/llm.js`.
 
  Part of the `llm` library: the runner executable installs these on its own
  runtime, and `llm::pipeline` installs them on the one a host program runs a
@@ -39,8 +39,8 @@ import std::time::clock;
 import std::encoding::base64;
 
 <*
- Which set of host verbs this is. `plugins/lib/lib.json` says which it needs
- (`host`); raise this when a verb is added or changes, so a newer lib is
+ Which set of host verbs this is. `llm/core/core.json` says which it needs
+ (`host`); raise this when a verb is added or changes, so a newer core is
  refused with a reason instead of failing on a missing verb.
 *>
 const int API = 1;
@@ -408,7 +408,7 @@ fn void js_model_open(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::
 
 	ModelSlot slot;
 	// A tensor table the caller read itself (a PyTorch checkpoint, see
-	// plugins/lib/torch.js), in safetensors' header form with file offsets.
+	// llm/core/weights/torch.js), in safetensors' header form with file offsets.
 	String table = argc >= 2 ? @text(&js, argc, args, 1) : "";
 	bool gguf = table.len == 0 && path.ends_with(".gguf");
 	if (table.len > 0)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference numbers for plugins/tests/sam3dbody_golden.js, from Meta's own code.
+"""Reference numbers for llm/tests/sam3dbody_golden.js, from Meta's own code.
 
     python tools/sam3dbody/golden.py --repo sam-3d-body --ckpt sam-3d-body-dinov3/model.ckpt \
         --mhr sam-3d-body-dinov3/assets/mhr_model.pt --image person.jpg [--bbox x0 y0 x1 y1] --out build/sam3d-golden

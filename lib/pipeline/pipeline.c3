@@ -11,23 +11,24 @@
 	mem::free(job);
 
  **Nothing blocks for the whole run.** A plugin breathes between its blocks of
- GPU work (`plugins/lib/gpu.js`, `breathe`), and here a breath waits for the next
+ GPU work (`llm/core/gpu.js`, `breathe`), and here a breath waits for the next
  `pump` - so a program that pumps once a frame keeps drawing while a generation
  runs, the way the studio does. What does block is whatever a plugin does
  between two breaths: opening a model file and uploading its weights is the long
  one.
 
  **The plugins are a folder on disk, not part of the library.** `llm.c3l` is
- code only. A program ships `plugins/lib` (the host API, its kernels) beside its
- executable, users link more plugins in, and a job reads the plugin it names
- when it starts - see `plugins.c3`, and `plugins_root` for where the folder is.
+ code only. A program ships the llm folder (`core/`: the host API, its kernels)
+ beside its executable, users link plugins into its `plugins/`, and a job reads
+ the plugin it names when it starts - see `plugins.c3`, and `plugins_root` for
+ where the folder is.
 
  **One job at a time per process.** The `__llm` host verbs keep their open models
  and tokenizers in module globals (`llm::host`), so a second job would share
  them; `start` refuses it.
 
  A job has a JavaScript runtime of its own on the caller's renderer, separate
- from any the program already runs: its module root is the plugins folder and it
+ from any the program already runs: its module root is the llm folder and it
  has no time budget, neither of which a program's own scripting wants.
 *>
 module llm::pipeline;
@@ -117,11 +118,11 @@ fn void Job.free_outputs(&self)
  reads from its config file). Returns at once; `pump` does the work.
 
  @param renderer : `The caller's; its device runs the kernels.`
- @param plugin : `A folder under plugins_root with a main.js.`
+ @param plugin : `A folder under plugins_root's plugins/ with a main.js.`
  @param config : `A JSON object.`
- @param plugins_root : `The plugins folder (plugins_root()): lib/ and the plugin's folder.`
+ @param plugins_root : `The llm folder (plugins_root()): core/ and plugins/.`
  @return? JOB_BUSY : `Another job is open in this process.`
- @return? JOB_NOT_STARTED : `The plugin is missing or does not match lib, the runtime would not open, or the plugin would not load; error() says why.`
+ @return? JOB_NOT_STARTED : `The plugin is missing or does not match core, the runtime would not open, or the plugin would not load; error() says why.`
 *>
 fn void? Job.start(&self, three::Renderer* renderer, String plugin, String config, String plugins_root,
 	LineHook on_line = null, void* line_context = null)
@@ -185,13 +186,13 @@ fn String kickoff_script(String plugin, String config, String plugins_root) @loc
 	s.appendf("globalThis.__llm_root = %s;\n", quote(plugins_root));
 	s.appendf("globalThis.__llm_config = JSON.parse(%s);\n", quote(config));
 	s.appendf("globalThis.__llm_cancel = false;\n");
-	s.append(`const gpu = await import('lib/gpu.js');
+	s.append(`const gpu = await import('core/gpu.js');
 gpu.setBreather(() => {
 	if (globalThis.__llm_cancel) throw new Error('stopped');
 	return three.nextFrame();
 });
 `);
-	s.appendf("await import(%s);\n", quote(string::tformat("%s/main.js", plugin)));
+	s.appendf("await import(%s);\n", quote(string::tformat("plugins/%s/main.js", plugin)));
 	s.append(`const p = globalThis.__llm_plugin;
 if (!p) throw new Error('the plugin did not register itself - its main.js calls llm.plugin({ ... })');
 (async () => {

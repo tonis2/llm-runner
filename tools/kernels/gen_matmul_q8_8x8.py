@@ -1,9 +1,9 @@
-# Writes plugins/lib/kernels/matmul_q8_8x8.shady: the shader language has no
+# Writes llm/core/kernels/matmul_q8_8x8.shady: the shader language has no
 # loops the compiler is sure to unroll, so the 64 accumulators are written out.
 #
 #   python3 tools/kernels/gen_matmul_q8_8x8.py
 import os
-out = os.path.join(os.path.dirname(__file__), '../../plugins/lib/kernels/matmul_q8_8x8.shady')
+out = os.path.join(os.path.dirname(__file__), '../../llm/core/kernels/matmul_q8_8x8.shady')
 L = []; w = L.append
 w("""// y[seq, out_dim] = x[seq, in_dim] @ W[row_offset .. row_offset + out_dim, :]^T, W in Q8_0,
 // without matrix cores.

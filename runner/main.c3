@@ -1,8 +1,8 @@
 <*
 llm-runner: one binary, pipelines as JavaScript plugins.
 
- A plugin is a directory under the plugins root with a `main.js` that registers
- itself with `llm.plugin({ load, generate })` - see `plugins/lib/llm.js`. This
+ A plugin is a directory under the llm folder's `plugins/` with a `main.js` that
+ registers itself with `llm.plugin({ load, generate })` - see `llm/core/llm.js`. This
  program brings up a headless GPU, opens the engine's JS runtime with the
  `__llm` host verbs beside `three.compute`, evaluates the plugin, and calls it:
 
@@ -13,15 +13,16 @@ llm-runner: one binary, pipelines as JavaScript plugins.
 	llm-runner ui
 	llm-runner tests/kernels.js
 
- A name is a plugin; a path ending in `.js` is a script run once as a module,
- which is how the kernel checks run. Paths inside the plugin are resolved
- against the plugins root, so a plugin imports the shared library as
- `../lib/llm.js`. The root is `--plugins` when given; else `plugins` beside the
- executable, which is where a release ships it; else `./plugins`, a checkout's.
- A plugin is read from there when it runs - see `lib/pipeline/plugins.c3`.
+ A name is an app (`apps/<name>`: graph, studio) or a plugin
+ (`plugins/<name>`); a path ending in `.js` is a script run once as a module,
+ which is how the kernel checks run. Imports are resolved against the llm
+ folder, so anything imports core rooted, as `/core/llm.js`. The folder is
+ `--plugins` when given; else `llm` beside the executable, which is where a
+ release ships it; else `./llm`, a checkout's. A plugin is read from there when
+ it runs - see `lib/pipeline/plugins.c3`.
 
  `ui` is the one mode with a window: the engine's own frame loop runs
- `studio/main.js` as a game, with the same `__llm` verbs and settings, and a
+ `apps/studio/main.js` as a game, with the same `__llm` verbs and settings, and a
  generation awaits `three.nextFrame()` between steps so the window keeps
  drawing.
 *>
@@ -44,7 +45,7 @@ three::Renderer heap_renderer;
 struct Options
 {
 	String target;          // plugin name, or a script path ending in .js
-	String plugins;         // the plugins root
+	String plugins;         // the llm folder: core/, apps/, plugins/
 	String config;          // a JSON file of settings
 	List{String} overrides; // key=value, applied over the file
 	bool server;
@@ -53,7 +54,7 @@ struct Options
 	bool validate;
 	uint width;
 	uint height;
-	String entry;           // ui: the module to boot, default <plugins>/studio/main.js
+	String entry;           // ui: the module to boot, default <llm>/apps/studio/main.js
 }
 
 // The options `ui_setup` reads: the loop calls it with nothing but the runtime.
@@ -63,7 +64,7 @@ fn void usage()
 {
 	io::printn("usage: llm-runner <plugin | script.js> [--config file.json] [key=value ...]");
 	io::printn("       llm-runner run graph.json [node.input=value ...]");
-	io::printn("       llm-runner ui [--size WxH] [--entry plugins/x.js]");
+	io::printn("       llm-runner ui [--size WxH] [--entry llm/tests/x.js]");
 	io::printn("                  [--plugins dir] [--server [--bind addr] [--port n]] [--validate]");
 }
 
@@ -95,7 +96,7 @@ fn Options? parse_args(String[] args)
 				return io::EOF~;
 			case a.contains("=") && !a.starts_with("-"): o.overrides.push(a);
 			case o.target.len == 0 && !a.starts_with("-"): o.target = a;
-			// `run file.json` is the graph plugin with that file.
+			// `run file.json` is the graph app with that file.
 			case o.target == "run" && !a.starts_with("-"):
 				o.target = "graph";
 				o.overrides.push(string::format(mem, "graph=%s", a));
@@ -115,7 +116,7 @@ fn Options? parse_args(String[] args)
 		usage();
 		return io::EOF~;
 	}
-	o.plugins = pipeline::plugins_root(mem, o.plugins, "plugins");
+	o.plugins = pipeline::plugins_root(mem, o.plugins, "llm");
 	return o;
 }
 
@@ -199,7 +200,7 @@ fn void report(three::RunResult* r, String what)
 }
 
 <*
- The studio: a window, the engine's frame loop, and `studio/main.js` booted in it
+ The studio: a window, the engine's frame loop, and `apps/studio/main.js` booted in it
  as a game. What the headless modes do by hand - the verbs, the settings, no
  budget - `ui_setup` does to the loop's runtime, on the first boot and on every
  reload.
@@ -219,7 +220,7 @@ fn int run_ui(Options* o)
 	io::printfn("llm-runner: %s", ((ZString)&engine.renderer.gpu.limits.device_name).str_view());
 	defer host::shutdown();
 
-	String entry = o.entry.len > 0 ? o.entry : string::tformat("%s/studio/main.js", o.plugins);
+	String entry = o.entry.len > 0 ? o.entry : string::tformat("%s/apps/studio/main.js", o.plugins);
 	if (catch err = three::live(
 		&engine.renderer,
 		engine.viewer(),
@@ -255,7 +256,7 @@ fn int main(String[] args)
 	if (catch parsed) return 1;
 	Options o = parsed;
 	if (o.target == "ui") return run_ui(&o);
-	if (!o.target.ends_with(".js"))
+	if (!o.target.ends_with(".js") && !pipeline::is_app(o.plugins, o.target))
 	{
 		String unfit = pipeline::check_plugin(o.plugins, o.target);
 		if (unfit.len > 0)
@@ -329,7 +330,7 @@ fn int main(String[] args)
 		return 1;
 	}
 
-	String entry = string::tformat("%s/main.js", o.target);
+	String entry = pipeline::entry_of(o.plugins, o.target);
 	three::RunResult loaded = runtime.run_module(entry);
 	defer loaded.free();
 	report(&loaded, entry);

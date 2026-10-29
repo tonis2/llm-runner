@@ -1,0 +1,312 @@
+// Qwen-Image 2.1 as graph nodes: the prompt encoding (Qwen3-VL-8B's last layer),
+// the DiT loader and the sampler. Its latents are its own VAE's ('qwen'), which
+// the core VAE nodes decode and encode.
+
+import { llm, f32, image } from '/core/llm.js';
+import { submit, copy, profileReset, profileReport } from '/core/gpu.js';
+import { eulerStep, cfgCombine } from '/core/ops.js';
+import { TextEncoder } from '/core/models/qwen3.js';
+import { Qwen3Vision } from '/core/models/qwen3_vision.js';
+import { makeLatent, encodeImage } from '/core/vae/latents.js';
+import { defineNodes } from '/core/graph/registry.js';
+import { QwenImageDiT } from './dit.js';
+import { mergeLoras } from './lora.js';
+import { sigmas } from './sched.js';
+
+const SYSTEM = '<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n';
+
+// The prompt as the model was trained on it: a raw template, not the chat
+// template, and never empty.
+function template(prompt) {
+	return `${SYSTEM}<|im_start|>user\n${prompt || ' '}<|im_end|>\n<|im_start|>assistant\n`;
+}
+
+// `slots` are where each reference image's latent tokens go in the text rows
+// ({ at, h, w } in latent tokens), `images` those images at the size they were
+// read, for the sampler to put through the VAE.
+function conditioning(tensor, n, dim, slots = [], images = []) {
+	return { family: 'qwenimage', tensor, n, dim, slots, images, dispose() { tensor.dispose(); } };
+}
+
+// The pipeline's size for a reference image: about `resolution` squared pixels
+// at the image's aspect, the sides multiples of 32.
+function referenceSize(resolution, img) {
+	const ratio = img.width / img.height;
+	const w = Math.sqrt(resolution * resolution * ratio);
+	return { w: Math.max(32, Math.round(w / 32) * 32), h: Math.max(32, Math.round(w / ratio / 32) * 32) };
+}
+
+// Prompt tokens with each image's pad tokens in place, and Qwen3-VL's 3D
+// positions: text counts up on all three axes; an image's tokens hold the time
+// axis at the position reached and lay out rows and columns from it, and the
+// text after goes on from there plus the grid's longer side.
+function tokenizeWithImages(tokenizer, prompt, grids) {
+	const pad = tokenizer.find('<|image_pad|>');
+	const ids = [];
+	const blocks = [];
+	const text = (t) => { for (const id of tokenizer.encode(t, true)) ids.push(id); };
+	text(`${SYSTEM}<|im_start|>user\n`);
+	grids.forEach((g, i) => {
+		text(`${i > 0 ? ' ' : ''}<image${i + 1}><|vision_start|>`);
+		blocks.push({ at: ids.length, rows: g.gh * g.gw, gh: g.gh, gw: g.gw });
+		for (let j = 0; j < g.gh * g.gw; j++) ids.push(pad);
+		text('<|vision_end|>');
+	});
+	text(`${prompt || ' '}<|im_end|>\n<|im_start|>assistant\n`);
+	const positions = new Int32Array(3 * ids.length);
+	let pos = 0, t = 0;
+	for (const b of blocks) {
+		for (; t < b.at; t++, pos++) positions.fill(pos, 3 * t, 3 * t + 3);
+		for (let r = 0; r < b.gh; r++) {
+			for (let c = 0; c < b.gw; c++, t++) {
+				positions[3 * t] = pos;
+				positions[3 * t + 1] = pos + r;
+				positions[3 * t + 2] = pos + c;
+			}
+		}
+		pos += Math.max(b.gh, b.gw);
+	}
+	for (; t < ids.length; t++, pos++) positions.fill(pos, 3 * t, 3 * t + 3);
+	return { ids: Uint32Array.from(ids), positions, blocks };
+}
+
+async function encodeWithImages(encoder, prompt, vision, images, resolution, t0) {
+	if (!vision) throw new Error('a prompt with images needs the vision encoder: wire an mmproj file into `vision`');
+	const sized = images.map((img) => {
+		const { w, h } = referenceSize(resolution, img);
+		return img.width === w && img.height === h ? img : image.resize(img, w, h);
+	});
+	const vis = new Qwen3Vision(vision);
+	const seen = [];
+	try {
+		await vis.load();
+		for (const img of sized) seen.push(await vis.encode(image.toTensor(img), img.height, img.width));
+	} finally {
+		vis.close();
+	}
+	const enc = new TextEncoder(encoder.path);
+	try {
+		const { ids, positions, blocks } = tokenizeWithImages(enc.tokenizer, prompt, seen);
+		const drop = enc.tokenizer.encode(SYSTEM, true).length;
+		const all = await enc.encodeLayers(ids, [enc.config.nLayers - 1], {
+			positions,
+			inject: blocks.map((b, i) => ({ at: b.at, rows: b.rows, tensor: seen[i].main })),
+			deepstack: blocks.map((b, i) => ({ at: b.at, rows: b.rows, tensors: seen[i].deepstack })),
+		});
+		// The text rows alone (the image pads' rows are where the DiT puts the
+		// references' latent tokens), and where each image goes among them.
+		const dim = enc.config.dim;
+		const n = ids.length - drop - blocks.reduce((sum, b) => sum + b.rows, 0);
+		const out = f32(n * dim);
+		const slots = [];
+		let from = drop, to = 0;
+		for (const b of blocks) {
+			copy(all, out, (b.at - from) * dim * 4, from * dim * 4, to * dim * 4);
+			to += b.at - from;
+			slots.push({ at: to, h: 2 * b.gh, w: 2 * b.gw });
+			from = b.at + b.rows;
+		}
+		copy(all, out, (ids.length - from) * dim * 4, from * dim * 4, to * dim * 4);
+		submit();
+		all.dispose();
+		llm.print(`  [phase] text_encode: ${n} tokens and ${blocks.length} image(s) in ${llm.since(t0)}`);
+		return conditioning(out, n, dim, slots, sized);
+	} finally {
+		for (const s of seen) {
+			s.main.dispose();
+			for (const d of s.deepstack) d.dispose();
+		}
+		enc.close();
+	}
+}
+
+async function encodePrompt(encoder, prompt, vision, images, resolution) {
+	const t0 = llm.now();
+	if (images.length > 0) return encodeWithImages(encoder, prompt, vision, images, resolution, t0);
+	const enc = new TextEncoder(encoder.path);
+	try {
+		const tokens = enc.tokenizer.encode(template(prompt), true);
+		const drop = enc.tokenizer.encode(SYSTEM, true).length;
+		const all = await enc.encodeLayers(tokens, [enc.config.nLayers - 1]);
+		const dim = enc.config.dim;
+		const n = tokens.length - drop;
+		const out = f32(n * dim);
+		copy(all, out, n * dim * 4, drop * dim * 4);
+		submit();
+		all.dispose();
+		llm.print(`  [phase] text_encode: ${n} tokens in ${llm.since(t0)}`);
+		return conditioning(out, n, dim);
+	} finally {
+		enc.close();
+	}
+}
+
+defineNodes('qwenimage', {
+	'qwenimage.load': {
+		title: 'Qwen-Image DiT',
+		category: 'loaders',
+		description: 'A Qwen-Image 2.1 GGUF or safetensors (fp8 weights run as they are, bf16/f16 are requantised to Q8_0), with any LoRAs folded in: wire in as many LoRA nodes (or chains of them) as you like, applied in the order they are wired. `merge_lora` off keeps them unmerged: exact, about 6% slower a step.',
+		inputs: { path: 'PATH(dit)', lora: 'LORA+?', merge_lora: 'BOOL=true' },
+		outputs: { model: 'MODEL' },
+		async run({ path, lora, merge_lora }) {
+			const t0 = llm.now();
+			const file = llm.open(path);
+			const dit = new QwenImageDiT(file);
+			await dit.load();
+			// One list per wire; each is a LoRA node's chain.
+			const loras = (lora ?? []).flat();
+			if (loras.length > 0) mergeLoras(dit, loras, merge_lora !== false);
+			llm.print(`  [phase] dit_load: ${llm.since(t0)}`);
+			return {
+				model: {
+					family: 'qwenimage',
+					dit,
+					dispose() { dit.release(); dit.unload(); file.close(); },
+				},
+			};
+		},
+	},
+
+	'qwenimage.text_encode': {
+		title: 'Qwen-Image prompt',
+		category: 'conditioning',
+		description: 'Qwen3-VL-8B hidden states from the last layer, the system prompt dropped. Images to edit from (up to three) are read by the vision encoder (`vision`, an mmproj file), resized to about resolution^2 pixels.',
+		inputs: {
+			encoder: 'TEXT_ENCODER',
+			prompt: 'STRING*=',
+			vision: 'PATH(mmproj)?',
+			image1: 'IMAGE?',
+			image2: 'IMAGE?',
+			image3: 'IMAGE?',
+			resolution: 'INT=1024',
+		},
+		outputs: { cond: 'CONDITIONING' },
+		async run({ encoder, prompt, vision, image1, image2, image3, resolution }) {
+			const images = [image1, image2, image3].filter(Boolean);
+			const cond = await encodePrompt(encoder, prompt, vision, images, resolution);
+			// The empty prompt with the same images, for a sampler running CFG
+			// with no negative wired in: encoded the first time one asks, and
+			// kept with this prompt for the next run.
+			let negative = null;
+			cond.negative = async () => (negative ??= await encodePrompt(encoder, '', vision, images, resolution));
+			const dispose = cond.dispose;
+			cond.dispose = () => {
+				dispose();
+				if (negative) negative.dispose();
+			};
+			return { cond };
+		},
+	},
+
+	'qwenimage.sample': {
+		title: 'Qwen-Image sampler',
+		category: 'sampling',
+		description: 'Flow-matching Euler steps (40 is what Qwen recommends), with true CFG when cfg > 1 (against the empty prompt when no negative is wired in). `cfg_rescale` keeps each guided token at the length of the prompt\'s own prediction, which lets a high cfg steer harder without burning; off, guidance is plain linear, as diffusers\' Qwen-Image 2.1 pipeline runs it. With a latent it is img2img. A prompt with images needs the VAE to encode them; a width or height of 0 then takes the last image\'s.',
+		inputs: {
+			positive: 'CONDITIONING',
+			negative: 'CONDITIONING?',
+			model: 'MODEL',
+			vae: 'VAE?',
+			latent: 'LATENT(qwen)?',
+			width: 'INT=1024',
+			height: 'INT=1024',
+			steps: 'INT=40',
+			seed: 'INT=42',
+			cfg: 'FLOAT=1',
+			cfg_rescale: 'BOOL=true',
+			strength: 'FLOAT=0.6',
+		},
+		outputs: { latent: 'LATENT(qwen)' },
+		async run({ positive, negative, model, vae, latent: init, width, height, steps, seed, cfg, cfg_rescale, strength }, ctx) {
+			for (const c of [positive, negative]) {
+				if (c && c.family !== 'qwenimage') throw new Error(`qwenimage.sample needs Qwen-Image prompts, not ${c.family}`);
+			}
+			if (model.family !== 'qwenimage') throw new Error(`qwenimage.sample needs a Qwen-Image DiT, not ${model.family}`);
+			if (init && init.format !== 'qwen') throw new Error(`qwenimage.sample starts from qwen latents; this one is ${init.format}`);
+			const useCfg = cfg > 1;
+			// With no negative wired in, CFG runs against the empty prompt. With
+			// images it carries the same ones, so the two agree up to the end of
+			// the last image and share those rows of the DiT's caches - two full
+			// prefixes of reference tokens do not fit beside the DiT.
+			const shared = useCfg && !negative && positive.images.length > 0;
+			if (useCfg && !negative) negative = await positive.negative();
+			const refsOf = async (c) => {
+				if (!c || c.images.length === 0) return [];
+				if (!vae || vae.format !== 'qwen') throw new Error('a prompt with images needs the Qwen-Image VAE wired into `vae`');
+				const out = [];
+				for (const img of c.images) out.push(await encodeImage(vae.path, img));
+				return out;
+			};
+			const t0 = llm.now();
+			const condRefs = await refsOf(positive);
+			const uncondRefs = useCfg && !shared ? await refsOf(negative) : [];
+			if (condRefs.length + uncondRefs.length > 0) llm.print(`  [phase] reference_encode: ${llm.since(t0)}`);
+			const last = condRefs[condRefs.length - 1];
+			if (last) {
+				width = width || last.w * 16;
+				height = height || last.h * 16;
+			}
+			// Sides are multiples of 32: a latent token is 16 pixels, and the
+			// vision encoder's tokens are 2x2 of them.
+			const latentH = init ? init.h : Math.max(2, Math.round(height / 32) * 2);
+			const latentW = init ? init.w : Math.max(2, Math.round(width / 32) * 2);
+			const dit = model.dit;
+			if (positive.dim !== dit.textDim) throw new Error(`Qwen-Image reads ${dit.textDim}-wide text states (Qwen3-VL-8B); this encoder gives ${positive.dim}`);
+
+			const t1 = llm.now();
+			dit.prepare(latentH, latentW);
+			let cond = null, uncond = null;
+			try {
+				if (shared) {
+					const tail = negative.n - negative.slots[negative.slots.length - 1].at;
+					cond = await dit.encodePrefix(positive, condRefs, tail);
+					uncond = await dit.encodeTail(cond, negative);
+				} else {
+					cond = await dit.encodePrefix(positive, condRefs);
+					uncond = useCfg ? await dit.encodePrefix(negative, uncondRefs) : null;
+				}
+				llm.print(`  [phase] dit_setup: ${llm.since(t1)}`);
+
+				const t2 = llm.now();
+				const count = dit.channels * latentH * latentW;
+				const sched = sigmas(steps, latentH * latentW, init ? strength : 1);
+				const n = sched.length - 1;
+				const x0 = llm.randomNormal(count, seed);
+				if (init) {
+					const s0 = sched[0];
+					for (let i = 0; i < count; i++) x0[i] = s0 * x0[i] + (1 - s0) * init.data[i];
+				}
+				dit.a.latent.buffer.write(x0);
+				const condV = useCfg ? f32(count) : null;
+				profileReset();
+				try {
+					for (let s = 0; s < n; s++) {
+						const ts = llm.now();
+						if (useCfg) {
+							await dit.forward(cond, sched[s]);
+							copy(dit.a.velocity, condV, count * 4);
+							await dit.forward(uncond, sched[s]);
+							cfgCombine(condV, dit.a.velocity, dit.channels, latentH * latentW, cfg, cfg_rescale);
+						} else {
+							await dit.forward(cond, sched[s]);
+						}
+						eulerStep(dit.a.latent, dit.a.velocity, count, sched[s + 1] - sched[s]);
+						submit();
+						llm.print(`  step ${s + 1}/${n}: sigma ${sched[s].toFixed(4)}  ${(llm.now() - ts).toFixed(0)}ms`);
+						await ctx.progress(s + 1, n, {});
+					}
+				} finally {
+					if (condV) condV.dispose();
+				}
+				profileReport('denoise');
+				const out = new Float32Array(dit.a.latent.buffer.readBytes().buffer);
+				llm.print(`  [phase] denoise: ${llm.since(t2)}`);
+				return { latent: makeLatent('qwen', out, latentH, latentW) };
+			} finally {
+				// uncond first: a shared one only frees its own rope.
+				for (const p of [uncond, cond]) if (p) p.dispose();
+				dit.release();
+			}
+		},
+	},
+});

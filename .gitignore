@@ -11,6 +11,6 @@ __pycache__
 analyze/
 .DS_STORE
 output/
-plugins/tests/out/
+llm/tests/out/
 graphs/
 shader-cache

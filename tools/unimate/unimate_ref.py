@@ -1,6 +1,6 @@
 """UniMate reference run on a rig, bypassing UniMate's dataset loader: what the
-llm-runner plugin (plugins/unimate) was checked against. Needs PyTorch (CPU is
-enough), the UniMate repo and its dependencies (see ../../plugins/unimate).
+llm-runner plugin (llm/plugins/unimate) was checked against. Needs PyTorch (CPU is
+enough), the UniMate repo and its dependencies (see ../../llm/plugins/unimate).
 
   python unimate_ref.py jobs.json out_dir
 

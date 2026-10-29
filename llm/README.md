@@ -1,0 +1,462 @@
+# Pipelines as plugins
+
+`llm-runner` is one binary. It brings up a headless GPU through three.c3l, opens
+the engine's JavaScript runtime and runs a **plugin**: a directory under
+`llm/plugins/` whose `main.js` builds a model's graph out of shady kernels and
+drives it. A new model is a new directory. The binary does not change.
+
+```
+llm-runner flux   --config flux-t2i.json
+llm-runner flux   --config flux-kontext.json prompt="make it night" seed=7
+llm-runner flux   --config flux-t2i.json keep_dit=true --server --port 7860
+llm-runner zimage --config zimage-t2i.json
+llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6 taesd=taef1.safetensors
+llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg output=depth.png
+llm-runner qwenimage --config qwenimage.json prompt="a neon sign that says OPEN"
+llm-runner run llm/apps/graph/templates/qwenimage-edit.json input0.path=photo.png prompt.prompt="make it winter"
+llm-runner run llm/apps/graph/templates/flux-t2i.json sample.seed=7   # a node graph
+llm-runner graph list=true                                     # the node types there are
+llm-runner tests/matmul_coop.js     # a script: run once as a module
+```
+
+`--config file.json` is read first, then each `key=value` is applied on top of
+it. A value that parses as JSON is taken as JSON; anything else is a string.
+`--plugins dir` points at an llm folder other than `./llm`.
+
+## Layout
+
+Three kinds of thing, each in its own folder. **core** is what llm-runner
+provides and every plugin may use; **apps** are llm-runner's own programs;
+**plugins** are the models. A plugin imports only core, never another plugin.
+
+```
+llm/
+  core/                what llm-runner provides
+    llm.js             the host API: models, tensors, tokenizer, images, noise
+    gpu.js             kernels by name, push-block packing, dispatch
+    ops.js             the operations models are written in (matmul, norms, attention, conv ...)
+    kernels/*.shady    one kernel per file; common.shady is put in front of each
+    weights/           torch.js: PyTorch checkpoints read without torch, mapped like safetensors
+                       lora.js: LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
+    vae/               latents.js: latent formats ('flux2', 'flux1', 'qwen') and their encode/decode
+                       flux.js (Flux 1 and 2), qwen.js (Qwen-Image 2.1, RGBA, 64 ch at /16), taesd.js (taef1)
+    models/            shared encoders: qwen3.js (Qwen-family text encoder, Qwen3-VL image rows),
+                       qwen3_vision.js (mmproj vision encoder), t5.js, dinov3.js (ViT features)
+    image/             warp.js: crops warped out of an 8-bit image on the GPU, normalised
+    motion/            quaternions, clip cleanup, smoothing, the GLB and BVH writers
+    graph/             node registry, port types, the executor, plugin discovery
+    nodes.js           the nodes every graph uses: image load/save/preview, loaders, VAE
+    core.json          which core this is, and which host verbs it needs
+  apps/
+    studio/            the node editor (llm-runner ui)
+    graph/             runs a graph file with every plugin's nodes (llm-runner run); templates/
+  plugins/
+    flux/              Flux 2 Klein: txt2img, img2img, kontext, LoRA/LoKr, server
+    zimage/            Z-Image Turbo: txt2img, img2img, LoRA, TAESD
+    qwenimage/         Qwen-Image 2.1: txt2img, img2img, editing with up to three images, LoRA, CFG
+    depth/             Depth Anything V2
+    kimodo/            Kimodo text-to-motion: LLM2Vec text encoder, two-stage motion denoiser, DDIM,
+                       guide poses (full-body keyframes), rest skeletons in skeletons/
+    unimate/           UniMate text-to-motion for any skeleton: the rig's own joints, T5 captions,
+                       either released flow model (graph or full attention) read straight from its .pt
+    sam3dbody/         SAM 3D Body: an image to a posed MHR rig; video frames to a motion (GLB, BVH)
+    creature/          video frames and a rigged .glb to an animation of that rig: DINOv3 point
+                       tracking and a rig fit, as a JSON server or a Rigsmith job
+  tests/               kernel checks against float32, model goldens, benchmarks
+```
+
+**Imports are rooted.** Anything outside a file's own folder is imported from
+the llm folder's root, so it reads the same at any depth and from a linked
+plugin: `import { llm } from '/core/llm.js'`, `'/core/vae/latents.js'`. A
+plugin's own files import each other as `./x.js`.
+
+Each plugin directory has a `plugin.json` (`name`, `version`, `description`,
+`nodes`, `main`, and optionally `requires_core`). `nodes` registers the plugin's
+node types; `main` is its command-line and server entry, which builds a fixed
+graph from the config keys and runs it. `core/` has a `plugin.json` too, for
+its nodes.
+
+## Installing a plugin
+
+Plugins are read from disk when they run; nothing is compiled into a binary.
+The llm folder is `--plugins` when given; else `llm` beside the executable,
+where a release ships it (`tools/package.py`); else `./llm`, a checkout's. A
+program that links the `llm` library (Rigsmith) finds it the same way, with its
+own setting first (`lib/pipeline/plugins.c3`).
+
+To add a plugin, link its folder into `plugins/`; its `/core/...` imports then
+resolve to the folder's core, wherever the plugin itself lives:
+
+```
+ln -s ~/src/my-plugin  dist/llm/plugins/my-plugin     # or Rigsmith: Settings › AI › Plugins › Link plugin folder…
+```
+
+Edits to a linked folder are what the next job runs. Unlinking removes the link
+only, never the folder it points at.
+
+`core/core.json` says which core this is (`version`) and which host verbs it
+needs (`host`, checked against `llm::host::API`). A plugin that needs a newer
+core says so with `"requires_core": n` in its `plugin.json`. A job is refused
+with a sentence saying which is out of date, instead of failing on a missing
+function. Code two plugins would share belongs in core.
+
+## A plugin
+
+```js
+import { llm, image } from '/core/llm.js';
+import * as op from '/core/ops.js';
+import { submit } from '/core/gpu.js';
+
+llm.plugin({
+	name: 'mine',
+	load(config) { /* once: compile kernels, maybe keep weights resident */ },
+	async generate(config) { /* one job; return a JSON-able result */ },
+	async handle(request) { /* server mode, optional: llm.respond(status, type, body) */ },
+});
+```
+
+The runner evaluates `main.js`, calls `load(config)`, and then calls
+`generate(config)` once. With `--server` it calls `handle({ method, path, body })`
+for each request instead. A plugin without `handle` gets `generate({ ...config,
+...jsonBody })` and its result is sent back as JSON. Buffers and kernels persist
+between requests, so weights a plugin keeps are loaded once.
+
+`console.log` output is collected and printed when a call finishes. Use
+`llm.print` for progress you want to see while it runs.
+
+## Nodes and graphs
+
+A model's work is split into **nodes** with typed inputs and outputs, the way
+ComfyUI splits it: a loader, a prompt encoder, a sampler, a VAE decode. A graph
+wires them together, so a VAE, a LoRA or a text encoder can be swapped without
+touching the model's code.
+
+```js
+import { defineNodes } from '/core/graph/registry.js';
+
+defineNodes('mine', {
+	'mine.sample': {
+		title: 'My sampler',
+		inputs: { cond: 'CONDITIONING', model: 'MODEL', steps: 'INT=4', seed: 'INT=42', latent: 'LATENT?' },
+		outputs: { latent: 'LATENT(flux1)' },
+		async run({ cond, model, steps, seed, latent }, ctx) {
+			// After each step: reports progress, lets the studio's window draw a
+			// frame, and throws if the run was cancelled. `latent` is read only
+			// if something shows a preview.
+			//   await ctx.progress(step, steps, { latent: () => makeLatent(...) });
+			return { latent: makeLatent('flux1', data, h, w) };
+		},
+	},
+});
+```
+
+Port types (`core/graph/types.js`):
+
+| | |
+|---|---|
+| `IMAGE` | `{ width, height, channels, pixels }` on the host |
+| `LATENT` | `{ format, data, channels, h, w }`. A VAE decodes only its own `format` (`core/vae/latents.js`), so taef1 can stand in for the Flux 1 VAE and a Flux 2 latent is refused by it. |
+| `CONDITIONING` | `{ family, tensor, n, dim }`, the text encoder's hidden states on the GPU. A sampler takes only its own `family`. |
+| `MODEL`, `TEXT_ENCODER`, `VAE`, `LORA`, `REFERENCES` | loaders' handles; `LORA` is a list of `{ path, strength }` |
+| `POSE`, `MOTION` | SAM 3D Body's pose of one image; a clip on a skeleton (`{ skeleton, fps, frames, rotations, root }`, y up, metres) |
+| `STRING`, `INT`, `FLOAT`, `BOOL`, `ENUM(a\|b)`, `PATH(kind)` | settings; `=value` is the default, `?` optional, `*` multi-line |
+
+`+` after a type (`LORA+?`) lets an input take any number of wires. The node
+then gets a list of their values, in the order they were wired; in a graph
+file the input is a list of `{ "from": ... }`. The DiT loaders take LoRAs this
+way, so two LoRA nodes can be wired straight into one loader, as well as
+chained.
+
+A node never disposes its inputs. The executor owns every output and disposes
+it (anything with a `dispose()`) once the last node that reads it has run. That
+keeps one-shot runs as lean as the old pipelines: the DiT is freed before the
+VAE decodes. The graph server keeps results between requests instead, keyed by
+a node's settings and inputs. A new seed then re-samples without reloading the
+model or re-encoding the prompt.
+
+A graph file lists nodes and their settings. `{ "from": "node.output" }` is a
+wire:
+
+```json
+{ "nodes": [
+	{ "id": "vae",    "type": "core.vae",          "params": { "path": "ae.safetensors" } },
+	{ "id": "decode", "type": "core.vae_decode",   "params": { "vae": { "from": "vae.vae" }, "latent": { "from": "sample.latent" } } },
+	{ "id": "save",   "type": "core.save_image",   "params": { "image": { "from": "decode.image" }, "path": "output/cat-#.png" } }
+] }
+```
+
+Only what the sinks (`core.save_image`, `core.preview`) need runs.
+`llm-runner run file.json node.input=value` overrides a setting, and
+`apps/graph/templates/` holds the graphs the flux, zimage and qwenimage plugins build.
+`llm-runner graph --server` answers `GET /nodes` (the catalogue), `GET /plugins`
+and `POST /graph` (`{ graph, "node.input": value }` returns the sinks' results
+with images as base64 PNG).
+
+Plugins are found through their `plugin.json` under `plugins/` (and core's).
+`~/.config/llm-runner/settings.json` can list `disabled_plugins`. Plugins are
+trusted code: they read and write files and run kernels on the GPU.
+
+## Kimodo's weights
+
+`model=` takes NVIDIA's release as it is downloaded — no conversion:
+
+```
+huggingface-cli download nvidia/Kimodo-SOMA-RP-v1.2 model.safetensors --local-dir Kimodo-SOMA-RP-v1.2
+llm-runner kimodo model=Kimodo-SOMA-RP-v1.2 text_model=Llama-3-Kimodo-Q8_0.gguf prompt="a person waves"
+```
+
+`model=` is the folder or its `.safetensors`, under any name. The motion
+statistics (the release's `stats/motion/`, six small `.npy` files) are carried
+by the plugin for the models it recognises (`kimodo/stats.js`, currently
+Kimodo-SOMA-RP-v1.1 and v1.2, licensed by NVIDIA Corporation under the NVIDIA Open Model
+License, `kimodo/NVIDIA-LICENSE.txt`), so for those the weights file is the
+whole download; for any other, put `stats/motion/` beside the weights, which is
+also read first when it is there. `config.yaml` is
+not read: the network's shape and the skeleton are read off the weights, and
+what they cannot say (30 fps, the 1000-step schedule, 8 heads, 50 prompt
+tokens) is the plugin's own default. kimodo.cpp's `kimodo-*-f32.gguf` still
+works. The text encoder (`text_model`, plus `Llama-3-Kimodo-tokenizer.gguf`
+beside it) is only read as a GGUF, from `LocalAI-io/Llama-3-Kimodo-GGML`: it is
+Llama-3-8B with LLM2Vec's adapters merged and quantized, not part of NVIDIA's
+release.
+
+## SAM 3D Body's weights
+
+```
+hf download facebook/sam-3d-body-dinov3 --local-dir sam-3d-body-dinov3    # gated: accept the license first
+llm-runner sam3dbody model=sam-3d-body-dinov3 input=person.jpg output=pose.json preview=pose.png
+
+ffmpeg -i clip.mp4 frames/%05d.png
+llm-runner sam3dbody model=sam-3d-body-dinov3 frames=frames fps=24 glb=motion.glb bvh=motion.bvh
+```
+
+`model=` is the downloaded folder as it is: `model.ckpt` (the network, read
+straight out of the PyTorch zip) and `assets/mhr_model.pt` (the MHR rig, a
+TorchScript file read the same way). Nothing is converted and the plugin
+carries none of either. The weights are Meta's, released under the SAM License
+the gated download asks you to accept; the MHR rig is Apache-2.0. The plugin
+writes motion made with them, so what you do with that motion is under the
+same license's terms.
+
+A frame takes about 3.6 s on an Apple M5 (the q8 DINOv3 backbone is 3.05 s of
+it). The camera may look up or down: the floor is fitted as a plane under the
+feet over the whole clip and levelled, and the turn is kept as the camera's
+rotation in the .glb's extras and the frames JSON. `hands=true` poses the
+hands as SAM 3D Body's full inference does: a crop around each hand through the
+backbone and the hand decoder (the left one mirrored, the decoder knowing only
+right hands), the good ones' wrists and the elbows as prompts to the body
+decoder again, and their finger angles and wrist turns put in. It takes about
+10.5 s a frame (three backbone passes). A hand the checks turn down keeps the
+fingers of the last frame it passed; `hand_stride=2` runs the hand passes on
+every second frame only, the fingers blended between them. `posed=frames.json` (a
+run's `output`) makes the clip again from the posed frames in seconds, to try
+other `smooth` or `cleanup` settings. A clip is the MHR skeleton's 126
+joints, y up, metres, its proportions held to their median over the clip and
+standing on y = 0, the camera taken as fixed; `apps/graph/templates/sam3dbody-motion.json`
+is the same as nodes. `tests/sam3dbody_golden.js` checks every stage of one
+image against the reference (`tools/sam3dbody/golden.py` writes its numbers),
+`tests/sam3dbody_hands.js` the hand passes and their merge
+(`tools/sam3dbody/golden_hands.py`), and `tests/sam3dbody_motion.js` the motion skeleton and writers against MHR's
+own kinematics.
+
+A clip faces +z on average (`facing=forward`, the default), as the rigs it is
+put on do; `facing=camera` keeps the way the person faced the camera. One camera
+guesses along its line of sight: filmed from the side, a walk leans sideways and
+spreads its feet; from the front, it leans forward. Two cameras of the same
+moments fix that:
+
+```
+llm-runner sam3dbody model=sam-3d-body-dinov3 frames=front/ side=side/ fps=24 hands=true \
+    glb=walk.glb output=front.json side_output=side.json
+llm-runner sam3dbody model=sam-3d-body-dinov3 posed=front.json side_posed=side.json glb=walk.glb
+```
+
+Frame N of `frames` and `side` must be the same instant. Each bone is taken from
+where both cameras draw it (the planes through each camera's line of sight and
+the bone as drawn, crossed), so a lean to the side and the feet's spacing come
+from the front camera and a lean forward and the arms' swing from the side one.
+`sam3dbody.fuse_views` is the same as a node, and `tests/sam3dbody_fuse.js`
+checks it against a known walk.
+
+## Creature
+
+```
+llm-runner creature model=sam-3d-body-dinov3 --server --port 7860
+curl -X POST http://127.0.0.1:7860/animate -d '{"rig": "rig.glb", "frames": "frames", "labels": {...}}'
+```
+
+Any animal, any rig: points labelled on a keyframe or two (named after the
+rig's joints, or markers on them) are followed through the frames by DINOv3's
+patch features on the GPU (`creature/track.js`: the features stay on the GPU,
+every point is scored against every patch with one matmul, and only the scores
+come back; about 1.1 s a 1280x720 frame on an RX 7800 XT, the backbone nearly
+all of it), and the rig is fitted to the tracks on the host (`creature/fit.js`:
+forward kinematics with hand-written gradients, a robust choice among the
+tracks from each keyframe, one orthographic camera that follows the animal,
+the legs in their planes and the feet on the floor; about a minute for 124
+frames). The clip comes back as Rigsmith takes clips (rest turns identity,
+facing as-is), as `apply_clip` arguments, as BVH, or on the uploaded .glb
+itself. Routes and fields: `docs/creature_server.md`. Rigsmith can run it
+in-process like Kimodo, from its llm folder. `tests/creature_track.js` checks the
+tracker against a track made before, `tests/creature_fit.js` the fit's
+gradients and every output read back.
+
+## UniMate's weights
+
+```
+hf download Linzhan/UniMate unimate_uniml3d_f60_v2/checkpoints/checkpoint_step_100000.pt --local-dir UniMate
+hf download google/flan-t5-base model.safetensors tokenizer.json --local-dir flan-t5-base
+llm-runner unimate model=UniMate/unimate_uniml3d_f60_v2/checkpoints/checkpoint_step_100000.pt \
+    text_model=flan-t5-base rig_glb=character.glb prompt="walks forward" glb=walk.glb
+```
+
+The `.pt` is a training checkpoint (model, EMA copy, optimizer state; 1.2 GB):
+the plugin reads its EMA weights out of the zip itself and needs nothing else
+from the release - the normalisation statistics (`unimate/stats.js`) and the
+joint-name vocabulary (`unimate/names_vocab.js`) are carried, and the shape
+is the released v2 models'. About 1.5 GB of GPU memory. One motion is 60 frames
+at 30 fps; a 65-joint rig takes about 7 s for 20 steps on an RX 7800 XT.
+
+The other released model,
+`unimate_uniml3d_f60_v2_full_cross_attn/checkpoints/checkpoint_step_90000.pt`,
+runs the same way (the checkpoint says which it is): one attention over the
+whole motion instead of per-frame and per-joint ones, and the caption's words
+attended to in every block instead of their mean. About 9 s for the same rig.
+
+Which way a rig faces is read off its left/right joint names, as the reference
+does; a rig whose head then stands well behind its root (sides named the wrong
+way round for its head, as happens on quadrupeds) is turned round to face its
+head, or it would move tail first. The clip comes back in the rig's own space
+and facing, the root at its rest position, with `extras.facing = "as-is"` so
+crig does not turn it again when it reads it.
+
+`tests/t5_golden.js` and `tests/unimate_names.js` compare against the reference implementation's numbers, which
+`tools/unimate/unimate_golden.py` writes (it needs PyTorch and a clone of the
+UniMate repository).
+
+## The host API (`core/llm.js`)
+
+| | |
+|---|---|
+| `openTorch(path)` (`core/weights/torch.js`) | A PyTorch checkpoint as the same kind of model: its pickle read in JS (nothing in it is run), its stored tensors mapped from the file. F32/F16/BF16 upload; `ints(name)` reads integer ones |
+| `llm.open(path)` | A GGUF or safetensors file, memory-mapped: `.tensors`, `.metadata`, `.meta(key)`, `.shape(name)` (GGUF order), `.type(name)` |
+| `model.upload(name, as)` | A `Tensor` on the GPU. `as` is `'raw'` (file bytes), `'f32'` (dequantised or widened), `'conv'` (f32, laid out `[kh, kw, in, out]`), `'q8'` (requantised to Q8_0), or `'auto'` (raw for the types matmul reads natively, otherwise f32). The bytes go from the mapping straight to VRAM in 64 MB pieces. |
+| `model.floats(name)` | A small tensor on the host, as a Float32Array |
+| `model.embedRows(name, ids, into)` | Embedding lookup on the host, written into a GPU buffer |
+| `model.tokenizer()` | `.encode(text, specials)`, `.find(special)`, `.decode(ids)` |
+| `llm.randomNormal(n, seed)` | The same noise the C3 pipelines drew for a seed |
+| `image.load / decode / savePng / encodePng / cropTo / fit16 / resize / toTensor / fromTensor` | Images as `{ width, height, channels, pixels }` |
+| `llm.readText / readBytes / writeBytes / exists / base64Encode / base64Decode` | Files |
+| `__llm.readRange(path, offset, length) / fileSize(path)` | Part of a large file without reading it all |
+| `__llm.listDir / makeDir / homeDir` | Directories: `[{ name, dir }]`, make with parents, the home directory |
+| `llm.print(...)`, `llm.now()`, `llm.since(t0)` | Progress |
+
+GPU work goes through `three.compute` (see `lib/three.c3l/docs/functions.md`,
+section `three.compute`). `gpu.js` and `ops.js` wrap it. Every op records a
+dispatch, and `submit()` runs everything recorded and waits.
+`independent: true` on an op leaves out the barrier after it, for work the next
+op does not read, such as Q, K and V over one input.
+
+## Kernels
+
+A kernel is `core/kernels/<name>.shady`, compiled at runtime by the shady
+compiler inside three.c3l and cached on disk (`llm/build/shader-cache`). Shady reads
+like C3. The language reference is `lib/three.c3l/lib/shady.c3l/LANGUAGE.md`.
+Keep one entry point per file: a kernel's bindings are its module's.
+
+A kernel can be sized from JS. It spells a size `$NAME`, and
+`kernel(name, { NAME: value })` compiles one pipeline per set of values. This is
+how `flash_attention` serves head widths of 64 and 128.
+
+### The matrix cores
+
+With `VK_KHR_cooperative_matrix` and 64-wide subgroups, `ops.js` sends the heavy
+work to kernels built on 16x16x16 float16 products with float32 accumulators:
+
+| | kernel | against the float32 kernel, RX 7800 XT |
+|---|---|---|
+| Q8_0 matmul | `matmul_q8_coop` | 7-8 -> 28-36 TFLOPS |
+| attention, head 128 | `flash_attention_split` (wave32) | 42 -> 3.1 ms (32 heads x 2176) |
+| 3x3 / 1x1 conv | `conv2d_coop` | 5x / 40x |
+
+Their operands are float16, so an input past 65504 overflows. `ops.matmul`
+takes an `exact` flag for inputs that can: the SwiGLU down-projections of
+Qwen3 and Z-Image use it. A plugin reads `matrix_cores` (default true) and
+calls `useMatrixCores()`; `matrix_cores=false` runs everything in float32.
+
+## Checking a port
+
+The move to nodes changed no output: every plugin's run through its graph is
+byte-identical to the PNG it wrote before (Flux txt2img, img2img, kontext with
+two LoRAs; Z-Image txt2img, img2img with TAESD, CFG with a LoRA; depth and
+height map).
+
+Each pipeline was compared image to image against the C3 build it replaced,
+with the same seed, before that build was deleted:
+
+| | against the C3 pipeline |
+|---|---|
+| Flux txt2img, 512² | 53.6 dB PSNR |
+| Flux kontext edit | 66.3 dB |
+| Flux img2img | 63.6 dB |
+| Flux kontext + LoKr + LoRA | 38.1 dB (requantised merge) |
+| Depth Anything, depth / height map | 92.3 / 91.5 dB |
+| Z-Image DiT, first step | velocity correlation 0.999998 |
+
+Z-Image had no clean reference: the C3 build's Q8_0 matmul converted
+activations to fp16, some of Z-Image's FFN activations exceed 65,504, and from
+the second step on it overflowed into a washed-out image. The plugin keeps
+those matmuls in float32 and produces a clean one.
+
+The Qwen3 text encoder turned its rotary pairs the wrong way until the
+Qwen-Image port: element 2j with 2j+1, where Qwen3 turns j with j + 64 (and the
+GGUF weights are not permuted for the other convention). Against transformers
+on the same weights, layer 0 was 21% off and is now 0.1%. Flux and Z-Image
+read this encoder, so their images changed with the fix; the tables above are
+from before it.
+
+Qwen-Image 2.1 was checked against diffusers' own code (the PR that added it)
+run on the CPU from the same files:
+
+| | against diffusers |
+|---|---|
+| VAE encode and decode, 512² | 62.8 dB |
+| DiT velocity, one step at 256² | relative error 1%, cosine 0.99995 (reference in bf16) |
+| Sigmas, 40 and 4 steps | equal to 6 places |
+
+Qwen-Image 2.1 LoRAs were checked in both layouts files come in: PEFT's
+(`transformer.` prefix, `img_mlp.gate_layer` and `proj` folded into the two
+halves of the fused `gate_up`) and ai-toolkit's (`diffusion_model.` prefix,
+`gate_up` fused whole). Every site of a constant-delta test file merges, and
+rows sampled at both halves match the host's `B @ A` at the file's scale —
+PEFT's `lora_alpha` read from its metadata, rank when no alpha is given.
+Qwen-Image merges LoRAs by default; `lora_merge: false` (the load node's
+`merge_lora`) keeps them unmerged (`ops.matmul` adds x @ A^T @ B^T). Their
+deltas are about one Q8_0 step, and requantising merged weights rounds much of
+them away. On two blocks with a real LoRA (VNCCS PoseStudio) against diffusers
+with W + B @ A in float32, the merged velocity was 1% off (the LoRA's effect 9%
+short), the unmerged one 0.035%, the same as with no LoRA. Q, K and V share one
+stacked A (as do gate and up), held as Q8_0 for the matrix cores: a rank-32
+LoRA costs 6% a step (3.71 s against 3.51 s, 992x1056, RX 7800 XT). The edit path itself
+(two reference latents, the block-causal mask, their rope) is 0.028% off.
+
+The matrix-core kernels were checked against the float32 plugin itself:
+`tests/matmul_coop.js`, `tests/bench_attention.js` and `tests/conv_coop.js`
+per kernel (relative error ~3e-4), and whole images with `matrix_cores=false`:
+
+| | float16 matrix cores against float32 |
+|---|---|
+| Flux kontext + LoKr + LoRA | 67.8 dB |
+| Flux txt2img | 51.2 dB |
+| Z-Image txt2img | 56.7 dB |
+| Depth / height map | 67.6 / 66.4 dB |
+
+Timings, 512², 4 steps, RX 7800 XT:
+
+| | C3 build | plugin, float32 | plugin, matrix cores |
+|---|---|---|---|
+| Flux kontext + LoRA, per step | 3.6 s | 4.66 s | 1.23 s |
+| Flux kontext + LoRA, whole run | | 32.4 s | 13.5 s |
+| Flux txt2img, whole run | 39.7 s (spilled VRAM) | 13.7 s | 6.9 s |
+| Z-Image, per step | 2.4 s | 1.8 s | 0.86 s |
+| Z-Image, whole run | 17.1 s | 21.1 s | 12.8 s |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference numbers for plugins/tests/sam3dbody_hands.js: SAM 3D Body's full
+"""Reference numbers for llm/tests/sam3dbody_hands.js: SAM 3D Body's full
 inference (`inference_type="full"`), body decoder, both hands and the keypoint
 prompted second body pass, from Meta's own code.
 

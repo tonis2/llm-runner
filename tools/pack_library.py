@@ -7,8 +7,8 @@ c3c takes a zipped .c3l wherever it takes a library folder, and unpacks it under
 the build directory. The zip holds manifest.json and every source file its
 "sources" globs name (and anything those sources `$embed`, at the same paths, so
 the embeds still resolve - today nothing). The plugins are not in it: a program
-ships `plugins/lib` beside its executable and reads plugins from that folder at
-run time (`tools/package.py --plugins-only`). `version.txt` says which commit it
+ships the llm folder (`llm/core`, its plugins) beside its executable and reads
+plugins from it at run time (`tools/package.py --llm-only`). `version.txt` says which commit it
 was packed from, and whether the tree had changes then.
 """
 import glob

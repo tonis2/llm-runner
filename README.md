@@ -6,10 +6,15 @@ GPU inference engine in [C3](https://c3-lang.org), running on Vulkan compute.
 
 `llm-runner` is one binary built on [three.c3l](lib/three.c3l). It opens the
 engine's headless GPU and JavaScript runtime and runs a pipeline written as a
-plugin under `plugins/`: JS drives the graph and the kernels are `.shady`
+plugin under `llm/plugins/`: JS drives the graph and the kernels are `.shady`
 compiled at runtime. The C3 side supplies what JS can't do cheaply: memory-mapped
 GGUF and safetensors weights streamed straight to VRAM, the tokenizer, and
 images. A new model is a new plugin directory, with no rebuild.
+
+The `llm/` folder holds three kinds of thing: `core/` is what llm-runner
+provides (the host API, GPU ops and kernels, weight readers, VAEs, text and
+vision encoders, the graph machinery), `apps/` the studio and the graph runner,
+and `plugins/` the models. Plugins import only core, as `/core/...`.
 
 ```sh
 c3c build llm-runner
@@ -19,9 +24,9 @@ c3c build llm-runner
 ./build/llm-runner zimage --config zimage-t2i.json
 ./build/llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6
 ./build/llm-runner depth model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg
-./build/llm-runner run plugins/graph/templates/zimage-t2i.json sample.seed=7
+./build/llm-runner run llm/apps/graph/templates/zimage-t2i.json sample.seed=7
 ./build/llm-runner graph --server --port 7860     # POST /graph, GET /nodes
-./build/llm-runner ui                             # the node editor (plugins/studio/)
+./build/llm-runner ui                             # the node editor (llm/apps/studio/)
 ```
 
 Each model is also a set of typed nodes (loader, prompt, sampler, and shared
@@ -32,7 +37,7 @@ between requests, so a new seed doesn't reload the model.
 Ported: Flux 2 Klein (txt2img, img2img, kontext, LoRA/LoKr, the A1111-style
 server), Z-Image Turbo (txt2img, img2img, LoRA, TAESD), and Depth Anything V2.
 The C3 pipelines they replaced, and their Slang shaders, are gone; SkinTokens
-was dropped. See [plugins/README.md](plugins/README.md) for the plugin API and
+was dropped. See [llm/README.md](llm/README.md) for the plugin API and
 for how each port was checked.
 
 On a GPU with `VK_KHR_cooperative_matrix` and 64-wide subgroups (RDNA3), the
@@ -49,8 +54,8 @@ git submodule update --init --recursive
 c3c build llm-runner
 ```
 
-Kernels are compiled from `plugins/lib/kernels/*.shady` when first used and
-cached in `build/shader-cache`. The cache key is the source, not the compiler, so
+Kernels are compiled from `llm/core/kernels/*.shady` when first used and
+cached in `llm/build/shader-cache`. The cache key is the source, not the compiler, so
 clear it after changing shady itself.
 
 ### macOS

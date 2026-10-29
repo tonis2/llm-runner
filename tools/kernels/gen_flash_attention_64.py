@@ -1,4 +1,4 @@
-# Writes plugins/lib/kernels/flash_attention_64.shady, unrolled so a thread's
+# Writes llm/core/kernels/flash_attention_64.shady, unrolled so a thread's
 # query row and output stay in registers.
 #
 #   python3 tools/kernels/gen_flash_attention_64.py
@@ -8,7 +8,7 @@
 # 4 and 64, 49 ms at 8 and 32). ops.js dispatches ceil(seq / WG) groups.
 import os
 CH, WG = 8, 128
-out = os.path.join(os.path.dirname(__file__), '../../plugins/lib/kernels/flash_attention_64.shady')
+out = os.path.join(os.path.dirname(__file__), '../../llm/core/kernels/flash_attention_64.shady')
 D4 = 16
 L = []; w = L.append
 w(f"""// Flash attention for head_dim 64 without matrix cores: one thread a query
