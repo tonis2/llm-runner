@@ -21,6 +21,13 @@
  which core it is and which host verbs it needs (`host`, against
  `llm::host::API`); a plugin may say which core it needs (`requires_core`).
  `check_plugin` refuses what would not run, with a sentence saying why.
+
+ **Carried in llm.c3l.** A program that vendors only the packed library can
+ carry the folder in it too (`tools/pack_library.py <out> [plugin ...]` adds
+ `llm/core` and the plugins named). c3c unpacks the zip to build the program and
+ compiles this file from there, so `$$FILEPATH` says where the folder is
+ (`build/unpacked_c3l/llm.c3l/llm`) and `plugins_root` finds it with no help
+ from the program; a release copies it into its bundle.
 *>
 module llm::pipeline;
 
@@ -73,19 +80,34 @@ fn bool has_core(String root) => @pool()
 }
 
 <*
- The llm folder a host uses: `explicit` when one is set; else `llm` beside the
- executable, which is where a release puts it; else `fallback`, the host's own
- place (a checkout's `llm`, the copy a program vendors). Owned.
+ The llm folder a host uses, the first of:
+
+ 1. `explicit`, the user's setting or a --plugins argument;
+ 2. `llm` beside the executable - a release, wherever it is installed;
+ 3. `fallback` when it has core - the host's own place (a checkout's `llm`, a
+    macOS bundle's Resources);
+ 4. `llm` beside this library's sources - the llm-runner checkout, or the folder
+    c3c unpacked llm.c3l into, so a program vendoring the zip needs no path;
+ 5. `fallback` as it is, so a refusal can name it.
+
+ Owned.
 
  @param explicit : `The user's setting or a --plugins argument; "" for none.`
- @param fallback : `Where to look last. Returned even when it has no core, so a refusal can name it.`
+ @param fallback : `The host's own place to look.`
 *>
 fn String plugins_root(Allocator allocator, String explicit, String fallback)
 {
 	if (explicit.len > 0) return trimmed_root(explicit).copy(allocator);
 	String beside = plugins_beside_executable(allocator);
 	if (beside.len > 0) return beside;
-	return trimmed_root(fallback).copy(allocator);
+	String own = trimmed_root(fallback);
+	if (has_core(own)) return own.copy(allocator);
+	@pool()
+	{
+		String carried = string::tformat("%s/llm", library_root());
+		if (has_core(carried)) return carried.copy(allocator);
+	};
+	return own.copy(allocator);
 }
 
 // `llm` beside the executable when it is an llm folder, else "". Owned.
@@ -95,6 +117,25 @@ fn String plugins_beside_executable(Allocator allocator) @local => @pool()
 	if (catch beside) return "";
 	String candidate = string::tformat("%s/llm", beside);
 	return has_core(candidate) ? candidate.copy(allocator) : "";
+}
+
+<*
+ Where this library's sources are: this file's compile-time path without
+ `lib/pipeline/plugins.c3`. c3c builds the library from source, so this is the
+ checkout or the folder it unpacked llm.c3l into. The path names the build
+ machine; a binary copied elsewhere will not find it, and looks beside itself
+ first anyway.
+*>
+fn String library_root() @local
+{
+	String path = $$FILEPATH;
+	usz cut = path.len;
+	for (int i = 0; i < 3; i++)
+	{
+		while (cut > 0 && path[cut - 1] != '/' && path[cut - 1] != '\\') cut--;
+		if (cut > 0) cut--;
+	}
+	return path[:cut];
 }
 
 fn String trimmed_root(String root) @local

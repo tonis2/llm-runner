@@ -405,8 +405,8 @@ identity, +Y up, facing +Z. Today, without any Rigsmith code:
 4. Clean up with Rigsmith's own tools: `pin_feet`, `smooth_clip`, `make_loop`.
 
 Rigsmith can also run the plugin in its own process, the way it runs Kimodo,
-through `llm::pipeline::Job`, once `creature` is in its plugins folder (Settings
-› AI › Plugins; see "Installing a plugin" in `plugins/README.md`). The plugin is
+through `llm::pipeline::Job`, once `creature` is in its llm folder's `plugins/`
+(Settings › AI › Plugins; see "Installing a plugin" in `llm/README.md`). The plugin is
 read from that folder when the job starts, so an edit here reaches Rigsmith on
 its next job.
 

@@ -110,6 +110,14 @@ fn void an_explicit_folder_wins_and_a_fallback_is_named() @test
 	test::@check(fallback == "llm", "nothing beside the test binary, so the fallback (%s)", fallback);
 }
 
+fn void the_library_finds_its_own_llm_folder() @test
+{
+	String found = pipeline::plugins_root(mem, "", "/nowhere");
+	defer free(found.ptr);
+	test::@check(found.starts_with("/") && found.ends_with("/llm") && pipeline::has_core(found),
+		"the llm folder beside the library's sources (%s)", found);
+}
+
 fn void a_name_is_an_app_or_a_plugin() @test
 {
 	make_folders();

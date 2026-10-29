@@ -79,10 +79,19 @@ its nodes.
 ## Installing a plugin
 
 Plugins are read from disk when they run; nothing is compiled into a binary.
-The llm folder is `--plugins` when given; else `llm` beside the executable,
-where a release ships it (`tools/package.py`); else `./llm`, a checkout's. A
-program that links the `llm` library (Rigsmith) finds it the same way, with its
-own setting first (`lib/pipeline/plugins.c3`).
+The llm folder is the first of (`lib/pipeline/plugins.c3`, `plugins_root`):
+
+1. `--plugins`, or a program's own setting;
+2. `llm` beside the executable, where a release ships it (`tools/package.py`) -
+   found through symlinks, wherever the release is installed;
+3. the program's own place when it has core: `./llm` for llm-runner, a macOS
+   bundle's Resources for Rigsmith;
+4. `llm` beside the library's own sources, which the library knows from where
+   c3c compiled it: a checkout's `llm`, or, for a program that vendors
+   `llm.c3l`, the folder c3c unpacked it into,
+   `build/unpacked_c3l/llm.c3l/llm` (`tools/pack_library.py <out> kimodo
+   creature` packs core and those plugins into the zip). The program needs no
+   path of its own for it.
 
 To add a plugin, link its folder into `plugins/`; its `/core/...` imports then
 resolve to the folder's core, wherever the plugin itself lives:

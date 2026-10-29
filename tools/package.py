@@ -2,7 +2,10 @@
 """Lays out a release: the llm-runner binary with its llm folder beside it.
 
     tools/package.py <out> [plugin ...]              # <out>/llm-runner and <out>/llm/{core, apps, plugins/...}
-    tools/package.py --llm-only <out> [plugin ...]   # just <out>/llm/{core, plugins/...}: what a host such as Rigsmith ships
+    tools/package.py --llm-only <out> [plugin ...]   # just <out>/llm/{core, plugins/...}
+
+A program that vendors only the packed library (Rigsmith) gets the llm folder
+inside llm.c3l instead: `tools/pack_library.py <out> [plugin ...]`.
 
 `llm/core` (the host API every plugin imports, its kernels, weights, VAEs and
 encoders) always goes; the plugins named go into `llm/plugins`. The apps (the
