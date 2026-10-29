@@ -10,10 +10,27 @@
 import { llm, image } from '/core/llm.js';
 import { app, runGraph, safe, dropImages } from './app.js';
 import { Doc, defOf, isWire } from './doc.js';
-import { clip } from './canvas.js';
 import { THEME, PALETTE_W } from './theme.js';
 
 const { Padding, Column, Row, Clip, Drawing, Label, Button } = three.ui;
+
+// A line cut to `width` points with an ellipsis, remembered: the cards draw
+// the same few strings on every render.
+const clipCache = new Map();
+function clip(text, width, size) {
+	const key = `${size}|${width | 0}|${text}`;
+	const hit = clipCache.get(key);
+	if (hit !== undefined) return hit;
+	const measure = (t) => three.ui.measure(t, { size })[0];
+	let out = text;
+	if (measure(out) > width) {
+		while (out.length > 1 && measure(out + '…') > width) out = out.slice(0, -1);
+		out += '…';
+	}
+	if (clipCache.size > 4000) clipCache.clear();
+	clipCache.set(key, out);
+	return out;
+}
 
 const CARD_H = 64;
 const CARD_GAP = 6;

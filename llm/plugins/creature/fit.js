@@ -18,7 +18,8 @@
 //                 15 px), softly nearest at first and sharply by the end; a
 //                 hypothesis a point is far from in every frame costs little;
 //                 a found point (a finder's) pulls as hard as it is sure
-//   smoothness    the joints' and markers' accelerations, and the turns'
+//   smoothness    the tracked joints' and markers' accelerations, and the
+//                 turns' (a hand's untracked fingers do not make its sway dearer)
 //   twist         a one-child joint's turn about its own bone, which no point
 //                 sees, held near none
 //   rest          the turns near rest: weakly where points see them, firmly
@@ -188,6 +189,8 @@ export class RigFit {
 		this.points = [...new Map(views.flatMap((o) => o.points).map((p) => [p.name, p])).values()];
 		this.markerJoint = new Int32Array(this.M);
 		for (const p of this.points) if (p.marker >= 0) this.markerJoint[p.marker] = p.joint;
+		// The joints a point sees, whose accelerations the smoothness weighs.
+		this.tracked = Int32Array.from(new Set(this.points.filter((p) => p.marker < 0).map((p) => p.joint)));
 		this.fixed = new Uint8Array(this.M);
 		for (let m = 0; m < this.M; m++) if (fixed?.[m]) this.fixed[m] = 1;
 		this.pitchPriors = views.map((_, v) => (Array.isArray(pitch) ? pitch[v] : pitch) * DEG);
@@ -470,19 +473,23 @@ export class RigFit {
 		}
 		terms.reproj = reproj * W.reproj;
 
-		// Accelerations of the joints and markers, in pixels.
+		// Accelerations of the tracked joints and the markers, in pixels.
 		if (T > 2) {
-			const pts = J + this.M;
-			const c = (W.acc * k0 * k0) / ((T - 2) * pts);
+			// Weighed per joint of the rig as before, so the body is as smooth.
+			const markers = Int32Array.from({ length: this.M }, (_, m) => m);
+			const c = (W.acc * k0 * k0) / ((T - 2) * (J + this.M));
 			let acc = 0;
-			for (const [X, gX, n] of [[this.pos, this.gPos, J], [this.mpos, this.gM, this.M]]) {
+			for (const [X, gX, n, which] of [[this.pos, this.gPos, J, this.tracked], [this.mpos, this.gM, this.M, markers]]) {
 				for (let t = 1; t < T - 1; t++) {
-					for (let i = 0; i < n * 3; i++) {
-						const A = X[(t + 1) * n * 3 + i] - 2 * X[t * n * 3 + i] + X[(t - 1) * n * 3 + i];
-						acc += c * A * A;
-						gX[(t + 1) * n * 3 + i] += 2 * c * A;
-						gX[t * n * 3 + i] -= 4 * c * A;
-						gX[(t - 1) * n * 3 + i] += 2 * c * A;
+					for (const j of which) {
+						for (let d = 0; d < 3; d++) {
+							const i = j * 3 + d;
+							const A = X[(t + 1) * n * 3 + i] - 2 * X[t * n * 3 + i] + X[(t - 1) * n * 3 + i];
+							acc += c * A * A;
+							gX[(t + 1) * n * 3 + i] += 2 * c * A;
+							gX[t * n * 3 + i] -= 4 * c * A;
+							gX[(t - 1) * n * 3 + i] += 2 * c * A;
+						}
 					}
 				}
 			}

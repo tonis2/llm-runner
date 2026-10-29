@@ -10,7 +10,11 @@ import { Doc } from './doc.js';
 
 export const app = {
 	doc: new Doc(),
+	// The node the inspector shows, and every node selected with it (a box,
+	// Shift or Ctrl add to it), and a selected wire instead of either.
 	selected: null,
+	selection: new Set(),
+	selectedWire: null,
 	// Per node: 'running', 'done', 'cached' or 'error', for the last run.
 	nodeState: {},
 	// Per node: { tex, width, height } - its last picture (a sink's result, a
@@ -27,8 +31,10 @@ export const app = {
 	widgets: {},
 
 	select(id) {
-		if (this.selected === id) return;
+		if (this.selected === id && this.selection.size === (id ? 1 : 0)) return;
 		this.selected = id;
+		this.selection = new Set(id ? [id] : []);
+		this.selectedWire = null;
 		this.refresh();
 	},
 

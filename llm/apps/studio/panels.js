@@ -115,8 +115,10 @@ export class Inspector extends three.Widget {
 		if (!n) {
 			rows.push(new Label('Nothing selected', { textSize: 13 }));
 			rows.push(new Label('Click a node to edit it.', { color: THEME.dim, textSize: 11 }));
-			rows.push(new Label('Drag from a port to wire it; drag', { color: THEME.dim, textSize: 11 }));
-			rows.push(new Label('the background to pan, wheel to zoom.', { color: THEME.dim, textSize: 11 }));
+			rows.push(new Label('Drag from a port to wire it; drag the', { color: THEME.dim, textSize: 11 }));
+			rows.push(new Label('background to select, right or middle', { color: THEME.dim, textSize: 11 }));
+			rows.push(new Label('drag to pan, wheel to zoom. Space or a', { color: THEME.dim, textSize: 11 }));
+			rows.push(new Label('right click adds a node.', { color: THEME.dim, textSize: 11 }));
 		} else {
 			const def = defOf(n.type);
 			rows.push(new Label(def.title, { textSize: 15 }));
@@ -165,16 +167,9 @@ export class Inspector extends three.Widget {
 	}
 }
 
+// Everything selected on the canvas — the nodes, or the one wire.
 export function removeSelected() {
-	if (!app.selected || app.running) return;
-	const id = app.selected;
-	app.doc.remove(id);
-	if (app.images[id]) {
-		three.ui.freeTexture(app.images[id].tex);
-		delete app.images[id];
-	}
-	app.selected = null;
-	app.refresh();
+	app.widgets.canvas.deleteSelection();
 }
 
 // ---------------------------------------------------------------------------

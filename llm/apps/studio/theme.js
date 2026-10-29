@@ -44,23 +44,15 @@ export const TAB_H = 36;       // the Nodes / Queue tabs over the left panel
 export const PALETTE_W = 230;
 export const INSPECTOR_W = 330;
 
-// Node geometry, in graph units (one unit is one point at zoom 1).
+// Node geometry, in graph units (one unit is one point at zoom 1) — what the
+// cards are given, and what `layout.js` estimates their heights from.
 export const NODE_W = 280;
 export const NODE_HEAD = 26;
 export const NODE_ROW = 22;
 export const NODE_PAD = 8;
-export const PORT_R = 5;
 
-// The editors inside a node: inset from its sides, a small label over each box,
-// and the gap between them.
-export const FIELD_X = 12;
+// The editors on a card: a small label over each box, and the gap between them.
 export const FIELD_H = 26;
 export const LABEL_H = 14;
 export const PROMPT_H = 90;
 export const FIELD_GAP = 6;
-// Below this zoom the editors are too small to use, and a node shows its values
-// as text instead.
-export const EDIT_ZOOM = 0.5;
-
-// How much one wheel notch zooms the canvas.
-export const ZOOM_STEP = 1.1;
