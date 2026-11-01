@@ -108,7 +108,8 @@ export function linearBias(w, b, x, y, out, inDim, seq) {
 
 export function silu(x, n) { dispatch('silu', [x], [groups(n, 256)], pc('u', n)); }
 export function mul(a, b, n) { dispatch('elemwise_mul', [a, b], [groups(n, 256)], pc('u', n)); }
-export function siluMul(gate, up, n) { dispatch('silu_mul', [gate, up], [groups(n, 256)], pc('u', n)); }
+// gate = silu(gate) * up * scale.
+export function siluMul(gate, up, n, scale = 1) { dispatch('silu_mul', [gate, up], [groups(n, 256)], pc('uf', n, scale)); }
 export function add(acc, src, n) { dispatch('residual_add', [acc, src], [groups(n, 256)], pc('u', n)); }
 
 export function rmsNorm(x, weight, y, dim, rows, eps) {
@@ -175,8 +176,11 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 		flashAttentionSplit(q, null, null, k, v, out, heads, seq, 0, seq);
 		return;
 	}
-	if (hd === 64 && !matrixCores) {
-		// Each row split over 4 threads, 2 rows a thread, in registers.
+	if (hd === 64) {
+		// Each row split over 4 threads, 2 rows a thread, in registers. Written
+		// for GPUs without matrix cores, it is also twice the general kernel's
+		// speed on one with them (tests/attention_64.js), which has no head-64
+		// kernel of its own.
 		dispatch('flash_attention_64', [q, k, v, out], [groups(seq, 64), heads], pc('uuf', heads, seq, 1 / Math.sqrt(hd)));
 		return;
 	}
@@ -188,11 +192,24 @@ export function flashAttention(q, k, v, out, heads, seq, hd = 128) {
 // caps the keys each row sees - a block-causal mask. A prefix that is not
 // packed gives `layout` { stride, skipAt, skipLen }: its rows `stride` apart a
 // head, and keys from `skipAt` on read `skipLen` rows further in.
-export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2, limits = null, layout = null) {
+// `scale` is the scores' (1 / sqrt(128) for a true head width of 128).
+export function flashAttentionSplit(q, k1, v1, k2, v2, out, heads, qLen, l1, l2, limits = null, layout = null, scale = 1 / Math.sqrt(128)) {
 	const bindings = [q, l1 > 0 ? k1 : k2, l1 > 0 ? v1 : v2, k2, v2, limits ?? q, out];
 	const { stride = l1, skipAt = l1, skipLen = 0 } = layout ?? {};
 	dispatch('flash_attention_split', bindings, [groups(qLen, 128), heads],
-		pc('uuuufuuuu', heads, qLen, l1, l2, 1 / Math.sqrt(128), limits ? 1 : 0, stride, skipAt, skipLen));
+		pc('uuuufuuuu', heads, qLen, l1, l2, scale, limits ? 1 : 0, stride, skipAt, skipLen));
+}
+// Head-64 attention on the matrix cores, from rows: q, k, v [seq, heads * 64]
+// zero-padded to head width 128 in `pad` ({ q, k, v, o }, [heads, seq, 128]
+// each), the split kernel at width 64's scale, the result back to rows out
+// [seq, heads * 64]. Twice the work of flash_attention_64 and still twice its
+// speed, layout included (DINOv3's 20 heads at 789 tokens: 0.80 ms to 1.58).
+export function attention64Padded(q, k, v, out, pad, heads, seq) {
+	padHeads(q, pad.q, seq, heads, 64, 128);
+	padHeads(k, pad.k, seq, heads, 64, 128);
+	padHeads(v, pad.v, seq, heads, 64, 128);
+	flashAttentionSplit(pad.q, null, null, pad.k, pad.v, pad.o, heads, seq, 0, seq, null, null, 1 / 8);
+	copyRows(pad.o, out, seq * heads, 64, 64, 0, 128);
 }
 // GQA over a whole prompt, Q [n, qHeads * hd], K/V [n, kvHeads * hd];
 // `causal` false lets every token see every other (an LLM2Vec encoder).
@@ -316,6 +333,11 @@ export function gelu(x, n) { dispatch('gelu', [x], [groups(n, 256)], pc('u', n))
 export function relu(x, n) { dispatch('relu', [x], [groups(n, 256)], pc('u', n)); }
 // d *= (a > 0): the gradient back through relu, a being its output.
 export function reluGrad(d, a, n) { dispatch('relu_grad', [d, a], [groups(n, 256)], pc('u', n)); }
+// One Adam step over p [n] in place, its moments m and v kept beside it: the
+// learning rate, one minus beta1 and beta2 to the step's power, the decay.
+export function adamStep(p, m, v, g, n, lr, c1, c2, decay) {
+	dispatch('adam_step', [p, m, v, g], [groups(n, 256)], pc('uffff', n, lr, c1, c2, decay));
+}
 // Heatmaps' loss and gradient: scores [images * n, joints] softmaxed over each
 // image's n patches against Gaussians about target [images * joints, 4]
 // (grid x, grid y, weight, -), the gradient into g and each one's loss.

@@ -1,0 +1,21 @@
+// One Adam step in place over n parameters: the moments m and v follow the
+// gradient g, and p moves by lr times the bias-corrected ratio (c1, c2: one
+// minus beta1 and beta2 to the step's power), plus decoupled weight decay.
+float p[];
+float m[];
+float v[];
+float g[];
+struct Push @pushconstant { uint n; float lr; float c1; float c2; float decay; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    float gi = g[i];
+    float mi = 0.9 * m[i] + 0.1 * gi;
+    float vi = 0.999 * v[i] + 0.001 * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+    p[i] = p[i] - pc.lr * ((mi / pc.c1) / (sqrt(vi / pc.c2) + 1e-8) + pc.decay * p[i]);
+}

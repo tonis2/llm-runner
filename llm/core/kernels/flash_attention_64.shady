@@ -1,5 +1,6 @@
-// Flash attention for head_dim 64 without matrix cores. A query row is split
-// over 4 threads (16 dimensions each) and a thread has 2 rows, its
+// Flash attention for head_dim 64, with matrix cores or without (it beats the
+// general kernel on both). A query row is split over 4 threads (16 dimensions
+// each) and a thread has 2 rows, its
 // share of Q (pre-scaled) and of the output in registers; a K or V value read
 // from shared memory feeds all 2 rows. A step of 2 keys: partial scores,
 // summed across the 4 threads through shared memory (double-buffered, one

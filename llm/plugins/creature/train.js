@@ -32,7 +32,7 @@
 
 import { llm, f32 } from '/core/llm.js';
 import * as op from '/core/ops.js';
-import { submit, copy, breathe, breathing } from '/core/gpu.js';
+import { submit, copy, zero, breathe, breathing } from '/core/gpu.js';
 import { PATCH } from '/core/models/dinov3.js';
 import { uploadImage, warpCropGpu, boxAffine } from '/core/image/warp.js';
 import { Head, saveFinder, peaks } from './detect.js';
@@ -131,17 +131,25 @@ export class Backdrops {
 		return [r.int(256), r.int(256), r.int(256)];
 	}
 
-	// One made-up background, size x size x 3.
-	made() {
+	// One made-up background, size x size x 3. Its draws here, its loops in
+	// native code when the host has it (lib/host/finder_train.c3, the same
+	// arithmetic): in QuickJS one takes about 75 ms.
+	made(native = llm.trainNative) {
 		const S = this.size, r = this.random, px = new Uint8Array(S * S * 3);
 		const kind = r.int(5);
+		const fill = (params) => {
+			llm.imageBackdrop(kind, Float64Array.from(params), S, px);
+			return px;
+		};
 		if (kind === 0) {
 			// Flat, with a slight gradient.
 			const a = this.colour(), b = a.map((v) => Math.max(0, Math.min(255, v + r.between(-40, 40))));
+			if (native) return fill([...a, ...b]);
 			for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) for (let c = 0; c < 3; c++) px[(y * S + x) * 3 + c] = a[c] + ((b[c] - a[c]) * y) / S;
 		} else if (kind === 1) {
 			// Sky and ground.
 			const sky = this.colour(), ground = this.colour(), horizon = r.between(0.2, 0.8) * S;
+			if (native) return fill([...sky, ...ground, horizon]);
 			for (let y = 0; y < S; y++) {
 				const col = y < horizon ? sky : ground, shade = y < horizon ? 1 - (0.3 * y) / S : 0.7 + (0.3 * y) / S;
 				for (let x = 0; x < S; x++) for (let c = 0; c < 3; c++) px[(y * S + x) * 3 + c] = Math.min(255, col[c] * shade);
@@ -149,6 +157,7 @@ export class Backdrops {
 		} else if (kind === 2) {
 			// Tiles.
 			const a = this.colour(), b = this.colour(), t = 8 + r.int(56);
+			if (native) return fill([...a, ...b, t]);
 			for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
 				const col = (Math.floor(x / t) + Math.floor(y / t)) % 2 ? a : b;
 				for (let c = 0; c < 3; c++) px[(y * S + x) * 3 + c] = col[c];
@@ -158,6 +167,7 @@ export class Backdrops {
 			// way a turntable or a generated clip is shot.
 			const tone = r.between(170, 250), tint = [0, 1, 2].map(() => r.between(-12, 12)), horizon = r.between(0.45, 0.9) * S;
 			const floor = r.between(0.75, 0.95);
+			if (native) return fill([tone, ...tint, horizon, floor]);
 			for (let y = 0; y < S; y++) {
 				const shade = y < horizon ? 1 - (0.08 * y) / horizon : floor * (0.9 + (0.1 * (y - horizon)) / Math.max(1, S - horizon));
 				for (let x = 0; x < S; x++) for (let c = 0; c < 3; c++) px[(y * S + x) * 3 + c] = Math.max(0, Math.min(255, (tone + tint[c]) * shade));
@@ -165,6 +175,7 @@ export class Backdrops {
 		} else {
 			// A soft colour field: a coarse random grid, smoothly blown up.
 			const g = 3 + r.int(6), grid = Array.from({ length: (g + 1) * (g + 1) }, () => this.colour());
+			if (native) return fill([g, ...grid.flat()]);
 			for (let y = 0; y < S; y++) {
 				const fy = (y / S) * g, y0 = Math.floor(fy), ty = fy - y0;
 				for (let x = 0; x < S; x++) {
@@ -180,10 +191,14 @@ export class Backdrops {
 	}
 
 	// A crop of a photo, nearest-pixel, size x size x 3.
-	photo() {
+	photo(native = llm.trainNative) {
 		const S = this.size, r = this.random, img = this.photos[r.int(this.photos.length)], px = new Uint8Array(S * S * 3);
 		const side = Math.min(img.width, img.height) * r.between(0.3, 1);
 		const x0 = r.between(0, img.width - side), y0 = r.between(0, img.height - side), flip = r() < 0.5, ch = img.channels;
+		if (native) {
+			llm.imageCropNearest(img.pixels, img.width, img.height, ch, x0, y0, side, flip ? 1 : 0, S, px);
+			return px;
+		}
 		for (let y = 0; y < S; y++) {
 			const sy = Math.min(img.height - 1, Math.floor(y0 + (y * side) / S));
 			for (let x = 0; x < S; x++) {
@@ -208,9 +223,16 @@ export class Backdrops {
 // A render laid over a background, its colours jittered and noise added. The
 // jitter is a table per channel; most pixels are background or solid, which
 // need no blend.
-export function composite(render, backdrop, random, noise) {
+export function composite(render, backdrop, random, noise, native = llm.trainNative) {
 	const S = render.width, ch = render.channels, src = render.pixels, out = new Uint8ClampedArray(S * S * 3);
 	const bright = random.between(0.7, 1.3), lift = random.between(-20, 20), grain = random() < 0.5 ? random.between(0, 8) : 0;
+	if (native) {
+		// The same draws in the same order as below, the loops in lib/host/finder_train.c3.
+		const gains = Float64Array.from([0, 1, 2], () => bright * random.between(0.8, 1.2));
+		const at = grain > 0 ? random.int(noise.length - out.length) : 0;
+		llm.imageComposite(src, ch, backdrop, out, gains, lift, grain, noise, at);
+		return { width: S, height: S, channels: 3, pixels: out };
+	}
 	const [l0, l1, l2] = [0, 1, 2].map(() => {
 		const gain = bright * random.between(0.8, 1.2);
 		return Float32Array.from({ length: 256 }, (_, v) => v * gain + lift);
@@ -309,8 +331,11 @@ async function subspace(cov, D, rank, random, iterations) {
 // twice over (Q = L^-1 Z for Z Z^T = L L^T, then again on Q), in float64, each
 // row brought to unit length first (rows of very different lengths square to
 // a Gram matrix past float64's precision), a little added to the diagonal for
-// rows with next to nothing left of their own.
-export function orthonormalRows(Z, n, D) {
+// rows with next to nothing left of their own. Native code when the host has
+// it (lib/host/finder_train.c3, the same steps): in QuickJS a 384 x 2560 call
+// takes about fifteen seconds, and the PCA makes twenty-two.
+export function orthonormalRows(Z, n, D, native = llm.trainNative) {
+	if (native) return llm.orthonormalRows(Z, n, D);
 	for (let pass = 0; pass < 2; pass++) {
 		for (let i = 0; i < n; i++) {
 			const zi = Z.subarray(i * D, (i + 1) * D);
@@ -353,26 +378,31 @@ export function orthonormalRows(Z, n, D) {
 	return Z;
 }
 
-// Adam over Float32Arrays (the head is small; the host keeps the master copy).
+// Adam on the GPU: each parameter is the head's own tensor, its gradient the
+// step's buffer of the same layout, its moments kept beside it. Nothing comes
+// back to the host until the head is saved (in QuickJS the step's loops took
+// longer than the step's matmuls).
 class Adam {
 	constructor(params, { lr, decay }) {
-		this.params = params.map((p) => ({ ...p, m: new Float32Array(p.value.length), v: new Float32Array(p.value.length) }));
+		this.params = params.map((p) => {
+			const m = f32(p.n), v = f32(p.n);
+			zero(m);
+			zero(v);
+			return { ...p, m, v };
+		});
 		this.lr = lr;
 		this.decay = decay;
 		this.t = 0;
 	}
 
-	step(grads, scale) {
+	step(scale) {
 		this.t++;
 		const c1 = 1 - 0.9 ** this.t, c2 = 1 - 0.999 ** this.t, lr = this.lr * scale;
-		for (const p of this.params) {
-			const g = grads[p.name], { value, m, v } = p, decay = p.decay ? this.decay : 0;
-			for (let i = 0; i < value.length; i++) {
-				m[i] = 0.9 * m[i] + 0.1 * g[i];
-				v[i] = 0.999 * v[i] + 0.001 * g[i] * g[i];
-				value[i] -= lr * ((m[i] / c1) / (Math.sqrt(v[i] / c2) + 1e-8) + decay * value[i]);
-			}
-		}
+		for (const p of this.params) op.adamStep(p.value, p.m, p.v, p.grad, p.n, lr, c1, c2, p.decay ? this.decay : 0);
+	}
+
+	dispose() {
+		for (const p of this.params) { p.m.dispose(); p.v.dispose(); }
 	}
 }
 
@@ -418,6 +448,10 @@ export async function trainFinder(encoder, request, step = null) {
 	const sample = Math.min(train, Number(request.pca_pictures ?? 48));
 	const raw = [];
 	let head = null, chunks = [], perChunk = 256, kept = 0;
+	// Where the time goes, in ms: making the pictures, the backbone, the PCA,
+	// projecting and keeping the features, then fitting the head.
+	const spent = { pictures: 0, backbone: 0, pca: 0, keep: 0, head: 0 };
+	const timed = (key, t) => { spent[key] += llm.now() - t; };
 	const features = (i) => [chunks[Math.floor(i / perChunk)], (i % perChunk) * N * rank * 4];
 	const keep = (tokens, i) => {
 		const [chunk, at] = features(i);
@@ -429,6 +463,7 @@ export async function trainFinder(encoder, request, step = null) {
 	};
 	try {
 		for (let i = 0; i < M; i++) {
+			let t = llm.now();
 			const im = images[i];
 			const render = llm.image.load(im.path);
 			if (render.width !== S || render.height !== S) throw bad(`renders: ${im.path} is ${render.width}x${render.height}, not ${S}`);
@@ -456,14 +491,21 @@ export async function trainFinder(encoder, request, step = null) {
 			const image = uploadImage(picture);
 			const input = warpCropGpu(image, picture, affine, { width: S, height: S });
 			image.dispose();
+			timed('pictures', t);
+			t = llm.now();
 			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
 			input.dispose();
+			timed('backbone', t);
+			t = llm.now();
 			if (!head) {
 				raw.push(tokens);
 				if (raw.length === sample) {
 					// 2. The PCA, from the pictures so far; then they are kept as features.
 					step?.(i + 1, M, 'principal components');
+					const tp = llm.now();
 					const p = await principal(raw, N, D, rank, random);
+					spent.pca += llm.now() - tp;
+					t += llm.now() - tp;
 					kept = p.kept;
 					llm.print(`  PCA: ${rank} of ${D} components keep ${(kept * 100).toFixed(1)}% of the variance (${sample} pictures)`);
 					const w1 = llm.randomNormal(hidden * rank, Number(request.seed ?? 1) + 1).map((v) => v * Math.sqrt(2 / rank));
@@ -479,6 +521,7 @@ export async function trainFinder(encoder, request, step = null) {
 				keep(tokens, i);
 				tokens.dispose();
 			}
+			timed('keep', t);
 			step?.(i + 1, M, 'encoding pictures');
 			if (breathing()) await breathe();
 		}
@@ -486,18 +529,15 @@ export async function trainFinder(encoder, request, step = null) {
 		llm.print(`  encoded ${M} pictures in ${encoded.toFixed(0)}s`);
 
 		// 3. The head.
+		const headStart = llm.now();
 		const BN = B * N, g = stepBuffers({ B, N, J, rank, hidden });
 		const host = head.host;
 		const adam = new Adam([
-			{ name: 'w1', value: host.w1, decay: true }, { name: 'b1', value: host.b1 },
-			{ name: 'w2', value: host.w2, decay: true }, { name: 'b2', value: host.b2 },
+			{ value: head.g.w1, grad: g.dw1, n: hidden * rank, decay: true }, { value: head.g.b1, grad: g.db1, n: hidden },
+			{ value: head.g.w2, grad: g.dw2, n: J * hidden, decay: true }, { value: head.g.b2, grad: g.db2, n: J },
 		], { lr: Number(request.lr ?? 1e-3), decay: 1e-4 });
-		const writeWeights = () => {
-			head.set('w1', host.w1); head.set('b1', host.b1); head.set('w2', host.w2); head.set('b2', host.b2);
-			const t = new Float32Array(hidden * J);
-			for (let j = 0; j < J; j++) for (let h = 0; h < hidden; h++) t[h * J + j] = host.w2[j * hidden + h];
-			g.w2t.buffer.write(t);
-		};
+		// w2 [J, hidden] transposed for the step's dA = dS W2.
+		const transposeW2 = () => op.transposeChannelSpatial(head.g.w2, g.w2t, hidden, J, 1);
 		const gather = (batch) => {
 			batch.forEach((i, b) => {
 				const [chunk, at] = features(i);
@@ -511,17 +551,17 @@ export async function trainFinder(encoder, request, step = null) {
 		const steps = epochs * Math.floor(train / B), warm = Math.min(200, steps / 10);
 		let done = 0, lossSum = 0, lossCount = 0;
 		const history = [];
-		writeWeights();
+		transposeW2();
 		for (let epoch = 0; epoch < epochs; epoch++) {
 			for (let i = order.length - 1; i > 0; i--) { const k = random.int(i + 1); [order[i], order[k]] = [order[k], order[i]]; }
 			for (let b0 = 0; b0 + B <= train; b0 += B) {
 				gather(order.slice(b0, b0 + B));
-				const { grads, loss } = headGradients(head, g, { B, N, J, G, rank, hidden, sigma });
+				const { loss } = headGradients(head, g, { B, N, J, G, rank, hidden, sigma }, false);
 				for (const v of loss) lossSum += v;
 				lossCount += B;
 				const scale = Math.min(1, (done + 1) / warm) * 0.5 * (1 + Math.cos((Math.PI * done) / steps));
-				adam.step(grads, scale);
-				writeWeights();
+				adam.step(scale);
+				transposeW2();
 				done++;
 				step?.(done, steps, 'training');
 				if (done % 50 === 0 && breathing()) await breathe();
@@ -537,6 +577,9 @@ export async function trainFinder(encoder, request, step = null) {
 		}
 		const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S, landmarksFrom: chosen.length });
 		for (const t of Object.values(g)) t.dispose();
+		adam.dispose();
+		for (const name of ['w1', 'b1', 'w2', 'b2']) host[name] = readFloats(head.g[name], host[name].length);
+		timed('head', headStart);
 
 		const report = {
 			pictures: M, held_out: held, joints: names, size: S,
@@ -547,13 +590,16 @@ export async function trainFinder(encoder, request, step = null) {
 			// hides (median scores): far apart, the fit can tell them apart.
 			...(landmarks.length ? { landmark_score: { seen: round(v.seenScore, 3), hidden: round(v.hiddenScore, 3) } } : {}),
 			history,
-			seconds: { encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1) },
+			seconds: {
+				encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1),
+				...Object.fromEntries(Object.entries(spent).map(([k, ms]) => [k, round(ms / 1000, 1)])),
+			},
 		};
 		saveFinder(request.out, { pca: host.pca, pca_bias: host.pca_bias, w1: host.w1, b1: host.b1, w2: host.w2, b2: host.b2 }, {
 			joints: names, size: S, dim: D, layers, rank, hidden, sigma, fill: set.fill, report,
 			landmarks: landmarks.map((m) => ({ name: m.name, joint: m.joint, offset: m.offset })),
 		});
-		llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px, in ${report.seconds.total}s`);
+		llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px, in ${report.seconds.total}s (${Object.keys(spent).map((k) => `${k} ${report.seconds[k]}s`).join(', ')})`);
 		return report;
 	} finally {
 		for (const t of raw) t.dispose();
@@ -577,12 +623,13 @@ export function stepBuffers({ B, N, J, rank, hidden }) {
 
 /**
  * One step's loss and gradients for the features in g.x [B N, rank] and the
- * targets in g.target, the head's own weights (g.w2t its w2 transposed):
+ * targets in g.target, the head's own weights (g.w2t its w2 transposed). The
+ * gradients stay in g (dw1, db1, dw2, db2) and come back with `read`:
  * forward through the head, the heatmaps' loss, and back, every product a
  * matmul (W [out, in] times rows): dW2 = dS^T A, dA = dS W2, through the relu,
  * dW1 = dA^T X; the biases' gradients are the columns' sums (a matmul by ones).
  */
-export function headGradients(head, g, { B, N, J, G, rank, hidden, sigma }) {
+export function headGradients(head, g, { B, N, J, G, rank, hidden, sigma }, read = true) {
 	const BN = B * N;
 	head.hide(g.x, g.a, BN);
 	head.score(g.a, g.s, BN);
@@ -599,7 +646,7 @@ export function headGradients(head, g, { B, N, J, G, rank, hidden, sigma }) {
 	op.matmul(g.dat, g.ones, g.db1, hidden, BN, 1);
 	submit();
 	return {
-		grads: { w1: readFloats(g.dw1, hidden * rank), b1: readFloats(g.db1, hidden), w2: readFloats(g.dw2, J * hidden), b2: readFloats(g.db2, J) },
+		grads: read ? { w1: readFloats(g.dw1, hidden * rank), b1: readFloats(g.db1, hidden), w2: readFloats(g.dw2, J * hidden), b2: readFloats(g.db2, J) } : null,
 		loss: readFloats(g.loss, B * J),
 	};
 }

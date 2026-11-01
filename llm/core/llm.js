@@ -218,6 +218,20 @@ export const llm = {
 
 	image,
 
+	// The creature plugin's rig fit in native code (lib/host/rig_fit.c3), when
+	// this host has it: RigFit.native's packing, the params changed in place.
+	rigFitNative: typeof H.rigFitSteps === 'function',
+	rigFitEvaluate(...args) { return H.rigFitEvaluate(...args); },
+	rigFitSteps(...args) { return H.rigFitSteps(...args); },
+
+	// The joint-finder trainer's host loops in native code (lib/host/finder_train.c3),
+	// when this host has them; train.js keeps the JavaScript as the reference.
+	trainNative: typeof H.orthonormalRows === 'function',
+	orthonormalRows(z, n, d) { H.orthonormalRows(z, n, d); return z; },
+	imageComposite(...args) { H.imageComposite(...args); },
+	imageCropNearest(...args) { H.imageCropNearest(...args); },
+	imageBackdrop(...args) { H.imageBackdrop(...args); },
+
 	// Register the plugin this file is. The runner calls `load(config)` once and
 	// then `generate(config)` — or, as a server, `handle(request)` per request
 	// (or `generate` with the request's JSON over the config, when there is no

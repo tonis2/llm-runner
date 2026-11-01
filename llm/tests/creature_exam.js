@@ -136,7 +136,7 @@ if (dropped.size) {
 		f.tracks = { ...t, points: keep.map((p) => t.points[p]), hypotheses: t.hypotheses.map((h) => ({ ...h, tracks: h.tracks.map(pick), scores: h.scores.map(pick) })) };
 	}
 }
-const fit = fitRig(rig, fitted, { markers, iterations: Number(cfg.iterations ?? 1500), weights: typeof cfg.weights === 'string' ? JSON.parse(cfg.weights) : cfg.weights ?? null });
+const fit = await fitRig(rig, fitted, { markers, iterations: Number(cfg.iterations ?? 1500), weights: typeof cfg.weights === 'string' ? JSON.parse(cfg.weights) : cfg.weights ?? null });
 const p = fit.problem;
 p.forward();
 const J = rig.names.length;

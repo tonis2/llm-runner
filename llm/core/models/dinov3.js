@@ -21,6 +21,11 @@ import { submit, copy, breathe, breathing, uploadEach } from '/core/gpu.js';
 export const PATCH = 16;
 const HEAD = 64;
 const EPS = 1e-5;
+// The SwiGLU hidden values are divided by this before the down-projection's
+// half operands and the product multiplied back (LayerScale's gamma times it,
+// the bias over it). SAM 3D Body's reach about 3000 (block 22) on renders and
+// video frames; float16 holds 65504, so 16 leaves a margin of over 300.
+const FFN_SCALE = 16;
 
 function upload(data) {
 	const t = f32(data.length);
@@ -38,9 +43,10 @@ export class DinoV3 {
 	// `m` is an open llm.js Model (safetensors or `openTorch`); `prefix` is where
 	// the ViT's tensors are in it. `linear` is how the blocks' matmul weights go
 	// to the GPU: 'q8' (Q8_0, a quarter of float32, the matrix cores' format) or
-	// 'f32'. `exact` keeps the SwiGLU down-projection in float32 on the matrix
-	// cores, whose float16 operands an MLP's hidden values can overflow.
-	constructor(m, { prefix = 'backbone.encoder.', linear = 'q8', exact = true } = {}) {
+	// 'f32'. `exact` keeps the SwiGLU down-projection in float32, off the
+	// matrix cores (four times slower); otherwise its hidden values go to their
+	// float16 operands divided by FFN_SCALE.
+	constructor(m, { prefix = 'backbone.encoder.', linear = 'q8', exact = false } = {}) {
 		this.m = m;
 		this.p = prefix;
 		this.linear = linear;
@@ -84,6 +90,7 @@ export class DinoV3 {
 			normW: f('norm.weight'), normB: f('norm.bias'),
 		};
 		this.blocks = [];
+		const ffnScale = this.exact ? 1 : FFN_SCALE;
 		for (let l = 0; l < this.depth; l++) {
 			const b = `blocks.${l}.`;
 			// LinearKMaskedBias: the bias times its mask (zero over K). The mask
@@ -107,8 +114,9 @@ export class DinoV3 {
 				n2w: () => f(`${b}norm2.weight`), n2b: () => f(`${b}norm2.bias`),
 				w1: () => w(`${b}mlp.w1.weight`), w1b: () => f(`${b}mlp.w1.bias`),
 				w2: () => w(`${b}mlp.w2.weight`), w2b: () => f(`${b}mlp.w2.bias`),
-				w3: () => w(`${b}mlp.w3.weight`), w3b: () => f(`${b}mlp.w3.bias`),
-				ls2: () => f(`${b}ls2.gamma`),
+				w3: () => w(`${b}mlp.w3.weight`),
+				w3b: () => upload(m.floats(`${P}${b}mlp.w3.bias`).map((v) => v / ffnScale)),
+				ls2: () => upload(m.floats(`${P}${b}ls2.gamma`).map((v) => v * ffnScale)),
 			}));
 		}
 		llm.print(`  DINOv3: dim ${D}, ${this.depth} blocks, ${this.heads} heads, ${this.storage} storage tokens, ${this.linear} weights, loaded in ${llm.since(t0)}`);
@@ -168,6 +176,9 @@ export class DinoV3 {
 			qt: f32(n * D), kt: f32(n * D), vt: f32(n * D), o: f32(n * D),
 			gate: f32(n * F), up: f32(n * F),
 		};
+		// Heads padded to 128 for the matrix cores' attention (op.attention64Padded).
+		const padded = op.matrixCoresOn() && HEAD === 64;
+		if (padded) a.pad = { q: f32(n * nh * 128), k: f32(n * nh * 128), v: f32(n * nh * 128), o: f32(n * nh * 128) };
 		const rope = this.ropeTables(gh, gw);
 		const rows = (t, first, count) => t.view(first * D * 4, count * D * 4);
 		const extra = tokens && layers?.length ? layers : null, wide = D * ((extra?.length ?? 0) + 1);
@@ -193,8 +204,9 @@ export class DinoV3 {
 					op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
 					op.copyRows(rows(a.x, pre, N), out, N, D, wide, at * D);
 				}
+				// Headless, the whole pass is one submission: a wait after every
+				// block left the GPU idle while the next one was recorded.
 				if (breathing()) await breathe(true);
-				else submit();
 			}
 			op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
 			if (extra) op.copyRows(rows(a.x, pre, N), out, N, D, wide, extra.length * D);
@@ -227,10 +239,14 @@ export class DinoV3 {
 		if (b.vb) op.biasAdd(a.v, b.vb, n * D, D);
 		op.ropeNeox(rows(a.q, pre, N), rope.cos, rope.sin, HEAD, nh, N, true);
 		op.ropeNeox(rows(a.k, pre, N), rope.cos, rope.sin, HEAD, nh, N);
-		op.transposeHeads(a.q, a.qt, n, nh, HEAD, 0, true);
-		op.transposeHeads(a.k, a.kt, n, nh, HEAD, 0, true);
-		op.transposeHeads(a.v, a.vt, n, nh, HEAD, 0);
-		op.flashAttention(a.qt, a.kt, a.vt, a.o, nh, n, HEAD);
+		if (a.pad) {
+			op.attention64Padded(a.q, a.k, a.v, a.o, a.pad, nh, n);
+		} else {
+			op.transposeHeads(a.q, a.qt, n, nh, HEAD, 0, true);
+			op.transposeHeads(a.k, a.kt, n, nh, HEAD, 0, true);
+			op.transposeHeads(a.v, a.vt, n, nh, HEAD, 0);
+			op.flashAttention(a.qt, a.kt, a.vt, a.o, nh, n, HEAD);
+		}
 		op.linearBiasRows(b.proj, b.projB, a.o, a.q, D, D, n);
 		op.gatedAdd(a.h, b.ls1, a.q, n * D, D, 0);
 
@@ -239,7 +255,9 @@ export class DinoV3 {
 		op.matmul(b.w2, a.x, a.up, F, D, n);
 		op.biasAdd(a.gate, b.w1b, n * F, F);
 		op.biasAdd(a.up, b.w2b, n * F, F);
-		op.siluMul(a.gate, a.up, n * F);
+		// Scaled down for the half operands; ls2 (times FFN_SCALE) and w3b (over
+		// it) bring the branch back to its size in gatedAdd.
+		op.siluMul(a.gate, a.up, n * F, this.exact ? 1 : 1 / FFN_SCALE);
 		op.matmul(b.w3, a.gate, a.q, D, F, n, 0, false, this.exact);
 		op.biasAdd(a.q, b.w3b, n * D, D);
 		op.gatedAdd(a.h, b.ls2, a.q, n * D, D, 0);

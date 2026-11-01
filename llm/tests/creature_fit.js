@@ -3,7 +3,7 @@
 // time it takes. No GPU.
 //
 //   llm-runner tests/creature_fit.js rig=rig.glb tracks=tracks.json request=request.json \
-//       [iterations=1500] [pitch=8] [check=true] [out=fit.json] [save=dir]
+//       [iterations=1500] [pitch=8] [check=true] [native=true] [out=fit.json] [save=dir]
 //
 // `tracks` is track.js's output (tests/creature_track.js out=), `request` the
 // JSON with its `markers`; `out` writes the fit's projections beside the
@@ -22,6 +22,8 @@ const tracks = JSON.parse(llm.readText(cfg.tracks));
 const request = cfg.request ? JSON.parse(llm.readText(cfg.request)) : {};
 const markers = request.markers ?? {};
 let failures = 0;
+// native=false: the fit in JavaScript only, to time or compare against.
+if (String(cfg.native ?? true) === 'false') RigFit.useNative = false;
 
 // A small problem at a random state; every parameter group's gradient against
 // central differences at a few entries. Once with the one view, once with it
@@ -42,6 +44,28 @@ if (cfg.check ?? true) {
 		for (let i = 0; i < f.logS.length; i++) { f.logS[i] += 0.05 * rnd(); f.shift[i * 2] = 600 + 30 * rnd(); f.shift[i * 2 + 1] = -500 + 30 * rnd(); }
 		for (let v = 0; v < views.length; v++) { f.cam[2 * v] = 1.2 - 1.6 * v; f.cam[2 * v + 1] = 0.2 + 0.1 * v; }
 		const tau = 40;
+		// The native fit (lib/host/rig_fit.c3) against this one: the loss, every
+		// term and every gradient, with the limits full and coming in.
+		if (llm.rigFitNative) {
+			let far = 0;
+			const rel = (a, b) => Math.abs(a - b) / Math.max(1e-9, Math.abs(a) + Math.abs(b));
+			for (const scale of [1, 0.3]) {
+				f.limitScale = scale;
+				const loss = f.evaluate(tau), terms = { ...f.terms }, g = Float64Array.from(f.grads);
+				f.grads.fill(NaN);
+				const native = f.evaluateNative(tau);
+				far = Math.max(far, rel(loss, native));
+				for (const [k, v] of Object.entries(terms)) far = Math.max(far, k in f.terms ? rel(v, f.terms[k]) : 1);
+				if (Object.keys(f.terms).length !== Object.keys(terms).length) far = 1;
+				for (let i = 0; i < g.length; i++) far = Math.max(far, Math.abs(g[i] - f.grads[i]) <= 1e-12 ? 0 : rel(g[i], f.grads[i]));
+			}
+			f.limitScale = 1;
+			llm.print(`  native fit against this one (${views.length} view(s)): worst relative difference ${far.toExponential(2)}`);
+			if (!(far < 1e-7)) {
+				llm.print('FAIL: native fit');
+				failures++;
+			}
+		}
 		f.evaluate(tau);
 		const grads = Object.fromEntries(Object.entries(f.g).map(([k, v]) => [k, Float64Array.from(v)]));
 		const params = { theta: f.theta, root: f.root, marks: f.marks, logS: f.logS, shift: f.shift, cam: f.cam };
@@ -79,7 +103,7 @@ if (cfg.check ?? true) {
 }
 
 const t0 = llm.now();
-const fit = fitRig(rig, tracks, { markers, pitch: Number(cfg.pitch ?? request.pitch ?? 8), iterations: Number(cfg.iterations ?? 1500) });
+const fit = await fitRig(rig, tracks, { markers, pitch: Number(cfg.pitch ?? request.pitch ?? 8), iterations: Number(cfg.iterations ?? 1500) });
 llm.print(`  ${tracks.frames} frames, ${rig.names.length} joints in ${llm.since(t0)}`);
 const r = fit.report.reprojection_px;
 if (!(r.median <= Number(cfg.max_median ?? 8))) {

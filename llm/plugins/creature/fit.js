@@ -2,7 +2,7 @@
 // and one orthographic camera fitted together, on the host, with gradients
 // written out by hand.
 //
-//   const fit = fitRig(rig, tracks, { markers });   // rig.js, track.js
+//   const fit = await fitRig(rig, tracks, { markers });   // rig.js, track.js
 //   fit.theta, fit.root, fit.camera, fit.report
 //
 // The rig is posed by forward kinematics from its rest pose (rest turns all
@@ -46,6 +46,7 @@
 // points below a: one pass up the tree with each subtree's Σ g and Σ x × g.
 
 import { llm } from '/core/llm.js';
+import { breathe, breathing } from '/core/gpu.js';
 import { bad, markerJoint } from './request.js';
 
 const DEG = Math.PI / 180;
@@ -57,6 +58,11 @@ export const DEFAULT_WEIGHTS = Object.freeze({
 	reproj: 1, acc: 6, thetaAcc: 6, twist: 1, twistMarked: 0, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, chainBranch: 0.1,
 	floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10,
 });
+// The native fit's orders (lib/host/rig_fit.c3): weights in, terms out.
+const WEIGHT_ORDER = Object.keys(DEFAULT_WEIGHTS);
+const TERM_ORDER = ['reproj', 'acc', 'floor', 'inPlace', 'marks', 'lateral', 'heading', 'twist', 'rest', 'chain', 'thetaAcc', 'limit', 'level', 'follow'];
+// The main fit's iterations between breaths, so the host keeps drawing.
+const SLICE = 50;
 
 // The rotation vector s of the way from a to b (each 3 at `ao`, `bo`), the short
 // way round, into out at `oo`.
@@ -206,17 +212,17 @@ export class RigFit {
 		this.rootRest = rig.positions[0].slice();
 		this.prepareStructure(foot);
 
-		// Parameters and their gradients.
-		this.theta = new Float64Array(T * J * 3);
-		this.root = new Float64Array(T * 3);
+		// Parameters and their gradients, each set in one buffer (the native fit's).
+		const sizes = [T * J * 3, T * 3, this.M * 3, V * T, V * T * 2, 2 * V];
+		const cut = (buf) => { let at = 0; return sizes.map((n) => buf.subarray(at, (at += n))); };
+		this.params = new Float64Array(sizes.reduce((a, b) => a + b, 0));
+		this.grads = new Float64Array(this.params.length);
+		[this.theta, this.root, this.marks, this.logS, this.shift, this.cam] = cut(this.params);
 		for (let t = 0; t < T; t++) this.root.set(this.rootRest, t * 3);
-		this.marks = new Float64Array(this.M * 3);
 		for (let m = 0; m < this.M; m++) if (this.fixed[m]) this.marks.set(fixed[m], m * 3);
 		// Each view's camera: its scale and aim per frame, its yaw and pitch (view
 		// v's at v T, v T 2 and 2 v).
-		this.logS = new Float64Array(V * T).fill(Math.log(k0));
-		this.shift = new Float64Array(V * T * 2);
-		this.cam = new Float64Array(2 * V);
+		this.logS.fill(Math.log(k0));
 		for (let v = 0; v < V; v++) this.cam[2 * v + 1] = this.pitchPriors[v];
 		this.knownCameras = !!cameras;
 		if (cameras) {
@@ -228,10 +234,8 @@ export class RigFit {
 				for (let t = v * T; t < (v + 1) * T; t++) { this.shift[t * 2] = c.shift[0]; this.shift[t * 2 + 1] = c.shift[1]; }
 			}
 		}
-		this.g = {
-			theta: new Float64Array(T * J * 3), root: new Float64Array(T * 3), marks: new Float64Array(this.M * 3),
-			logS: new Float64Array(V * T), shift: new Float64Array(V * T * 2), cam: new Float64Array(2 * V),
-		};
+		const [gTheta, gRoot, gMarks, gLogS, gShift, gCam] = cut(this.grads);
+		this.g = { theta: gTheta, root: gRoot, marks: gMarks, logS: gLogS, shift: gShift, cam: gCam };
 		// Forward kinematics' results.
 		this.R = new Float64Array(T * J * 9);
 		this.G = new Float64Array(T * J * 9);
@@ -765,7 +769,81 @@ export class RigFit {
 		return out;
 	}
 
+	// The problem packed for the native fit (rig_fit.c3 RigProblem.read), once.
+	native() {
+		if (this.packed) return this.packed;
+		const ints = [this.T, this.J, this.M, this.V, this.tracked.length, this.feet.length, this.lateral.length, this.limits.length, this.knownCameras ? 1 : 0];
+		for (const a of [this.parents, this.markerJoint, this.tracked, this.fixed, this.seenBelow, this.twistSeen, this.oneChild, this.chainChild, this.chainBranch, this.feet]) ints.push(...a);
+		for (const o of this.views) {
+			ints.push(o.points.length, o.H);
+			for (const p of o.points) ints.push(p.joint, p.marker);
+		}
+		const reals = [this.k0, this.sigma2, this.rig.height, ...this.rootRest, ...WEIGHT_ORDER.map((k) => this.weights[k]), ...this.pitchPriors, ...this.views.map((o) => o.gamma ?? 0)];
+		for (const a of [this.offsets, this.reach, this.boneDir, this.chainReach]) reals.push(...a);
+		for (const l of this.lateral) reals.push(...l);
+		for (const lim of this.limits) {
+			reals.push(lim.joint, ...lim.frame);
+			for (const r of lim.axes) reals.push(r ? 1 : 0, r ? r[0] : 0, r ? r[1] : 0);
+		}
+		const obs = new Float64Array(this.views.reduce((n, o) => n + this.T * o.points.length * o.H * 3, 0));
+		let at = 0;
+		for (const o of this.views) {
+			const n = this.T * o.points.length * o.H;
+			obs.set(o.x.subarray(0, n), at); obs.set(o.y.subarray(0, n), at + n); obs.set(o.w.subarray(0, n), at + 2 * n);
+			at += 3 * n;
+		}
+		this.packed = { ints: Int32Array.from(ints), reals: Float64Array.from(reals), obs };
+		return this.packed;
+	}
+
+	// The native fit's answer: the terms, the count and the limits' scale; the loss.
+	answered(a) {
+		const terms = {};
+		TERM_ORDER.forEach((name, i) => { if (!Number.isNaN(a[i])) terms[name] = a[i]; });
+		this.terms = terms;
+		this.observed = a[TERM_ORDER.length + 1];
+		this.limitScale = a[TERM_ORDER.length + 3];
+		return a[TERM_ORDER.length];
+	}
+
+	// evaluate in native code: the same loss and gradients (the tests compare).
+	evaluateNative(tau) {
+		const { ints, reals, obs } = this.native();
+		return this.answered(llm.rigFitEvaluate(ints, reals, obs, this.params, this.grads, tau, this.limitScale));
+	}
+
+	// The run's learning rates, theta root marks logS shift cam.
+	rates(lr) {
+		const k0 = this.k0, held = this.knownCameras;
+		return Float64Array.from([lr.theta ?? 0.01, lr.root ?? 1 / k0, lr.marks ?? 1 / k0, held ? 0 : lr.logS ?? 0.002, held ? 0 : lr.shift ?? 1, held ? 0 : lr.cam ?? 0.003]);
+	}
+
+	// `run` as the main fit takes it: native, in slices with a breath between,
+	// so the host program keeps drawing and answering.
+	async runAsync(iterations, { lr = {}, tau0 = 500, tau1 = 20, onStep = null } = {}) {
+		if (!RigFit.useNative) return this.run(iterations, { lr, tau0, tau1, onStep });
+		const { ints, reals, obs } = this.native();
+		const m = new Float64Array(this.params.length), v = new Float64Array(this.params.length), rates = this.rates(lr);
+		let t = 0, loss = 0;
+		for (let from = 0; from < iterations; from += SLICE) {
+			const to = Math.min(iterations, from + SLICE);
+			const a = llm.rigFitSteps(ints, reals, obs, this.params, this.grads, m, v, rates, from, to, iterations, tau0, tau1, t);
+			t = a[TERM_ORDER.length + 2];
+			loss = this.answered(a);
+			onStep?.(to, iterations, loss);
+			if (breathing()) await breathe();
+		}
+		return loss;
+	}
+
 	run(iterations, { lr = {}, tau0 = 500, tau1 = 20, onStep = null } = {}) {
+		if (RigFit.useNative) {
+			const { ints, reals, obs } = this.native();
+			const m = new Float64Array(this.params.length), v = new Float64Array(this.params.length);
+			const loss = this.answered(llm.rigFitSteps(ints, reals, obs, this.params, this.grads, m, v, this.rates(lr), 0, iterations, iterations, tau0, tau1, 0));
+			onStep?.(iterations, iterations, loss);
+			return loss;
+		}
 		const k0 = this.k0;
 		const adam = new Adam([
 			{ value: this.theta, grad: this.g.theta, lr: lr.theta ?? 0.01 },
@@ -789,6 +867,9 @@ export class RigFit {
 		return loss;
 	}
 }
+
+// Whether RigFit runs in native code: when the host has it (a test may turn it off).
+RigFit.useNative = llm.rigFitNative;
 
 // The tracks (track.js) as the fit's observations, and the points as joints
 // and markers of `rig`: the first `frames` of them, the markers numbered in
@@ -950,7 +1031,7 @@ function startFrom(f, from) {
  * a studio clip's, held), after each keyframe alone in all the views;
  * `onStep(done, total)` as it goes.
  */
-export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, confidence = null } = {}) {
+export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, confidence = null } = {}) {
 	const t0 = llm.now();
 	if (!Array.isArray(views)) views = [{ tracks: views }];
 	const V = views.length, T = views[0].tracks.frames, J = rig.names.length;
@@ -1142,7 +1223,7 @@ export function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500,
 	else fit.cam.set(best.f.cam);
 	const before = done;
 	let lastPrint = llm.now();
-	fit.run(iterations, {
+	await fit.runAsync(iterations, {
 		onStep: (n, of, loss) => {
 			onStep?.(before + n / 10, total);
 			if (llm.now() - lastPrint > 5000) {

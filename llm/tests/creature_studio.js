@@ -86,7 +86,7 @@ const drawn = views.map((v) => {
 	}
 	return { tracks: { points: rig.names, frames: T, hypotheses }, camera: v.camera };
 });
-const fit = fitRig(rig, drawn, { iterations });
+const fit = await fitRig(rig, drawn, { iterations });
 const p = fit.problem;
 p.forward();
 let rootWorst = 0, jointMean = 0;

@@ -119,6 +119,14 @@ fn void install(three::JsRuntime* runtime)
 	runtime.bind(host, "imageToTensor", &js_image_to_tensor, 2);
 	runtime.bind(host, "tensorToImage", &js_tensor_to_image, 4);
 
+	runtime.bind(host, "rigFitEvaluate", &js_rig_fit_evaluate, 7);
+	runtime.bind(host, "rigFitSteps", &js_rig_fit_steps, 14);
+
+	runtime.bind(host, "orthonormalRows", &js_orthonormal_rows, 3);
+	runtime.bind(host, "imageComposite", &js_image_composite, 9);
+	runtime.bind(host, "imageCropNearest", &js_image_crop_nearest, 10);
+	runtime.bind(host, "imageBackdrop", &js_image_backdrop, 4);
+
 	runtime.js.set_property(global, "__llm", host);
 }
 

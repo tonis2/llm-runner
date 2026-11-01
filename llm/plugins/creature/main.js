@@ -304,7 +304,7 @@ export async function animate(request, config = {}) {
 		if (sync) llm.print(`  sync: heights ${sync.height_gap_px}px apart on average (worst ${sync.worst_gap_px}px), best lag ${sync.best_lag} frames${sync.retimed ? `; front re-timed, up to ${sync.shift_frames} frames (${sync.retime_gap_px}px apart now)` : ''}`);
 	}
 	const iterations = Number(request.iterations ?? 1500);
-	const fit = fitRig(rig, fitted, {
+	const fit = await fitRig(rig, fitted, {
 		markers, pitch: Number(request.pitch ?? 8), iterations, ...fitSettings(request),
 		onStep: (done, total) => step(done, total, 'fitting'),
 	});

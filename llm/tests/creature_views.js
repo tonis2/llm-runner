@@ -23,7 +23,7 @@ const iterations = Number(cfg.iterations ?? 600);
 const angle = (Number(cfg.angle ?? 90) * Math.PI) / 180;
 let failures = 0;
 
-const truth = fitRig(rig, tracks, { markers, pitch, iterations }).problem;
+const truth = (await fitRig(rig, tracks, { markers, pitch, iterations })).problem;
 truth.forward();
 const T = truth.T, J = truth.J;
 
@@ -76,8 +76,8 @@ function error(fit) {
 	return { mean: (100 * each.reduce((x, e) => x + e, 0)) / (P * rig.height), worst: (100 * each[worst]) / rig.height, at: points[worst].name, turn: (turn * 180) / Math.PI };
 }
 
-const one = fitRig(rig, A, { markers, pitch, iterations });
-const two = fitRig(rig, [{ tracks: A }, { tracks: B }], { markers, pitch, iterations });
+const one = await fitRig(rig, A, { markers, pitch, iterations });
+const two = await fitRig(rig, [{ tracks: A }, { tracks: B }], { markers, pitch, iterations });
 const e1 = error(one), e2 = error(two);
 llm.print(`  truth's yaw ${(truth.cam[0] * 180 / Math.PI).toFixed(1)}°; view A at +${(angle * 180 / Math.PI).toFixed(0)}°`);
 llm.print(`  A alone: points ${e1.mean.toFixed(2)}% of height off, worst ${e1.at} ${e1.worst.toFixed(2)}% (turned ${e1.turn.toFixed(1)}°); yaw ${one.report.camera.yaw}°`);
