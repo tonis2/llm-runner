@@ -143,9 +143,15 @@ export function submit() { C.submit(); }
 const FRAME_MS = 40;
 let breather = null;
 let lastBreath = 0;
+// Blocks sent per breath, grown while the GPU finishes them before the frame
+// comes (and then idles): a frame per small block halved a long pass's speed.
+let perBreath = 1;
+let held = 0;
 export function setBreather(fn) {
 	breather = fn;
 	lastBreath = llm.now();
+	perBreath = 1;
+	held = 0;
 }
 
 // Whether anything takes a breath. Headless nothing does, and a long loop can
@@ -170,10 +176,16 @@ export async function breathe(submitHere = false) {
 		if (submitHere) C.submit();
 		return;
 	}
+	if (++held < perBreath && llm.now() - lastBreath < FRAME_MS) return;
+	held = 0;
 	C.submitAsync();
 	if (C.busy() || llm.now() - lastBreath >= FRAME_MS) {
 		await breather();
+		const idle = !C.busy();
 		C.submit();
+		// Frames far apart: send less next time; the GPU idle by the frame: more.
+		if (llm.now() - lastBreath > 2 * FRAME_MS) perBreath = Math.max(1, perBreath >> 1);
+		else if (idle) perBreath = Math.min(perBreath * 2, 32);
 		lastBreath = llm.now();
 	}
 }
