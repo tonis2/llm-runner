@@ -21,7 +21,8 @@
 //   smoothness    the tracked joints' and markers' accelerations, and the
 //                 turns' (a hand's untracked fingers do not make its sway dearer)
 //   twist         a one-child joint's turn about its own bone, which no point
-//                 sees, held near none
+//                 sees, held near none; above a hand, the hand's turn about
+//                 the forearm instead, so the forearm takes the roll
 //   rest          the turns near rest: weakly where points see them, firmly
 //                 where none do (a hand nobody labelled)
 //   chain         neighbouring joints along a line bend alike (spines, tails,
@@ -288,14 +289,16 @@ export class RigFit {
 			}
 			this.reach[j] = r;
 		}
-		this.boneDir = new Float64Array(J * 3);
-		this.oneChild = new Uint8Array(J);
+		// Whose twist is held, and about what: a one-child joint's, about its bone.
+		this.twistAxis = new Float64Array(J * 3);
+		this.twistHeld = new Uint8Array(J);
+		const oneChild = new Uint8Array(J);
 		for (let j = 0; j < J; j++) {
 			if (children[j].length !== 1) continue;
 			const c = children[j][0], o = this.offsets.subarray(c * 3, c * 3 + 3), n = Math.hypot(o[0], o[1], o[2]);
 			if (n < 1e-9) continue;
-			this.oneChild[j] = 1;
-			for (let d = 0; d < 3; d++) this.boneDir[j * 3 + d] = o[d] / n;
+			oneChild[j] = this.twistHeld[j] = 1;
+			for (let d = 0; d < 3; d++) this.twistAxis[j * 3 + d] = o[d] / n;
 		}
 		// Chains that bend evenly: a joint and the child that carries its line on,
 		// whose bones run within 35 degrees of each other at rest (a spine, a
@@ -331,9 +334,23 @@ export class RigFit {
 			const a = unit(this.offsets.subarray(c * 3, c * 3 + 3)), b = unit(this.offsets.subarray(carries[c] * 3, carries[c] * 3 + 3));
 			if (dot(a, b) <= Math.cos(35 * DEG)) continue;
 			this.chainChild[j] = c;
-			this.chainBranch[j] = this.oneChild[j] && this.oneChild[c] ? 0 : 1;
+			this.chainBranch[j] = oneChild[j] && oneChild[c] ? 0 : 1;
 			this.chainReach[j] = Math.hypot(...this.offsets.subarray(c * 3, c * 3 + 3)) + this.reach[c];
 		}
+		// A forearm's roll shows in the hand's points: the hold moves to the hand,
+		// about the forearm, so the roll lands on the forearm, not the wrist. An
+		// arm straight at rest is no spine: its upper arm and forearm are no chain.
+		const freed = new Uint8Array(J);
+		for (let j = 0; j < J; j++) {
+			if (!oneChild[j] || this.chainChild[j] >= 0) continue;
+			const c = children[j][0];
+			if (children[c].length < 2 || this.seenBelow[c] !== 2) continue;
+			this.twistHeld[j] = 0;
+			this.twistHeld[c] = 1;
+			freed[j] = 1;
+			for (let d = 0; d < 3; d++) this.twistAxis[c * 3 + d] = this.twistAxis[j * 3 + d];
+		}
+		for (let j = 0; j < J; j++) if (this.chainChild[j] >= 0 && freed[this.chainChild[j]]) this.chainChild[j] = -1;
 		// Feet: the leaves well below the root, and their parents.
 		const rootY = rig.positions[0][1], lowest = Math.min(...rig.positions.map((p) => p[1]));
 		const feet = new Set();
@@ -648,7 +665,7 @@ export class RigFit {
 			const L = Math.max(this.reach[j], 0.05 * this.rig.height) * k0, L2 = L * L;
 			const wr = [W.unseen, W.oneMarker, W.rest][this.seenBelow[j]] * L2 * norm;
 			const wt = (this.twistSeen[j] ? W.twistMarked : W.twist) * L2 * norm;
-			const b = this.boneDir.subarray(j * 3, j * 3 + 3);
+			const b = this.twistAxis.subarray(j * 3, j * 3 + 3);
 			const c = this.chainChild[j];
 			for (let t = 0; t < T; t++) {
 				const o = (t * J + j) * 3;
@@ -656,7 +673,7 @@ export class RigFit {
 					rest += wr * theta[o + d] * theta[o + d];
 					g.theta[o + d] += 2 * wr * theta[o + d];
 				}
-				if (this.oneChild[j] && wt > 0) {
+				if (this.twistHeld[j] && wt > 0) {
 					const tw = theta[o] * b[0] + theta[o + 1] * b[1] + theta[o + 2] * b[2];
 					twist += wt * tw * tw;
 					for (let d = 0; d < 3; d++) g.theta[o + d] += 2 * wt * tw * b[d];
@@ -773,13 +790,13 @@ export class RigFit {
 	native() {
 		if (this.packed) return this.packed;
 		const ints = [this.T, this.J, this.M, this.V, this.tracked.length, this.feet.length, this.lateral.length, this.limits.length, this.knownCameras ? 1 : 0];
-		for (const a of [this.parents, this.markerJoint, this.tracked, this.fixed, this.seenBelow, this.twistSeen, this.oneChild, this.chainChild, this.chainBranch, this.feet]) ints.push(...a);
+		for (const a of [this.parents, this.markerJoint, this.tracked, this.fixed, this.seenBelow, this.twistSeen, this.twistHeld, this.chainChild, this.chainBranch, this.feet]) ints.push(...a);
 		for (const o of this.views) {
 			ints.push(o.points.length, o.H);
 			for (const p of o.points) ints.push(p.joint, p.marker);
 		}
 		const reals = [this.k0, this.sigma2, this.rig.height, ...this.rootRest, ...WEIGHT_ORDER.map((k) => this.weights[k]), ...this.pitchPriors, ...this.views.map((o) => o.gamma ?? 0)];
-		for (const a of [this.offsets, this.reach, this.boneDir, this.chainReach]) reals.push(...a);
+		for (const a of [this.offsets, this.reach, this.twistAxis, this.chainReach]) reals.push(...a);
 		for (const l of this.lateral) reals.push(...l);
 		for (const lim of this.limits) {
 			reals.push(lim.joint, ...lim.frame);

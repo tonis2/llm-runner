@@ -74,7 +74,7 @@ struct RigProblem
 	char* fixed;
 	int* seen_below;
 	int* twist_seen;
-	int* one_child;
+	int* twist_held;
 	int* chain_child;
 	int* chain_branch;
 	int[] feet;
@@ -85,7 +85,7 @@ struct RigProblem
 	double* w;
 	double* offsets;
 	double* reach;
-	double* bone_dir;
+	double* twist_axis;
 	double* chain_reach;
 	double[] lateral;   // [j, anchor, rest, w]
 	double[] limits;    // [joint, frame 4, (has, lo, hi) 3]
@@ -157,7 +157,7 @@ fn void? RigProblem.read(&self, int[] ints, double[] reals, double[] obs, double
 	int* fixed = base + at; at += m;
 	self.seen_below = base + at; at += j;
 	self.twist_seen = base + at; at += j;
-	self.one_child = base + at; at += j;
+	self.twist_held = base + at; at += j;
 	self.chain_child = base + at; at += j;
 	self.chain_branch = base + at; at += j;
 	self.feet = base[at:feet]; at += feet;
@@ -177,7 +177,7 @@ fn void? RigProblem.read(&self, int[] ints, double[] reals, double[] obs, double
 	double* gamma = reals.ptr + r; r += v;
 	self.offsets = reals.ptr + r; r += (long)j * 3;
 	self.reach = reals.ptr + r; r += j;
-	self.bone_dir = reals.ptr + r; r += (long)j * 3;
+	self.twist_axis = reals.ptr + r; r += (long)j * 3;
 	self.chain_reach = reals.ptr + r; r += j;
 	self.lateral = reals[r:(long)lateral * 4]; r += (long)lateral * 4;
 	self.limits = reals[r:(long)limits * 14];
@@ -730,7 +730,7 @@ fn void RigProblem.turn_priors(&self, double[FIT_TERMS]* terms)
 		long seen = self.seen_below[j];
 		double wr = (seen == 0 ? w[FitWeight.UNSEEN.ordinal] : seen == 1 ? w[FitWeight.ONE_MARKER.ordinal] : w[FitWeight.REST.ordinal]) * l2 * norm;
 		double wt = (self.twist_seen[j] ? w[FitWeight.TWIST_MARKED.ordinal] : w[FitWeight.TWIST.ordinal]) * l2 * norm;
-		double* b = self.bone_dir + j * 3;
+		double* b = self.twist_axis + j * 3;
 		long c = self.chain_child[j];
 		for (long t = 0; t < tn; t++)
 		{
@@ -740,7 +740,7 @@ fn void RigProblem.turn_priors(&self, double[FIT_TERMS]* terms)
 				rest += wr * theta[o + d] * theta[o + d];
 				g[o + d] += 2 * wr * theta[o + d];
 			}
-			if (self.one_child[j] && wt > 0)
+			if (self.twist_held[j] && wt > 0)
 			{
 				double tw = theta[o] * b[0] + theta[o + 1] * b[1] + theta[o + 2] * b[2];
 				twist += wt * tw * tw;
