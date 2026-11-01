@@ -35,7 +35,7 @@ import * as op from '/core/ops.js';
 import { submit, copy, zero, breathe, breathing } from '/core/gpu.js';
 import { PATCH } from '/core/models/dinov3.js';
 import { uploadImage, warpCropGpu, boxAffine } from '/core/image/warp.js';
-import { Head, saveFinder, peaks } from './detect.js';
+import { Head, saveFinder, peaks, partner, FINDER_VERSION } from './detect.js';
 import { bad } from './request.js';
 
 const IMAGE = /\.(png|jpe?g)$/i;
@@ -406,11 +406,292 @@ class Adam {
 	}
 }
 
+// The rig's hands: joints with two children or more whose whole reach is
+// small (a wrist and its fingers, not a hip or a chest). The first hand's
+// points (it, its children, the finger tips) are the hand head's; a hand that
+// is its mirror image (wrist_L of wrist_R) is looked at mirrored. `anchors`:
+// the joints of each hand the body's look finds, round which it is cropped.
+// `scale`: the crop's side, a share of the joints' box. Null without hands.
+export function handsOf(set, chosen) {
+	const J = set.joints.length, children = Array.from({ length: J }, () => []);
+	set.parents.forEach((p, j) => { if (p >= 0) children[p].push(j); });
+	const ys = set.rest.map((p) => p[1]);
+	const height = Math.max(...ys) - Math.min(...ys) || 1;
+	const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+	const below = (j) => children[j].flatMap((c) => [c, ...below(c)]);
+	const found = [];
+	for (let j = 0; j < J; j++) {
+		if (children[j].length < 2 || !chosen.includes(j)) continue;
+		const under = below(j), reach = Math.max(...under.map((c) => dist(set.rest[c], set.rest[j])));
+		if (reach >= 0.15 * height || reach < 0.02 * height) continue;
+		const tips = under.filter((c) => !children[c].length && !children[j].includes(c));
+		found.push({ j, reach, points: [j, ...children[j], ...tips], anchors: [j, ...children[j].filter((c) => chosen.includes(c))] });
+	}
+	if (!found.length) return null;
+	const name = (k) => set.joints[k], first = found[0];
+	const points = first.points.map(name), anchors = first.anchors.map(name);
+	const hands = [{ points, anchors, mirror: false }];
+	for (const h of found.slice(1)) {
+		const names = h.points.map(name), mirrored = points.map(partner);
+		if (name(h.j) === partner(name(first.j)) && mirrored.every((n) => names.includes(n))) hands.push({ points: mirrored, anchors: anchors.map(partner), mirror: true });
+	}
+	return { scale: (2.6 * first.reach) / height, points, hands };
+}
+
+// The longer side of the box round `chosen` joints of a picture's points.
+function jointBox(points, chosen) {
+	const xs = chosen.map((j) => points[j][0]), ys = chosen.map((j) => points[j][1]);
+	return Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+}
+
+// The body of a finder already at `path` trained as this one would be and
+// without hands: its weights and metadata, so only the hands need training.
+function bodyFrom(path, { names, S, D, layers, rank, hidden }) {
+	if (!path || !llm.exists(path)) return null;
+	const m = llm.open(path);
+	try {
+		const text = m.meta('finder', null);
+		if (!text) return null;
+		const meta = JSON.parse(text);
+		if (meta.version !== FINDER_VERSION || meta.hands || meta.joints.join() !== names.join() || meta.size !== S || meta.dim !== D
+			|| (meta.layers ?? []).join() !== layers.join() || meta.rank !== rank || meta.hidden !== hidden) return null;
+		const weights = {};
+		for (const n of ['pca', 'pca_bias', 'w1', 'b1', 'w2', 'b2']) weights[n] = Float32Array.from(m.floats(n));
+		return { weights, meta };
+	} finally {
+		m.close();
+	}
+}
+
+/**
+ * Pictures through the backbone, kept as a head's features: the first `sample`
+ * give the PCA, then every picture's tokens are kept as their whitened
+ * components, on the GPU, so the head trains from memory. `picture(i)` makes
+ * picture i's input (S x S, on the GPU) and writes its targets. Returns the
+ * head (the PCA and fresh weights, `host` their copies), `features(i)` and
+ * dispose().
+ */
+async function encodePictures(encoder, { M, S, layers, rank, hidden, J, seed, random, sample, picture, step, spent, what = 'encoding pictures' }) {
+	const N = (S / PATCH) ** 2, D = encoder.dim * (layers.length + 1), perChunk = 256;
+	const raw = [], chunks = [];
+	let head = null, kept = 0;
+	const timed = (key, t) => { spent[key] += llm.now() - t; };
+	const features = (i) => [chunks[Math.floor(i / perChunk)], (i % perChunk) * N * rank * 4];
+	const keep = (tokens, i) => {
+		const [chunk, at] = features(i);
+		const f = f32(N * rank);
+		head.project(tokens, f, N);
+		copy(f, chunk, N * rank * 4, 0, at);
+		submit();
+		f.dispose();
+	};
+	const dispose = () => {
+		for (const t of raw) t.dispose();
+		for (const t of chunks) t.dispose();
+		raw.length = chunks.length = 0;
+		head?.dispose();
+	};
+	try {
+		for (let i = 0; i < M; i++) {
+			let t = llm.now();
+			const input = picture(i);
+			timed('pictures', t);
+			t = llm.now();
+			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
+			input.dispose();
+			timed('backbone', t);
+			t = llm.now();
+			if (!head) {
+				raw.push(tokens);
+				if (raw.length === sample) {
+					step?.(i + 1, M, 'principal components');
+					const tp = llm.now();
+					const p = await principal(raw, N, D, rank, random);
+					spent.pca += llm.now() - tp;
+					t += llm.now() - tp;
+					kept = p.kept;
+					llm.print(`  PCA: ${rank} of ${D} components keep ${(kept * 100).toFixed(1)}% of the variance (${sample} pictures)`);
+					const w1 = llm.randomNormal(hidden * rank, seed + 1).map((v) => v * Math.sqrt(2 / rank));
+					const w2 = llm.randomNormal(J * hidden, seed + 2).map((v) => v * 0.01);
+					head = new Head({ pca: p.pca, pca_bias: p.pca_bias, w1, b1: new Float32Array(hidden), w2, b2: new Float32Array(J) }, { dim: D, rank, hidden, joints: J });
+					head.host = { w1: Float32Array.from(w1), b1: new Float32Array(hidden), w2: Float32Array.from(w2), b2: new Float32Array(J), pca: p.pca, pca_bias: p.pca_bias };
+					for (let c = 0; c * perChunk < M; c++) chunks.push(f32(Math.min(perChunk, M - c * perChunk) * N * rank));
+					raw.forEach((x, k) => keep(x, k));
+					for (const x of raw) x.dispose();
+					raw.length = 0;
+				}
+			} else {
+				keep(tokens, i);
+				tokens.dispose();
+			}
+			timed('keep', t);
+			step?.(i + 1, M, what);
+			if (breathing()) await breathe();
+		}
+	} catch (e) {
+		dispose();
+		throw e;
+	}
+	return { head, features, kept, dispose };
+}
+
+/**
+ * The head fitted to the kept features of pictures [0, train), scored on
+ * [train, M) every five epochs. Its weights are read back into head.host.
+ * Returns the last held-out scoring and the history.
+ */
+async function fitHead(head, features, targets, { M, train, B, S, J, rank, hidden, sigma, epochs, lr, random, step, landmarksFrom = J, what = 'training', label = '' }) {
+	const G = S / PATCH, N = G * G;
+	const g = stepBuffers({ B, N, J, rank, hidden });
+	const adam = new Adam([
+		{ value: head.g.w1, grad: g.dw1, n: hidden * rank, decay: true }, { value: head.g.b1, grad: g.db1, n: hidden },
+		{ value: head.g.w2, grad: g.dw2, n: J * hidden, decay: true }, { value: head.g.b2, grad: g.db2, n: J },
+	], { lr, decay: 1e-4 });
+	try {
+		// w2 [J, hidden] transposed for the step's dA = dS W2.
+		const transposeW2 = () => op.transposeChannelSpatial(head.g.w2, g.w2t, hidden, J, 1);
+		const gather = (batch) => {
+			batch.forEach((i, b) => {
+				const [chunk, at] = features(i);
+				copy(chunk, g.x, N * rank * 4, at, b * N * rank * 4);
+			});
+			const t = new Float32Array(B * J * 4);
+			batch.forEach((i, b) => t.set(targets.subarray(i * J * 4, (i + 1) * J * 4), b * J * 4));
+			g.target.buffer.write(t);
+		};
+		const order = Array.from({ length: train }, (_, i) => i);
+		const steps = epochs * Math.floor(train / B), warm = Math.min(200, steps / 10);
+		const opts = { B, N, J, G, rank, hidden, S, landmarksFrom };
+		let done = 0, lossSum = 0, lossCount = 0;
+		const history = [];
+		transposeW2();
+		for (let epoch = 0; epoch < epochs; epoch++) {
+			for (let i = order.length - 1; i > 0; i--) { const k = random.int(i + 1); [order[i], order[k]] = [order[k], order[i]]; }
+			for (let b0 = 0; b0 + B <= train; b0 += B) {
+				gather(order.slice(b0, b0 + B));
+				const { loss } = headGradients(head, g, { B, N, J, G, rank, hidden, sigma }, false);
+				for (const v of loss) lossSum += v;
+				lossCount += B;
+				const scale = Math.min(1, (done + 1) / warm) * 0.5 * (1 + Math.cos((Math.PI * done) / steps));
+				adam.step(scale);
+				transposeW2();
+				done++;
+				step?.(done, steps, what);
+				if (done % 50 === 0 && breathing()) await breathe();
+			}
+			const mean = lossSum / Math.max(1, lossCount);
+			lossSum = 0;
+			lossCount = 0;
+			if (epoch % 5 === 4 || epoch === epochs - 1) {
+				const v = evaluate(head, g, features, targets, train, M, opts);
+				history.push({ epoch: epoch + 1, loss: round(mean, 3), held_out_px: v.median });
+				llm.print(`  ${label}epoch ${epoch + 1}/${epochs}: loss ${mean.toFixed(3)}, held out: median ${v.median.toFixed(1)}px, ${(v.within * 100).toFixed(0)}% within ${v.near}px`);
+			}
+		}
+		const v = evaluate(head, g, features, targets, train, M, opts);
+		for (const name of ['w1', 'b1', 'w2', 'b2']) head.host[name] = readFloats(head.g[name], head.host[name].length);
+		return { v, history };
+	} finally {
+		for (const t of Object.values(g)) t.dispose();
+		adam.dispose();
+	}
+}
+
+/**
+ * The hand head: every picture's hands cropped square, the hand filling the
+ * crop as it fills the detector's (the joints' box times `hands.scale`), the
+ * crop's centre and side jittered as much as the body's look strays, the left
+ * hand mirrored. `images` in the body's order, the last `held` held out.
+ */
+async function trainHands(encoder, set, images, held, chosen, hands, request, step, spent) {
+	const S = Number(request.hand_size ?? 256), seed = Number(request.seed ?? 1) + 7;
+	if (S % PATCH) throw bad(`hand_size: ${S} pixels is not a multiple of ${PATCH}`);
+	const layers = (request.layers ?? []).map(Number), D = encoder.dim * (layers.length + 1);
+	const rank = Number(request.hand_rank ?? 256), hidden = Number(request.hand_hidden ?? 256);
+	const epochs = Number(request.hand_epochs ?? request.epochs ?? 40), B = Number(request.batch ?? 32), sigma = Number(request.sigma ?? 1);
+	if (!(rank >= 16 && rank <= D)) throw bad(`hand_rank: 16 to ${D}`);
+	const random = generator(seed), P = hands.points.length;
+	const at = (n) => set.joints.indexOf(n);
+	const kinds = hands.hands.map((h) => ({ ...h, idx: h.points.map(at), anchorIdx: h.anchors.map(at) }));
+	// Every picture's hands whose wrist is in it; the held-out pictures' last.
+	const crops = [];
+	images.forEach((im, i) => kinds.forEach((h, k) => {
+		const w = im.points[h.idx[0]];
+		if (w[0] >= 0 && w[1] >= 0 && w[0] < set.size && w[1] < set.size) crops.push({ i, k });
+	}));
+	const M = crops.length, train = crops.filter((c) => c.i < images.length - held).length;
+	if (train < B) throw bad(`renders: ${train} hands to train on, too few for batches of ${B}`);
+	llm.print(`  hands: ${M} crops (${M - train} held out) of ${S}x${S}, ${kinds.length} hand${kinds.length > 1 ? 's' : ''}, points ${hands.points.join(', ')}`);
+
+	const backdrops = new Backdrops(set.size, request.backgrounds ?? null, random);
+	const noise = llm.randomNormal(1 << 21, seed);
+	const targets = new Float32Array(M * P * 4);
+	let cached = -1, picture = null;
+	const make = (c) => {
+		const { i, k } = crops[c], im = images[i], h = kinds[k];
+		if (cached !== i) {
+			const render = llm.image.load(im.path);
+			picture = composite(render, backdrops.next(), random, noise);
+			cached = i;
+		}
+		const anchors = h.anchorIdx.map((j) => im.points[j]);
+		const ax = anchors.reduce((s, p) => s + p[0], 0) / anchors.length, ay = anchors.reduce((s, p) => s + p[1], 0) / anchors.length;
+		const side = Math.max(16, hands.scale * jointBox(im.points, chosen) * random.between(0.85, 1.2));
+		const cx = ax + random.between(-0.18, 0.18) * side, cy = ay + random.between(-0.18, 0.18) * side;
+		const affine = boxAffine([cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2], S, S), [a, , tx, , d, ty] = affine;
+		for (let n = 0; n < P; n++) {
+			const p = im.points[h.idx[n]], o = (c * P + n) * 4;
+			// Rigsmith's pixels are counted from the left edge, the warp's from the first centre.
+			let x = a * (p[0] - 0.5) + tx;
+			const y = d * (p[1] - 0.5) + ty;
+			if (h.mirror) x = S - 1 - x;
+			targets[o] = (x - (PATCH - 1) / 2) / PATCH;
+			targets[o + 1] = (y - (PATCH - 1) / 2) / PATCH;
+			targets[o + 2] = x >= 0 && y >= 0 && x < S && y < S ? 1 : 0;
+		}
+		const image = uploadImage(picture);
+		const m = h.mirror ? [a, 0, S - 1 - tx - a * (picture.width - 1), 0, d, ty] : affine;
+		const input = warpCropGpu(image, picture, m, { width: S, height: S, mirror: h.mirror });
+		image.dispose();
+		return input;
+	};
+	const t0 = llm.now();
+	const enc = await encodePictures(encoder, {
+		M, S, layers, rank, hidden, J: P, seed, random, sample: Math.min(train, Number(request.pca_pictures ?? 48)),
+		picture: make, step, spent, what: 'encoding hands',
+	});
+	try {
+		const encoded = (llm.now() - t0) / 1000;
+		llm.print(`  encoded ${M} hands in ${encoded.toFixed(0)}s`);
+		const { v, history } = await fitHead(enc.head, enc.features, targets, {
+			M, train, B, S, J: P, rank, hidden, sigma, epochs, lr: Number(request.lr ?? 1e-3), random, step, what: 'training hands', label: 'hands ',
+		});
+		const host = enc.head.host;
+		return {
+			weights: { hand_pca: host.pca, hand_pca_bias: host.pca_bias, hand_w1: host.w1, hand_b1: host.b1, hand_w2: host.w2, hand_b2: host.b2 },
+			meta: {
+				size: S, rank, hidden, sigma, scale: round(hands.scale, 4), points: hands.points, hands: hands.hands,
+				report: {
+					crops: M, held_out: M - train, pca_variance_kept: round(enc.kept, 3),
+					held_out_px: { median: round(v.median, 2), mean: round(v.mean, 2), p90: round(v.p90, 2), within: round(v.within, 3), near: v.near },
+					worst_points: v.perJoint.map((e, n) => ({ point: hands.points[n], px: round(e, 1) })).sort((x, y) => y.px - x.px).slice(0, 6),
+					history, seconds: { encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1) },
+				},
+			},
+		};
+	} finally {
+		enc.dispose();
+	}
+}
+
 /**
  * Trains a finder on `request.renders` and writes it to `request.out`.
  * Options: joints, landmarks (true), hidden_weight (0.3), layers ([]), backgrounds, rank (384), hidden (256), epochs (40),
  * batch (32), lr (0.001), sigma (1, patches), holdout (0.05), seed (1),
- * limit (pictures at most). Returns the report.
+ * limit (pictures at most), hands (true), hand_size (256), hand_rank (256),
+ * hand_hidden (256), hand_epochs (epochs). A finder already at `out` for the
+ * same body and without hands keeps its body: only the hands are trained.
+ * Returns the report.
  */
 export async function trainFinder(encoder, request, step = null) {
 	const t0 = llm.now();
@@ -428,7 +709,8 @@ export async function trainFinder(encoder, request, step = null) {
 	const epochs = Number(request.epochs ?? 40), B = Number(request.batch ?? 32), sigma = Number(request.sigma ?? 1);
 	if (S % PATCH) throw bad(`renders: ${S} pixels is not a multiple of ${PATCH}`);
 	if (!(rank >= 16 && rank <= D)) throw bad(`rank: 16 to ${D}`);
-	const random = generator(Number(request.seed ?? 1));
+	const seed = Number(request.seed ?? 1);
+	const random = generator(seed);
 	const hiddenWeight = Number(request.hidden_weight ?? 0.3);
 
 	// The pictures, shuffled, a twentieth held out.
@@ -438,41 +720,32 @@ export async function trainFinder(encoder, request, step = null) {
 	const held = Math.max(1, Math.round(images.length * Number(request.holdout ?? 0.05)));
 	const M = images.length, train = M - held;
 	if (train < B) throw bad(`renders: ${M} pictures, too few for batches of ${B}`);
-	llm.print(`  finder: ${M} pictures (${held} held out) of ${S}x${S}, ${chosen.length} of ${set.joints.length} joints and ${landmarks.length} landmarks: ${names.join(', ')}`);
-
-	// 1. Every picture through the backbone; each one's labels in its crop
-	// ([image, joint, (grid x, grid y, weight, -)]).
-	const backdrops = new Backdrops(S, request.backgrounds ?? null, random);
-	const noise = llm.randomNormal(1 << 21, Number(request.seed ?? 1));
-	const targets = new Float32Array(M * J * 4);
-	const sample = Math.min(train, Number(request.pca_pictures ?? 48));
-	const raw = [];
-	let head = null, chunks = [], perChunk = 256, kept = 0;
+	const hands = request.hands === false ? null : handsOf(set, chosen);
 	// Where the time goes, in ms: making the pictures, the backbone, the PCA,
-	// projecting and keeping the features, then fitting the head.
+	// projecting and keeping the features, then fitting the heads.
 	const spent = { pictures: 0, backbone: 0, pca: 0, keep: 0, head: 0 };
-	const timed = (key, t) => { spent[key] += llm.now() - t; };
-	const features = (i) => [chunks[Math.floor(i / perChunk)], (i % perChunk) * N * rank * 4];
-	const keep = (tokens, i) => {
-		const [chunk, at] = features(i);
-		const f = f32(N * rank);
-		head.project(tokens, f, N);
-		copy(f, chunk, N * rank * 4, 0, at);
-		submit();
-		f.dispose();
-	};
-	try {
-		for (let i = 0; i < M; i++) {
-			let t = llm.now();
+	const kept = hands ? bodyFrom(request.out, { names, S, D, layers, rank, hidden }) : null;
+	let body, bodyReport;
+	if (kept) {
+		llm.print(`  finder: ${request.out} already finds this body; training its hands`);
+		body = kept.weights;
+		bodyReport = kept.meta.report;
+	} else {
+		llm.print(`  finder: ${M} pictures (${held} held out) of ${S}x${S}, ${chosen.length} of ${set.joints.length} joints and ${landmarks.length} landmarks: ${names.join(', ')}`);
+		// 1. Every picture through the backbone; each one's labels in its crop
+		// ([image, joint, (grid x, grid y, weight, -)]).
+		const backdrops = new Backdrops(S, request.backgrounds ?? null, random);
+		const noise = llm.randomNormal(1 << 21, seed);
+		const targets = new Float32Array(M * J * 4);
+		const picture = (i) => {
 			const im = images[i];
 			const render = llm.image.load(im.path);
 			if (render.width !== S || render.height !== S) throw bad(`renders: ${im.path} is ${render.width}x${render.height}, not ${S}`);
-			const picture = composite(render, backdrops.next(), random, noise);
+			const pic = composite(render, backdrops.next(), random, noise);
 			// Cropped a little larger or smaller and off centre.
 			const zoom = random.between(0.85, 1.2), side = S / zoom;
 			const cx = S / 2 + random.between(-0.06, 0.06) * S, cy = S / 2 + random.between(-0.06, 0.06) * S;
-			const box = [cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2];
-			const affine = boxAffine(box, S, S);
+			const affine = boxAffine([cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2], S, S);
 			// Each point: a joint's, or a landmark's (learnt only where it shows).
 			const point = (n) => (n < chosen.length ? im.points[chosen[n]] : im.marks[n - chosen.length]);
 			for (let n = 0; n < J; n++) {
@@ -488,124 +761,52 @@ export async function trainFinder(encoder, request, step = null) {
 				else if (inside && p[3] === 1) targets[o + 2] = 1;
 				else { targets[o] = targets[o + 1] = G / 2; targets[o + 2] = hiddenWeight; targets[o + 3] = FLAT; }
 			}
-			const image = uploadImage(picture);
-			const input = warpCropGpu(image, picture, affine, { width: S, height: S });
+			const image = uploadImage(pic);
+			const input = warpCropGpu(image, pic, affine, { width: S, height: S });
 			image.dispose();
-			timed('pictures', t);
-			t = llm.now();
-			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
-			input.dispose();
-			timed('backbone', t);
-			t = llm.now();
-			if (!head) {
-				raw.push(tokens);
-				if (raw.length === sample) {
-					// 2. The PCA, from the pictures so far; then they are kept as features.
-					step?.(i + 1, M, 'principal components');
-					const tp = llm.now();
-					const p = await principal(raw, N, D, rank, random);
-					spent.pca += llm.now() - tp;
-					t += llm.now() - tp;
-					kept = p.kept;
-					llm.print(`  PCA: ${rank} of ${D} components keep ${(kept * 100).toFixed(1)}% of the variance (${sample} pictures)`);
-					const w1 = llm.randomNormal(hidden * rank, Number(request.seed ?? 1) + 1).map((v) => v * Math.sqrt(2 / rank));
-					const w2 = llm.randomNormal(J * hidden, Number(request.seed ?? 1) + 2).map((v) => v * 0.01);
-					head = new Head({ pca: p.pca, pca_bias: p.pca_bias, w1, b1: new Float32Array(hidden), w2, b2: new Float32Array(J) }, { dim: D, rank, hidden, joints: J });
-					head.host = { w1: Float32Array.from(w1), b1: new Float32Array(hidden), w2: Float32Array.from(w2), b2: new Float32Array(J), pca: p.pca, pca_bias: p.pca_bias };
-					for (let c = 0; c * perChunk < M; c++) chunks.push(f32(Math.min(perChunk, M - c * perChunk) * N * rank));
-					raw.forEach((t, k) => keep(t, k));
-					for (const t of raw) t.dispose();
-					raw.length = 0;
-				}
-			} else {
-				keep(tokens, i);
-				tokens.dispose();
-			}
-			timed('keep', t);
-			step?.(i + 1, M, 'encoding pictures');
-			if (breathing()) await breathe();
-		}
-		const encoded = (llm.now() - t0) / 1000;
-		llm.print(`  encoded ${M} pictures in ${encoded.toFixed(0)}s`);
-
-		// 3. The head.
-		const headStart = llm.now();
-		const BN = B * N, g = stepBuffers({ B, N, J, rank, hidden });
-		const host = head.host;
-		const adam = new Adam([
-			{ value: head.g.w1, grad: g.dw1, n: hidden * rank, decay: true }, { value: head.g.b1, grad: g.db1, n: hidden },
-			{ value: head.g.w2, grad: g.dw2, n: J * hidden, decay: true }, { value: head.g.b2, grad: g.db2, n: J },
-		], { lr: Number(request.lr ?? 1e-3), decay: 1e-4 });
-		// w2 [J, hidden] transposed for the step's dA = dS W2.
-		const transposeW2 = () => op.transposeChannelSpatial(head.g.w2, g.w2t, hidden, J, 1);
-		const gather = (batch) => {
-			batch.forEach((i, b) => {
-				const [chunk, at] = features(i);
-				copy(chunk, g.x, N * rank * 4, at, b * N * rank * 4);
-			});
-			const t = new Float32Array(B * J * 4);
-			batch.forEach((i, b) => t.set(targets.subarray(i * J * 4, (i + 1) * J * 4), b * J * 4));
-			g.target.buffer.write(t);
+			return input;
 		};
-		const order = Array.from({ length: train }, (_, i) => i);
-		const steps = epochs * Math.floor(train / B), warm = Math.min(200, steps / 10);
-		let done = 0, lossSum = 0, lossCount = 0;
-		const history = [];
-		transposeW2();
-		for (let epoch = 0; epoch < epochs; epoch++) {
-			for (let i = order.length - 1; i > 0; i--) { const k = random.int(i + 1); [order[i], order[k]] = [order[k], order[i]]; }
-			for (let b0 = 0; b0 + B <= train; b0 += B) {
-				gather(order.slice(b0, b0 + B));
-				const { loss } = headGradients(head, g, { B, N, J, G, rank, hidden, sigma }, false);
-				for (const v of loss) lossSum += v;
-				lossCount += B;
-				const scale = Math.min(1, (done + 1) / warm) * 0.5 * (1 + Math.cos((Math.PI * done) / steps));
-				adam.step(scale);
-				transposeW2();
-				done++;
-				step?.(done, steps, 'training');
-				if (done % 50 === 0 && breathing()) await breathe();
-			}
-			const mean = lossSum / Math.max(1, lossCount);
-			lossSum = 0;
-			lossCount = 0;
-			if (epoch % 5 === 4 || epoch === epochs - 1) {
-				const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S, landmarksFrom: chosen.length });
-				history.push({ epoch: epoch + 1, loss: round(mean, 3), held_out_px: v.median });
-				llm.print(`  epoch ${epoch + 1}/${epochs}: loss ${mean.toFixed(3)}, held out: median ${v.median.toFixed(1)}px, ${(v.within * 100).toFixed(0)}% within ${v.near}px`);
-			}
-		}
-		const v = evaluate(head, g, features, targets, train, M, { B, N, J, G, rank, hidden, S, landmarksFrom: chosen.length });
-		for (const t of Object.values(g)) t.dispose();
-		adam.dispose();
-		for (const name of ['w1', 'b1', 'w2', 'b2']) host[name] = readFloats(head.g[name], host[name].length);
-		timed('head', headStart);
-
-		const report = {
-			pictures: M, held_out: held, joints: names, size: S,
-			pca_variance_kept: round(kept, 3),
-			held_out_px: { median: round(v.median, 2), mean: round(v.mean, 2), p90: round(v.p90, 2), within: round(v.within, 3), near: v.near },
-			worst_joints: v.perJoint.map((e, n) => ({ joint: names[n], px: round(e, 1) })).sort((a, b) => b.px - a.px).slice(0, 8),
-			// How sure the finder is of a landmark the picture shows, and of one it
-			// hides (median scores): far apart, the fit can tell them apart.
-			...(landmarks.length ? { landmark_score: { seen: round(v.seenScore, 3), hidden: round(v.hiddenScore, 3) } } : {}),
-			history,
-			seconds: {
-				encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1),
-				...Object.fromEntries(Object.entries(spent).map(([k, ms]) => [k, round(ms / 1000, 1)])),
-			},
-		};
-		saveFinder(request.out, { pca: host.pca, pca_bias: host.pca_bias, w1: host.w1, b1: host.b1, w2: host.w2, b2: host.b2 }, {
-			joints: names, size: S, dim: D, layers, rank, hidden, sigma, fill: set.fill, report,
-			landmarks: landmarks.map((m) => ({ name: m.name, joint: m.joint, offset: m.offset })),
+		const enc = await encodePictures(encoder, {
+			M, S, layers, rank, hidden, J, seed, random, sample: Math.min(train, Number(request.pca_pictures ?? 48)), picture, step, spent,
 		});
-		llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px, in ${report.seconds.total}s (${Object.keys(spent).map((k) => `${k} ${report.seconds[k]}s`).join(', ')})`);
-		return report;
-	} finally {
-		for (const t of raw) t.dispose();
-		for (const t of chunks) t.dispose();
-		head?.dispose();
+		try {
+			const encoded = (llm.now() - t0) / 1000;
+			llm.print(`  encoded ${M} pictures in ${encoded.toFixed(0)}s`);
+			// 3. The head.
+			const headStart = llm.now();
+			const { v, history } = await fitHead(enc.head, enc.features, targets, {
+				M, train, B, S, J, rank, hidden, sigma, epochs, lr: Number(request.lr ?? 1e-3), random, step, landmarksFrom: chosen.length,
+			});
+			spent.head += llm.now() - headStart;
+			const host = enc.head.host;
+			body = { pca: host.pca, pca_bias: host.pca_bias, w1: host.w1, b1: host.b1, w2: host.w2, b2: host.b2 };
+			bodyReport = {
+				pictures: M, held_out: held, joints: names, size: S,
+				pca_variance_kept: round(enc.kept, 3),
+				held_out_px: { median: round(v.median, 2), mean: round(v.mean, 2), p90: round(v.p90, 2), within: round(v.within, 3), near: v.near },
+				worst_joints: v.perJoint.map((e, n) => ({ joint: names[n], px: round(e, 1) })).sort((a, b) => b.px - a.px).slice(0, 8),
+				// How sure the finder is of a landmark the picture shows, and of one it
+				// hides (median scores): far apart, the fit can tell them apart.
+				...(landmarks.length ? { landmark_score: { seen: round(v.seenScore, 3), hidden: round(v.hiddenScore, 3) } } : {}),
+				history,
+				seconds: {
+					encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1),
+					...Object.fromEntries(Object.entries(spent).map(([k, ms]) => [k, round(ms / 1000, 1)])),
+				},
+			};
+		} finally {
+			enc.dispose();
+		}
 	}
+	const hand = hands ? await trainHands(encoder, set, images, held, chosen, hands, request, step, spent) : null;
+	const report = { ...bodyReport, ...(hand ? { hands: hand.meta.report } : {}) };
+	saveFinder(request.out, { ...body, ...(hand?.weights ?? {}) }, {
+		joints: names, size: S, dim: D, layers, rank, hidden, sigma, fill: set.fill, report,
+		landmarks: landmarks.map((m) => ({ name: m.name, joint: m.joint, offset: m.offset })),
+		...(hand ? { hands: hand.meta } : {}),
+	});
+	llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px${hand ? `, hands ${hand.meta.report.held_out_px.median}px of ${hand.meta.size}` : ''}, in ${round((llm.now() - t0) / 1000, 1)}s`);
+	return report;
 }
 
 const round = (v, d) => Number(v.toFixed(d));

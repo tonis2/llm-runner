@@ -23,9 +23,18 @@
 // each joint's scores there read as its partner's (left for right), and the
 // two averaged.
 //
+// Hands are small in a picture of the whole body: a hand is a few patches,
+// its knuckles one or two. A finder with `hands` looks again at each hand,
+// cropped square round where the first look put it (`scale` times the joints'
+// box) at `size` pixels, with a head of its own; the left hand mirrored, so the
+// one head knows a right hand. Its points (the wrist, the knuckles, the finger
+// tips) replace the first look's.
+//
 // The finder file is a .safetensors: pca [K, D], pca_bias [K], w1 [H, K],
-// b1 [H], w2 [J, H], b2 [J] in float32, and `finder` in its metadata, JSON:
-// { version, joints, size, dim, layers?, rank, hidden, sigma, fill, landmarks?, report }.
+// b1 [H], w2 [J, H], b2 [J] in float32, the hand head's as hand_pca and so on,
+// and `finder` in its metadata, JSON: { version, joints, size, dim, layers?,
+// rank, hidden, sigma, fill, landmarks?, hands?, report }, hands { size, rank,
+// hidden, sigma, scale, points, hands: [{ points, anchors, mirror }], report }.
 // `layers`: the DINOv3 blocks laid beside the last one's patches (dim is the
 // backbone's width times their number plus one).
 // `joints` are the points it finds: the rig's joints, then its landmarks
@@ -41,6 +50,7 @@ import { bad } from './request.js';
 
 export const FINDER_VERSION = 1;
 const NAMES = ['pca', 'pca_bias', 'w1', 'b1', 'w2', 'b2'];
+export const HAND_NAMES = NAMES.map((n) => `hand_${n}`);
 
 function upload(data, shape = [data.length]) {
 	const t = f32(data.length, shape);
@@ -108,11 +118,11 @@ export class Head {
 export function saveFinder(path, weights, meta) {
 	const header = {}, parts = [];
 	let at = 0;
-	const shapes = {
-		pca: [meta.rank, meta.dim], pca_bias: [meta.rank], w1: [meta.hidden, meta.rank], b1: [meta.hidden],
-		w2: [meta.joints.length, meta.hidden], b2: [meta.joints.length],
-	};
-	for (const name of NAMES) {
+	const shape = (rank, hidden, joints) => [[rank, meta.dim], [rank], [hidden, rank], [hidden], [joints, hidden], [joints]];
+	const shapes = Object.fromEntries(NAMES.map((n, i) => [n, shape(meta.rank, meta.hidden, meta.joints.length)[i]]));
+	const h = meta.hands;
+	if (h) HAND_NAMES.forEach((n, i) => { shapes[n] = shape(h.rank, h.hidden, h.points.length)[i]; });
+	for (const name of Object.keys(shapes)) {
 		const data = weights[name];
 		if (data.length !== shapes[name].reduce((a, b) => a * b, 1)) throw new Error(`finder: ${name} has ${data.length} values for shape ${shapes[name]}`);
 		header[name] = { dtype: 'F32', shape: shapes[name], data_offsets: [at, at + data.length * 4] };
@@ -259,6 +269,9 @@ export class Finder {
 		this.landmarks = meta.landmarks ?? [];
 		// Each point's partner on the other side, for looking mirrored.
 		this.mirror = this.joints.map((n) => { const k = this.joints.indexOf(partner(n)); return k < 0 ? this.joints.indexOf(n) : k; });
+		// The points it gives: the joints, then the hands' the first look lacks.
+		this.points = this.joints.slice();
+		for (const h of meta.hands?.hands ?? []) for (const n of h.points) if (!this.points.includes(n)) this.points.push(n);
 	}
 
 	static load(path) {
@@ -273,6 +286,11 @@ export class Finder {
 			for (const name of NAMES) w[name] = m.floats(name);
 			const head = new Head(w, { dim: meta.dim, rank: meta.rank, hidden: meta.hidden, joints: meta.joints.length });
 			const finder = new Finder(head, meta);
+			if (meta.hands) {
+				const hw = {};
+				NAMES.forEach((name, i) => { hw[name] = m.floats(HAND_NAMES[i]); });
+				finder.hands = new Head(hw, { dim: meta.dim, rank: meta.hands.rank, hidden: meta.hands.hidden, joints: meta.hands.points.length });
+			}
 			finder.path = path;
 			return finder;
 		} finally {
@@ -282,27 +300,49 @@ export class Finder {
 
 	dispose() {
 		this.head?.dispose();
-		this.head = null;
+		this.hands?.dispose();
+		this.head = this.hands = null;
+	}
+
+	// One look through `head` at the S x S crop `affine` makes of `image`.
+	async look(encoder, image, img, affine, S, head, mirror) {
+		const layers = this.meta.layers ?? [];
+		const input = warpCropGpu(image, img, affine, { width: S, height: S, mirror });
+		const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
+		input.dispose();
+		try {
+			return head.scores(tokens, (S / PATCH) ** 2);
+		} finally {
+			tokens.dispose();
+		}
+	}
+
+	// A hand's points in `box` (frame pixels, square) of `img`, as findIn's;
+	// `mirror` for a left hand, which the hand head knows as a right one.
+	async findHand(encoder, img, box, mirror) {
+		const H = this.meta.hands, S = H.size, G = S / PATCH, P = H.points.length;
+		const affine = boxAffine(box, S, S), [a, , tx, , d, ty] = affine;
+		const image = uploadImage(img);
+		let scores;
+		try {
+			scores = await this.look(encoder, image, img, mirror ? [a, 0, S - 1 - tx - a * (img.width - 1), 0, d, ty] : affine, S, this.hands, mirror);
+		} finally {
+			image.dispose();
+		}
+		// A mirrored crop's column gx is the crop's G - 1 - gx.
+		const toFrame = ([gx, gy]) => [((mirror ? G - 1 - gx : gx) * PATCH + (PATCH - 1) / 2 - tx) / a, (gy * PATCH + (PATCH - 1) / 2 - ty) / d];
+		return Array.from({ length: P }, (_, j) => peaks(scores, j, P, G, G).map((q) => ({ at: toFrame(q.at), score: q.mass })));
 	}
 
 	// Every joint in `box` (frame pixels, square) of `img`: per joint its peaks
 	// in frame pixels, [{ at: [x, y], score }]. `flip`: looked at mirrored too.
 	async findIn(encoder, img, box, { flip = false } = {}) {
-		const S = this.size, G = S / PATCH, N = G * G, J = this.joints.length;
+		const S = this.size, G = S / PATCH, J = this.joints.length;
 		const layers = this.meta.layers ?? [];
 		if (encoder.dim * (layers.length + 1) !== this.meta.dim) throw bad(`finder: trained on ${this.meta.dim}-wide features, the loaded backbone gives ${encoder.dim * (layers.length + 1)}`);
 		const affine = boxAffine(box, S, S);
 		const image = uploadImage(img);
-		const look = async (m, mirror) => {
-			const input = warpCropGpu(image, img, m, { width: S, height: S, mirror });
-			const tokens = await encoder.encode(input, S, S, { tokens: true, quiet: true, layers });
-			input.dispose();
-			try {
-				return this.head.scores(tokens, N);
-			} finally {
-				tokens.dispose();
-			}
-		};
+		const look = (m, mirror) => this.look(encoder, image, img, m, S, this.head, mirror);
 		let scores;
 		try {
 			scores = await look(affine, false);
@@ -349,7 +389,8 @@ export class Finder {
 		const first = frames.image(0);
 		const whole = region ?? [0, 0, first.width, first.height];
 		const wide = square((whole[0] + whole[2]) / 2, (whole[1] + whole[3]) / 2, Math.max(whole[2] - whole[0], whole[3] - whole[1]));
-		const looks = Math.ceil(count / every) + count * (flip ? 2 : 1);
+		const hands = this.hands ? this.meta.hands.hands : [];
+		const looks = Math.ceil(count / every) + count * ((flip ? 2 : 1) + hands.length);
 		let done = 0;
 
 		// The figure, frame by frame: where its joints are when the frame is
@@ -368,12 +409,22 @@ export class Finder {
 		const scx = smoothed(cx, 6), scy = smoothed(cy, 6), sside = smoothed(side, 12);
 
 		// Then each frame cropped round it.
-		const J = this.joints.length, found = [], boxes = [];
+		const J = this.points.length, found = [], boxes = [];
 		for (let k = 0; k < count; k++) {
+			const img = frames.image(k);
 			const box = square(scx[k], scy[k], Math.max(32, sside[k] / fillMid));
 			boxes.push(box.map((v) => Math.round(v * 10) / 10));
-			found.push(await this.findIn(encoder, frames.image(k), box, { flip }));
+			const f = await this.findIn(encoder, img, box, { flip });
 			done += flip ? 2 : 1;
+			// Each hand looked at again, round where the joints by it were found.
+			for (const h of hands) {
+				const at = h.anchors.map((n) => f[this.joints.indexOf(n)][0].at);
+				const cx = at.reduce((s, p) => s + p[0], 0) / at.length, cy = at.reduce((s, p) => s + p[1], 0) / at.length;
+				const got = await this.findHand(encoder, img, square(cx, cy, Math.max(16, this.meta.hands.scale * sside[k])), h.mirror);
+				h.points.forEach((n, p) => { f[this.points.indexOf(n)] = got[p]; });
+				done++;
+			}
+			found.push(f);
 			onFrame?.(done, looks);
 			if (breathing()) await breathe();
 		}
@@ -404,7 +455,7 @@ export class Finder {
 		const sure = found.flat().map((q) => q[0].score).sort((a, b) => a - b);
 		llm.print(`  found ${J} joints in ${count} frames in ${seconds.toFixed(1)}s (${looks} looks), median score ${sure[sure.length >> 1].toFixed(2)}`);
 		return {
-			points: this.joints.slice(), frames: count, size: [first.width, first.height], region: whole, width: this.size,
+			points: this.points.slice(), frames: count, size: [first.width, first.height], region: whole, width: this.size,
 			boxes, hypotheses, seconds: Math.round(seconds * 10) / 10,
 		};
 	}

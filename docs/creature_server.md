@@ -228,7 +228,11 @@ DINO on the character's own mesh" method does it:
 The finder only knows the rig it was trained on, and the joints it was trained
 on: by default every joint whose bone is at least 4% of the rig's height
 (fingers are too small for 16-pixel patches), and the landmarks it was drawn
-with. A joint sits inside the body, where nothing in the picture marks it; a
+with. Hands are a few patches in a picture of the whole body, too few to
+tell a palm turned up from one turned down, so a rig with hands gets a second
+head: each hand is looked at again, cropped round where the first look put
+it at 256 pixels, and its wrist, knuckles and finger tips are found there (the
+left hand mirrored, so one head knows both). A joint sits inside the body, where nothing in the picture marks it; a
 nose or a heel shows, and shows which way the head or the foot is turned,
 which no joint can: the head's turn about its own neck leaves both its ends
 where they were. The fit takes a finder's landmarks as markers with known
@@ -287,13 +291,16 @@ front of it); and every pose's joint turns. The document is not touched.
 | `rank`, `hidden` | number | The PCA's size and the head's hidden width. Defaults 384 and 256. |
 | `batch`, `lr`, `sigma` | number | 32 pictures a step; Adam's rate 0.001; the target Gaussian's width in patches, 1. |
 | `holdout`, `seed`, `limit` | number | The share held out to score (0.05); the seed (1); a cap on the pictures used. |
+| `hands` | bool | Train the hand head too, for a rig with hands. Default true. A finder already at `out` with the same body (joints, size, layers, rank, hidden) and no hands keeps its body: only the hands are trained, a few minutes. |
+| `hand_size`, `hand_rank`, `hand_hidden`, `hand_epochs` | number | The hand crop's side (256), its PCA (256), hidden width (256) and passes (`epochs`). |
 
 The reply is `{ finder, report }`. The report gives `held_out_px`, the
 distance from each held-out picture's joints to where the finder puts them
 (`median`, `mean`, `p90`, and `within`, the share inside `near` pixels). It
 also gives `worst_joints`, the loss over the epochs, and with landmarks
 `landmark_score`: the median score of a shown landmark and of a hidden one,
-which should be far apart. Encoding the pictures takes most of the time,
+which should be far apart; with hands, `hands` scores the hand head the same
+way, in its crop's pixels. Encoding the pictures takes most of the time,
 about 0.3 s each on an RX 7800 XT. The head itself trains in a few minutes.
 The request blocks until training is done (about 25 minutes for 4500
 pictures), so run it with no client timeout.
