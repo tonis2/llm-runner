@@ -5,6 +5,7 @@
 import { llm } from '/core/llm.js';
 
 const IMAGE = /\.(png|jpe?g)$/i;
+const VIDEO = /\.(mp4|m4v|mov)$/i;
 
 // An error in what the client sent: the server answers it with 400.
 export function bad(message) {
@@ -22,10 +23,12 @@ export function bytesOf(text) {
 	return isInline(text) ? llm.base64Decode(text) : llm.readBytes(text);
 }
 
-// `spec` a folder of PNG/JPEG frames (name order) or a list of paths and
-// base64 images, to { count, image(k) }. The last image decoded is kept: a
-// sweep asks for each frame once, the tracker its first twice.
+// `spec` a folder of PNG/JPEG frames (name order), an H.264 .mp4/.mov read a
+// frame at a time, or a list of paths and base64 images, to { count, image(k) }.
+// The last image decoded is kept: a sweep asks for each frame once, the
+// tracker its first twice.
 export function frameSource(spec) {
+	if (typeof spec === 'string' && VIDEO.test(spec)) return videoSource(spec);
 	let list = spec;
 	if (typeof spec === 'string') {
 		const dir = spec.replace(/\/+$/, '');
@@ -41,6 +44,24 @@ export function frameSource(spec) {
 			if (k !== last) {
 				const s = list[k];
 				held = isInline(s) ? llm.image.decode(llm.base64Decode(s)) : llm.image.load(s);
+				last = k;
+			}
+			return held;
+		},
+	};
+}
+
+function videoSource(path) {
+	const info = llm.video.info(path);
+	if (!info.frames) throw bad(`frames: ${path} holds no frames`);
+	let last = -1, held = null;
+	return {
+		count: info.frames,
+		fps: info.fps,
+		names: Array.from({ length: info.frames }, (_, k) => `${path} frame ${k}`),
+		image(k) {
+			if (k !== last) {
+				held = llm.video.frame(path, k);
 				last = k;
 			}
 			return held;

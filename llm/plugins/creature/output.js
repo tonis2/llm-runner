@@ -105,7 +105,15 @@ export function fittedMotion(fit, rig, { fps = 24, travel = true, smooth = 25 } 
 	};
 }
 
+// One frame (a picture's pose) is held for a second key: a clip needs two.
+function heldTwice(motion) {
+	if (motion.frames !== 1) return motion;
+	const twice = (a) => { const out = new a.constructor(a.length * 2); out.set(a); out.set(a, a.length); return out; };
+	return { ...motion, frames: 2, rotations: twice(motion.rotations), root: twice(motion.root) };
+}
+
 export function clipGlb(motion, name) {
+	motion = heldTwice(motion);
 	return motionGlb({
 		name, skeleton: motion.skeleton, fps: motion.fps, frames: motion.frames, rotations: motion.rotations, root: motion.root,
 		rest: motion.skeleton.restRoot, generator: 'llm-runner creature', extras: { facing: 'as-is', source: 'creature' },

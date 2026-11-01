@@ -161,6 +161,13 @@ function asBytes(floats) {
 	return new Uint8Array(floats.buffer, floats.byteOffset, floats.byteLength);
 }
 
+export const video = {
+	// { width, height, frames, fps } of an H.264 .mp4/.mov.
+	info(path) { return H.videoInfo(path); },
+	// Frame k as an image; frames read in order decode one each.
+	frame(path, k) { return H.videoFrame(path, k); },
+};
+
 export const image = {
 	// { width, height, channels, pixels: Uint8Array }
 	load(path) { return H.imageLoad(path); },
@@ -217,6 +224,7 @@ export const llm = {
 	randomNormal(count, seed) { return H.randomNormal(count, seed); },
 
 	image,
+	video,
 
 	// The creature plugin's rig fit in native code (lib/host/rig_fit.c3), when
 	// this host has it: RigFit.native's packing, the params changed in place.

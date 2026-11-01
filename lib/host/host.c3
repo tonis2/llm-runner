@@ -28,6 +28,7 @@ import llm;
 import qjs;
 import image;
 import image::png;
+import image::mp4;
 import std::io;
 import std::io::file;
 import std::io::file::mmap;
@@ -43,7 +44,7 @@ import std::encoding::base64;
  (`host`); raise this when a verb is added or changes, so a newer core is
  refused with a reason instead of failing on a missing verb.
 *>
-const int API = 1;
+const int API = 2;
 
 // --- Handle tables ---------------------------------------------------------------
 
@@ -65,6 +66,10 @@ struct TokenizerSlot
 List{ModelSlot} models;
 List{TokenizerSlot} tokenizers;
 Clock started;
+
+// The video `videoFrame` last read, kept open so frames in order decode on.
+mp4::Video video;
+String video_path;
 
 <*
  Where `print` lines go instead of stdout, when set: a program running a
@@ -113,6 +118,8 @@ fn void install(three::JsRuntime* runtime)
 	runtime.bind(host, "randomNormal", &js_random_normal, 2);
 	runtime.bind(host, "imageLoad", &js_image_load, 1);
 	runtime.bind(host, "imageDecode", &js_image_decode, 1);
+	runtime.bind(host, "videoInfo", &js_video_info, 1);
+	runtime.bind(host, "videoFrame", &js_video_frame, 2);
 	runtime.bind(host, "imageSavePng", &js_image_save_png, 2);
 	runtime.bind(host, "imageEncodePng", &js_image_encode_png, 1);
 	runtime.bind(host, "imageResize", &js_image_resize, 4);
@@ -143,6 +150,24 @@ fn void shutdown()
 		if (slot.live) slot.tok.free();
 	}
 	tokenizers.free();
+	close_video();
+}
+
+fn void close_video() @local
+{
+	if (video_path.len == 0) return;
+	video.close();
+	alloc::free(mem, video_path.ptr);
+	video_path = "";
+}
+
+fn mp4::Video*? open_video(String path) @local
+{
+	if (video_path == path) return &video;
+	close_video();
+	video = mp4::open(path)!;
+	video_path = path.copy(mem);
+	return &video;
 }
 
 fn void close_model(ModelSlot* slot) @local
@@ -1032,6 +1057,52 @@ fn void js_image_load(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::
 	if (catch err = img)
 	{
 		*out = js.raise(string::tformat("could not load %s (%s)", path, err));
+		return;
+	}
+	defer drop_image(&img);
+	*out = image_value(&js, &img);
+}
+
+// { width, height, frames, fps } of an .mp4/.mov's video.
+fn void js_video_info(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	String path = @text(&js, argc, args, 0);
+	mp4::Video*? v = open_video(path);
+	if (catch err = v)
+	{
+		*out = js.raise(string::tformat("could not read %s: %s", path, err));
+		return;
+	}
+	qjs::Value result = js.object();
+	js.set_property(result, "width", qjs::number_value(v.width));
+	js.set_property(result, "height", qjs::number_value(v.height));
+	js.set_property(result, "frames", qjs::number_value((double)v.frames));
+	js.set_property(result, "fps", qjs::number_value(v.fps));
+	*out = result;
+}
+
+// Frame k of a video as an image; frames asked in order decode one each.
+fn void js_video_frame(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+{
+	qjs::Context js = qjs::wrap(ctx);
+	String path = @text(&js, argc, args, 0);
+	int k = three::arg_int(&js, argc, args, 1);
+	mp4::Video*? v = open_video(path);
+	if (catch err = v)
+	{
+		*out = js.raise(string::tformat("could not read %s: %s", path, err));
+		return;
+	}
+	if (k < 0)
+	{
+		*out = js.raise(string::tformat("%s has no frame %d", path, k));
+		return;
+	}
+	image::Image? img = v.frame((usz)k);
+	if (catch err = img)
+	{
+		*out = js.raise(string::tformat("could not read frame %d of %s: %s", k, path, err));
 		return;
 	}
 	defer drop_image(&img);
