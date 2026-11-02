@@ -22,6 +22,8 @@ extern fn double c_log1p(double x) @cname("log1p");
 extern fn double c_fmod(double x, double y) @cname("fmod");
 extern fn double c_atan2(double y, double x) @cname("atan2");
 
+// fit.js's ACC_SCALE: pixels a frame squared where an acceleration's cost turns from square to linear.
+const double ACC_SCALE = 3;
 const int FIT_TERMS = 14;
 const int FIT_WEIGHTS = 18;
 // The answer: the terms in fit.js's order (NaN when absent), then the loss,
@@ -488,6 +490,7 @@ fn double RigProblem.evaluate(&self, double tau, double[FIT_TERMS]* terms)
 	if (tn > 2)
 	{
 		double c = (w[FitWeight.ACC.ordinal] * k0 * k0) / ((double)(tn - 2) * (double)(jn + mn));
+		double s2 = (ACC_SCALE / k0) * (ACC_SCALE / k0);
 		double acc = 0;
 		for (long pass = 0; pass < 2; pass++)
 		{
@@ -500,14 +503,24 @@ fn double RigProblem.evaluate(&self, double tau, double[FIT_TERMS]* terms)
 				for (long k = 0; k < which; k++)
 				{
 					long j = pass == 0 ? (long)self.tracked[k] : k;
+					double[3] aa;
+					double a2 = 0;
 					for (long d = 0; d < 3; d++)
 					{
 						long i = j * 3 + d;
-						double aa = xx[(t + 1) * n * 3 + i] - 2 * xx[t * n * 3 + i] + xx[(t - 1) * n * 3 + i];
-						acc += c * aa * aa;
-						gx[(t + 1) * n * 3 + i] += 2 * c * aa;
-						gx[t * n * 3 + i] -= 4 * c * aa;
-						gx[(t - 1) * n * 3 + i] += 2 * c * aa;
+						aa[d] = xx[(t + 1) * n * 3 + i] - 2 * xx[t * n * 3 + i] + xx[(t - 1) * n * 3 + i];
+						a2 += aa[d] * aa[d];
+					}
+					// Pseudo-Huber: the square near zero, linear far out.
+					double root = math::sqrt(1 + a2 / s2);
+					double kk = (2 * c) / root;
+					acc += 2 * c * s2 * (root - 1);
+					for (long d = 0; d < 3; d++)
+					{
+						long i = j * 3 + d;
+						gx[(t + 1) * n * 3 + i] += kk * aa[d];
+						gx[t * n * 3 + i] -= 2 * kk * aa[d];
+						gx[(t - 1) * n * 3 + i] += kk * aa[d];
 					}
 				}
 			}
@@ -763,17 +776,27 @@ fn void RigProblem.turn_priors(&self, double[FIT_TERMS]* terms)
 		if (tn > 2)
 		{
 			double wa = (w[FitWeight.THETA_ACC.ordinal] * l2) / ((double)(tn - 2) * (double)jn);
+			double s2 = (ACC_SCALE * ACC_SCALE) / l2;
 			long n = (long)jn * 3;
 			for (long t = 1; t < tn - 1; t++)
 			{
+				double[3] aa;
+				double a2 = 0;
 				for (long d = 0; d < 3; d++)
 				{
 					long i = ((long)t * jn + j) * 3 + d;
-					double aa = theta[i + n] - 2 * theta[i] + theta[i - n];
-					tacc += wa * aa * aa;
-					g[i + n] += 2 * wa * aa;
-					g[i] -= 4 * wa * aa;
-					g[i - n] += 2 * wa * aa;
+					aa[d] = theta[i + n] - 2 * theta[i] + theta[i - n];
+					a2 += aa[d] * aa[d];
+				}
+				double root = math::sqrt(1 + a2 / s2);
+				double kk = (2 * wa) / root;
+				tacc += 2 * wa * s2 * (root - 1);
+				for (long d = 0; d < 3; d++)
+				{
+					long i = ((long)t * jn + j) * 3 + d;
+					g[i + n] += kk * aa[d];
+					g[i] -= 2 * kk * aa[d];
+					g[i - n] += kk * aa[d];
 				}
 			}
 		}
@@ -913,7 +936,7 @@ fn void js_rig_fit_evaluate(qjs::ContextRef ctx, qjs::Value* this_val, int argc,
 
 <*
  `rigFitSteps(ints, reals, obs, params, grads, adamM, adamV, lr, from, to,
- iterations, tau0, tau1, adamT)`: fit.js RigFit.run's iterations from..to.
+ iterations, tau0, tau1, adamT, wide?)`: fit.js RigFit.run's iterations from..to.
 *>
 fn void js_rig_fit_steps(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
 {
@@ -940,6 +963,8 @@ fn void js_rig_fit_steps(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qj
 	double tau0 = js.number(args[11]);
 	double tau1 = js.number(args[12]);
 	double adam_t = js.number(args[13]);
+	double wide = argc > 14 ? js.number(args[14]) : 1.0;
+	double sigma2 = p.sigma2;
 	double[FIT_TERMS] terms;
 	for (long i = 0; i < FIT_TERMS; i++) terms[i] = fit_nan();
 	double loss = 0;
@@ -947,6 +972,7 @@ fn void js_rig_fit_steps(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qj
 	{
 		double tau = tau0 * math::pow(tau1 / tau0, math::min(1.0, it / (0.6 * iterations)));
 		p.limit_scale = math::min(1.0, it / (0.5 * iterations));
+		p.sigma2 = sigma2 * math::pow(wide, 2 * (1 - math::min(1.0, it / (0.5 * iterations))));
 		loss = p.evaluate(tau, &terms);
 		if (it == iterations - 1) break;
 		adam_t += 1;

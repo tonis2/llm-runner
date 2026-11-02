@@ -4,7 +4,7 @@
 //   llm-runner tests/creature_exam.js model=sam-3d-body-dinov3 rig=rig.glb \
 //       finder=rig.finder.safetensors exam=exam/ [backgrounds=frames/] \
 //       [iterations=1500] [place_pct=6] [found_px=12] [tracks_out=t.json | tracks_in=t.json]
-//       [weights='{"lateral":0}'] [noise=side:15] [chain=hips,spine,...,head]
+//       [weights='{"lateral":0}'] [sigma=15] [sigma_wide=4] [confidence=2] [noise=side:15] [chain=hips,spine,...,head]
 //       [chain_deg=10] [head_deg=12] [wobble=2] [flip=false] [landmarks=all|none|a,b,...]
 //
 // `exam` is Rigsmith's render_poses with motion: one smooth movement inside
@@ -136,7 +136,8 @@ if (dropped.size) {
 		f.tracks = { ...t, points: keep.map((p) => t.points[p]), hypotheses: t.hypotheses.map((h) => ({ ...h, tracks: h.tracks.map(pick), scores: h.scores.map(pick) })) };
 	}
 }
-const fit = await fitRig(rig, fitted, { markers, iterations: Number(cfg.iterations ?? 1500), weights: typeof cfg.weights === 'string' ? JSON.parse(cfg.weights) : cfg.weights ?? null });
+const fit = await fitRig(rig, fitted, { markers, iterations: Number(cfg.iterations ?? 1500), weights: typeof cfg.weights === 'string' ? JSON.parse(cfg.weights) : cfg.weights ?? null,
+	sigma: Number(cfg.sigma ?? 15), wide: Number(cfg.sigma_wide ?? 4), confidence: cfg.confidence === undefined ? null : Number(cfg.confidence) });
 const p = fit.problem;
 p.forward();
 const J = rig.names.length;

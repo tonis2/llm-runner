@@ -104,7 +104,7 @@ function fitSettings(request) {
 		if (!Number.isFinite(v) || v < least) throw bad(`${key}: ${JSON.stringify(request[key])} is not a number of ${least} or more`);
 		return v;
 	};
-	return { weights, sigma: number('sigma', 15, 0.5), confidence: number('confidence', null, 0) };
+	return { weights, sigma: number('sigma', 15, 0.5), wide: number('sigma_wide', 4, 1), confidence: number('confidence', null, 0) };
 }
 let backbone = null, tracker = null, modelPath = null, finder = null;
 
@@ -384,6 +384,7 @@ const INFO = {
 		landmarks: 'with a finder: which of its landmarks (points of the mesh) to fit: true for all, false for none, or a list of names (all but a mirror pair on one joint, such as a head\'s two sides)',
 		weights: `{ "<term>": weight } over the fit's defaults: ${Object.entries(DEFAULT_WEIGHTS).map(([k, v]) => `${k} ${v}`).join(', ')}`,
 		sigma: 'the reprojection\'s robust scale in pixels (15)',
+		sigma_wide: 'how many times wider the robust scale starts, narrowing to sigma over the fit\'s first half (4)',
 		confidence: 'how a found point\'s score weighs its pull, weight^confidence (2 for a finder\'s tracks, 0 for labels and tracks)',
 		outputs: `any of ${OUTPUTS.join(', ')} (["glb", "clip"])`,
 	},

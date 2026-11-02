@@ -18,7 +18,8 @@
 //                 15 px), softly nearest at first and sharply by the end; a
 //                 hypothesis a point is far from in every frame costs little;
 //                 a found point (a finder's) pulls as hard as it is sure
-//   smoothness    the tracked joints' and markers' accelerations, and the
+//   smoothness    the tracked joints' and markers' accelerations (a shake's
+//                 squared, a fast swing's only in proportion), and the
 //                 turns' (a hand's untracked fingers do not make its sway dearer)
 //   twist         a one-child joint's turn about its own bone, which no point
 //                 sees, held near none; above a hand, the hand's turn about
@@ -53,10 +54,13 @@ import { bad, markerJoint } from './request.js';
 const DEG = Math.PI / 180;
 const W_PLANE = 10, W_FOOT = 0.05, W_MIDLINE = 0.5;
 const WIDE = 100;
+// Accelerations below this many pixels a frame squared cost their square (jitter);
+// past it they cost in proportion, so a fast swing is not held back like a shake.
+const ACC_SCALE = 3;
 
 // Every term's weight; a request's `weights` overrides any of them.
 export const DEFAULT_WEIGHTS = Object.freeze({
-	reproj: 1, acc: 6, thetaAcc: 6, twist: 1, twistMarked: 0, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, chainBranch: 0.1,
+	reproj: 1, acc: 2, thetaAcc: 6, twist: 1, twistMarked: 0, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, chainBranch: 0.1,
 	floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10,
 });
 // The native fit's orders (lib/host/rig_fit.c3): weights in, terms out.
@@ -362,6 +366,14 @@ export class RigFit {
 		}
 		this.feet = Int32Array.from([...feet]);
 		this.footLeaves = [...feet].filter((j) => children[j].length === 0);
+		// A leg straight at rest is no spine either: in a stride the hip and the
+		// knee bend opposite ways, which the chain would hold even.
+		for (const leaf of this.footLeaves) {
+			for (let j = leaf; j > 0; j = this.parents[j]) {
+				this.chainChild[j] = -1;
+				if (children[this.parents[j]].length !== 1) break;
+			}
+		}
 
 		// Sideways offsets in the root's frame (x is across the body: rest turns
 		// are identity and the rig faces +Z), which one view does not see: each
@@ -498,18 +510,26 @@ export class RigFit {
 		if (T > 2) {
 			// Weighed per joint of the rig as before, so the body is as smooth.
 			const markers = Int32Array.from({ length: this.M }, (_, m) => m);
-			const c = (W.acc * k0 * k0) / ((T - 2) * (J + this.M));
+			const c = (W.acc * k0 * k0) / ((T - 2) * (J + this.M)), s2 = (ACC_SCALE / k0) ** 2;
 			let acc = 0;
+			const A = [0, 0, 0];
 			for (const [X, gX, n, which] of [[this.pos, this.gPos, J, this.tracked], [this.mpos, this.gM, this.M, markers]]) {
 				for (let t = 1; t < T - 1; t++) {
 					for (const j of which) {
+						let a2 = 0;
 						for (let d = 0; d < 3; d++) {
 							const i = j * 3 + d;
-							const A = X[(t + 1) * n * 3 + i] - 2 * X[t * n * 3 + i] + X[(t - 1) * n * 3 + i];
-							acc += c * A * A;
-							gX[(t + 1) * n * 3 + i] += 2 * c * A;
-							gX[t * n * 3 + i] -= 4 * c * A;
-							gX[(t - 1) * n * 3 + i] += 2 * c * A;
+							A[d] = X[(t + 1) * n * 3 + i] - 2 * X[t * n * 3 + i] + X[(t - 1) * n * 3 + i];
+							a2 += A[d] * A[d];
+						}
+						// Pseudo-Huber: the square near zero, linear far out.
+						const root = Math.sqrt(1 + a2 / s2), k = (2 * c) / root;
+						acc += 2 * c * s2 * (root - 1);
+						for (let d = 0; d < 3; d++) {
+							const i = j * 3 + d;
+							gX[(t + 1) * n * 3 + i] += k * A[d];
+							gX[t * n * 3 + i] -= 2 * k * A[d];
+							gX[(t - 1) * n * 3 + i] += k * A[d];
 						}
 					}
 				}
@@ -690,15 +710,22 @@ export class RigFit {
 				}
 			}
 			if (T > 2) {
-				const wa = (W.thetaAcc * L2) / ((T - 2) * J);
+				// As the accelerations: the turn's, measured at the joint's reach.
+				const wa = (W.thetaAcc * L2) / ((T - 2) * J), s2 = (ACC_SCALE * ACC_SCALE) / L2, n = J * 3, A = [0, 0, 0];
 				for (let t = 1; t < T - 1; t++) {
+					let a2 = 0;
 					for (let d = 0; d < 3; d++) {
-						const i = (t * J + j) * 3 + d, n = J * 3;
-						const A = theta[i + n] - 2 * theta[i] + theta[i - n];
-						tacc += wa * A * A;
-						g.theta[i + n] += 2 * wa * A;
-						g.theta[i] -= 4 * wa * A;
-						g.theta[i - n] += 2 * wa * A;
+						const i = (t * J + j) * 3 + d;
+						A[d] = theta[i + n] - 2 * theta[i] + theta[i - n];
+						a2 += A[d] * A[d];
+					}
+					const root = Math.sqrt(1 + a2 / s2), k = (2 * wa) / root;
+					tacc += 2 * wa * s2 * (root - 1);
+					for (let d = 0; d < 3; d++) {
+						const i = (t * J + j) * 3 + d;
+						g.theta[i + n] += k * A[d];
+						g.theta[i] -= 2 * k * A[d];
+						g.theta[i - n] += k * A[d];
 					}
 				}
 			}
@@ -837,14 +864,14 @@ export class RigFit {
 
 	// `run` as the main fit takes it: native, in slices with a breath between,
 	// so the host program keeps drawing and answering.
-	async runAsync(iterations, { lr = {}, tau0 = 500, tau1 = 20, onStep = null } = {}) {
-		if (!RigFit.useNative) return this.run(iterations, { lr, tau0, tau1, onStep });
+	async runAsync(iterations, { lr = {}, tau0 = 500, tau1 = 20, wide = 1, onStep = null } = {}) {
+		if (!RigFit.useNative) return this.run(iterations, { lr, tau0, tau1, wide, onStep });
 		const { ints, reals, obs } = this.native();
 		const m = new Float64Array(this.params.length), v = new Float64Array(this.params.length), rates = this.rates(lr);
 		let t = 0, loss = 0;
 		for (let from = 0; from < iterations; from += SLICE) {
 			const to = Math.min(iterations, from + SLICE);
-			const a = llm.rigFitSteps(ints, reals, obs, this.params, this.grads, m, v, rates, from, to, iterations, tau0, tau1, t);
+			const a = llm.rigFitSteps(ints, reals, obs, this.params, this.grads, m, v, rates, from, to, iterations, tau0, tau1, t, wide);
 			t = a[TERM_ORDER.length + 2];
 			loss = this.answered(a);
 			onStep?.(to, iterations, loss);
@@ -853,11 +880,14 @@ export class RigFit {
 		return loss;
 	}
 
-	run(iterations, { lr = {}, tau0 = 500, tau1 = 20, onStep = null } = {}) {
+	// `wide`: the reprojection's sigma starts that many times wider and narrows
+	// to its own over the first half, so a limb far from its points still feels
+	// them; at the end, points that disagree pull as little as before.
+	run(iterations, { lr = {}, tau0 = 500, tau1 = 20, wide = 1, onStep = null } = {}) {
 		if (RigFit.useNative) {
 			const { ints, reals, obs } = this.native();
 			const m = new Float64Array(this.params.length), v = new Float64Array(this.params.length);
-			const loss = this.answered(llm.rigFitSteps(ints, reals, obs, this.params, this.grads, m, v, this.rates(lr), 0, iterations, iterations, tau0, tau1, 0));
+			const loss = this.answered(llm.rigFitSteps(ints, reals, obs, this.params, this.grads, m, v, this.rates(lr), 0, iterations, iterations, tau0, tau1, 0, wide));
 			onStep?.(iterations, iterations, loss);
 			return loss;
 		}
@@ -871,8 +901,10 @@ export class RigFit {
 			{ value: this.cam, grad: this.g.cam, lr: this.knownCameras ? 0 : lr.cam ?? 0.003 },
 		]);
 		let loss = 0;
+		const sigma2 = this.sigma2;
 		for (let it = 0; it < iterations; it++) {
 			const tau = tau0 * (tau1 / tau0) ** Math.min(1, it / (0.6 * iterations));
+			this.sigma2 = sigma2 * wide ** (2 * (1 - Math.min(1, it / (0.5 * iterations))));
 			// The limits come in over the first half: the fit finds the pose the
 			// points ask for, then the nearest one the rig allows.
 			this.limitScale = Math.min(1, it / (0.5 * iterations));
@@ -881,6 +913,7 @@ export class RigFit {
 			adam.step(0.5 * (1 + Math.cos((Math.PI * it) / iterations)));
 			onStep?.(it + 1, iterations, loss);
 		}
+		this.sigma2 = sigma2;
 		return loss;
 	}
 }
@@ -1048,7 +1081,7 @@ function startFrom(f, from) {
  * a studio clip's, held), after each keyframe alone in all the views;
  * `onStep(done, total)` as it goes.
  */
-export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, confidence = null } = {}) {
+export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, wide = 4, confidence = null } = {}) {
 	const t0 = llm.now();
 	if (!Array.isArray(views)) views = [{ tracks: views }];
 	const V = views.length, T = views[0].tracks.frames, J = rig.names.length;
@@ -1241,6 +1274,7 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	const before = done;
 	let lastPrint = llm.now();
 	await fit.runAsync(iterations, {
+		wide,
 		onStep: (n, of, loss) => {
 			onStep?.(before + n / 10, total);
 			if (llm.now() - lastPrint > 5000) {
@@ -1254,6 +1288,7 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	// hypothesis, per view and over all of them.
 	const viewErrors = all.map((o, v) => {
 		const proj = fit.projections(v), errs = [];
+		const byPoint = o.points.map(() => []);
 		for (let t = 0; t < T; t++) {
 			for (let p = 0; p < o.points.length; p++) {
 				let e = Infinity;
@@ -1261,9 +1296,10 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 					const k = (t * o.points.length + p) * o.H + h;
 					if (o.w[k] > 0) e = Math.min(e, Math.hypot(proj[t][p][0] - o.x[k], proj[t][p][1] - o.y[k]));
 				}
-				if (e < Infinity) errs.push(e);
+				if (e < Infinity) { errs.push(e); byPoint[p].push(e); }
 			}
 		}
+		errs.byPoint = byPoint;
 		return errs;
 	});
 	const stats = (errs) => {
@@ -1279,6 +1315,10 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 		seconds: round((llm.now() - t0) / 1000, 1),
 	};
 	if (V > 1) report.views = viewErrors.map((errs, v) => ({ reprojection_px: stats(errs), camera: camera(v) }));
+	// The points the fit misses most, by their median error: where to look first.
+	report.worst_points = viewErrors.map((errs, v) => errs.byPoint
+		.map((e, p) => [all[v].points[p].name, e.length ? stats(e).median : 0])
+		.sort((a, b) => b[1] - a[1]).slice(0, 8));
 	if (fit.limits.length) {
 		// How far past the rig's limits the clip goes at worst; Rigsmith plays it held at them.
 		let worst = 0;

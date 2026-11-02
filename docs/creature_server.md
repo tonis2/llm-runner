@@ -56,6 +56,7 @@ one request at a time; there is one GPU.
 | `flip`       | bool | With a finder: look at each crop mirrored as well, each joint's scores there read as its partner's on the other side (`thigh_L` as `thigh_R`), and average the two. Twice the finding time (about 40 s more for a two-view clip), and on the Zidane exam the joints found 10% nearer and the head a degree nearer. A character that is strongly lopsided (a sword in one hand) may do better with `false`. Default true. |
 | `weights`    | object | `{ "<term>": weight }` over the fit's defaults, to tune it without code. `GET /info` lists the terms and their defaults. Unknown terms are refused. |
 | `sigma`      | number | The reprojection's robust scale in pixels: an error much past it barely pulls. Default 15. |
+| `sigma_wide` | number | How many times wider the robust scale starts. It narrows to `sigma` over the fit's first half, so a limb that starts far from its points still feels them. Default 4. |
 | `confidence` | number | How a found point's score weighs its pull: its weight to this power. Default 2 for a finder's tracks, 0 (every point pulls fully) for labels and tracked points. |
 
 What each output is:
