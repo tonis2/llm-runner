@@ -58,6 +58,7 @@ one request at a time; there is one GPU.
 | `sigma`      | number | The reprojection's robust scale in pixels: an error much past it barely pulls. Default 15. |
 | `sigma_wide` | number | How many times wider the robust scale starts. It narrows to `sigma` over the fit's first half, so a limb that starts far from its points still feels them. Default 4. |
 | `confidence` | number | How a found point's score weighs its pull: its weight to this power. Default 2 for a finder's tracks, 0 (every point pulls fully) for labels and tracked points. |
+| `recheck`    | number | Passes after the fit that swap crossed limbs and let go of reads the other views disagree with, then fit on (studio clips). Default 1; 0 for none. |
 
 What each output is:
 
@@ -184,11 +185,19 @@ rarely step together. A **studio clip** avoids both, as
   is re-timed onto the side's (`sync: false` only reports).
 - **Left and right agree.** A view that cannot see a foot (the rear foot of
   a run, behind the standing leg from the front) reads the visible one as
-  both, and names it as the other view does not. Before the fit, each limb
-  pair in each view is read straight or crossed, whichever puts its points'
-  two reads in one place through the cameras, in stretches that each cost
-  `weights.swap` (2, in units of `sigma`²; a large value turns it off).
-  `report.crossed` gives, per view, the frames read crossed.
+  both, or names both legs the other way round. Before the fit, each limb
+  pair is read straight or crossed in every view at once, whichever way puts
+  each point's reads in one place through the cameras, keeps the limb's bones
+  near the rig's lengths, and moves its points least from the frame before
+  (a leg does not jump to the other's place); any view may be the one that is
+  wrong. Each change costs `weights.swap` (2, in units of `sigma`²; a large
+  value turns it off). `report.crossed` gives, per view, the frames read
+  crossed.
+- **Checked again after the fit.** A limb pair whose reads lie clearly nearer
+  the fitted limbs crossed is swapped, and a read three `sigma` from its
+  fitted point while every other view's read of it is within one is let go to
+  the least weight; then the fit runs on 300 steps. `recheck: 0` turns it
+  off; `report.recheck` gives how many of each.
 - **Tracks again, no GPU:** `{ studio, views: [{ tracks }, { tracks }], size:
   [width, height] }` with a reply's two tracks and the clip's size (or
   `frames` in place of `size`, which calibrates too).
@@ -302,9 +311,13 @@ front of it); and every pose's joint turns. The document is not touched.
 | `epochs` | number | Passes over the pictures. Default 40. |
 | `rank`, `hidden` | number | The PCA's size and the head's hidden width. Defaults 384 and 256. |
 | `batch`, `lr`, `sigma` | number | 32 pictures a step; Adam's rate 0.001; the target Gaussian's width in patches, 1. |
-| `holdout`, `seed`, `limit` | number | The share held out to score (0.05); the seed (1); a cap on the pictures used. |
+| `holdout`, `seed`, `limit` | number | The share held out to score (0.05, whole poses: no other camera's picture of a held-out pose is trained on); the seed (1); a cap on the pictures used. |
+| `memory_gb` | number | The GPU memory every picture's features may take while the head trains (12). A set over it is refused before it is encoded, with the `limit` that fits: at 768 a picture keeps about 3.4 MB. |
 | `hands` | bool | Train the hand head too, for a rig with hands. Default true. A finder already at `out` with the same body (joints, size, layers, rank, hidden) and no hands keeps its body: only the hands are trained, a few minutes. |
 | `hand_size`, `hand_rank`, `hand_hidden`, `hand_epochs` | number | The hand crop's side (256), its PCA (256), hidden width (256) and passes (`epochs`). |
+| `feet` | bool | Train a foot head too: each foot (the ankle, the joints below it and the landmarks on them, such as the heel) looked at again, closer, as hands are. Default false. |
+| `foot_size`, `foot_rank`, `foot_hidden`, `foot_epochs` | number | The foot crop's side (384) and the rest, as the hand's. |
+| `keep` | string | A finder of the same body whose body, and parts not trained again, the new one keeps: `{ keep: old, feet: true }` adds feet to it without training the body. |
 
 The reply is `{ finder, report }`. The report gives `held_out_px`, the
 distance from each held-out picture's joints to where the finder puts them
@@ -312,7 +325,8 @@ distance from each held-out picture's joints to where the finder puts them
 also gives `worst_joints`, the loss over the epochs, and with landmarks
 `landmark_score`: the median score of a shown landmark and of a hidden one,
 which should be far apart; with hands, `hands` scores the hand head the same
-way, in its crop's pixels. Encoding the pictures takes most of the time,
+way, in its crop's pixels, and `feet` the foot head's. `worst_joints` gives
+each one's mean and median. Encoding the pictures takes most of the time,
 about 0.3 s each on an RX 7800 XT. The head itself trains in a few minutes.
 The request blocks until training is done (about 25 minutes for 4500
 pictures), so run it with no client timeout.
@@ -391,6 +405,27 @@ Bone directions in degrees are printed too. Short bones (a finger's root, a
 toe's tip) turn tens of degrees on a few pixels, so those numbers show where
 the fit goes wrong rather than how wrong the clip looks. `tracks_out=` keeps
 what was found, and `tracks_in=` fits it again without the GPU.
+
+#### The studio exam
+
+`render_studio` with `"layout"` (an earlier studio.json) keeps that picture's
+cameras, so a clip drawn frame by frame (`clip`, `time`) is a studio clip
+whose every joint is known: each frame's studio.json has their pixels in both
+views. Put the pictures in `frames/` and the studio.json files in `truth/`
+(0000.png, 0000.json, ...). `tests/creature_studio_exam.js` animates the
+frames as `/animate` does a video model's clip and grades the fit against the
+truth: every joint's distance in both views (median, 90%, share over 30 px,
+per group: body, feet, hands, tail) and the frames where a pair of limbs is
+the wrong way round. `swap=<view>:<frames>` (for example `swap=0:30-40;1:70`)
+names the legs the other way round in one view's tracks on those frames, at a
+score of at least `swap_score` (0.9), as a finder's confident mistake:
+
+```sh
+./build/llm-runner tests/creature_studio_exam.js model=sam-3d-body-dinov3 rig=zidane.glb \
+    finder=zidane.finder.safetensors exam=/data/exam_sprint tracks_out=/data/exam_sprint/tracks.json
+./build/llm-runner tests/creature_studio_exam.js rig=zidane.glb finder=zidane.finder.safetensors \
+    exam=/data/exam_sprint tracks_in=/data/exam_sprint/tracks.json swap='0:30-40;1:70-76'
+```
 
 ### `GET /info`
 

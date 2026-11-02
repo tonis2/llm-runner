@@ -177,35 +177,6 @@ class Adam {
 	}
 }
 
-// Each limb pair's reads over the frames, straight (S [T G]) or crossed (C),
-// as a chain that starts straight and pays `penalty` each change over: its
-// soft-min over every way through (temperature tau), summed over the pairs,
-// and each frame's crossed share (forward-backward) into `share`.
-function pairChain(S, C, T, G, penalty, tau, share) {
-	const lse = (a, b) => (a > b ? a + Math.log1p(Math.exp(b - a)) : b + Math.log1p(Math.exp(a - b)));
-	const f = new Float64Array(T * 2), b = new Float64Array(T * 2), jump = penalty / tau;
-	let total = 0;
-	for (let l = 0; l < G; l++) {
-		f[0] = -S[l] / tau;
-		f[1] = -C[l] / tau - jump;
-		for (let t = 1; t < T; t++) {
-			const s = -S[t * G + l] / tau, c = -C[t * G + l] / tau;
-			f[t * 2] = s + lse(f[t * 2 - 2], f[t * 2 - 1] - jump);
-			f[t * 2 + 1] = c + lse(f[t * 2 - 2] - jump, f[t * 2 - 1]);
-		}
-		b[(T - 1) * 2] = b[(T - 1) * 2 + 1] = 0;
-		for (let t = T - 2; t >= 0; t--) {
-			const s = -S[(t + 1) * G + l] / tau + b[t * 2 + 2], c = -C[(t + 1) * G + l] / tau + b[t * 2 + 3];
-			b[t * 2] = lse(s, c - jump);
-			b[t * 2 + 1] = lse(s - jump, c);
-		}
-		const z = lse(f[(T - 1) * 2], f[(T - 1) * 2 + 1]);
-		for (let t = 0; t < T; t++) share[t * G + l] = Math.exp(f[t * 2 + 1] + b[t * 2 + 1] - z);
-		total += -tau * z;
-	}
-	return total;
-}
-
 // The mirror limbs of `points` on `rig`: each point's partner (its index, -1
 // for none) and the limb pair both are in (-1 for none), and how many pairs.
 function limbPairs(rig, points) {
@@ -1012,12 +983,19 @@ export function observations(rig, tracks, markers = {}, { frames = tracks.frames
 }
 
 // Studio views whose mirror limbs disagree (one reads a hidden foot on the
-// other): per frame and limb pair, whether view v reads it crossed against
-// view 0, by how well each point's two reads meet in one place through the
-// known cameras, in stretches each costing `swap` (pairChain); those reads
-// swapped in place. The frames crossed, per view.
+// other, or names both legs the other way round): per frame and limb pair,
+// which views read it crossed, any of them. Each way is scored by how well
+// the views' reads meet in one place through the known cameras, how near the
+// limb's bones come to the rig's lengths there, and how far its points jump
+// from the frame before; each view crossed costs a little (`AGREE_LABEL`, so
+// the finder's names hold when nothing tells), each change `swap`. The
+// cheapest way through the frames (Viterbi) wins; those reads are swapped in
+// place. The frames crossed, per view.
+const AGREE_BONE = 1, AGREE_LABEL = 0.05, AGREE_MOVE = 1, AGREE_MOVE_SCALE = 0.05;
 function agreeViews(rig, all, cameras, swap, sigma) {
-	const T = all[0].T, sigma2 = sigma * sigma;
+	const T = all[0].T, V = all.length, sigma2 = sigma * sigma, crossed = new Array(V).fill(0);
+	if (V > 4) return crossed;
+	const S = 1 << V, s0 = Math.exp(cameras[0].logS);
 	const rows = cameras.map((c) => {
 		const s = Math.exp(c.logS), cy = Math.cos(c.yaw), sy = Math.sin(c.yaw), cp = Math.cos(c.pitch), sp = Math.sin(c.pitch);
 		return [[s * cy, 0, s * sy], [s * sp * sy, s * cp, -s * sp * cy]];
@@ -1028,53 +1006,177 @@ function agreeViews(rig, all, cameras, swap, sigma) {
 		for (let h = 0, i = (t * o.points.length + p) * o.H; h < o.H; h++, i++) if (o.w[i] > 0 && (k < 0 || o.w[i] > o.w[k])) k = i;
 		return k;
 	};
-	// How far apart reads a (view 0) and b (view v) are, as one point seen twice.
-	const apart = (v, a, b) => {
-		const A = [...rows[0], ...rows[v]];
-		const u = [all[0].x[a] - cameras[0].shift[0], all[0].y[a] - cameras[0].shift[1], all[v].x[b] - cameras[v].shift[0], all[v].y[b] - cameras[v].shift[1]];
-		const N = [0, 0, 0, 0, 0, 0, 0, 0, 0], r = [0, 0, 0];
-		for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) { r[j] += A[i][j] * u[i]; for (let k = 0; k < 3; k++) N[j * 3 + k] += A[i][j] * A[i][k]; }
+	// One point from reads [view, index]: its place (model units) and how far
+	// the reads miss it (pixels squared); null under two views.
+	const meet = (reads) => {
+		if (reads.length < 2) return null;
+		const N = [0, 0, 0, 0, 0, 0, 0, 0, 0], r = [0, 0, 0], A = [], u = [];
+		for (const [v, k] of reads) {
+			A.push(rows[v][0], rows[v][1]);
+			u.push(all[v].x[k] - cameras[v].shift[0], all[v].y[k] - cameras[v].shift[1]);
+		}
+		for (let i = 0; i < A.length; i++) for (let j = 0; j < 3; j++) { r[j] += A[i][j] * u[i]; for (let k = 0; k < 3; k++) N[j * 3 + k] += A[i][j] * A[i][k]; }
 		for (let j = 0; j < 3; j++) N[j * 4] += 1e-9 * (N[0] + N[4] + N[8]);
 		const X = solve3(N, r);
 		let e2 = 0;
-		for (let i = 0; i < 4; i++) e2 += (A[i][0] * X[0] + A[i][1] * X[1] + A[i][2] * X[2] - u[i]) ** 2;
-		return e2;
+		for (let i = 0; i < A.length; i++) e2 += (A[i][0] * X[0] + A[i][1] * X[1] + A[i][2] * X[2] - u[i]) ** 2;
+		return { X, e2 };
 	};
-	const o0 = all[0], crossed = [0];
-	for (let v = 1; v < all.length; v++) {
-		const o = all[v], P = o.points.length, pairs = limbPairs(rig, o.points), G = pairs.G;
-		const S = new Float64Array(T * G), C = new Float64Array(T * G), share = new Float64Array(T * G);
-		const in0 = o.points.map((p) => o0.points.findIndex((q) => q.name === p.name));
-		for (let t = 0; t < T; t++) {
-			for (let p = 0; p < P; p++) {
-				const l = pairs.group[p], a = in0[p] < 0 ? -1 : surest(o0, t, in0[p]);
-				if (l < 0 || a < 0) continue;
-				for (const [into, from] of [[S, p], [C, pairs.partner[p]]]) {
-					const b = surest(o, t, from);
-					if (b < 0) continue;
-					const pull = o.gamma > 0 ? (o0.w[a] * o.w[b]) ** o.gamma : 1;
-					into[t * G + l] += pull * sigma2 * Math.log1p(apart(v, a, b) / sigma2);
-				}
+	const rob = (d2, scale2) => scale2 * Math.log1p(d2 / scale2);
+	const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+	const bits = (n) => { let c = 0; for (; n; n &= n - 1) c++; return c; };
+	// The pairs by view 0's points; every view's index of each.
+	const o0 = all[0], P = o0.points.length, pairs = limbPairs(rig, o0.points), G = pairs.G;
+	if (!G) return crossed;
+	const index = all.map((o) => o0.points.map((q) => o.points.findIndex((p) => p.name === q.name)));
+	const moveScale2 = (AGREE_MOVE_SCALE * rig.height * s0) ** 2;
+	const decided = new Uint8Array(T * G);
+	for (let l = 0; l < G; l++) {
+		const members = [];
+		for (let p = 0; p < P; p++) if (pairs.group[p] === l) members.push(p);
+		// Each member's nearest tracked joint up the same limb, for its bone.
+		const bones = [];
+		for (const p of members) {
+			if (o0.points[p].marker >= 0) continue;
+			for (let j = rig.parents[o0.points[p].joint]; j >= 0; j = rig.parents[j]) {
+				const q = members.find((m) => o0.points[m].joint === j && o0.points[m].marker < 0);
+				if (q === undefined) continue;
+				bones.push([p, q, dist(rig.positions[o0.points[p].joint], rig.positions[j])]);
+				break;
 			}
 		}
-		if (!G) { crossed.push(0); continue; }
-		pairChain(S, C, T, G, swap * sigma2, 1, share);
-		let n = 0;
+		const cost = new Float64Array(T * S), places = [];
+		for (let t = 0; t < T; t++) {
+			places.push([]);
+			for (let st = 0; st < S; st++) {
+				let c = AGREE_LABEL * sigma2 * bits(st);
+				const at = new Map(), pulls = new Map();
+				for (const p of members) {
+					const reads = [];
+					let pull = 1;
+					for (let v = 0; v < V; v++) {
+						const i = index[v][(st >> v) & 1 ? pairs.partner[p] : p];
+						const k = i < 0 ? -1 : surest(all[v], t, i);
+						if (k < 0) continue;
+						reads.push([v, k]);
+						if (all[v].gamma > 0) pull *= all[v].w[k] ** all[v].gamma;
+					}
+					const m = meet(reads);
+					if (!m) continue;
+					c += pull * rob(m.e2, sigma2);
+					at.set(p, m.X);
+					pulls.set(p, pull);
+				}
+				for (const [p, q, length] of bones) {
+					if (!at.has(p) || !at.has(q)) continue;
+					c += AGREE_BONE * Math.min(pulls.get(p), pulls.get(q)) * rob((s0 * (dist(at.get(p), at.get(q)) - length)) ** 2, sigma2);
+				}
+				cost[t * S + st] = c;
+				places[t].push(at);
+			}
+		}
+		// The cheapest way through: each frame's state from the one before.
+		const best = new Float64Array(T * S), from = new Int32Array(T * S);
+		for (let st = 0; st < S; st++) best[st] = cost[st];
+		for (let t = 1; t < T; t++) {
+			for (let st = 0; st < S; st++) {
+				let low = Infinity, arg = 0;
+				for (let pr = 0; pr < S; pr++) {
+					let c = best[(t - 1) * S + pr] + swap * sigma2 * bits(st ^ pr);
+					const a = places[t - 1][pr], b = places[t][st];
+					for (const [p, X] of b) if (a.has(p)) c += AGREE_MOVE * rob((s0 * dist(X, a.get(p))) ** 2, moveScale2);
+					if (c < low) { low = c; arg = pr; }
+				}
+				best[t * S + st] = cost[t * S + st] + low;
+				from[t * S + st] = arg;
+			}
+		}
+		let st = 0;
+		for (let k = 1; k < S; k++) if (best[(T - 1) * S + k] < best[(T - 1) * S + st]) st = k;
+		for (let t = T - 1; t >= 0; t--) { decided[t * G + l] = st; st = from[t * S + st]; }
+	}
+	// Each view's crossed pairs swapped in place, every read of both points.
+	for (let v = 0; v < V; v++) {
+		const o = all[v], Pv = o.points.length;
+		// Pair ids are the rig's limbs, the same in every view.
+		const pairsV = limbPairs(rig, o.points);
 		for (let t = 0; t < T; t++) {
 			let any = false;
-			for (let p = 0; p < P; p++) {
-				const l = pairs.group[p], q = pairs.partner[p];
-				if (l < 0 || q < p || !(share[t * G + l] > 0.5)) continue;
+			for (let p = 0; p < Pv; p++) {
+				const l = pairsV.group[p], q = pairsV.partner[p];
+				if (l < 0 || q < p || !((decided[t * G + l] >> v) & 1)) continue;
 				any = true;
-				for (let h = 0, i = (t * P + p) * o.H, k = (t * P + q) * o.H; h < o.H; h++, i++, k++) {
+				for (let h = 0, i = (t * Pv + p) * o.H, k = (t * Pv + q) * o.H; h < o.H; h++, i++, k++) {
 					for (const arr of [o.x, o.y, o.w]) [arr[i], arr[k]] = [arr[k], arr[i]];
 				}
 			}
-			if (any) n++;
+			if (any) crossed[v]++;
 		}
-		crossed.push(n);
 	}
 	return crossed;
+}
+
+// After the fit, each view's reads held against it. A limb pair whose reads
+// sit clearly nearer the fitted limbs crossed is swapped (the fit, every view
+// at once, is surer than one view's names); a read far from its fitted point
+// (over `RECHECK_FAR` sigmas) where every other view's read of it is near
+// (under one sigma) is let go to the least weight, but kept, so a move the
+// fit lagged still pulls. The counts.
+const RECHECK_FAR = 3, RECHECK_MARGIN = 2, RECHECK_ITERATIONS = 300;
+function recheckReads(fit, rig, sigma) {
+	const T = fit.T, V = fit.V, sigma2 = sigma * sigma;
+	const proj = fit.views.map((_, v) => fit.projections(v));
+	const surest = (o, t, p) => {
+		let k = -1;
+		for (let h = 0, i = (t * o.points.length + p) * o.H; h < o.H; h++, i++) if (o.w[i] > 0 && (k < 0 || o.w[i] > o.w[k])) k = i;
+		return k;
+	};
+	const miss2 = (v, t, p, k) => (proj[v][t][p][0] - fit.views[v].x[k]) ** 2 + (proj[v][t][p][1] - fit.views[v].y[k]) ** 2;
+	const rob = (d2) => sigma2 * Math.log1p(d2 / sigma2);
+	let relabeled = 0, letGo = 0;
+	for (let v = 0; v < V; v++) {
+		const o = fit.views[v], P = o.points.length, pairs = limbPairs(rig, o.points);
+		for (let t = 0; t < T; t++) {
+			// Crossed limbs: each pair's cost as read and swapped.
+			const straight = new Float64Array(pairs.G), swapped = new Float64Array(pairs.G);
+			for (let p = 0; p < P; p++) {
+				const l = pairs.group[p], q = pairs.partner[p];
+				if (l < 0) continue;
+				const a = surest(o, t, p), b = surest(o, t, q);
+				if (a < 0 || b < 0) continue;
+				straight[l] += rob(miss2(v, t, p, a));
+				swapped[l] += rob(miss2(v, t, p, b));
+			}
+			for (let p = 0; p < P; p++) {
+				const l = pairs.group[p], q = pairs.partner[p];
+				if (l < 0 || q < p || !(swapped[l] + RECHECK_MARGIN * sigma2 < straight[l])) continue;
+				for (let h = 0, i = (t * P + p) * o.H, k = (t * P + q) * o.H; h < o.H; h++, i++, k++) {
+					for (const arr of [o.x, o.y, o.w]) [arr[i], arr[k]] = [arr[k], arr[i]];
+				}
+				relabeled++;
+			}
+		}
+	}
+	for (let v = 0; v < V && V > 1; v++) {
+		const o = fit.views[v], P = o.points.length;
+		const others = fit.views.map((u, w) => (w === v ? null : o.points.map((pt) => u.points.findIndex((q) => q.name === pt.name))));
+		for (let t = 0; t < T; t++) {
+			for (let p = 0; p < P; p++) {
+				const k = surest(o, t, p);
+				if (k < 0 || !(miss2(v, t, p, k) > (RECHECK_FAR * sigma) ** 2)) continue;
+				let near = 0, far = 0;
+				for (let w = 0; w < V; w++) {
+					const i = others[w]?.[p] ?? -1, kw = i < 0 ? -1 : surest(fit.views[w], t, i);
+					if (kw < 0) continue;
+					if (miss2(w, t, i, kw) < sigma2) near++; else far++;
+				}
+				if (!near || far) continue;
+				for (let h = 0, i = (t * P + p) * o.H; h < o.H; h++, i++) if (o.w[i] > 0.05) o.w[i] = 0.05;
+				letGo++;
+			}
+		}
+	}
+	return { relabeled, let_go: letGo };
 }
 
 // The solution of the 3x3 system N x = r (row-major), by Cramer's rule.
@@ -1213,7 +1315,7 @@ function startFrom(f, from) {
  * a studio clip's, held), after each keyframe alone in all the views;
  * `onStep(done, total)` as it goes.
  */
-export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, wide = 4, confidence = null } = {}) {
+export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations = 1500, onStep = null, weights = null, sigma = 15, wide = 4, confidence = null, recheck = 1 } = {}) {
 	const t0 = llm.now();
 	if (!Array.isArray(views)) views = [{ tracks: views }];
 	const V = views.length, T = views[0].tracks.frames, J = rig.names.length;
@@ -1234,7 +1336,7 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	const cameras = views.every((v) => v.camera) ? views.map((v) => v.camera) : null;
 	if (cameras) weights = { inPlace: 0, heading: 0, floor: 0, ...weights };
 	const crossed = cameras && V > 1 ? agreeViews(rig, all, cameras, { ...DEFAULT_WEIGHTS, ...weights }.swap, sigma) : null;
-	if (crossed) llm.print(`  views agreed: limbs read crossed against view 0 on ${crossed.slice(1).join(', ')} frames`);
+	if (crossed) llm.print(`  views agreed: limbs read crossed on ${crossed.join(', ')} frames, per view`);
 	const k0 = cameras ? Math.exp(cameras[0].logS) : pixelsPerUnit(rig, keyObs);
 
 	const allKeys = [...new Set(keysOf.flat())].sort((x, y) => x - y);
@@ -1418,6 +1520,17 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 		},
 	});
 
+	// Reads the fit shows wrong, put right or let go, and the fit run on.
+	let rechecked = null;
+	for (let pass = 0; pass < recheck; pass++) {
+		const r = recheckReads(fit, rig, sigma);
+		rechecked = rechecked ? { relabeled: rechecked.relabeled + r.relabeled, let_go: rechecked.let_go + r.let_go } : r;
+		if (!r.relabeled && !r.let_go) break;
+		fit.packed = null;
+		await fit.runAsync(RECHECK_ITERATIONS, { tau0: 20, tau1: 20, wide: 1 });
+	}
+	if (rechecked) llm.print(`  recheck: ${rechecked.relabeled} limb reads relabelled, ${rechecked.let_go} reads let go`);
+
 	// How well it fits: each observed point's distance to its nearest
 	// hypothesis, per view and over all of them.
 	const viewErrors = all.map((o, v) => {
@@ -1448,8 +1561,9 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 		terms: Object.fromEntries(Object.entries(fit.terms).map(([k, v]) => [k, round(v, 3)])),
 		seconds: round((llm.now() - t0) / 1000, 1),
 	};
-	// Per view, the frames on which its limbs were read crossed against view 0's.
+	// Per view, the frames on which its limbs were read crossed.
 	if (crossed) report.crossed = crossed;
+	if (rechecked) report.recheck = rechecked;
 	if (V > 1) report.views = viewErrors.map((errs, v) => ({ reprojection_px: stats(errs), camera: camera(v) }));
 	// The points the fit misses most, by their median error: where to look first.
 	report.worst_points = viewErrors.map((errs, v) => errs.byPoint

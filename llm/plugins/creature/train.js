@@ -37,7 +37,7 @@ import * as op from '/core/ops.js';
 import { submit, copy, zero, breathe, breathing } from '/core/gpu.js';
 import { PATCH } from '/core/models/dinov3.js';
 import { uploadImage, warpCropGpu, boxAffine } from '/core/image/warp.js';
-import { Head, saveFinder, peaks, partner, FINDER_VERSION } from './detect.js';
+import { Head, saveFinder, peaks, partner, FINDER_VERSION, PART_KINDS } from './detect.js';
 import { bad } from './request.js';
 
 const IMAGE = /\.(png|jpe?g)$/i;
@@ -84,7 +84,7 @@ export function readRenders(folders) {
 			if (set.joints.join() !== head.joints.join()) throw bad(`renders: ${dir}/${e.name} is another rig's (its joints differ from the first set's)`);
 			if (set.size !== head.size) throw bad(`renders: ${dir}/${e.name} is ${set.size} pixels; the first set is ${head.size}`);
 			if (landmarks.map((m) => m.name).join() !== head.landmarks.map((m) => m.name).join()) throw bad(`renders: ${dir}/${e.name} follows other landmarks than the first set (draw every set with the same "landmarks")`);
-			for (const im of set.images) images.push({ path: `${dir}/${im.file}`, points: im.points, marks: im.marks ?? [], camera: im.camera });
+			for (const im of set.images) images.push({ path: `${dir}/${im.file}`, points: im.points, marks: im.marks ?? [], camera: im.camera, pose: `${dir}:${im.pose}` });
 		}
 	}
 	if (!images.length) throw bad('renders: no pictures');
@@ -440,6 +440,43 @@ export function handsOf(set, chosen) {
 	return { scale: (2.6 * first.reach) / height, points, hands };
 }
 
+// The rig's feet: the topmost joints whose limb reaches the floor and is short
+// (an ankle with its toes, not a knee). The first foot's points (it, the joints
+// below it and the landmarks on them, such as a heel) are the foot head's; its
+// mirror image is looked at mirrored, as a hand is. `scale`: the crop's side, a
+// share of the joints' box. Null without feet.
+export function feetOf(set, chosen) {
+	const J = set.joints.length, children = Array.from({ length: J }, () => []);
+	set.parents.forEach((p, j) => { if (p >= 0) children[p].push(j); });
+	const ys = set.rest.map((p) => p[1]), floor = Math.min(...ys);
+	const height = Math.max(...ys) - floor || 1;
+	const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+	const below = (j) => children[j].flatMap((c) => [c, ...below(c)]);
+	const foot = (j) => {
+		const under = below(j);
+		if (!under.length || !chosen.includes(j)) return null;
+		const reach = Math.max(...under.map((c) => dist(set.rest[c], set.rest[j])));
+		const low = Math.min(...under.map((c) => set.rest[c][1]));
+		return reach <= 0.25 * height && low - floor < 0.03 * height ? { j, reach, under } : null;
+	};
+	const found = [];
+	for (let j = 0; j < J; j++) {
+		const f = foot(j);
+		if (f && !(set.parents[j] >= 0 && foot(set.parents[j]))) found.push(f);
+	}
+	if (!found.length) return null;
+	const name = (k) => set.joints[k], first = found[0];
+	const own = (f) => [f.j, ...f.under.filter((c) => chosen.includes(c))];
+	const marks = (f) => (set.landmarks ?? []).filter((m) => own(f).map(name).includes(m.joint)).map((m) => m.name);
+	const points = [...own(first).map(name), ...marks(first)], anchors = own(first).map(name);
+	const feet = [{ points, anchors, mirror: false }];
+	for (const f of found.slice(1)) {
+		const names = [...own(f).map(name), ...marks(f)], mirrored = points.map(partner);
+		if (name(f.j) === partner(name(first.j)) && mirrored.every((n) => names.includes(n))) feet.push({ points: mirrored, anchors: anchors.map(partner), mirror: true });
+	}
+	return { scale: (2 * first.reach) / height, points, feet };
+}
+
 // The longer side of the box round `chosen` joints of a picture's points.
 function jointBox(points, chosen) {
 	const xs = chosen.map((j) => points[j][0]), ys = chosen.map((j) => points[j][1]);
@@ -448,18 +485,24 @@ function jointBox(points, chosen) {
 
 // The body of a finder already at `path` trained as this one would be and
 // without hands: its weights and metadata, so only the hands need training.
-function bodyFrom(path, { names, S, D, layers, rank, hidden }) {
+// `any`: kept whatever parts it has, and those parts' heads with it ({ kind:
+// { weights, meta } }).
+function bodyFrom(path, { names, S, D, layers, rank, hidden }, any = false) {
 	if (!path || !llm.exists(path)) return null;
 	const m = llm.open(path);
 	try {
 		const text = m.meta('finder', null);
 		if (!text) return null;
 		const meta = JSON.parse(text);
-		if (meta.version !== FINDER_VERSION || meta.hands || meta.joints.join() !== names.join() || meta.size !== S || meta.dim !== D
+		if (meta.version !== FINDER_VERSION || (!any && PARTS.some((k) => meta[k.kind])) || meta.joints.join() !== names.join() || meta.size !== S || meta.dim !== D
 			|| (meta.layers ?? []).join() !== layers.join() || meta.rank !== rank || meta.hidden !== hidden) return null;
-		const weights = {};
-		for (const n of ['pca', 'pca_bias', 'w1', 'b1', 'w2', 'b2']) weights[n] = Float32Array.from(m.floats(n));
-		return { weights, meta };
+		const NAMES = ['pca', 'pca_bias', 'w1', 'b1', 'w2', 'b2'], weights = {}, parts = {};
+		for (const n of NAMES) weights[n] = Float32Array.from(m.floats(n));
+		for (const k of PARTS) {
+			if (!meta[k.kind]) continue;
+			parts[k.kind] = { meta: meta[k.kind], weights: Object.fromEntries(NAMES.map((n) => [`${k.prefix}_${n}`, Float32Array.from(m.floats(`${k.prefix}_${n}`))])) };
+		}
+		return { weights, meta, parts };
 	} finally {
 		m.close();
 	}
@@ -599,31 +642,40 @@ async function fitHead(head, features, targets, { M, train, B, S, J, rank, hidde
 	}
 }
 
+// The parts a finder looks at again, closer: their metadata key, weights'
+// prefix, crop size and seed.
+const PARTS = PART_KINDS.map((k) => ({ ...k, ...{ hands: { size: 256, seed: 7 }, feet: { size: 384, seed: 11 } }[k.kind] }));
+
 /**
- * The hand head: every picture's hands cropped square, the hand filling the
- * crop as it fills the detector's (the joints' box times `hands.scale`), the
+ * A part's head (hands, feet): every picture's part cropped square, filling
+ * the crop as it fills the detector's (the joints' box times `part.scale`), the
  * crop's centre and side jittered as much as the body's look strays, the left
- * hand mirrored. `images` in the body's order, the last `held` held out.
+ * one mirrored. `images` in the body's order, the last `held` held out.
+ * Options `<prefix>_size`, `_rank`, `_hidden`, `_epochs`.
  */
-async function trainHands(encoder, set, images, held, chosen, hands, request, step, spent) {
-	const S = Number(request.hand_size ?? 256), seed = Number(request.seed ?? 1) + 7;
-	if (S % PATCH) throw bad(`hand_size: ${S} pixels is not a multiple of ${PATCH}`);
+async function trainPart(encoder, set, images, held, chosen, part, kind, request, step, spent) {
+	const { kind: what, prefix } = kind, opt = (k, fallback) => request[`${prefix}_${k}`] ?? fallback;
+	const S = Number(opt('size', kind.size)), seed = Number(request.seed ?? 1) + kind.seed;
+	if (S % PATCH) throw bad(`${prefix}_size: ${S} pixels is not a multiple of ${PATCH}`);
 	const layers = (request.layers ?? []).map(Number), D = encoder.dim * (layers.length + 1);
-	const rank = Number(request.hand_rank ?? 256), hidden = Number(request.hand_hidden ?? 256);
-	const epochs = Number(request.hand_epochs ?? request.epochs ?? 40), B = Number(request.batch ?? 32), sigma = Number(request.sigma ?? 1);
-	if (!(rank >= 16 && rank <= D)) throw bad(`hand_rank: 16 to ${D}`);
-	const random = generator(seed), P = hands.points.length;
-	const at = (n) => set.joints.indexOf(n);
-	const kinds = hands.hands.map((h) => ({ ...h, idx: h.points.map(at), anchorIdx: h.anchors.map(at) }));
-	// Every picture's hands whose wrist is in it; the held-out pictures' last.
+	const rank = Number(opt('rank', 256)), hidden = Number(opt('hidden', 256));
+	const epochs = Number(opt('epochs', request.epochs ?? 40)), B = Number(request.batch ?? 32), sigma = Number(request.sigma ?? 1);
+	if (!(rank >= 16 && rank <= D)) throw bad(`${prefix}_rank: 16 to ${D}`);
+	const random = generator(seed), P = part.points.length;
+	// A point's place in a picture: a joint's, or a landmark's ([x, y, depth, shown]).
+	const marks = set.landmarks ?? [];
+	const pointOf = (n) => { const j = set.joints.indexOf(n); return j >= 0 ? (im) => im.points[j] : ((m) => (im) => im.marks[m])(marks.findIndex((l) => l.name === n)); };
+	const isMark = (n) => set.joints.indexOf(n) < 0;
+	const kinds = part[what].map((h) => ({ ...h, get: h.points.map(pointOf), mark: h.points.map(isMark), anchorGet: h.anchors.map(pointOf) }));
+	// Every picture's parts whose first point is in it; the held-out pictures' last.
 	const crops = [];
 	images.forEach((im, i) => kinds.forEach((h, k) => {
-		const w = im.points[h.idx[0]];
+		const w = h.get[0](im);
 		if (w[0] >= 0 && w[1] >= 0 && w[0] < set.size && w[1] < set.size) crops.push({ i, k });
 	}));
 	const M = crops.length, train = crops.filter((c) => c.i < images.length - held).length;
-	if (train < B) throw bad(`renders: ${train} hands to train on, too few for batches of ${B}`);
-	llm.print(`  hands: ${M} crops (${M - train} held out) of ${S}x${S}, ${kinds.length} hand${kinds.length > 1 ? 's' : ''}, points ${hands.points.join(', ')}`);
+	if (train < B) throw bad(`renders: ${train} ${what} to train on, too few for batches of ${B}`);
+	llm.print(`  ${what}: ${M} crops (${M - train} held out) of ${S}x${S}, ${kinds.length} of them, points ${part.points.join(', ')}`);
 
 	const backdrops = new Backdrops(set.size, request.backgrounds ?? null, random);
 	const noise = llm.randomNormal(1 << 21, seed);
@@ -636,20 +688,21 @@ async function trainHands(encoder, set, images, held, chosen, hands, request, st
 			picture = composite(render, backdrops.next(), random, noise);
 			cached = i;
 		}
-		const anchors = h.anchorIdx.map((j) => im.points[j]);
+		const anchors = h.anchorGet.map((g) => g(im));
 		const ax = anchors.reduce((s, p) => s + p[0], 0) / anchors.length, ay = anchors.reduce((s, p) => s + p[1], 0) / anchors.length;
-		const side = Math.max(16, hands.scale * jointBox(im.points, chosen) * random.between(0.85, 1.2));
+		const side = Math.max(16, part.scale * jointBox(im.points, chosen) * random.between(0.85, 1.2));
 		const cx = ax + random.between(-0.18, 0.18) * side, cy = ay + random.between(-0.18, 0.18) * side;
 		const affine = boxAffine([cx - side / 2, cy - side / 2, cx + side / 2, cy + side / 2], S, S), [a, , tx, , d, ty] = affine;
 		for (let n = 0; n < P; n++) {
-			const p = im.points[h.idx[n]], o = (c * P + n) * 4;
+			const p = h.get[n](im), o = (c * P + n) * 4;
 			// Rigsmith's pixels are counted from the left edge, the warp's from the first centre.
 			let x = a * (p[0] - 0.5) + tx;
 			const y = d * (p[1] - 0.5) + ty;
 			if (h.mirror) x = S - 1 - x;
 			targets[o] = (x - (PATCH - 1) / 2) / PATCH;
 			targets[o + 1] = (y - (PATCH - 1) / 2) / PATCH;
-			targets[o + 2] = x >= 0 && y >= 0 && x < S && y < S ? 1 : 0;
+			// A landmark is learnt only where it shows.
+			targets[o + 2] = x >= 0 && y >= 0 && x < S && y < S && (!h.mark[n] || p[3] === 1) ? 1 : 0;
 		}
 		const image = uploadImage(picture);
 		const m = h.mirror ? [a, 0, S - 1 - tx - a * (picture.width - 1), 0, d, ty] : affine;
@@ -660,23 +713,23 @@ async function trainHands(encoder, set, images, held, chosen, hands, request, st
 	const t0 = llm.now();
 	const enc = await encodePictures(encoder, {
 		M, S, layers, rank, hidden, J: P, seed, random, sample: Math.min(train, Number(request.pca_pictures ?? 48)),
-		picture: make, step, spent, what: 'encoding hands',
+		picture: make, step, spent, what: `encoding ${what}`,
 	});
 	try {
 		const encoded = (llm.now() - t0) / 1000;
-		llm.print(`  encoded ${M} hands in ${encoded.toFixed(0)}s`);
+		llm.print(`  encoded ${M} ${what} in ${encoded.toFixed(0)}s`);
 		const { v, history } = await fitHead(enc.head, enc.features, targets, {
-			M, train, B, S, J: P, rank, hidden, sigma, epochs, lr: Number(request.lr ?? 1e-3), random, step, what: 'training hands', label: 'hands ',
+			M, train, B, S, J: P, rank, hidden, sigma, epochs, lr: Number(request.lr ?? 1e-3), random, step, what: `training ${what}`, label: `${what} `,
 		});
 		const host = enc.head.host;
 		return {
-			weights: { hand_pca: host.pca, hand_pca_bias: host.pca_bias, hand_w1: host.w1, hand_b1: host.b1, hand_w2: host.w2, hand_b2: host.b2 },
+			weights: Object.fromEntries(['pca', 'pca_bias', 'w1', 'b1', 'w2', 'b2'].map((n) => [`${prefix}_${n}`, host[n]])),
 			meta: {
-				size: S, rank, hidden, sigma, scale: round(hands.scale, 4), points: hands.points, hands: hands.hands,
+				size: S, rank, hidden, sigma, scale: round(part.scale, 4), points: part.points, [what]: part[what],
 				report: {
 					crops: M, held_out: M - train, pca_variance_kept: round(enc.kept, 3),
 					held_out_px: { median: round(v.median, 2), mean: round(v.mean, 2), p90: round(v.p90, 2), within: round(v.within, 3), near: v.near },
-					worst_points: v.perJoint.map((e, n) => ({ point: hands.points[n], px: round(e, 1) })).sort((x, y) => y.px - x.px).slice(0, 6),
+					worst_points: v.perJoint.map((e, n) => ({ point: part.points[n], px: round(e, 1), median_px: round(v.perJointMedian[n], 1) })).sort((x, y) => y.px - x.px).slice(0, 6),
 					history, seconds: { encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1) },
 				},
 			},
@@ -690,9 +743,11 @@ async function trainHands(encoder, set, images, held, chosen, hands, request, st
  * Trains a finder on `request.renders` and writes it to `request.out`.
  * Options: joints, landmarks (true), hidden_weight (0.3), hidden_joint_width (0), layers ([]), backgrounds, rank (384), hidden (256), epochs (40),
  * batch (32), lr (0.001), sigma (1, patches), holdout (0.05), seed (1),
- * limit (pictures at most), hands (true), hand_size (256), hand_rank (256),
- * hand_hidden (256), hand_epochs (epochs). A finder already at `out` for the
- * same body and without hands keeps its body: only the hands are trained.
+ * limit (pictures at most), memory_gb (12, the features' GPU budget), hands (true), hand_size (256), hand_rank (256),
+ * hand_hidden (256), hand_epochs (epochs), feet (false), foot_size (384) and
+ * the like. A finder already at `out` for the same body and without parts
+ * keeps its body: only the parts are trained. `keep`: a finder whose body (and
+ * parts not trained again) the new one keeps.
  * Returns the report.
  */
 export async function trainFinder(encoder, request, step = null) {
@@ -717,21 +772,36 @@ export async function trainFinder(encoder, request, step = null) {
 	const hiddenJointWidth = Number(request.hidden_joint_width ?? 0);
 	if (!(hiddenJointWidth >= 0 && hiddenJointWidth < 50)) throw bad('hidden_joint_width: 0 (off) to 50 patches');
 
-	// The pictures, shuffled, a twentieth held out.
-	const images = set.images.slice();
-	for (let i = images.length - 1; i > 0; i--) { const k = random.int(i + 1); [images[i], images[k]] = [images[k], images[i]]; }
+	// The pictures, shuffled, a twentieth held out: whole poses, so no other
+	// camera's picture of a held-out pose is trained on.
+	const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const k = random.int(i + 1); [a[i], a[k]] = [a[k], a[i]]; } return a; };
+	let images = shuffle(set.images.slice());
 	if (request.limit) images.length = Math.min(images.length, Number(request.limit));
-	const held = Math.max(1, Math.round(images.length * Number(request.holdout ?? 0.05)));
+	const byPose = new Map();
+	for (const im of images) byPose.set(im.pose, [...(byPose.get(im.pose) ?? []), im]);
+	const poses = [...byPose.values()], heldOut = [];
+	while (poses.length > 1 && heldOut.length < Math.max(1, Math.round(images.length * Number(request.holdout ?? 0.05)))) heldOut.push(...poses.pop());
+	images = [...poses.flat(), ...heldOut];
+	const held = heldOut.length;
 	const M = images.length, train = M - held;
 	if (train < B) throw bad(`renders: ${M} pictures, too few for batches of ${B}`);
-	const hands = request.hands === false ? null : handsOf(set, chosen);
+	// Every picture's features stay on the GPU while the head trains.
+	const gb = (M * G * G * rank * 4) / 2 ** 30, budget = Number(request.memory_gb ?? 12);
+	if (gb > budget) throw bad(`renders: ${M} pictures of ${S} keep ${gb.toFixed(1)} GB of features on the GPU, over memory_gb ${budget}; use limit ${Math.floor((M * budget) / gb)} or fewer pictures`);
+	// The parts to look at closer: hands unless `hands: false`, feet with `feet:
+	// true`; a kept finder's own parts stay unless asked for again (true).
+	const shape = { names, S, D, layers, rank, hidden };
+	const keeping = request.keep ? bodyFrom(request.keep, shape, true) : null;
+	if (request.keep && !keeping) throw bad(`keep: ${request.keep} is not a finder of this body (same renders' joints, size, layers, rank and hidden)`);
+	const asked = (kind, byDefault) => request[kind] === true || (request[kind] !== false && byDefault && !keeping?.parts[kind]);
+	const wanted = { hands: asked('hands', true) ? handsOf(set, chosen) : null, feet: asked('feet', false) ? feetOf(set, chosen) : null };
 	// Where the time goes, in ms: making the pictures, the backbone, the PCA,
 	// projecting and keeping the features, then fitting the heads.
 	const spent = { pictures: 0, backbone: 0, pca: 0, keep: 0, head: 0 };
-	const kept = hands ? bodyFrom(request.out, { names, S, D, layers, rank, hidden }) : null;
+	const kept = keeping ?? (Object.values(wanted).some(Boolean) ? bodyFrom(request.out, shape) : null);
 	let body, bodyReport;
 	if (kept) {
-		llm.print(`  finder: ${request.out} already finds this body; training its hands`);
+		llm.print(`  finder: ${request.keep ?? request.out} already finds this body; training its ${Object.keys(wanted).filter((k) => wanted[k]).join(' and ')}`);
 		body = kept.weights;
 		bodyReport = kept.meta.report;
 	} else {
@@ -792,7 +862,7 @@ export async function trainFinder(encoder, request, step = null) {
 				pictures: M, held_out: held, joints: names, size: S,
 				pca_variance_kept: round(enc.kept, 3),
 				held_out_px: { median: round(v.median, 2), mean: round(v.mean, 2), p90: round(v.p90, 2), within: round(v.within, 3), near: v.near },
-				worst_joints: v.perJoint.map((e, n) => ({ joint: names[n], px: round(e, 1) })).sort((a, b) => b.px - a.px).slice(0, 8),
+				worst_joints: v.perJoint.map((e, n) => ({ joint: names[n], px: round(e, 1), median_px: round(v.perJointMedian[n], 1) })).sort((a, b) => b.px - a.px).slice(0, 8),
 				// How sure the finder is of a landmark the picture shows, and of one it
 				// hides (median scores): far apart, the fit can tell them apart.
 				...(landmarks.length ? { landmark_score: { seen: round(v.seenScore, 3), hidden: round(v.hiddenScore, 3) } } : {}),
@@ -807,14 +877,25 @@ export async function trainFinder(encoder, request, step = null) {
 			enc.dispose();
 		}
 	}
-	const hand = hands ? await trainHands(encoder, set, images, held, chosen, hands, request, step, spent) : null;
-	const report = { ...bodyReport, ...(hand ? { hands: hand.meta.report } : {}) };
-	saveFinder(request.out, { ...body, ...(hand?.weights ?? {}) }, {
-		joints: names, size: S, dim: D, layers, rank, hidden, sigma, fill: set.fill, report,
+	const meta = {
+		joints: names, size: S, dim: D, layers, rank, hidden, sigma, fill: set.fill,
 		landmarks: landmarks.map((m) => ({ name: m.name, joint: m.joint, offset: m.offset })),
-		...(hand ? { hands: hand.meta } : {}),
+	};
+	// The body written first: a part that fails to train loses only itself, and
+	// the same request again keeps this body.
+	if (!kept && Object.values(wanted).some(Boolean)) saveFinder(request.out, body, { ...meta, report: bodyReport });
+	// Each part trained, or kept from `keep` when not asked for again.
+	const parts = {};
+	for (const k of PARTS) {
+		if (wanted[k.kind]) parts[k.kind] = await trainPart(encoder, set, images, held, chosen, wanted[k.kind], k, request, step, spent);
+		else if (keeping?.parts[k.kind] && request[k.kind] !== false) parts[k.kind] = keeping.parts[k.kind];
+	}
+	const report = { ...bodyReport, ...Object.fromEntries(Object.entries(parts).map(([k, p]) => [k, p.meta.report])) };
+	saveFinder(request.out, { ...body, ...Object.assign({}, ...Object.values(parts).map((p) => p.weights)) }, {
+		...meta, report, ...Object.fromEntries(Object.entries(parts).map(([k, p]) => [k, p.meta])),
 	});
-	llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px${hand ? `, hands ${hand.meta.report.held_out_px.median}px of ${hand.meta.size}` : ''}, in ${round((llm.now() - t0) / 1000, 1)}s`);
+	const partsText = Object.entries(parts).map(([k, p]) => `, ${k} ${p.meta.report.held_out_px.median}px of ${p.meta.size}`).join('');
+	llm.print(`  finder written to ${request.out}: held out median ${report.held_out_px.median}px${partsText}, in ${round((llm.now() - t0) / 1000, 1)}s`);
 	return report;
 }
 
@@ -864,7 +945,7 @@ export function headGradients(head, g, { B, N, J, G, rank, hidden, sigma }, read
 // The held-out pictures [from, to) scored as the finder would: each joint's
 // peak against its label, in pixels.
 function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidden, S, landmarksFrom = J }) {
-	const errs = [], perJoint = new Float64Array(J), perCount = new Float64Array(J), seen = [], hid = [], jointSeen = [], jointHid = [];
+	const errs = [], perJoint = new Float64Array(J), perCount = new Float64Array(J), perList = Array.from({ length: J }, () => []), seen = [], hid = [], jointSeen = [], jointHid = [];
 	for (let b0 = from; b0 < to; b0 += B) {
 		const n = Math.min(B, to - b0);
 		for (let b = 0; b < n; b++) {
@@ -889,6 +970,7 @@ function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidd
 				errs.push(e);
 				perJoint[j] += e;
 				perCount[j]++;
+				perList[j].push(e);
 			}
 		}
 	}
@@ -900,6 +982,7 @@ function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidd
 		median: q(0.5), p90: q(0.9), mean: errs.reduce((a, b) => a + b, 0) / Math.max(1, errs.length),
 		within: errs.filter((e) => e <= near).length / Math.max(1, errs.length), near,
 		perJoint: Array.from(perJoint, (v, j) => v / Math.max(1, perCount[j])),
+		perJointMedian: perList.map(mid),
 		seenScore: mid(seen), hiddenScore: mid(hid), jointSeenScore: mid(jointSeen), jointHiddenScore: mid(jointHid),
 	};
 }

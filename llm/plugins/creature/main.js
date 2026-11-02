@@ -88,7 +88,7 @@ import { syncViews } from './sync.js';
 
 const OUTPUTS = ['glb', 'clip', 'bvh', 'animated_glb', 'tracks'];
 
-// The request's fit settings, checked: { weights, sigma, confidence }.
+// The request's fit settings, checked: { weights, sigma, confidence, recheck }.
 function fitSettings(request) {
 	const weights = request.weights ?? null;
 	if (weights !== null) {
@@ -104,7 +104,7 @@ function fitSettings(request) {
 		if (!Number.isFinite(v) || v < least) throw bad(`${key}: ${JSON.stringify(request[key])} is not a number of ${least} or more`);
 		return v;
 	};
-	return { weights, sigma: number('sigma', 15, 0.5), wide: number('sigma_wide', 4, 1), confidence: number('confidence', null, 0) };
+	return { weights, sigma: number('sigma', 15, 0.5), wide: number('sigma_wide', 4, 1), confidence: number('confidence', null, 0), recheck: number('recheck', 1, 0) };
 }
 let backbone = null, tracker = null, modelPath = null, finder = null;
 
@@ -328,7 +328,8 @@ export async function animate(request, config = {}) {
 	if (reply.clip) files['clip.json'] = utf8(JSON.stringify(reply.clip));
 	if (reply.tracks) files['tracks.json'] = utf8(JSON.stringify(reply.tracks));
 	llm.print(`  ${name}: ${motion.frames} frames on ${rig.names.length} joints, travel ${report.travel}, in ${report.seconds.total}s`);
-	return { reply, files };
+	// The fit itself for callers in JS (tests grade it); not sent.
+	return { reply, files, fit };
 }
 
 // /detect: the tracks of each view (one view's alone when there are no views).
