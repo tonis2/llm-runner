@@ -206,7 +206,7 @@ const framesOf = (spec) => (spec && typeof spec.image === 'function' ? spec : fr
 function studioViewsOf(request) {
 	const layout = readStudio(request.studio);
 	const given = request.views !== undefined;
-	if (given && (!Array.isArray(request.views) || request.views.length !== 2 || !request.views.every((v) => v?.tracks))) throw bad('studio: frames (the clip), or views [{ tracks }, { tracks }] (front, side) with the clip\'s size [width, height] or frames');
+	if (given && (!Array.isArray(request.views) || request.views.length !== 2 || !request.views.every((v) => v?.tracks))) throw bad('studio: frames (the clip), or views [{ tracks }, { tracks }] (left, side) with the clip\'s size [width, height] or frames');
 	const frames = request.frames !== undefined ? frameSource(request.frames) : null, first = frames?.image(0);
 	const size = first ? [first.width, first.height] : list(request.size, 2, 'size');
 	if (!size) throw bad('studio: with views and no frames, size [width, height] of the clip');
@@ -374,10 +374,10 @@ const INFO = {
 		iterations: 'fit iterations (1500)',
 		pitch: 'the camera\'s expected downward angle in degrees (8)',
 		views: '[{ frames, labels, region?, width?, pitch? } or { tracks, pitch? }]: the same moments from other cameras, fitted together',
-		studio: 'Rigsmith render_studio\'s studio.json: frames are a clip of its picture (front and side side by side); the views are cut out by its layout and their cameras known',
+		studio: 'Rigsmith render_studio\'s studio.json: frames are a clip of its picture (its two views side by side); the views are cut out by its layout and their cameras known',
 		reference: 'with studio: the picture the clip was made from (reference.png beside the studio.json by default), its first frame laid on it to put the cameras right',
 		calibrate: 'with studio: put the cameras right by the first frame against the reference (true)',
-		sync: 'with studio: re-time the front view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
+		sync: 'with studio: re-time the left view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
 		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
 		key_every: 'with a finder: a keyframe for the fit to start from every so many frames (6)',
 		flip: 'with a finder: look at each crop mirrored as well, left read as right, and average (true; false to look once)',

@@ -28,7 +28,9 @@
 // everywhere, as the body round it says where it is; a landmark where the
 // picture shows it, and where it does not (a nose seen from behind) its heatmap
 // is taught to be flat, at `hidden_weight` (0.3): it lights nothing, so its
-// score is low, and the fit hardly listens to it.
+// score is low, and the fit hardly listens to it. A joint the body hides (the
+// far leg behind the near one) can be taught `hidden_joint_width` patches wide
+// (0, off: on strike_2 it overshot the kick and fitted worse), so it scores low.
 
 import { llm, f32 } from '/core/llm.js';
 import * as op from '/core/ops.js';
@@ -686,7 +688,7 @@ async function trainHands(encoder, set, images, held, chosen, hands, request, st
 
 /**
  * Trains a finder on `request.renders` and writes it to `request.out`.
- * Options: joints, landmarks (true), hidden_weight (0.3), layers ([]), backgrounds, rank (384), hidden (256), epochs (40),
+ * Options: joints, landmarks (true), hidden_weight (0.3), hidden_joint_width (0), layers ([]), backgrounds, rank (384), hidden (256), epochs (40),
  * batch (32), lr (0.001), sigma (1, patches), holdout (0.05), seed (1),
  * limit (pictures at most), hands (true), hand_size (256), hand_rank (256),
  * hand_hidden (256), hand_epochs (epochs). A finder already at `out` for the
@@ -712,6 +714,8 @@ export async function trainFinder(encoder, request, step = null) {
 	const seed = Number(request.seed ?? 1);
 	const random = generator(seed);
 	const hiddenWeight = Number(request.hidden_weight ?? 0.3);
+	const hiddenJointWidth = Number(request.hidden_joint_width ?? 0);
+	if (!(hiddenJointWidth >= 0 && hiddenJointWidth < 50)) throw bad('hidden_joint_width: 0 (off) to 50 patches');
 
 	// The pictures, shuffled, a twentieth held out.
 	const images = set.images.slice();
@@ -757,7 +761,11 @@ export async function trainFinder(encoder, request, step = null) {
 				targets[o] = (x - (PATCH - 1) / 2) / PATCH;
 				targets[o + 1] = (y - (PATCH - 1) / 2) / PATCH;
 				const inside = x >= 0 && y >= 0 && x < S && y < S;
-				if (n < chosen.length) targets[o + 2] = inside && p[2] > 0 ? 1 : 0;
+				if (n < chosen.length) {
+					targets[o + 2] = inside && p[2] > 0 ? 1 : 0;
+					// Under 0 is sigma to the kernel: a hidden joint taught as a shown one, still told apart.
+					targets[o + 3] = p[3] === 0 ? hiddenJointWidth || -1 : 0;
+				}
 				else if (inside && p[3] === 1) targets[o + 2] = 1;
 				else { targets[o] = targets[o + 1] = G / 2; targets[o + 2] = hiddenWeight; targets[o + 3] = FLAT; }
 			}
@@ -788,6 +796,7 @@ export async function trainFinder(encoder, request, step = null) {
 				// How sure the finder is of a landmark the picture shows, and of one it
 				// hides (median scores): far apart, the fit can tell them apart.
 				...(landmarks.length ? { landmark_score: { seen: round(v.seenScore, 3), hidden: round(v.hiddenScore, 3) } } : {}),
+				joint_score: { seen: round(v.jointSeenScore, 3), hidden: round(v.jointHiddenScore, 3), hidden_width: hiddenJointWidth },
 				history,
 				seconds: {
 					encode: round(encoded, 1), total: round((llm.now() - t0) / 1000, 1),
@@ -855,7 +864,7 @@ export function headGradients(head, g, { B, N, J, G, rank, hidden, sigma }, read
 // The held-out pictures [from, to) scored as the finder would: each joint's
 // peak against its label, in pixels.
 function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidden, S, landmarksFrom = J }) {
-	const errs = [], perJoint = new Float64Array(J), perCount = new Float64Array(J), seen = [], hid = [];
+	const errs = [], perJoint = new Float64Array(J), perCount = new Float64Array(J), seen = [], hid = [], jointSeen = [], jointHid = [];
 	for (let b0 = from; b0 < to; b0 += B) {
 		const n = Math.min(B, to - b0);
 		for (let b = 0; b < n; b++) {
@@ -873,8 +882,9 @@ function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidd
 				if (!(targets[o + 2] > 0)) continue;
 				const [p] = peaks(one, j, J, G, G, { second: 2 });
 				if (j >= landmarksFrom) (targets[o + 3] > 0 ? hid : seen).push(p.mass);
+				else (targets[o + 3] !== 0 ? jointHid : jointSeen).push(p.mass);
 				// A hidden landmark's flat target has no place to be found at.
-				if (targets[o + 3] > 0) continue;
+				if (targets[o + 3] >= FLAT) continue;
 				const e = Math.hypot(p.at[0] - targets[o], p.at[1] - targets[o + 1]) * PATCH;
 				errs.push(e);
 				perJoint[j] += e;
@@ -890,6 +900,6 @@ function evaluate(head, g, features, targets, from, to, { B, N, J, G, rank, hidd
 		median: q(0.5), p90: q(0.9), mean: errs.reduce((a, b) => a + b, 0) / Math.max(1, errs.length),
 		within: errs.filter((e) => e <= near).length / Math.max(1, errs.length), near,
 		perJoint: Array.from(perJoint, (v, j) => v / Math.max(1, perCount[j])),
-		seenScore: mid(seen), hiddenScore: mid(hid),
+		seenScore: mid(seen), hiddenScore: mid(hid), jointSeenScore: mid(jointSeen), jointHiddenScore: mid(jointHid),
 	};
 }

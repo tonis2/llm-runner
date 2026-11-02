@@ -49,7 +49,7 @@ one request at a time; there is one GPU.
 | `pitch`      | number | The camera's expected downward angle, in degrees. Default 8. Raise it for a camera that stands close or looks down on the animal (it sees the feet from above); otherwise the fit leans the body to make up the difference. |
 | `outputs`    | string[] | Any of `glb`, `clip`, `bvh`, `animated_glb`, `tracks`. Default `["glb", "clip"]`. |
 | `views`      | object[] | Instead of `frames`, `labels`, `region`, `width` and `pitch`: the same moments filmed by several cameras. See [Two views](#two-views). |
-| `studio`     | string or object | Rigsmith `render_studio`'s `studio.json`. `frames` are then a clip a video model made from its `reference.png`: the front and the right side side by side in every frame. The views are cut out by the layout and their cameras are known. See [A studio clip](#a-studio-clip). |
+| `studio`     | string or object | Rigsmith `render_studio`'s `studio.json`. `frames` are then a clip a video model made from its `reference.png`: its two views (a front-left three-quarter or the front, and the right side) side by side in every frame. The views are cut out by the layout and their cameras are known. See [A studio clip](#a-studio-clip). |
 | `finder`     | string | A trained joint finder (`/train`). Views with neither `labels` nor `tracks` have their joints found with it. See [A trained finder](#a-trained-finder-no-labels). |
 | `key_every`  | number | With a finder: a keyframe for the fit to start from every so many frames. Default 6. |
 | `landmarks`  | bool or string[] | With a finder: which of its landmarks to fit: all (true), none (false), or those listed. By default all but a mirror pair on one joint (a head's two sides, from a finder drawn before render_poses stopped drawing them): each is the other's mirror image, and the finder takes one for the other, which tips the head over. |
@@ -142,12 +142,14 @@ rarely step together. A **studio clip** avoids both, as
 
 1. **The picture.** Rigsmith's hidden MCP tool `render_studio` draws the rig
    (its rest pose, or a clip's moment such as an idle's first frame) from
-   two level, orthographic cameras side by side: the front on the left, the
-   right side on the right, one scale and one floor row, over a grey wall and
-   a lighter floor band. It writes `reference.png`, `studio.json` (the
+   two level, orthographic cameras side by side: on the left a front-left
+   three-quarter view (`left_yaw` 45; 0 is the front), on the right the right
+   side, one scale and one floor row, over a grey wall and a lighter floor
+   band. A three-quarter view keeps both legs in sight in a stride, where a
+   front view hides one behind the other. It writes `reference.png`, `studio.json` (the
    layout) and `prompt.txt`.
 2. **The clip.** A video model (MiniMax, Seedance) animates `reference.png`
-   from the prompt, the action filled in. Both halves are one generation, so
+   from the prompt, the action written on its first line. Both halves are one generation, so
    they move together, and the cameras hold still.
 3. **The fit.** Extract the frames (`ffmpeg -i clip.mp4 frames/f_%04d.png`)
    and send them with the layout and a finder:
@@ -159,8 +161,9 @@ rarely step together. A **studio clip** avoids both, as
 
 - **The views** are cut out of every frame by the layout (each only its own
   pixels, so a view's crops never take in the other's figure), scaled with
-  the clip: a 1920 x 1080 clip of a 1280 x 720 picture is fine; a stretched
-  one is refused.
+  the clip the way video models do: the same both ways to cover the frame,
+  the rest cropped evenly (H3's 1344 x 768 and FLUX 3's 1280 x 704 of a
+  1280 x 720 picture). More than 5% cropped is refused.
 - **Calibrated.** A video model may draw its first frame a little bigger or
   moved (MiniMax: 1% bigger, each half 8 px out and 4 px down). Each view's
   figure in the first frame is laid on `reference.png`'s (beside the
@@ -177,8 +180,15 @@ rarely step together. A **studio clip** avoids both, as
   them out of step. `report.sync` gives the mean and worst gap in pixels, the
   constant lag that agrees best, and how well each foot's height matches
   between the views (1 when they rise and fall together). When matching the
-  views frame by frame brings the heights at least 15% closer, the front view
+  views frame by frame brings the heights at least 15% closer, the left view
   is re-timed onto the side's (`sync: false` only reports).
+- **Left and right agree.** A view that cannot see a foot (the rear foot of
+  a run, behind the standing leg from the front) reads the visible one as
+  both, and names it as the other view does not. Before the fit, each limb
+  pair in each view is read straight or crossed, whichever puts its points'
+  two reads in one place through the cameras, in stretches that each cost
+  `weights.swap` (2, in units of `sigma`²; a large value turns it off).
+  `report.crossed` gives, per view, the frames read crossed.
 - **Tracks again, no GPU:** `{ studio, views: [{ tracks }, { tracks }], size:
   [width, height] }` with a reply's two tracks and the clip's size (or
   `frames` in place of `size`, which calibrates too).
@@ -251,7 +261,7 @@ for first in 0 500 1000; do
   curl -s -X POST http://127.0.0.1:8808/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,
     "method":"tools/call","params":{"name":"render_poses","arguments":{"out":"/data/zidane_renders",
     "count":500,"first":'$first',"clips":"all","landmarks":"auto",
-    "cameras":[{"name":"front","yaw":0,"yaw_jitter":20},{"name":"left","yaw":90,"yaw_jitter":20},{"name":"right","yaw":-90,"yaw_jitter":20}]}}}'
+    "cameras":[{"name":"front","yaw":0,"yaw_jitter":20},{"name":"quarter","yaw":45,"yaw_jitter":20},{"name":"left","yaw":90,"yaw_jitter":20},{"name":"right","yaw":-90,"yaw_jitter":20}]}}}'
 done
 ```
 
@@ -286,6 +296,7 @@ front of it); and every pose's joint turns. The document is not touched.
 | `joints` | string[] | The joints to find. Default: those big enough to see. |
 | `landmarks` | bool | Find the set's landmarks too. Default true. Where a picture shows a landmark it is learnt at its pixel; where it hides it (a nose seen from behind), its heatmap is taught to be flat, so its score there is low and the fit hardly listens to it. |
 | `hidden_weight` | number | How much a hidden landmark's flat heatmap counts against a shown one's. Default 0.3. |
+| `hidden_joint_width` | number | A joint the body hides in a picture (the far leg behind the near one) is taught where it is, but this many patches wide, so the finder scores it low and the fit leans on another view. `report.joint_score` gives the median scores of shown and hidden joints. Default 0, taught like a shown one (2 lowered hidden scores from 0.70 to 0.46, but a studio run fitted worse). |
 | `layers` | number[] | DINOv3 blocks (0 to 30) whose patches are laid beside the last block's before the PCA: a middle block knows better where things are, the last what they are. Default none. |
 | `backgrounds` | string | A folder of images to crop backgrounds from, alongside made-up ones (flat, sky and ground, tiles, colour fields, and a pale studio wall and floor). |
 | `epochs` | number | Passes over the pictures. Default 40. |

@@ -1,5 +1,6 @@
-// A studio clip: one video of the rig from two cameras side by side, front on
-// the left and its right side on the right, made from Rigsmith's render_studio
+// A studio clip: one video of the rig from two cameras side by side, a front
+// three-quarter (or front) view on the left and its right side on the right,
+// made from Rigsmith's render_studio
 // picture (reference.png) by a video model. studio.json beside that picture is
 // the layout: the picture's size, the floor row, each view's columns, and how a
 // point p of the model lands in a view — across, the view's left edge plus
@@ -11,8 +12,9 @@
 //   const views = studioViews(layout, frameWidth, frameHeight);   // [{ name, box, camera }]
 //   const frames = cropFrames(source, views[0].box);
 //
-// A clip may be bigger than the picture (MiniMax gave 1920 x 1080 for 1280 x
-// 720): the layout is scaled to it, the same both ways.
+// A clip may be another size than the picture: video models scale it the same
+// both ways to cover the frame and crop the rest evenly (H3 gives 1344 x 768
+// for 1280 x 720, FLUX 3 1280 x 704), so the layout is too.
 
 import { llm } from '/core/llm.js';
 import { bad } from './request.js';
@@ -30,7 +32,7 @@ export function readStudio(spec) {
 	const ok = layout && layout.width > 0 && layout.height > 0 && layout.pixels_per_unit > 0 && Number.isFinite(layout.ground_row)
 		&& Array.isArray(layout.views) && layout.views.length === 2
 		&& layout.views.every((v) => v.width > 0 && [v.origin, v.right, v.up].every((a) => Array.isArray(a) && a.length === 3));
-	if (!ok) throw bad('studio: Rigsmith render_studio\'s studio.json ({ width, height, ground_row, pixels_per_unit, views: [front, side] })');
+	if (!ok) throw bad('studio: Rigsmith render_studio\'s studio.json ({ width, height, ground_row, pixels_per_unit, views: [left, side] })');
 	return layout;
 }
 
@@ -38,45 +40,47 @@ const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
 /**
  * Each view of a `width` x `height` clip of `layout`: { name, box [x1, y1, x2,
- * y2] (whole frame pixels, the divider left out), camera } — the camera as
- * fit.js's RigFit takes it, for points in the box's own pixels: { yaw, pitch,
- * logS, shift [x, y] } (y up).
+ * y2] (whole frame pixels, the divider left out), camera, scale, crop [x, y] }
+ * — the camera as fit.js's RigFit takes it, for points in the box's own
+ * pixels: { yaw, pitch, logS, shift [x, y] } (y up); the layout scaled by
+ * `scale` to cover the frame, less `crop` pixels off each side.
  */
 export function studioViews(layout, width, height) {
-	const sx = width / layout.width, sy = height / layout.height;
-	if (Math.abs(sx / sy - 1) > 0.02) throw bad(`studio: the clip is ${width} x ${height}, the studio ${layout.width} x ${layout.height}; it is stretched (${sx.toFixed(3)} across, ${sy.toFixed(3)} down), not scaled`);
-	const scale = (sx + sy) / 2;
+	const sx = width / layout.width, sy = height / layout.height, scale = Math.max(sx, sy);
+	if (Math.min(sx, sy) / scale < 0.95) throw bad(`studio: the clip is ${width} x ${height}, the studio ${layout.width} x ${layout.height}; scaled to cover it, ${((1 - Math.min(sx, sy) / scale) * 100).toFixed(1)}% would be cropped (5% at most)`);
+	const crop = [(layout.width * scale - width) / 2, (layout.height * scale - height) / 2];
 	const gap = Math.ceil(((layout.divider_width ?? 4) / 2 + 1) * scale);
 	const ppu = layout.pixels_per_unit * scale;
 	return layout.views.map((view, v) => {
-		const left = Math.round(view.x * scale), right = Math.round((view.x + view.width) * scale);
-		const box = [v === 0 ? left : left + gap, 0, v === layout.views.length - 1 ? Math.min(width, right) : right - gap, height];
+		const left = Math.max(0, Math.round(view.x * scale - crop[0])), right = Math.min(width, Math.round((view.x + view.width) * scale - crop[0]));
+		const box = [v === 0 ? left : left + gap, 0, v === layout.views.length - 1 ? right : right - gap, height];
 		const r = view.right, u = view.up, o = view.origin;
 		// The fit's cameras turn about the model's up only: a studio is level,
 		// and its up is the model's +Y unless the model was placed tipped over.
 		if (Math.abs(u[1] - 1) > 1e-3 || Math.abs(r[1]) > 1e-3) throw bad(`studio: view ${view.name} is not level in the model (up ${u.join(', ')}); render_studio of a model placed upright`);
 		// Across: s (p · right) + shift; up: s (p · up) + shift, the box's own pixels.
 		return {
-			name: view.name, box,
+			name: view.name, box, scale, crop,
 			camera: {
 				yaw: Math.atan2(r[2], r[0]),
 				pitch: 0,
 				logS: Math.log(ppu),
-				shift: [(view.x + view.width / 2) * scale - ppu * dot(o, r) - box[0], -layout.ground_row * scale - ppu * dot(o, u) + box[1]],
+				shift: [(view.x + view.width / 2) * scale - crop[0] - ppu * dot(o, r) - box[0], -(layout.ground_row * scale - crop[1]) - ppu * dot(o, u) + box[1]],
 			},
 		};
 	});
 }
 
 // The figure in one view of `img` (a frame, or the reference picture, read at
-// frame pixel (x, y) as its pixel (x / k, y / k)), sampled on a grid of `step`
-// frame pixels over `box`: 1 where a pixel is far from the view's own wall and
-// floor (their medians, from its top rows and the floor band), else 0.
-function figureMask(img, k, box, floorRow, step) {
+// frame pixel (x, y) as its pixel ((x + crop x) / k, (y + crop y) / k)), sampled
+// on a grid of `step` frame pixels over `box`: 1 where a pixel is far from the
+// view's own wall and floor (their medians, from its top rows and the floor
+// band), else 0.
+function figureMask(img, k, box, floorRow, step, crop = [0, 0]) {
 	const W = Math.floor((box[2] - box[0]) / step), H = Math.floor((box[3] - box[1]) / step);
 	const { pixels, channels: C } = img, iw = img.width, ih = img.height;
-	const cols = Int32Array.from({ length: W }, (_, j) => Math.min(iw - 1, Math.max(0, Math.round((box[0] + j * step) / k))) * C);
-	const row = (y) => Math.min(ih - 1, Math.max(0, Math.round(y / k))) * iw * C;
+	const cols = Int32Array.from({ length: W }, (_, j) => Math.min(iw - 1, Math.max(0, Math.round((box[0] + j * step + crop[0]) / k))) * C);
+	const row = (y) => Math.min(ih - 1, Math.max(0, Math.round((y + crop[1]) / k))) * iw * C;
 	const median = (y0, y1) => {
 		const vals = [[], [], []];
 		for (let y = y0; y < y1; y += step) for (const c0 of cols) { const o = row(y) + c0; for (let c = 0; c < 3; c++) vals[c].push(pixels[o + c]); }
@@ -145,12 +149,11 @@ function overlap(ref, vid, k, dx, dy, cx, cy) {
  * view, { name, scale, shift [x, y] (frame pixels), overlap [before, after] }.
  */
 export function calibrateViews(layout, views, reference, first) {
-	const scale = first.width / layout.width;
-	const floorRow = layout.ground_row * scale;
-	// The reference at its own size (the layout's), read in frame pixels.
-	const refScale = first.width / reference.width;
 	const report = [];
 	const out = views.map((view) => {
+		// The reference at its own size (the layout's), read in frame pixels.
+		const scale = view.scale ?? first.width / layout.width, crop = view.crop ?? [0, 0];
+		const floorRow = layout.ground_row * scale - crop[1], refScale = scale * layout.width / reference.width;
 		// Scaled about the box's middle column and the floor row.
 		const box = view.box, cxFrame = (box[0] + box[2]) / 2, cyFrame = floorRow;
 		let best = { k: 1, dx: 0, dy: 0, o: 0 };
@@ -160,7 +163,7 @@ export function calibrateViews(layout, views, reference, first) {
 		// a step lays the figures closer.
 		const passes = [[8, 0.02, 3, 3], [4, 0.005, 0, 0], [2, 0.0025, 0, 0]];
 		for (const [p, [step, ks, kn, reach]] of passes.entries()) {
-			const ref = figureMask(reference, refScale, box, floorRow, step), vid = figureMask(first, 1, box, floorRow, step);
+			const ref = figureMask(reference, refScale, box, floorRow, step, crop), vid = figureMask(first, 1, box, floorRow, step);
 			ref.extent = extent(ref);
 			vid.extent = extent(vid);
 			const cx = (cxFrame - box[0]) / step, cy = (cyFrame - box[1]) / step;
@@ -175,7 +178,8 @@ export function calibrateViews(layout, views, reference, first) {
 			} else {
 				for (let moved = true, rounds = 0; moved && rounds < 20; rounds++) {
 					moved = false;
-					for (const [a, b, c] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+					// Scale and height together too: about the floor row they move the top alike.
+					for (const [a, b, c] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1], [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1]]) {
 						const o = at(here.n + a, here.dx + b, here.dy + c);
 						if (o.o > here.o) { here = o; moved = true; }
 					}

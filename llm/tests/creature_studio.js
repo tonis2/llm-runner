@@ -33,10 +33,14 @@ const pixel = (c, X) => {
 	return [s * (Math.cos(c.yaw) * X[0] + Math.sin(c.yaw) * X[2]) + c.shift[0], -(s * X[1] + c.shift[1])];
 };
 
-// 1. The rest joints land where render_studio drew them, at its own size and
-//    at 1.5 times it.
-for (const scale of [1, 1.5]) {
-	const views = studioViews(layout, layout.width * scale, layout.height * scale);
+// 1. The rest joints land where render_studio drew them, at its own size, at
+//    1.5 times it, and scaled to cover and cropped as H3 (1344 x 768 of 1280 x
+//    720) and FLUX 3 (1280 x 704) give it.
+const sizes = [[1, 1], [1.5, 1.5], [1344 / 1280, 768 / 720], [1, 704 / 720]];
+for (const [fx, fy] of sizes) {
+	const W = Math.round(layout.width * fx), H = Math.round(layout.height * fy);
+	const views = studioViews(layout, W, H), scale = Math.max(W / layout.width, H / layout.height);
+	const crop = [(layout.width * scale - W) / 2, (layout.height * scale - H) / 2];
 	let worst = 0, n = 0;
 	views.forEach((v, i) => {
 		layout.joints.forEach((name, k) => {
@@ -44,15 +48,20 @@ for (const scale of [1, 1.5]) {
 			if (j < 0) return;
 			const [x, y] = pixel(v.camera, rig.positions[j]);
 			const want = layout.pixels[i][k];
-			worst = Math.max(worst, Math.hypot(x + v.box[0] - want[0] * scale, y + v.box[1] - want[1] * scale));
+			worst = Math.max(worst, Math.hypot(x + v.box[0] - (want[0] * scale - crop[0]), y + v.box[1] - (want[1] * scale - crop[1])));
 			n++;
 		});
 	});
-	check(n > 0 && worst < 0.5 * scale + 0.05, `at ${scale}x, ${n} rest joints land on render_studio's pixels (worst ${worst.toFixed(3)} px)`);
+	check(n > 0 && worst < 0.5 * scale + 0.05, `at ${W} x ${H} (cropped ${crop.map((c) => c.toFixed(1)).join(', ')}), ${n} rest joints land on render_studio's pixels (worst ${worst.toFixed(3)} px)`);
 }
+let refused = false;
+try { studioViews(layout, layout.height, layout.height); } catch { refused = true; }
+check(refused, 'a square clip of a wide studio (a view cropped away) is refused');
 const views = studioViews(layout, layout.width * 1.5, layout.height * 1.5);
 const front = views[0].camera, side = views[1].camera;
-check(Math.abs(front.yaw) < 0.05 && Math.abs(Math.abs(side.yaw) - Math.PI / 2) < 0.05, `front looks at the face, side across (yaws ${(front.yaw * 180 / Math.PI).toFixed(1)}°, ${(side.yaw * 180 / Math.PI).toFixed(1)}°)`);
+// The left view is the front (yaw 0) or a front-left three-quarter (45): the camera's yaw is its negative.
+const leftYaw = (layout.views[0].yaw ?? 0) * Math.PI / 180;
+check(Math.abs(front.yaw + leftYaw) < 0.05 && Math.abs(Math.abs(side.yaw) - Math.PI / 2) < 0.05, `left view at ${layout.views[0].yaw ?? 0}° from the face, side across (yaws ${(front.yaw * 180 / Math.PI).toFixed(1)}°, ${(side.yaw * 180 / Math.PI).toFixed(1)}°)`);
 const left = rig.positions[0].slice();
 left[0] += 0.2;
 check(pixel(front, left)[0] > pixel(front, rig.positions[0])[0], 'the rig\'s left (+X) is on the front view\'s right, as it faces the viewer');
@@ -156,6 +165,24 @@ calibrated.report.forEach((c, v) => {
 	});
 	check(worst < 4, `${c.name}: the corrected camera puts the rest joints where the frame has them (worst ${worst.toFixed(2)} px)`);
 });
+
+// 5. An H3 first frame: the picture scaled to cover 1344 x 768 and cropped,
+//    nothing else. Calibration finds nothing to correct.
+{
+	const W = 1344 * layout.width / 1280, H = 768 * layout.height / 720;
+	const hv = studioViews(layout, W, H), { scale, crop } = hv[0];
+	const px = new Uint8Array(W * H * 3);
+	for (let y = 0; y < H; y++) {
+		for (let x = 0; x < W; x++) {
+			const rx = Math.min(reference.width - 1, Math.round((x + crop[0]) / scale * reference.width / layout.width));
+			const ry = Math.min(reference.height - 1, Math.round((y + crop[1]) / scale * reference.height / layout.height));
+			for (let c = 0; c < 3; c++) px[(y * W + x) * 3 + c] = reference.pixels[(ry * reference.width + rx) * reference.channels + c];
+		}
+	}
+	const h3 = calibrateViews(layout, hv, reference, { width: W, height: H, channels: 3, pixels: px });
+	h3.report.forEach((c) => check(Math.abs(c.scale - 1) < 0.004 && Math.abs(c.shift[0]) <= 2 && Math.abs(c.shift[1]) <= 2,
+		`${c.name} at ${W} x ${H}: calibration finds it as drawn (scaled ${c.scale}, moved ${c.shift.join(', ')}; overlap ${c.overlap.join(' -> ')})`));
+}
 
 llm.print(failures ? `${failures} failed` : 'all passed');
 if (failures) throw new Error(`${failures} checks failed`);

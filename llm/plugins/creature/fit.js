@@ -40,7 +40,8 @@
 // frame N of each the same instant) each bring their own camera and points,
 // and all of them project the one motion. What one view cannot see along its
 // line of sight (an arm swinging toward it or hanging back) the other sees
-// across.
+// across. First the views agree on left and right (agreeViews): a view that
+// cannot see one foot finds the other twice, and the fit would sit between.
 //
 // Gradients: a turn δ of joint a's rotation vector θ turns everything below a
 // about it by ω = G_parent J_l(θ) δ in the world, moving a point x by
@@ -50,6 +51,7 @@
 import { llm } from '/core/llm.js';
 import { breathe, breathing } from '/core/gpu.js';
 import { bad, markerJoint } from './request.js';
+import { partner } from './detect.js';
 
 const DEG = Math.PI / 180;
 const W_PLANE = 10, W_FOOT = 0.05, W_MIDLINE = 0.5;
@@ -61,10 +63,11 @@ const ACC_SCALE = 3;
 // Every term's weight; a request's `weights` overrides any of them.
 export const DEFAULT_WEIGHTS = Object.freeze({
 	reproj: 1, acc: 2, thetaAcc: 6, twist: 1, twistMarked: 0, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, chainBranch: 0.1,
-	floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10,
+	floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10, swap: 2,
 });
-// The native fit's orders (lib/host/rig_fit.c3): weights in, terms out.
-const WEIGHT_ORDER = Object.keys(DEFAULT_WEIGHTS);
+// The native fit's orders (lib/host/rig_fit.c3): weights in, terms out. `swap`
+// is agreeViews', before the fit.
+const WEIGHT_ORDER = Object.keys(DEFAULT_WEIGHTS).filter((k) => k !== 'swap');
 const TERM_ORDER = ['reproj', 'acc', 'floor', 'inPlace', 'marks', 'lateral', 'heading', 'twist', 'rest', 'chain', 'thetaAcc', 'limit', 'level', 'follow'];
 // The main fit's iterations between breaths, so the host keeps drawing.
 const SLICE = 50;
@@ -172,6 +175,58 @@ class Adam {
 			}
 		}
 	}
+}
+
+// Each limb pair's reads over the frames, straight (S [T G]) or crossed (C),
+// as a chain that starts straight and pays `penalty` each change over: its
+// soft-min over every way through (temperature tau), summed over the pairs,
+// and each frame's crossed share (forward-backward) into `share`.
+function pairChain(S, C, T, G, penalty, tau, share) {
+	const lse = (a, b) => (a > b ? a + Math.log1p(Math.exp(b - a)) : b + Math.log1p(Math.exp(a - b)));
+	const f = new Float64Array(T * 2), b = new Float64Array(T * 2), jump = penalty / tau;
+	let total = 0;
+	for (let l = 0; l < G; l++) {
+		f[0] = -S[l] / tau;
+		f[1] = -C[l] / tau - jump;
+		for (let t = 1; t < T; t++) {
+			const s = -S[t * G + l] / tau, c = -C[t * G + l] / tau;
+			f[t * 2] = s + lse(f[t * 2 - 2], f[t * 2 - 1] - jump);
+			f[t * 2 + 1] = c + lse(f[t * 2 - 2] - jump, f[t * 2 - 1]);
+		}
+		b[(T - 1) * 2] = b[(T - 1) * 2 + 1] = 0;
+		for (let t = T - 2; t >= 0; t--) {
+			const s = -S[(t + 1) * G + l] / tau + b[t * 2 + 2], c = -C[(t + 1) * G + l] / tau + b[t * 2 + 3];
+			b[t * 2] = lse(s, c - jump);
+			b[t * 2 + 1] = lse(s - jump, c);
+		}
+		const z = lse(f[(T - 1) * 2], f[(T - 1) * 2 + 1]);
+		for (let t = 0; t < T; t++) share[t * G + l] = Math.exp(f[t * 2 + 1] + b[t * 2 + 1] - z);
+		total += -tau * z;
+	}
+	return total;
+}
+
+// The mirror limbs of `points` on `rig`: each point's partner (its index, -1
+// for none) and the limb pair both are in (-1 for none), and how many pairs.
+function limbPairs(rig, points) {
+	const names = rig.names, J = names.length, P = points.length;
+	const limb = new Int32Array(J).fill(-1), ids = new Map();
+	for (let j = 1; j < J; j++) {
+		if (limb[rig.parents[j]] >= 0) { limb[j] = limb[rig.parents[j]]; continue; }
+		const mate = names.indexOf(partner(names[j]));
+		if (mate < 0 || mate === j) continue;
+		const key = Math.min(j, mate);
+		if (!ids.has(key)) ids.set(key, ids.size);
+		limb[j] = ids.get(key);
+	}
+	const partnerOf = new Int32Array(P).fill(-1), group = new Int32Array(P).fill(-1);
+	points.forEach((p, i) => {
+		const k = points.findIndex((q) => q.name === partner(p.name));
+		if (k < 0 || k === i || limb[p.joint] < 0 || limb[points[k].joint] !== limb[p.joint]) return;
+		partnerOf[i] = k;
+		group[i] = limb[p.joint];
+	});
+	return { partner: partnerOf, group, G: ids.size };
 }
 
 // The problem: the rig, the points and their hypotheses over T frames, seen
@@ -956,18 +1011,95 @@ export function observations(rig, tracks, markers = {}, { frames = tracks.frames
 	return { T, H, points, markers: marked.length, x, y, w, gamma: gamma ?? (tracks.boxes ? 2 : 0) };
 }
 
+// Studio views whose mirror limbs disagree (one reads a hidden foot on the
+// other): per frame and limb pair, whether view v reads it crossed against
+// view 0, by how well each point's two reads meet in one place through the
+// known cameras, in stretches each costing `swap` (pairChain); those reads
+// swapped in place. The frames crossed, per view.
+function agreeViews(rig, all, cameras, swap, sigma) {
+	const T = all[0].T, sigma2 = sigma * sigma;
+	const rows = cameras.map((c) => {
+		const s = Math.exp(c.logS), cy = Math.cos(c.yaw), sy = Math.sin(c.yaw), cp = Math.cos(c.pitch), sp = Math.sin(c.pitch);
+		return [[s * cy, 0, s * sy], [s * sp * sy, s * cp, -s * sp * cy]];
+	});
+	// The surest read of point p on frame t, as its index, or -1.
+	const surest = (o, t, p) => {
+		let k = -1;
+		for (let h = 0, i = (t * o.points.length + p) * o.H; h < o.H; h++, i++) if (o.w[i] > 0 && (k < 0 || o.w[i] > o.w[k])) k = i;
+		return k;
+	};
+	// How far apart reads a (view 0) and b (view v) are, as one point seen twice.
+	const apart = (v, a, b) => {
+		const A = [...rows[0], ...rows[v]];
+		const u = [all[0].x[a] - cameras[0].shift[0], all[0].y[a] - cameras[0].shift[1], all[v].x[b] - cameras[v].shift[0], all[v].y[b] - cameras[v].shift[1]];
+		const N = [0, 0, 0, 0, 0, 0, 0, 0, 0], r = [0, 0, 0];
+		for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) { r[j] += A[i][j] * u[i]; for (let k = 0; k < 3; k++) N[j * 3 + k] += A[i][j] * A[i][k]; }
+		for (let j = 0; j < 3; j++) N[j * 4] += 1e-9 * (N[0] + N[4] + N[8]);
+		const X = solve3(N, r);
+		let e2 = 0;
+		for (let i = 0; i < 4; i++) e2 += (A[i][0] * X[0] + A[i][1] * X[1] + A[i][2] * X[2] - u[i]) ** 2;
+		return e2;
+	};
+	const o0 = all[0], crossed = [0];
+	for (let v = 1; v < all.length; v++) {
+		const o = all[v], P = o.points.length, pairs = limbPairs(rig, o.points), G = pairs.G;
+		const S = new Float64Array(T * G), C = new Float64Array(T * G), share = new Float64Array(T * G);
+		const in0 = o.points.map((p) => o0.points.findIndex((q) => q.name === p.name));
+		for (let t = 0; t < T; t++) {
+			for (let p = 0; p < P; p++) {
+				const l = pairs.group[p], a = in0[p] < 0 ? -1 : surest(o0, t, in0[p]);
+				if (l < 0 || a < 0) continue;
+				for (const [into, from] of [[S, p], [C, pairs.partner[p]]]) {
+					const b = surest(o, t, from);
+					if (b < 0) continue;
+					const pull = o.gamma > 0 ? (o0.w[a] * o.w[b]) ** o.gamma : 1;
+					into[t * G + l] += pull * sigma2 * Math.log1p(apart(v, a, b) / sigma2);
+				}
+			}
+		}
+		if (!G) { crossed.push(0); continue; }
+		pairChain(S, C, T, G, swap * sigma2, 1, share);
+		let n = 0;
+		for (let t = 0; t < T; t++) {
+			let any = false;
+			for (let p = 0; p < P; p++) {
+				const l = pairs.group[p], q = pairs.partner[p];
+				if (l < 0 || q < p || !(share[t * G + l] > 0.5)) continue;
+				any = true;
+				for (let h = 0, i = (t * P + p) * o.H, k = (t * P + q) * o.H; h < o.H; h++, i++, k++) {
+					for (const arr of [o.x, o.y, o.w]) [arr[i], arr[k]] = [arr[k], arr[i]];
+				}
+			}
+			if (any) n++;
+		}
+		crossed.push(n);
+	}
+	return crossed;
+}
+
+// The solution of the 3x3 system N x = r (row-major), by Cramer's rule.
+function solve3(N, r) {
+	const det = (m) => m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+	const D = det(N), x = [0, 0, 0];
+	if (!(Math.abs(D) > 0)) return x;
+	for (let i = 0; i < 3; i++) {
+		const M = N.slice();
+		for (let k = 0; k < 3; k++) M[k * 3 + i] = r[k];
+		x[i] = det(M) / D;
+	}
+	return x;
+}
+
 // One frame's observations: the labels of keyframe `k` alone, weighted by
 // their scores as the whole clip's are (a label's is 1, a found joint's how
 // sure the finder was).
 function keyframeObservations(obs, tracks, k) {
-	const P = obs.points.length;
+	const P = obs.points.length, H = obs.H;
 	const x = new Float64Array(P), y = new Float64Array(P), w = new Float64Array(P);
 	const h = tracks.hypotheses.findIndex((hyp) => hyp.from === k);
-	const row = tracks.hypotheses[h].frames.indexOf(k);
 	for (let p = 0; p < P; p++) {
-		const q = tracks.hypotheses[h].tracks[row][p];
-		if (!q) continue;
-		x[p] = q[0]; y[p] = -q[1]; w[p] = Math.min(1, Math.max(0.05, ((tracks.hypotheses[h].scores[row][p] ?? 1) - 0.2) / 0.4));
+		const i = (k * P + p) * H + h;
+		x[p] = obs.x[i]; y[p] = obs.y[i]; w[p] = obs.w[i];
 	}
 	return { T: 1, H: 1, points: obs.points, markers: obs.markers, x, y, w, gamma: obs.gamma };
 }
@@ -1101,6 +1233,8 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	// following camera (in place, heading, the floor at the lowest foot) are off.
 	const cameras = views.every((v) => v.camera) ? views.map((v) => v.camera) : null;
 	if (cameras) weights = { inPlace: 0, heading: 0, floor: 0, ...weights };
+	const crossed = cameras && V > 1 ? agreeViews(rig, all, cameras, { ...DEFAULT_WEIGHTS, ...weights }.swap, sigma) : null;
+	if (crossed) llm.print(`  views agreed: limbs read crossed against view 0 on ${crossed.slice(1).join(', ')} frames`);
 	const k0 = cameras ? Math.exp(cameras[0].logS) : pixelsPerUnit(rig, keyObs);
 
 	const allKeys = [...new Set(keysOf.flat())].sort((x, y) => x - y);
@@ -1314,6 +1448,8 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 		terms: Object.fromEntries(Object.entries(fit.terms).map(([k, v]) => [k, round(v, 3)])),
 		seconds: round((llm.now() - t0) / 1000, 1),
 	};
+	// Per view, the frames on which its limbs were read crossed against view 0's.
+	if (crossed) report.crossed = crossed;
 	if (V > 1) report.views = viewErrors.map((errs, v) => ({ reprojection_px: stats(errs), camera: camera(v) }));
 	// The points the fit misses most, by their median error: where to look first.
 	report.worst_points = viewErrors.map((errs, v) => errs.byPoint
