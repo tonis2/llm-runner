@@ -88,7 +88,7 @@ export async function loadPlugins(root = llm.root, settings = readSettings()) {
 	for (const p of plugins) {
 		if (!p.enabled || !p.nodes || p.error) continue;
 		try {
-			await llm.importModule(`/${p.path}/${p.nodes}`);
+			await import(`/${p.path}/${p.nodes}`);
 			p.loaded = true;
 		} catch (e) {
 			p.error = e.message ?? String(e);

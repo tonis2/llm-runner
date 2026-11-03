@@ -187,13 +187,13 @@ fn String kickoff_script(String plugin, String config, String plugins_root) @loc
 	s.appendf("globalThis.__llm_root = %s;\n", quote(plugins_root));
 	s.appendf("globalThis.__llm_config = JSON.parse(%s);\n", quote(config));
 	s.appendf("globalThis.__llm_cancel = false;\n");
-	// fastjs has no import(): the imports are modules of their own, the
-	// breather set before the plugin's main.js runs.
-	s.append(`await __llm.evalModule("import { setBreather } from 'core/gpu.js';\n"
-	+ "setBreather(() => { if (globalThis.__llm_cancel) throw new Error('stopped'); return three.nextFrame(); });\n", '__llm_job_breather.js');
+	s.append(`const gpu = await import('core/gpu.js');
+gpu.setBreather(() => {
+	if (globalThis.__llm_cancel) throw new Error('stopped');
+	return three.nextFrame();
+});
 `);
-	s.appendf("await __llm.evalModule('import ' + JSON.stringify(%s) + ';', '__llm_job_main.js');\n",
-		quote(string::tformat("plugins/%s/main.js", plugin)));
+	s.appendf("await import(%s);\n", quote(string::tformat("plugins/%s/main.js", plugin)));
 	s.append(`const p = globalThis.__llm_plugin;
 if (!p) throw new Error('the plugin did not register itself - its main.js calls llm.plugin({ ... })');
 (async () => {

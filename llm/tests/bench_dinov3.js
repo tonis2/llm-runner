@@ -4,7 +4,6 @@
 // `profile=true` adds the time by kernel.
 import { llm, f32, Tensor, GGML } from '/core/llm.js';
 import { DinoV3 } from '/core/models/dinov3.js';
-import { profileReport } from '/core/gpu.js';
 
 const cfg = globalThis.__llm_config;
 const linear = cfg.linear ?? 'q8';
@@ -77,7 +76,7 @@ for (let i = 0; i < passes; i++) {
 	feat.dispose();
 }
 enc.dispose();
-profileReport('dinov3');
+(await import('/core/gpu.js')).profileReport('dinov3');
 const best = Math.min(...times);
 const flops = DEPTH * 1029 * 2 * (4 * D * D + 3 * D * F) + DEPTH * 4 * 1029 * 1029 * D;
 llm.print(`DINOv3 ViT-H+ ${linear}, ${DEPTH} blocks at 512x512: best ${(best / 1000).toFixed(2)} s a pass (${times.map((t) => (t / 1000).toFixed(2)).join(', ')}), ${(flops / best / 1e9).toFixed(2)} TFLOPS`);

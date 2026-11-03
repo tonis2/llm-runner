@@ -45,7 +45,7 @@ import std::encoding::base64;
  (`host`); raise this when a verb is added or changes, so a newer core is
  refused with a reason instead of failing on a missing verb.
 *>
-const int API = 3;
+const int API = 4;
 
 // --- Handle tables ---------------------------------------------------------------
 
@@ -107,7 +107,6 @@ fn void? install(three::JsRuntime* runtime)
 	js.@bind(host, "homeDir", &js_home_dir, runtime)!;
 	js.@bind(host, "base64Encode", &js_base64_encode, runtime)!;
 	js.@bind(host, "base64Decode", &js_base64_decode, runtime)!;
-	js.@bind(host, "evalModule", &js_eval_module, runtime)!;
 
 	js.@bind(host, "modelOpen", &js_model_open, runtime)!;
 	js.@bind(host, "modelClose", &js_model_close, runtime)!;
@@ -405,21 +404,6 @@ fn js::Value? js_base64_decode(js::Engine* js, String text)
 	if (catch data) return js.fail("that is not base64")~;
 	defer mem::free(data);
 	return byte_array(js, data);
-}
-
-<*
- `evalModule(source, name)` - evaluate `source` as an ES module named `name`
- and answer the promise for its evaluation. Its imports resolve through the
- runtime's loader like any other module's, and a module already loaded is
- not run again.
-
- fastjs has no `import()`. `llm.import(specifier)` (`llm/core/llm.js`) stands in
- for it: a one-line module that imports the specifier and hands its namespace
- back through a global.
-*>
-fn js::Value? js_eval_module(js::Engine* js, String source, String name)
-{
-	return js.eval(source, name, MODULE);
 }
 
 // --- Models ----------------------------------------------------------------------

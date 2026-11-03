@@ -188,9 +188,6 @@ export const image = {
 	},
 };
 
-// What `llm.importModule` has handed over and not yet taken back, by call.
-let imports = 0;
-
 export const llm = {
 	// The llm folder (core/, apps/, plugins/), as the runner was pointed at it.
 	root: globalThis.__llm_root ?? 'llm',
@@ -217,19 +214,6 @@ export const llm = {
 	makeDir(path) { H.makeDir(path); },
 	base64Encode(bytes) { return H.base64Encode(bytes); },
 	base64Decode(text) { return H.base64Decode(text); },
-
-	// `import(specifier)`, which fastjs does not have: a one-line module imports
-	// the specifier and hands its namespace back. The specifier resolves as a
-	// static import in a file at the llm folder's top does ('/core/x.js' or
-	// 'core/x.js'), and a module already loaded is not run again.
-	async importModule(specifier) {
-		const id = imports++;
-		const slots = (globalThis.__llm_imports ??= {});
-		await H.evalModule(`import * as ns from ${JSON.stringify(specifier)};\nglobalThis.__llm_imports[${id}] = ns;\n`, `__llm_import_${id}.js`);
-		const ns = slots[id];
-		delete slots[id];
-		return ns;
-	},
 
 	// A path under the llm folder: llm.path("core/kernels/x.shady").
 	path(relative) { return `${this.root}/${relative}`; },
