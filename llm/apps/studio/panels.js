@@ -429,4 +429,4 @@ function togglePlugin(p, on) {
 	app.widgets.dialogs.update();
 }
 
-export { dropImages, safe } from './app.js';
+export { dropImages, safe };
