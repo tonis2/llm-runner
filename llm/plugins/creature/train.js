@@ -135,7 +135,7 @@ export class Backdrops {
 
 	// One made-up background, size x size x 3. Its draws here, its loops in
 	// native code when the host has it (lib/host/finder_train.c3, the same
-	// arithmetic): in QuickJS one takes about 75 ms.
+	// arithmetic): in a JS interpreter one took about 75 ms.
 	made(native = llm.trainNative) {
 		const S = this.size, r = this.random, px = new Uint8Array(S * S * 3);
 		const kind = r.int(5);
@@ -334,8 +334,8 @@ async function subspace(cov, D, rank, random, iterations) {
 // row brought to unit length first (rows of very different lengths square to
 // a Gram matrix past float64's precision), a little added to the diagonal for
 // rows with next to nothing left of their own. Native code when the host has
-// it (lib/host/finder_train.c3, the same steps): in QuickJS a 384 x 2560 call
-// takes about fifteen seconds, and the PCA makes twenty-two.
+// it (lib/host/finder_train.c3, the same steps): in a JS interpreter a 384 x 2560 call
+// took about fifteen seconds, and the PCA makes twenty-two.
 export function orthonormalRows(Z, n, D, native = llm.trainNative) {
 	if (native) return llm.orthonormalRows(Z, n, D);
 	for (let pass = 0; pass < 2; pass++) {
@@ -382,7 +382,7 @@ export function orthonormalRows(Z, n, D, native = llm.trainNative) {
 
 // Adam on the GPU: each parameter is the head's own tensor, its gradient the
 // step's buffer of the same layout, its moments kept beside it. Nothing comes
-// back to the host until the head is saved (in QuickJS the step's loops took
+// back to the host until the head is saved (in a JS interpreter the step's loops took
 // longer than the step's matmuls).
 class Adam {
 	constructor(params, { lr, decay }) {

@@ -39,7 +39,7 @@ export function writeSettings(settings) {
 	writeText(path, JSON.stringify(settings, null, '\t') + '\n');
 }
 
-// A text file, as UTF-8. QuickJS has no TextEncoder.
+// A text file, as UTF-8. fastjs has no TextEncoder.
 export function writeText(path, text) {
 	llm.writeBytes(path, utf8(text));
 }
@@ -88,7 +88,7 @@ export async function loadPlugins(root = llm.root, settings = readSettings()) {
 	for (const p of plugins) {
 		if (!p.enabled || !p.nodes || p.error) continue;
 		try {
-			await import(`/${p.path}/${p.nodes}`);
+			await llm.importModule(`/${p.path}/${p.nodes}`);
 			p.loaded = true;
 		} catch (e) {
 			p.error = e.message ?? String(e);

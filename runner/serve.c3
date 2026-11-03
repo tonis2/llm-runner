@@ -20,7 +20,7 @@ import std::io;
 import std::net;
 import std::core::mem;
 import std::encoding::base64;
-import qjs;
+import fastjs::js;
 
 three::JsRuntime* serving;
 http::HttpRequest* current;
@@ -38,12 +38,12 @@ fn bool serve(three::JsRuntime* runtime, String bind, uint port)
 	reply_body.init(mem, 4096);
 	defer { reply_type.free(); reply_body.free(); }
 
-	qjs::Value global = runtime.js.global();
-	defer runtime.js.release(global);
-	qjs::Value host = runtime.js.property(global, "__llm");
-	defer runtime.js.release(host);
-	runtime.bind(host, "request", &js_request, 0);
-	runtime.bind(host, "respond", &js_respond, 3);
+	js::Engine* js = runtime.js;
+	if (catch bind_verbs(js))
+	{
+		io::printfn("llm-runner: could not install the server verbs: %s", js.take_error(tmem));
+		return false;
+	}
 
 	if (catch err = server::serve(bind, port, &handle))
 	{
@@ -51,6 +51,13 @@ fn bool serve(three::JsRuntime* runtime, String bind, uint port)
 		return false;
 	}
 	return true;
+}
+
+fn void? bind_verbs(js::Engine* js) @local
+{
+	js::Value host = js.get(js.global(), "__llm")!;
+	js.@bind(host, "request", &js_request)!;
+	js.@bind(host, "respond", &js_respond)!;
 }
 
 fn void handle(net::Socket* sock, http::HttpRequest* req)
@@ -98,42 +105,33 @@ if (p.handle) {
  `request()` - the request being answered: `{ method, path, body }`, the body
  as text.
 *>
-fn void js_request(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+fn js::Value? js_request(js::Engine* js)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (current == null)
-	{
-		*out = qjs::null_value();
-		return;
-	}
-	qjs::Value r = js.object();
-	js.set_property(r, "method", js.string(current.method));
-	js.set_property(r, "path", js.string(current.path));
-	js.set_property(r, "body", js.string((String)current.body));
-	*out = r;
+	if (current == null) return js::NULL;
+	js::Value r = js.object()!;
+	js.set(r, "method", js.string(current.method)!)!;
+	js.set(r, "path", js.string(current.path)!)!;
+	js.set(r, "body", js.string((String)current.body)!)!;
+	return r;
 }
 
 <*
  `respond(status, contentType, body)` - what goes back. `body` is text or bytes.
 *>
-fn void js_respond(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+fn void js_respond(js::Engine* js, int status, String content_type, js::Value body)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	reply_status = three::arg_int(&js, argc, args, 0);
+	reply_status = status;
 	reply_type.clear();
-	reply_type.append(three::arg_text(&js, argc, args, 1, tmem));
+	reply_type.append(content_type);
 	reply_body.clear();
-	if (argc >= 3)
+	char[] bytes = js::bytes(body);
+	if (bytes.len > 0)
 	{
-		char[] bytes = js.bytes(args[2]);
-		if (bytes.len > 0)
-		{
-			reply_body.append((String)bytes);
-		}
-		else
-		{
-			reply_body.append(three::arg_text(&js, argc, args, 2, tmem));
-		}
+		reply_body.append((String)bytes);
+	}
+	else if (!body.is_undefined())
+	{
+		reply_body.append(js.text(body, tmem));
 	}
 	replied = true;
 }

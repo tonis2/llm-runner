@@ -3,7 +3,7 @@
   "warnings": [ "no-unused" ],
   "dependency-search-paths": ["lib/three.c3l/lib"],
   "dependencies": [
-                   "shady", "quickjs", "mcp", "c3w", "collision", "ktx", "font", "cui", "vk", "image", "gltf"],
+                   "shady", "fastjs", "mcp", "c3w", "collision", "ktx", "font", "cui", "vk", "image", "gltf"],
   "authors": [ "John Doe <john.doe@example.com>" ],
   "version": "0.1.0",
   "sources": [

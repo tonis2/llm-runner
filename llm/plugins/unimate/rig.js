@@ -5,7 +5,7 @@
 
 import { llm } from '/core/llm.js';
 
-// UTF-8 bytes as a string (QuickJS has no TextDecoder).
+// UTF-8 bytes as a string (fastjs has no TextDecoder).
 export function utf8(bytes) {
 	let s = '';
 	for (let i = 0; i < bytes.length;) {

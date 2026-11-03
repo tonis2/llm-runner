@@ -13,7 +13,7 @@
 
 import { cropGeometry, uploadImage, warpCropGpu as warpGpu, IMAGENET } from '/core/image/warp.js';
 
-export { cropGeometry, uploadImage };
+export { cropGeometry, uploadImage } from '/core/image/warp.js';
 
 export const SIZE = 512;
 const MEAN = IMAGENET.mean;

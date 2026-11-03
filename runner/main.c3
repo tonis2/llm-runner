@@ -244,7 +244,11 @@ fn void ui_setup(three::JsRuntime* runtime)
 	// wherever the models are.
 	runtime.browse_anywhere = true;
 	host::shutdown();
-	host::install(runtime);
+	if (catch host::install(runtime))
+	{
+		io::printfn("llm-runner: could not install the host verbs: %s", runtime.js.take_error(tmem));
+		return;
+	}
 	three::RunResult setup = runtime.run(config_script(&ui_options), "config");
 	defer setup.free();
 	report(&setup, "reading the config");
@@ -282,7 +286,7 @@ fn int main(String[] args)
 	runtime.open(&renderer.pass, renderer, memory_limit: 0)!!;
 	defer runtime.close();
 	runtime.script_budget_ns = 0;
-	host::install(&runtime);
+	host::install(&runtime)!!;
 	defer host::shutdown();
 
 	io::printfn("llm-runner: %s", ((ZString)&renderer.gpu.limits.device_name).str_view());

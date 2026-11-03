@@ -1,6 +1,6 @@
 {
   "provides": "llm",
-  "dependencies": ["vk", "image", "quickjs"],
+  "dependencies": ["vk", "image", "fastjs"],
   "sources": ["lib/gguf/**", "lib/model/**", "lib/host/**", "lib/pipeline/**"],
   "targets": {
     "macos-aarch64": {

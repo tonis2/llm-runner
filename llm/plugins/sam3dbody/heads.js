@@ -396,4 +396,4 @@ export function projectAt(points, t, { crop, cam }) {
 	return { focal_length: f, pred_keypoints_2d: kp2d, pred_keypoints_2d_cropped: cropped, pred_keypoints_2d_depth: depth };
 }
 
-export { JOINTS };
+export { JOINTS } from './mhr.js';

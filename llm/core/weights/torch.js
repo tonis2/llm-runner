@@ -21,7 +21,12 @@ import { Model } from '/core/llm.js';
 
 const H = globalThis.__llm;
 
-// QuickJS has no TextDecoder.
+// 64-bit little-endian integers as doubles (fastjs has no BigInt): exact to
+// 2^53, far past any size or offset a zip or a checkpoint holds.
+function u64(dv, at) { return dv.getUint32(at, true) + dv.getUint32(at + 4, true) * 4294967296; }
+function i64(dv, at) { return dv.getUint32(at, true) + dv.getInt32(at + 4, true) * 4294967296; }
+
+// fastjs has no TextDecoder.
 export function utf8(bytes) {
 	let s = '';
 	for (let i = 0; i < bytes.length;) {
@@ -70,12 +75,12 @@ export function zipEntries(reader) {
 	if (count === 0xffff || dirAt === 0xffffffff || dirSize === 0xffffffff) {
 		const loc = eocd - 20;
 		if (loc < 0 || tv.getUint32(loc, true) !== 0x07064b50) throw new Error('zip64 locator missing');
-		const recAt = Number(tv.getBigUint64(loc + 8, true));
+		const recAt = u64(tv, loc + 8);
 		const rv = view(reader.read(recAt, 56));
 		if (rv.getUint32(0, true) !== 0x06064b50) throw new Error('bad zip64 end record');
-		count = Number(rv.getBigUint64(32, true));
-		dirSize = Number(rv.getBigUint64(40, true));
-		dirAt = Number(rv.getBigUint64(48, true));
+		count = u64(rv, 32);
+		dirSize = u64(rv, 40);
+		dirAt = u64(rv, 48);
 	}
 	const dir = reader.read(dirAt, dirSize);
 	const dv = view(dir);
@@ -98,9 +103,9 @@ export function zipEntries(reader) {
 			const id = dv.getUint16(e, true), len = dv.getUint16(e + 2, true);
 			if (id === 0x0001) {
 				let q = e + 4;
-				if (size === 0xffffffff) { q += 8; size = Number(dv.getBigUint64(q, true)); q += 8; }
+				if (size === 0xffffffff) { q += 8; size = u64(dv, q); q += 8; }
 				else if (dv.getUint32(p + 20, true) === 0xffffffff) q += 8;
-				if (local === 0xffffffff) local = Number(dv.getBigUint64(q, true));
+				if (local === 0xffffffff) local = u64(dv, q);
 			}
 			e += 4 + len;
 		}
@@ -207,12 +212,15 @@ export function unpickle(bytes, persistent = torchStorage) {
 	const top = () => stack[stack.length - 1];
 	const text = (n) => { const s = utf8(bytes.subarray(p, p + n)); p += n; return s; };
 	const line = () => { const e = bytes.indexOf(10, p); const s = utf8(bytes.subarray(p, e)); p = e + 1; return s; };
+	// A little-endian two's-complement integer of n bytes, in doubles (fastjs has
+	// no BigInt): a negative one is the complement's magnitude, less one. Exact
+	// to 2^53, far past any size, offset or stride a checkpoint pickles.
 	const long = (n) => {
-		let v = 0n;
-		for (let i = n - 1; i >= 0; i--) v = (v << 8n) | BigInt(bytes[p + i]);
-		if (n > 0 && bytes[p + n - 1] & 0x80) v -= 1n << BigInt(8 * n);
+		const negative = n > 0 && (bytes[p + n - 1] & 0x80) !== 0;
+		let v = 0;
+		for (let i = n - 1; i >= 0; i--) v = v * 256 + (negative ? 255 - bytes[p + i] : bytes[p + i]);
 		p += n;
-		return Number(v);
+		return negative ? -v - 1 : v;
 	};
 	const setItems = (d, items) => {
 		for (let i = 0; i < items.length; i += 2) {
@@ -262,7 +270,7 @@ export function unpickle(bytes, persistent = torchStorage) {
 			case 0x47: stack.push(dv.getFloat64(p, false)); p += 8; break; // BINFLOAT
 			case 0x46: stack.push(Number(line())); break; // FLOAT
 			case 0x58: { const n = dv.getUint32(p, true); p += 4; stack.push(text(n)); break; } // BINUNICODE
-			case 0x8d: { const n = Number(dv.getBigUint64(p, true)); p += 8; stack.push(text(n)); break; } // BINUNICODE8
+			case 0x8d: { const n = u64(dv, p); p += 8; stack.push(text(n)); break; } // BINUNICODE8
 			case 0x8c: { const n = bytes[p++]; stack.push(text(n)); break; } // SHORT_BINUNICODE
 			case 0x56: stack.push(line()); break; // UNICODE (raw-unicode-escape; ASCII in practice)
 			case 0x54: { const n = dv.getInt32(p, true); p += 4; stack.push(text(n)); break; } // BINSTRING
@@ -270,7 +278,7 @@ export function unpickle(bytes, persistent = torchStorage) {
 			case 0x53: stack.push(line().replace(/^'|'$/g, '')); break; // STRING
 			case 0x42: { const n = dv.getUint32(p, true); p += 4; stack.push(bytes.slice(p, p + n)); p += n; break; } // BINBYTES
 			case 0x43: { const n = bytes[p++]; stack.push(bytes.slice(p, p + n)); p += n; break; } // SHORT_BINBYTES
-			case 0x8e: case 0x96: { const n = Number(dv.getBigUint64(p, true)); p += 8; stack.push(bytes.slice(p, p + n)); p += n; break; } // BINBYTES8, BYTEARRAY8
+			case 0x8e: case 0x96: { const n = u64(dv, p); p += 8; stack.push(bytes.slice(p, p + n)); p += n; break; } // BINBYTES8, BYTEARRAY8
 			case 0x71: memo.set(bytes[p++], top()); break; // BINPUT
 			case 0x72: memo.set(dv.getUint32(p, true), top()); p += 4; break; // LONG_BINPUT
 			case 0x70: memo.set(Number(line()), top()); break; // PUT
@@ -397,11 +405,11 @@ export function openTorch(path, { select = null } = {}) {
 		const dv = view(raw), n = t.elements, out = new Array(n);
 		for (let i = 0; i < n; i++) {
 			switch (t.dtype) {
-				case 'I64': out[i] = Number(dv.getBigInt64(i * 8, true)); break;
+				case 'I64': out[i] = i64(dv, i * 8); break;
 				case 'I32': out[i] = dv.getInt32(i * 4, true); break;
 				case 'I16': out[i] = dv.getInt16(i * 2, true); break;
 				case 'I8': out[i] = dv.getInt8(i); break;
-				case 'U64': out[i] = Number(dv.getBigUint64(i * 8, true)); break;
+				case 'U64': out[i] = u64(dv, i * 8); break;
 				case 'U32': out[i] = dv.getUint32(i * 4, true); break;
 				case 'U16': out[i] = dv.getUint16(i * 2, true); break;
 				case 'U8': case 'BOOL': out[i] = raw[i]; break;

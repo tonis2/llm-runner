@@ -1,6 +1,6 @@
 <*
  The joint-finder trainer's host loops (`llm/plugins/creature/train.js`) in
- C3: QuickJS runs them slowly, and the GPU waits while it does. Each is a
+ C3: a JS interpreter runs them slowly, and the GPU waits while it does. Each is a
  line-for-line port of its JS function, in the same order and precision, so
  the two agree (to rounding for the float64 one, byte for byte for the
  pictures); train.js keeps the JS as the reference and the fallback.
@@ -24,11 +24,13 @@
 module llm::host;
 
 import three;
-import qjs;
+import fastjs::js;
 import std::math;
 
-macro double[] @f64s(js, value) => (double[])((double*)js.bytes(value).ptr)[:js.bytes(value).len / 8];
-macro float[] @f32s(js, value) => (float[])((float*)js.bytes(value).ptr)[:js.bytes(value).len / 4];
+// A typed array's bytes read as doubles or floats, whatever its element type;
+// anything else is empty.
+macro double[] @f64s(value) => (double[])((double*)js::bytes(value).ptr)[:js::bytes(value).len / 8];
+macro float[] @f32s(value) => (float[])((float*)js::bytes(value).ptr)[:js::bytes(value).len / 4];
 
 <*
  Rows of Z [n, D] made orthonormal, spanning the same space: train.js
@@ -159,63 +161,40 @@ fn void crop_nearest(char[] pixels, usz width, usz height, usz channels, double 
 	}
 }
 
-fn void js_orthonormal_rows(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
+fn void? js_orthonormal_rows(js::Engine* js, js::Value z_value, long n, long d)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (argc < 3) { *out = js.raise("orthonormalRows(Z, n, D)"); return; }
-	double[] z = @f64s(js, args[0]);
-	long n = three::arg_int(&js, argc, args, 1);
-	long d = three::arg_int(&js, argc, args, 2);
-	if (n <= 0 || d <= 0 || z.len < (usz)(n * d))
-	{
-		*out = js.raise("orthonormalRows: Z must be a Float64Array of n x D");
-		return;
-	}
+	double[] z = @f64s(z_value);
+	if (n <= 0 || d <= 0 || z.len < (usz)(n * d)) return js.fail("orthonormalRows: Z must be a Float64Array of n x D")~;
 	orthonormal_rows(z, (usz)n, (usz)d);
 }
 
-fn void js_image_composite(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
+fn void? js_image_composite(js::Engine* js, js::Value render, long channels, js::Value backdrop_value, js::Value out_value,
+	js::Value gains_value, double lift, double grain, js::Value noise_value, long noise_at)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (argc < 9) { *out = js.raise("imageComposite(render, channels, backdrop, out, gains, lift, grain, noise, noiseAt)"); return; }
-	char[] src = js.bytes(args[0]);
-	long channels = three::arg_int(&js, argc, args, 1);
-	char[] backdrop = js.bytes(args[2]);
-	char[] dst = js.bytes(args[3]);
-	double[] gains = @f64s(js, args[4]);
-	double lift = js.number(args[5]);
-	double grain = js.number(args[6]);
-	float[] noise = @f32s(js, args[7]);
-	long noise_at = three::arg_int(&js, argc, args, 8);
+	char[] src = js::bytes(render);
+	char[] backdrop = js::bytes(backdrop_value);
+	char[] dst = js::bytes(out_value);
+	double[] gains = @f64s(gains_value);
+	float[] noise = @f32s(noise_value);
 	usz pixels = dst.len / 3;
 	if ((channels != 3 && channels != 4) || dst.len % 3 != 0 || backdrop.len != dst.len || src.len < pixels * (usz)channels || gains.len < 3
 		|| (grain > 0 && (noise_at < 0 || (usz)noise_at + dst.len > noise.len)))
 	{
-		*out = js.raise("imageComposite: the render, backdrop, out, gains or noise do not match");
-		return;
+		return js.fail("imageComposite: the render, backdrop, out, gains or noise do not match")~;
 	}
 	composite(src, (usz)channels, backdrop, dst, { gains[0], gains[1], gains[2] }, lift, grain, noise, (usz)noise_at);
 }
 
-fn void js_image_crop_nearest(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
+fn void? js_image_crop_nearest(js::Engine* js, js::Value pixels_value, long width, long height, long channels,
+	double x0, double y0, double side, double flip_number, long size, js::Value out_value)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (argc < 10) { *out = js.raise("imageCropNearest(pixels, width, height, channels, x0, y0, side, flip, size, out)"); return; }
-	char[] pixels = js.bytes(args[0]);
-	long width = three::arg_int(&js, argc, args, 1);
-	long height = three::arg_int(&js, argc, args, 2);
-	long channels = three::arg_int(&js, argc, args, 3);
-	double x0 = js.number(args[4]);
-	double y0 = js.number(args[5]);
-	double side = js.number(args[6]);
-	bool flip = js.number(args[7]) != 0;
-	long size = three::arg_int(&js, argc, args, 8);
-	char[] dst = js.bytes(args[9]);
+	char[] pixels = js::bytes(pixels_value);
+	char[] dst = js::bytes(out_value);
+	bool flip = flip_number != 0;
 	if (width <= 0 || height <= 0 || channels < 3 || size <= 0 || pixels.len < (usz)(width * height * channels)
 		|| dst.len < (usz)(size * size * 3) || !(x0 >= 0) || !(y0 >= 0))
 	{
-		*out = js.raise("imageCropNearest: the image or the crop do not match");
-		return;
+		return js.fail("imageCropNearest: the image or the crop do not match")~;
 	}
 	crop_nearest(pixels, (usz)width, (usz)height, (usz)channels, x0, y0, side, flip, (usz)size, dst);
 }
@@ -312,18 +291,10 @@ fn void? backdrop(long kind, double[] p, usz size, char[] px)
 	}
 }
 
-fn void js_image_backdrop(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
+fn void? js_image_backdrop(js::Engine* js, long kind, js::Value params_value, long size, js::Value out_value)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (argc < 4) { *out = js.raise("imageBackdrop(kind, params, size, out)"); return; }
-	long kind = three::arg_int(&js, argc, args, 0);
-	double[] params = @f64s(js, args[1]);
-	long size = three::arg_int(&js, argc, args, 2);
-	char[] dst = js.bytes(args[3]);
-	if (size <= 0 || dst.len < (usz)(size * size * 3))
-	{
-		*out = js.raise("imageBackdrop: out must hold size x size x 3 bytes");
-		return;
-	}
-	if (catch backdrop(kind, params, (usz)size, dst)) *out = js.raise("imageBackdrop: the kind or its draws do not match Backdrops.made's");
+	double[] params = @f64s(params_value);
+	char[] dst = js::bytes(out_value);
+	if (size <= 0 || dst.len < (usz)(size * size * 3)) return js.fail("imageBackdrop: out must hold size x size x 3 bytes")~;
+	if (catch backdrop(kind, params, (usz)size, dst)) return js.fail("imageBackdrop: the kind or its draws do not match Backdrops.made's")~;
 }

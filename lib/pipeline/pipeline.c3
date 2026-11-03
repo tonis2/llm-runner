@@ -34,7 +34,7 @@
 module llm::pipeline;
 
 import three;
-import qjs;
+import fastjs::js;
 import llm::host;
 import std::io;
 import std::io::file;
@@ -154,14 +154,15 @@ fn void? Job.start(&self, three::Renderer* renderer, String plugin, String confi
 	active = self;
 	self.runtime.script_budget_ns = 0;
 	self.runtime.set_assets_root(plugins_root);
-	host::install(&self.runtime);
 	host::print_hook = &job_print;
 	host::print_context = self;
-
-	qjs::Value global = self.runtime.js.global();
-	self.runtime.js.set_property(global, "__llm_job_done", self.runtime.js.function(&js_job_done, "done", 2, &self.runtime));
-	self.runtime.js.set_property(global, "__llm_job_output", self.runtime.js.function(&js_job_output, "output", 2, &self.runtime));
-	self.runtime.js.release(global);
+	js::Engine* js = self.runtime.js;
+	if (catch err = install_job_verbs(&self.runtime))
+	{
+		self.state = FAILED;
+		self.outcome.appendf("could not install the host verbs: %s", js.take_error(tmem));
+		return JOB_NOT_STARTED~;
+	}
 
 	three::RunResult started = self.runtime.run(kickoff_script(plugin, config, plugins_root), "llm:start", drain_frame: false);
 	defer started.free();
@@ -186,13 +187,13 @@ fn String kickoff_script(String plugin, String config, String plugins_root) @loc
 	s.appendf("globalThis.__llm_root = %s;\n", quote(plugins_root));
 	s.appendf("globalThis.__llm_config = JSON.parse(%s);\n", quote(config));
 	s.appendf("globalThis.__llm_cancel = false;\n");
-	s.append(`const gpu = await import('core/gpu.js');
-gpu.setBreather(() => {
-	if (globalThis.__llm_cancel) throw new Error('stopped');
-	return three.nextFrame();
-});
+	// fastjs has no import(): the imports are modules of their own, the
+	// breather set before the plugin's main.js runs.
+	s.append(`await __llm.evalModule("import { setBreather } from 'core/gpu.js';\n"
+	+ "setBreather(() => { if (globalThis.__llm_cancel) throw new Error('stopped'); return three.nextFrame(); });\n", '__llm_job_breather.js');
 `);
-	s.appendf("await import(%s);\n", quote(string::tformat("plugins/%s/main.js", plugin)));
+	s.appendf("await __llm.evalModule('import ' + JSON.stringify(%s) + ';', '__llm_job_main.js');\n",
+		quote(string::tformat("plugins/%s/main.js", plugin)));
 	s.append(`const p = globalThis.__llm_plugin;
 if (!p) throw new Error('the plugin did not register itself - its main.js calls llm.plugin({ ... })');
 (async () => {
@@ -225,7 +226,7 @@ fn bool Job.pump(&self, long budget_ns = 12_000_000)
 	Clock began = clock::now();
 	while (self.state == RUNNING && self.runtime.js.jobs_waiting())
 	{
-		self.runtime.js.step_job();
+		self.runtime.step_job();
 		if ((long)began.to_now() >= budget_ns) break;
 	}
 	return self.state == RUNNING;
@@ -238,9 +239,8 @@ fn bool Job.pump(&self, long budget_ns = 12_000_000)
 fn void Job.cancel(&self)
 {
 	if (self.state != RUNNING) return;
-	qjs::Value global = self.runtime.js.global();
-	self.runtime.js.set_property(global, "__llm_cancel", qjs::bool_value(true));
-	self.runtime.js.release(global);
+	js::Engine* js = self.runtime.js;
+	(void)js.set(js.global(), "__llm_cancel", js::TRUE);
 }
 
 <*
@@ -283,26 +283,36 @@ fn void job_print(void* context, String line) @local
 	if (job.on_line) job.on_line(job.line_context, line);
 }
 
-fn void js_job_done(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+<*
+ The job's own verbs, beside the host's: `__llm_job_done(ok, outcome)` and
+ `__llm_job_output(name, bytes)`.
+
+ @return? js::THREW
+*>
+fn void? install_job_verbs(three::JsRuntime* runtime) @local
+{
+	host::install(runtime)!;
+	js::Engine* js = runtime.js;
+	js.@bind(js.global(), "__llm_job_done", &js_job_done, runtime)!;
+	js.@bind(js.global(), "__llm_job_output", &js_job_output, runtime)!;
+}
+
+fn void js_job_done(bool ok, String outcome)
 {
 	Job* job = active;
 	if (job == null || job.state != RUNNING) return;
-	qjs::Context js = qjs::wrap(ctx);
-	bool ok = argc > 0 && js.truth(args[0]);
 	job.outcome.clear();
-	job.outcome.append(three::arg_text(&js, argc, args, 1, tmem));
+	job.outcome.append(outcome);
 	job.state = ok ? DONE : FAILED;
 }
 
 // `__llm_job_output(name, bytes)`: keep a copy of the bytes under `name`,
 // replacing any handed over under it before.
-fn void js_job_output(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out) @local
+fn void js_job_output(String name, js::Value value)
 {
 	Job* job = active;
 	if (job == null || job.state != RUNNING) return;
-	qjs::Context js = qjs::wrap(ctx);
-	String name = three::arg_text(&js, argc, args, 0, tmem);
-	char[] bytes = argc >= 2 ? js.bytes(args[1]) : (char[]){};
+	char[] bytes = js::bytes(value);
 	char[] kept = bytes.len > 0 ? mem::new_array(char, bytes.len) : (char[]){};
 	if (bytes.len > 0) kept[..] = bytes[..];
 	foreach (&held : job.outputs)

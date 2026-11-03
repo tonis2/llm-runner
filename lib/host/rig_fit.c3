@@ -1,7 +1,7 @@
 <*
  The creature plugin's rig fit (`llm/plugins/creature/fit.js`, RigFit) in C3:
- its forward kinematics, loss, hand-written gradients and Adam, which QuickJS
- runs slowly. A line-for-line port in doubles, in the same order, so the two
+ its forward kinematics, loss, hand-written gradients and Adam, which a JS
+ interpreter runs slowly. A line-for-line port in doubles, in the same order, so the two
  agree to rounding; fit.js packs the problem (RigFit.native) and keeps the JS
  as the reference.
 
@@ -14,7 +14,8 @@
 module llm::host;
 
 import three;
-import qjs;
+import fastjs::js;
+import fastjs::js::opt;
 import std::math;
 import std::core::mem;
 
@@ -128,8 +129,10 @@ faultdef FIT_BAD_LAYOUT;
 macro double fit_nan() => bitcast(0x7FF8000000000000UL, double);
 macro double fit_inf() => bitcast(0x7FF0000000000000UL, double);
 
-macro double[] @doubles(js, value) => (double[])((double*)js.bytes(value).ptr)[:js.bytes(value).len / 8];
-macro int[] @ints(js, value) => (int[])((int*)js.bytes(value).ptr)[:js.bytes(value).len / 4];
+// A typed array's bytes read as doubles or ints, whatever its element type, as
+// these verbs always have; anything else is empty.
+macro double[] @doubles(value) => (double[])((double*)js::bytes(value).ptr)[:js::bytes(value).len / 8];
+macro int[] @ints(value) => (int[])((int*)js::bytes(value).ptr)[:js::bytes(value).len / 4];
 
 <*
  The problem from fit.js's packing: `ints` and `reals` RigFit.native's layout,
@@ -900,7 +903,7 @@ fn void RigProblem.adam_step(&self, double* am, double* av, double* lr, double t
 	}
 }
 
-fn qjs::Value fit_answer(qjs::Context* js, double[FIT_TERMS]* terms, double loss, double observed, double adam_t, double limit_scale) @local
+fn js::Value? fit_answer(js::Engine* js, double[FIT_TERMS]* terms, double loss, double observed, double adam_t, double limit_scale) @local
 {
 	double[FIT_ANSWER] out;
 	for (long i = 0; i < FIT_TERMS; i++) out[i] = (*terms)[i];
@@ -908,62 +911,50 @@ fn qjs::Value fit_answer(qjs::Context* js, double[FIT_TERMS]* terms, double loss
 	out[FIT_TERMS + 1] = observed;
 	out[FIT_TERMS + 2] = adam_t;
 	out[FIT_TERMS + 3] = limit_scale;
-	qjs::Value buffer = js.buffer_copy((char*)&out, FIT_ANSWER * 8);
-	defer js.release(buffer);
-	return js.typed_array(qjs::ARRAY_FLOAT64, buffer, 0, FIT_ANSWER);
+	return js.typed_copy(FLOAT64, ((char*)&out)[:FIT_ANSWER * 8]);
 }
 
 <*
  `rigFitEvaluate(ints, reals, obs, params, grads, tau, limitScale)`: the loss's
  gradient into grads; answers the terms, the loss and the count.
 *>
-fn void js_rig_fit_evaluate(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
+fn js::Value? js_rig_fit_evaluate(js::Engine* js, js::Value ints, js::Value reals, js::Value obs, js::Value params, js::Value grads,
+	double tau, double limit_scale)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (argc < 7) { *out = js.raise("rigFitEvaluate(ints, reals, obs, params, grads, tau, limitScale)"); return; }
 	RigProblem p;
 	defer p.free();
-	if (catch p.read(@ints(js, args[0]), @doubles(js, args[1]), @doubles(js, args[2]), @doubles(js, args[3]), @doubles(js, args[4])))
+	if (catch p.read(@ints(ints), @doubles(reals), @doubles(obs), @doubles(params), @doubles(grads)))
 	{
-		*out = js.raise("rigFitEvaluate: the arrays do not match RigFit.native's layout");
-		return;
+		return js.fail("rigFitEvaluate: the arrays do not match RigFit.native's layout")~;
 	}
-	p.limit_scale = js.number(args[6]);
+	p.limit_scale = limit_scale;
 	double[FIT_TERMS] terms;
-	double loss = p.evaluate(js.number(args[5]), &terms);
-	*out = fit_answer(&js, &terms, loss, p.observed, 0, p.limit_scale);
+	double loss = p.evaluate(tau, &terms);
+	return fit_answer(js, &terms, loss, p.observed, 0, p.limit_scale);
 }
 
 <*
  `rigFitSteps(ints, reals, obs, params, grads, adamM, adamV, lr, from, to,
  iterations, tau0, tau1, adamT, wide?)`: fit.js RigFit.run's iterations from..to.
 *>
-fn void js_rig_fit_steps(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qjs::Value* args, void* opaque, qjs::Value* out)
+fn js::Value? js_rig_fit_steps(js::Engine* js, js::Value ints, js::Value reals, js::Value obs, js::Value params, js::Value grads,
+	js::Value adam_m, js::Value adam_v, js::Value rates, long from, long to, long iterations, double tau0, double tau1, double adam_t,
+	Opt {double} wide_arg)
 {
-	qjs::Context js = qjs::wrap(ctx);
-	if (argc < 14) { *out = js.raise("rigFitSteps(ints, reals, obs, params, grads, adamM, adamV, lr, from, to, iterations, tau0, tau1, adamT)"); return; }
 	RigProblem p;
 	defer p.free();
-	if (catch p.read(@ints(js, args[0]), @doubles(js, args[1]), @doubles(js, args[2]), @doubles(js, args[3]), @doubles(js, args[4])))
+	if (catch p.read(@ints(ints), @doubles(reals), @doubles(obs), @doubles(params), @doubles(grads)))
 	{
-		*out = js.raise("rigFitSteps: the arrays do not match RigFit.native's layout");
-		return;
+		return js.fail("rigFitSteps: the arrays do not match RigFit.native's layout")~;
 	}
-	double[] am = @doubles(js, args[5]);
-	double[] av = @doubles(js, args[6]);
-	double[] lr = @doubles(js, args[7]);
+	double[] am = @doubles(adam_m);
+	double[] av = @doubles(adam_v);
+	double[] lr = @doubles(rates);
 	if (am.len != p.params || av.len != p.params || lr.len != 6)
 	{
-		*out = js.raise("rigFitSteps: Adam's moments are the params' size and lr has 6 rates");
-		return;
+		return js.fail("rigFitSteps: Adam's moments are the params' size and lr has 6 rates")~;
 	}
-	long from = three::arg_int(&js, argc, args, 8);
-	long to = three::arg_int(&js, argc, args, 9);
-	long iterations = three::arg_int(&js, argc, args, 10);
-	double tau0 = js.number(args[11]);
-	double tau1 = js.number(args[12]);
-	double adam_t = js.number(args[13]);
-	double wide = argc > 14 ? js.number(args[14]) : 1.0;
+	double wide = wide_arg.or(1.0);
 	double sigma2 = p.sigma2;
 	double[FIT_TERMS] terms;
 	for (long i = 0; i < FIT_TERMS; i++) terms[i] = fit_nan();
@@ -978,5 +969,5 @@ fn void js_rig_fit_steps(qjs::ContextRef ctx, qjs::Value* this_val, int argc, qj
 		adam_t += 1;
 		p.adam_step(am.ptr, av.ptr, lr.ptr, adam_t, 0.5 * (1 + math::cos((math::PI * it) / iterations)));
 	}
-	*out = fit_answer(&js, &terms, loss, p.observed, adam_t, p.limit_scale);
+	return fit_answer(js, &terms, loss, p.observed, adam_t, p.limit_scale);
 }
