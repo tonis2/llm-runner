@@ -51,6 +51,12 @@ export function frameSource(spec) {
 	};
 }
 
+// The first `n` frames of a frame source; the source itself when it has no more.
+export function firstFrames(frames, n) {
+	if (!(n < frames.count)) return frames;
+	return { ...frames, count: n, names: frames.names?.slice(0, n), image: (k) => frames.image(k) };
+}
+
 function videoSource(path) {
 	const info = llm.video.info(path);
 	if (!info.frames) throw bad(`frames: ${path} holds no frames`);

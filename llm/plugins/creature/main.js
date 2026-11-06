@@ -13,7 +13,7 @@
 //   POST /animate  { rig, frames, labels, markers?, region?, width?, fps?,
 //                    name?, travel?, travel_smooth?, iterations?, pitch?,
 //                    outputs?, views?, studio?, finder?, key_every?, flip?,
-//                    landmarks?, weights?, sigma?, confidence? }
+//                    landmarks?, weights?, sigma?, confidence?, max_frames? }
 //                  -> { name, frames, fps, joints, glb?, clip?, bvh?,
 //                       animated_glb?, tracks?, report }
 //   POST /track    { frames, labels, region?, width?, draw? }
@@ -77,7 +77,7 @@ import { llm } from '/core/llm.js';
 import { utf8 } from '/core/graph/plugins.js';
 import { loadBackbone } from './backbone.js';
 import { Tracker } from './track.js';
-import { frameSource, readLabels, drawTracks, bad } from './request.js';
+import { frameSource, firstFrames, readLabels, drawTracks, bad } from './request.js';
 import { readRig } from './rig.js';
 import { fitRig, DEFAULT_WEIGHTS } from './fit.js';
 import { fittedMotion, clipGlb, clipBvh, clipJson, animatedGlb } from './output.js';
@@ -232,8 +232,17 @@ function referenceOf(request) {
 	}
 }
 
-// The request's views: its `views`, or the request itself as the one view.
+// The request's views: its `views`, or the request itself as the one view;
+// with `max_frames`, each view's frames cut to that many from the start.
 function viewsOf(request) {
+	const views = allViewsOf(request);
+	if (request.max_frames === undefined || request.max_frames === null || request.max_frames === '') return views;
+	const n = Number(request.max_frames);
+	if (!Number.isInteger(n) || n < 1) throw bad(`max_frames: a whole number of frames, 1 or more, got ${JSON.stringify(request.max_frames)}`);
+	return views.map((v) => (v.frames === undefined ? v : { ...v, frames: firstFrames(framesOf(v.frames), n) }));
+}
+
+function allViewsOf(request) {
 	if (request.studio !== undefined) return studioViewsOf(request);
 	if (request.views === undefined) return [request];
 	if (!Array.isArray(request.views) || !request.views.length) throw bad('views: a list of views, each { frames, labels } or { tracks }, frame N of each the same moment');
@@ -380,6 +389,7 @@ const INFO = {
 		calibrate: 'with studio: put the cameras right by the first frame against the reference (true)',
 		sync: 'with studio: re-time the left view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
 		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
+		max_frames: 'read only the clip\'s first this many frames (all of them)',
 		key_every: 'with a finder: a keyframe for the fit to start from every so many frames (6)',
 		flip: 'with a finder: look at each crop mirrored as well, left read as right, and average (true; false to look once)',
 		landmarks: 'with a finder: which of its landmarks (points of the mesh) to fit: true for all, false for none, or a list of names (all but a mirror pair on one joint, such as a head\'s two sides)',
