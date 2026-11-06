@@ -5,7 +5,7 @@
 // anymove's sync check does.
 //
 //   const s = syncViews(frontTracks, sideTracks, [frontCamera, sideCamera]);
-//   s.report    { height_gap_px, worst_gap_px, best_lag, gap_at_lag_px, feet, retimed, ... }
+//   s.report    { height_gap_px, worst_gap_px, best_lag, gap_at_lag_px, repeat_frames, feet, retimed, ... }
 //   s.front     the front view's tracks, re-timed onto the side's when that helps
 //
 // The heights are taken without trusting left and right: a middle joint's as
@@ -13,6 +13,8 @@
 // a pair still agrees. When matching the views frame to frame by dynamic time
 // warping (DTW) brings the heights at least 15% closer, the front view's
 // tracks are resampled onto the side view's timeline.
+// Heights that repeat, as a run's do every step, can't say which step they are
+// on, so no shift goes as far as half a repeat.
 
 import { partner } from './detect.js';
 
@@ -62,6 +64,21 @@ function gap(F, S, i, j) {
 }
 
 const mean = (xs) => { const v = xs.filter(Number.isFinite); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN; };
+
+// How many frames the side view's heights take to come round again, or null when
+// they do not: a run's repeat every step, left and right being left out. The
+// first dip of the heights against themselves, well under the gap before it.
+const REPEAT_DIP = 0.5;
+function repeatOf(S) {
+	const most = Math.floor(S.length / 2), gaps = [];
+	for (let lag = 1; lag <= most; lag++) gaps[lag] = mean(Array.from({ length: S.length - lag }, (_, t) => gap(S, S, t + lag, t)));
+	let peak = 0;
+	for (let lag = 2; lag < most; lag++) {
+		peak = Math.max(peak, gaps[lag - 1]);
+		if (gaps[lag] <= gaps[lag + 1] && gaps[lag] < REPEAT_DIP * peak) return lag;
+	}
+	return null;
+}
 
 // The front frame matched to each side frame, by DTW in a band of `band`
 // frames, a step that holds one view still costing `hold` rig units; smoothed
@@ -133,6 +150,11 @@ export function syncViews(front, side, cameras, { gain = 0.15, retime = true, ba
 	});
 	const F = features(front, cameras[0], pairs).slice(0, T), S = features(side, cameras[1], pairs).slice(0, T);
 	const px = Math.exp(cameras[0].logS);
+	// Half a repeat or more may only be matching the next step, the other foot
+	// forward, so neither the lag nor the warp goes that far.
+	const repeat = repeatOf(S), reach = repeat ? Math.ceil(repeat / 2) - 1 : Infinity;
+	lags = Math.min(lags, reach);
+	band = Math.min(band, reach);
 	const perFrame = F.map((_, t) => gap(F, S, t, t));
 	const at = (lag) => mean(Array.from({ length: T }, (_, t) => (t + lag >= 0 && t + lag < T ? gap(F, S, t + lag, t) : NaN)));
 	let bestLag = 0;
@@ -154,7 +176,7 @@ export function syncViews(front, side, cameras, { gain = 0.15, retime = true, ba
 	const round = (v) => (Number.isFinite(v) ? Number(v.toFixed(2)) : null);
 	const report = {
 		height_gap_px: round(mean(perFrame) * px), worst_gap_px: round(Math.max(...perFrame.filter(Number.isFinite)) * px),
-		best_lag: bestLag, gap_at_lag_px: round(at(bestLag) * px), feet, retimed: false,
+		best_lag: bestLag, gap_at_lag_px: round(at(bestLag) * px), repeat_frames: repeat, feet, retimed: false,
 	};
 	if (!retime || T < 8) return { report, front };
 	const match = warp(F, S, Math.min(band, T - 1), mean(perFrame) || 1e-3);
