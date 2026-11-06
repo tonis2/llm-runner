@@ -183,7 +183,14 @@ rarely step together. A **studio clip** avoids both, as
   constant lag that agrees best, and how well each foot's height matches
   between the views (1 when they rise and fall together). When matching the
   views frame by frame brings the heights at least 15% closer, the left view
-  is re-timed onto the side's (`sync: false` only reports).
+  is re-timed onto the side's (`sync: false` only reports). Heights that repeat,
+  as a run's do every step, can't say which step they are on, so no shift goes as
+  far as half a repeat (`report.sync.repeat_frames`).
+- **Fast clips.** Firm turns keep a slow clip steady and shave a fast one's at
+  their peaks, so a run's strides come up short and a toe goes through the floor.
+  A studio clip is fitted again with its turns an eighth as firm, which takes
+  seconds, and that fit is kept when at least 10% fewer reads are missed by over
+  30 px (`report.fast_turns`). Setting `thetaAcc` in `weights` skips this.
 - **Left and right agree.** A view that cannot see a foot (the rear foot of
   a run, behind the standing leg from the front) reads the visible one as
   both, or names both legs the other way round. Before the fit, each limb

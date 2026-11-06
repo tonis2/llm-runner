@@ -65,6 +65,13 @@ export const DEFAULT_WEIGHTS = Object.freeze({
 	reproj: 1, acc: 2, thetaAcc: 6, twist: 1, twistMarked: 0, rest: 0.0005, oneMarker: 0.05, unseen: 1, chain: 0.1, chainBranch: 0.1,
 	floor: 2, inPlace: 1, marks: 0.001, follow: 1, level: 1e4, lateral: 1, heading: 1, limit: 10, swap: 2,
 });
+// Firm turns keep a slow clip steady and shave a fast one's at their peaks: a run's
+// strides come up short and a toe goes through the floor. No one weight suits both,
+// so a studio clip is fitted looser too, by FAST_TURNS, and that stands when
+// FAST_GAIN fewer of its reads are missed.
+export const FAST_TURNS = 1 / 8, FAST_GAIN = 0.1;
+export const fitsFaster = (firm, loose) => loose.reprojection_px.over_30 < (1 - FAST_GAIN) * firm.reprojection_px.over_30;
+
 // The native fit's orders (lib/host/rig_fit.c3): weights in, terms out. `swap`
 // is agreeViews', before the fit.
 const WEIGHT_ORDER = Object.keys(DEFAULT_WEIGHTS).filter((k) => k !== 'swap');

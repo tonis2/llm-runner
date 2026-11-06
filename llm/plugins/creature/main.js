@@ -79,7 +79,7 @@ import { loadBackbone } from './backbone.js';
 import { Tracker } from './track.js';
 import { frameSource, firstFrames, readLabels, drawTracks, bad } from './request.js';
 import { readRig } from './rig.js';
-import { fitRig, DEFAULT_WEIGHTS } from './fit.js';
+import { fitRig, fitsFaster, DEFAULT_WEIGHTS, FAST_TURNS } from './fit.js';
 import { fittedMotion, clipGlb, clipBvh, clipJson, animatedGlb } from './output.js';
 import { Finder, fittedLandmarks } from './detect.js';
 import { trainFinder } from './train.js';
@@ -313,10 +313,17 @@ export async function animate(request, config = {}) {
 		if (sync) llm.print(`  sync: heights ${sync.height_gap_px}px apart on average (worst ${sync.worst_gap_px}px), best lag ${sync.best_lag} frames${sync.retimed ? `; front re-timed, up to ${sync.shift_frames} frames (${sync.retime_gap_px}px apart now)` : ''}`);
 	}
 	const iterations = Number(request.iterations ?? 1500);
-	const fit = await fitRig(rig, fitted, {
-		markers, pitch: Number(request.pitch ?? 8), iterations, ...fitSettings(request),
-		onStep: (done, total) => step(done, total, 'fitting'),
-	});
+	const settings = { markers, pitch: Number(request.pitch ?? 8), iterations, ...fitSettings(request) };
+	let fit = await fitRig(rig, fitted, { ...settings, onStep: (done, total) => step(done, total, 'fitting') });
+	// A clip's turns as loose as its reads ask for: seconds, against the minutes spent reading it.
+	if (fitted.every((v) => v.camera) && fitted[0].tracks.frames > 2 && settings.weights?.thetaAcc === undefined) {
+		const weights = { ...settings.weights, thetaAcc: DEFAULT_WEIGHTS.thetaAcc * FAST_TURNS };
+		const loose = await fitRig(rig, fitted, { ...settings, weights, onStep: (done, total) => step(done, total, 'fitting again') });
+		const fast = fitsFaster(fit.report, loose.report);
+		llm.print(`  fast turns: ${fit.report.reprojection_px.over_30} -> ${loose.report.reprojection_px.over_30} of reads over 30px, ${fast ? 'kept' : 'left firm'}`);
+		if (fast) fit = loose;
+		fit.report.fast_turns = fast;
+	}
 	const motion = fittedMotion(fit, rig, { fps, travel: request.travel ?? true, smooth: Number(request.travel_smooth ?? 25) });
 	const report = {
 		...fit.report,
