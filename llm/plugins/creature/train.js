@@ -743,7 +743,7 @@ async function trainPart(encoder, set, images, held, chosen, part, kind, request
  * Trains a finder on `request.renders` and writes it to `request.out`.
  * Options: joints, landmarks (true), hidden_weight (0.3), hidden_joint_width (0), layers ([]), backgrounds, rank (384), hidden (256), epochs (40),
  * batch (32), lr (0.001), sigma (1, patches), holdout (0.05), seed (1),
- * limit (pictures at most), memory_gb (12, the features' GPU budget), hands (true), hand_size (256), hand_rank (256),
+ * limit (pictures at most), memory_gb (12, the features' GPU budget), fit_memory (false; cut to that budget, not refused), hands (true), hand_size (256), hand_rank (256),
  * hand_hidden (256), hand_epochs (epochs), feet (false), foot_size (384) and
  * the like. A finder already at `out` for the same body and without parts
  * keeps its body: only the parts are trained. `keep`: a finder whose body (and
@@ -777,6 +777,13 @@ export async function trainFinder(encoder, request, step = null) {
 	const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const k = random.int(i + 1); [a[i], a[k]] = [a[k], a[i]]; } return a; };
 	let images = shuffle(set.images.slice());
 	if (request.limit) images.length = Math.min(images.length, Number(request.limit));
+	// Every picture's features stay on the GPU while the head trains. `fit_memory`:
+	// as many as fit, drawn at random, so every pose can still be seen from some camera.
+	const budget = Number(request.memory_gb ?? 12), fits = Math.floor((budget * 2 ** 30) / (G * G * rank * 4));
+	if (request.fit_memory && images.length > fits) {
+		llm.print(`  ${fits} of ${images.length} pictures fit memory_gb ${budget}: training on those`);
+		images.length = fits;
+	}
 	const byPose = new Map();
 	for (const im of images) byPose.set(im.pose, [...(byPose.get(im.pose) ?? []), im]);
 	const poses = [...byPose.values()], heldOut = [];
@@ -785,8 +792,7 @@ export async function trainFinder(encoder, request, step = null) {
 	const held = heldOut.length;
 	const M = images.length, train = M - held;
 	if (train < B) throw bad(`renders: ${M} pictures, too few for batches of ${B}`);
-	// Every picture's features stay on the GPU while the head trains.
-	const gb = (M * G * G * rank * 4) / 2 ** 30, budget = Number(request.memory_gb ?? 12);
+	const gb = (M * G * G * rank * 4) / 2 ** 30;
 	if (gb > budget) throw bad(`renders: ${M} pictures of ${S} keep ${gb.toFixed(1)} GB of features on the GPU, over memory_gb ${budget}; use limit ${Math.floor((M * budget) / gb)} or fewer pictures`);
 	// The parts to look at closer: hands unless `hands: false`, feet with `feet:
 	// true`; a kept finder's own parts stay unless asked for again (true).
