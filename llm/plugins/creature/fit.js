@@ -1335,6 +1335,9 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	// following camera (in place, heading, the floor at the lowest foot) are off.
 	const cameras = views.every((v) => v.camera) ? views.map((v) => v.camera) : null;
 	if (cameras) weights = { inPlace: 0, heading: 0, floor: 0, ...weights };
+	// Two known cameras see across the body too, so the legs are not held in
+	// the hips' plane: held there, a wide stance swung with every turn of the hips.
+	if (cameras && V > 1) weights = { lateral: 0, ...weights };
 	const crossed = cameras && V > 1 ? agreeViews(rig, all, cameras, { ...DEFAULT_WEIGHTS, ...weights }.swap, sigma) : null;
 	if (crossed) llm.print(`  views agreed: limbs read crossed on ${crossed.join(', ')} frames, per view`);
 	const k0 = cameras ? Math.exp(cameras[0].logS) : pixelsPerUnit(rig, keyObs);
