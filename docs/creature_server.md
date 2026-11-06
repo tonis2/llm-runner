@@ -51,6 +51,7 @@ one request at a time; there is one GPU.
 | `views`      | object[] | Instead of `frames`, `labels`, `region`, `width` and `pitch`: the same moments filmed by several cameras. See [Two views](#two-views). |
 | `studio`     | string or object | Rigsmith `render_studio`'s `studio.json`. `frames` are then a clip a video model made from its `reference.png`: its two views (a front-left three-quarter or the front, and the right side) side by side in every frame. The views are cut out by the layout and their cameras are known. See [A studio clip](#a-studio-clip). |
 | `finder`     | string | A trained joint finder (`/train`). Views with neither `labels` nor `tracks` have their joints found with it. See [A trained finder](#a-trained-finder-no-labels). |
+| `max_frames` | number | Read only the clip's first this many frames, from every view. Default all of them. |
 | `key_every`  | number | With a finder: a keyframe for the fit to start from every so many frames. Default 6. |
 | `landmarks`  | bool or string[] | With a finder: which of its landmarks to fit: all (true), none (false), or those listed. By default all but a mirror pair on one joint (a head's two sides, from a finder drawn before render_poses stopped drawing them): each is the other's mirror image, and the finder takes one for the other, which tips the head over. |
 | `flip`       | bool | With a finder: look at each crop mirrored as well, each joint's scores there read as its partner's on the other side (`thigh_L` as `thigh_R`), and average the two. Twice the finding time (about 40 s more for a two-view clip), and on the Zidane exam the joints found 10% nearer and the head a degree nearer. A character that is strongly lopsided (a sword in one hand) may do better with `false`. Default true. |
@@ -313,6 +314,7 @@ front of it); and every pose's joint turns. The document is not touched.
 | `batch`, `lr`, `sigma` | number | 32 pictures a step; Adam's rate 0.001; the target Gaussian's width in patches, 1. |
 | `holdout`, `seed`, `limit` | number | The share held out to score (0.05, whole poses: no other camera's picture of a held-out pose is trained on); the seed (1); a cap on the pictures used. |
 | `memory_gb` | number | The GPU memory every picture's features may take while the head trains (12). A set over it is refused before it is encoded, with the `limit` that fits: at 768 a picture keeps about 3.4 MB. |
+| `fit_memory` | bool | Cut a set over `memory_gb` to as many pictures as fit, drawn at random, instead of refusing it. Default false. |
 | `hands` | bool | Train the hand head too, for a rig with hands. Default true. A finder already at `out` with the same body (joints, size, layers, rank, hidden) and no hands keeps its body: only the hands are trained, a few minutes. |
 | `hand_size`, `hand_rank`, `hand_hidden`, `hand_epochs` | number | The hand crop's side (256), its PCA (256), hidden width (256) and passes (`epochs`). |
 | `feet` | bool | Train a foot head too: each foot (the ankle, the joints below it and the landmarks on them, such as the heel) looked at again, closer, as hands are. Default false. |
