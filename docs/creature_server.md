@@ -186,6 +186,19 @@ rarely step together. A **studio clip** avoids both, as
   is re-timed onto the side's (`sync: false` only reports). Heights that repeat,
   as a run's do every step, can't say which step they are on, so no shift goes as
   far as half a repeat (`report.sync.repeat_frames`).
+- **A view that slips.** A video model can jump one half back partway through
+  and leave it behind to the end. The halves then show different moments, and
+  the only pose fitting both has the legs crossed, which no smooth re-timing
+  follows. Each leg pair's gap across the body keeps left and right, and holds
+  steady through a walk, so the first third of the clip says what it should be.
+  When taking up to 20 frames out of one view at least halves how far the gap
+  strays, those frames are cut and both views end that much sooner.
+  `report.sync.slip` gives `frame`, `frames`, the view that was `late`, the
+  stray before and after (`stray`, `left`, in rig heights) and `put_back`
+  (false with `sync: false`). One slip per clip. Motion with no steady gap
+  between the legs is left alone. On `nero_walk`, 14 frames at frame 52 took the
+  frames read crossed from 59 and 70 to 0 and 1, and reads over 30 px from 14.4%
+  to 7.5%; `nero_run`, `nero_handsup` and `fight` came out unchanged.
 - **Fast clips.** Firm turns keep a slow clip steady and shave a fast one's at
   their peaks, so a run's strides come up short and a toe goes through the floor.
   A studio clip is fitted again with its turns an eighth as firm, which takes

@@ -307,10 +307,12 @@ export async function animate(request, config = {}) {
 	// side when that brings their heights well closer (sync.js).
 	let sync = null;
 	if (request.studio !== undefined && fitted.length === 2) {
-		const s = syncViews(fitted[0].tracks, fitted[1].tracks, fitted.map((v) => v.camera), { retime: request.sync !== false });
+		const s = syncViews(fitted[0].tracks, fitted[1].tracks, fitted.map((v) => v.camera), { retime: request.sync !== false, height: rig.height });
 		fitted[0].tracks = s.front;
+		fitted[1].tracks = s.side;
 		sync = s.report;
 		if (sync) llm.print(`  sync: heights ${sync.height_gap_px}px apart on average (worst ${sync.worst_gap_px}px), best lag ${sync.best_lag} frames${sync.retimed ? `; front re-timed, up to ${sync.shift_frames} frames (${sync.retime_gap_px}px apart now)` : ''}`);
+		if (sync?.slip) llm.print(`  sync: the ${sync.slip.late} view slipped ${sync.slip.frames} frames at frame ${sync.slip.frame}${sync.slip.put_back ? ', put back' : ''}`);
 	}
 	const iterations = Number(request.iterations ?? 1500);
 	const settings = { markers, pitch: Number(request.pitch ?? 8), iterations, ...fitSettings(request) };
@@ -394,7 +396,7 @@ const INFO = {
 		studio: 'Rigsmith render_studio\'s studio.json: frames are a clip of its picture (its two views side by side); the views are cut out by its layout and their cameras known',
 		reference: 'with studio: the picture the clip was made from (reference.png beside the studio.json by default), its first frame laid on it to put the cameras right',
 		calibrate: 'with studio: put the cameras right by the first frame against the reference (true)',
-		sync: 'with studio: re-time the left view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
+		sync: 'with studio: put a view back in step when it jumped back partway through, and re-time the left view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
 		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
 		max_frames: 'read only the clip\'s first this many frames (all of them)',
 		key_every: 'with a finder: a keyframe for the fit to start from every so many frames (6)',
