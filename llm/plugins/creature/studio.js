@@ -71,6 +71,27 @@ export function studioViews(layout, width, height) {
 	});
 }
 
+/**
+ * Where the picture's pose has each joint, in the model: { names, positions },
+ * from `layout.pixels` (each joint's pixel in both views of reference.png)
+ * through the layout's own two cameras; null without them, or when the views
+ * look the same way and cannot place a point.
+ */
+export function referenceJoints(layout) {
+	const names = layout.joints, pixels = layout.pixels, ppu = layout.pixels_per_unit;
+	if (!Array.isArray(names) || !Array.isArray(pixels) || pixels.length !== 2 || pixels.some((v) => !Array.isArray(v) || v.length !== names.length)) return null;
+	const [a, b] = layout.views, det = a.right[0] * b.right[2] - a.right[2] * b.right[0];
+	if (Math.abs(det) < 0.2) return null;
+	// Along a view's right, and up: (p - origin) · right = (x - the view's middle column) / ppu.
+	const across = (view, x) => (x - view.x - view.width / 2) / ppu + dot(view.origin, view.right);
+	const positions = names.map((_, j) => {
+		const pa = across(a, pixels[0][j][0]), pb = across(b, pixels[1][j][0]);
+		const y = ((layout.ground_row - pixels[0][j][1]) / ppu + dot(a.origin, a.up) + (layout.ground_row - pixels[1][j][1]) / ppu + dot(b.origin, b.up)) / 2;
+		return [(pa * b.right[2] - pb * a.right[2]) / det, y, (pb * a.right[0] - pa * b.right[0]) / det];
+	});
+	return { names, positions };
+}
+
 // The figure in one view of `img` (a frame, or the reference picture, read at
 // frame pixel (x, y) as its pixel ((x + crop x) / k, (y + crop y) / k)), sampled
 // on a grid of `step` frame pixels over `box`: 1 where a pixel is far from the

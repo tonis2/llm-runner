@@ -186,7 +186,7 @@ class Adam {
 
 // The mirror limbs of `points` on `rig`: each point's partner (its index, -1
 // for none) and the limb pair both are in (-1 for none), and how many pairs.
-function limbPairs(rig, points) {
+export function limbPairs(rig, points) {
 	const names = rig.names, J = names.length, P = points.length;
 	const limb = new Int32Array(J).fill(-1), ids = new Map();
 	for (let j = 1; j < J; j++) {
@@ -1545,18 +1545,20 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	// hypothesis, per view and over all of them.
 	const viewErrors = all.map((o, v) => {
 		const proj = fit.projections(v), errs = [];
-		const byPoint = o.points.map(() => []);
+		const byPoint = o.points.map(() => []), weights = o.points.map(() => []);
 		for (let t = 0; t < T; t++) {
 			for (let p = 0; p < o.points.length; p++) {
-				let e = Infinity;
+				let e = Infinity, w = 0;
 				for (let h = 0; h < o.H; h++) {
 					const k = (t * o.points.length + p) * o.H + h;
 					if (o.w[k] > 0) e = Math.min(e, Math.hypot(proj[t][p][0] - o.x[k], proj[t][p][1] - o.y[k]));
+					w = Math.max(w, o.w[k]);
 				}
-				if (e < Infinity) { errs.push(e); byPoint[p].push(e); }
+				if (e < Infinity) { errs.push(e); byPoint[p].push(e); weights[p].push(w); }
 			}
 		}
 		errs.byPoint = byPoint;
+		errs.weights = weights;
 		return errs;
 	});
 	const stats = (errs) => {
@@ -1579,6 +1581,12 @@ export async function fitRig(rig, views, { markers = {}, pitch = 8, iterations =
 	report.worst_points = viewErrors.map((errs, v) => errs.byPoint
 		.map((e, p) => [all[v].points[p].name, e.length ? stats(e).median : 0])
 		.sort((a, b) => b[1] - a[1]).slice(0, 8));
+	// Every point's reads against the fit, per view: its name, the median weight
+	// of its surest read, its median miss and the share of frames over 30 px off.
+	const middle = (a) => (a.length ? a.slice().sort((x, y) => x - y)[a.length >> 1] : 0);
+	report.reads = viewErrors.map((errs, v) => errs.byPoint.map((e, p) => [
+		all[v].points[p].name, round(middle(errs.weights[p]), 2), round(middle(e), 1), e.length ? round(e.filter((d) => d > 30).length / e.length, 2) : 0,
+	]));
 	if (fit.limits.length) {
 		// How far past the rig's limits the clip goes at worst; Rigsmith plays it held at them.
 		let worst = 0;

@@ -13,9 +13,10 @@
 //   POST /animate  { rig, frames, labels, markers?, region?, width?, fps?,
 //                    name?, travel?, travel_smooth?, iterations?, pitch?,
 //                    outputs?, views?, studio?, finder?, key_every?, flip?,
-//                    landmarks?, weights?, sigma?, confidence?, max_frames? }
+//                    landmarks?, weights?, sigma?, confidence?, max_frames?,
+//                    draw?, start?, follow? }
 //                  -> { name, frames, fps, joints, glb?, clip?, bvh?,
-//                       animated_glb?, tracks?, report }
+//                       animated_glb?, tracks?, reads?, report }
 //   POST /track    { frames, labels, region?, width?, draw? }
 //                  -> { tracks, previews?, report }
 //   POST /fit      { rig, tracks, markers?, ... }  -> as /animate, no GPU
@@ -57,6 +58,14 @@
 //            views are cut out by the layout and their cameras are known
 //            (studio.js), so none is searched for and the root moves as the
 //            cameras saw it (no travel from the feet)
+//   start    with studio, "reference": the clip's first frame is the studio's
+//            picture, so frame 0's joints are where studio.json's `pixels`
+//            put them, read at full score, and the fit starts from the truth
+//   follow   with start "reference" and a finder: the picture's joints are
+//            followed through the frames (track.js) and each limb joint's
+//            reads held against where it was followed to (follow.js), so the
+//            finder cannot put two limbs of one shape on one of them; true by
+//            default, false to take the finder's reads as they are
 //   finder   a trained joint finder (/train): a view with neither labels
 //            nor tracks has its joints found on every frame instead; the
 //            points of the mesh it finds (landmarks) are markers with known
@@ -67,24 +76,33 @@
 //   confidence  how a found point's score weighs its pull, weight^confidence;
 //            2 for a finder's tracks, 0 (all pull fully) for labels and tracks
 //
+//   draw     how many frames to draw, spread over the clip, or a list of
+//            them: `reads` is one PNG of those frames (reads.png in a job),
+//            each with its views side by side, the fitted bones and joints
+//            (rings) and every read (filled, smaller the less it weighs, tied
+//            to its joint by a white line when far from it). A limb pair
+//            shares a colour, one limb in discs and its mirror in squares;
+//            report.drawn names the frames and each limb's colour
+//
 // Rigsmith runs it in-process as a job (llm::pipeline::Job): the job's
 // config is the same request plus `model`, the clip comes back as the job's
 // outputs `glb`, `clip.json`, `tracks.json` and `animated.glb` (whichever
-// `outputs` names), and progress as "  step N/M, ..." lines. `task: "train"`
+// `outputs` names) and `reads.png` (with `draw`), and progress as "  step N/M, ..." lines. `task: "train"`
 // or `"detect"` runs /train's or /detect's request instead.
 
 import { llm } from '/core/llm.js';
 import { utf8 } from '/core/graph/plugins.js';
 import { loadBackbone } from './backbone.js';
 import { Tracker } from './track.js';
-import { frameSource, firstFrames, readLabels, drawTracks, bad } from './request.js';
+import { frameSource, firstFrames, readLabels, drawTracks, drawReads, sheetPng, bad } from './request.js';
 import { readRig } from './rig.js';
 import { fitRig, fitsFaster, DEFAULT_WEIGHTS, FAST_TURNS } from './fit.js';
 import { fittedMotion, clipGlb, clipBvh, clipJson, animatedGlb } from './output.js';
-import { Finder, fittedLandmarks } from './detect.js';
+import { Finder, fittedLandmarks, partner } from './detect.js';
 import { trainFinder } from './train.js';
-import { readStudio, studioViews, calibrateViews, cropFrames } from './studio.js';
+import { readStudio, studioViews, calibrateViews, cropFrames, referenceJoints } from './studio.js';
 import { syncViews } from './sync.js';
+import { followLimbs } from './follow.js';
 
 const OUTPUTS = ['glb', 'clip', 'bvh', 'animated_glb', 'tracks'];
 
@@ -216,7 +234,8 @@ function studioViewsOf(request) {
 		({ views, report: calibration } = calibrateViews(layout, views, reference, first));
 		for (const c of calibration) llm.print(`  studio: ${c.name} view scaled ${c.scale}, moved ${c.shift.join(', ')} px against the picture (figures overlap ${c.overlap[0]} -> ${c.overlap[1]})`);
 	}
-	return views.map((v, i) => ({ ...(given ? request.views[i] : { frames: cropFrames(frames, v.box) }), name: v.name, box: v.box, camera: v.camera, calibration }));
+	// Tracks given with the clip's frames keep the frames too, to draw the reads on.
+	return views.map((v, i) => ({ ...(given ? request.views[i] : {}), ...(frames ? { frames: cropFrames(frames, v.box) } : {}), name: v.name, box: v.box, camera: v.camera, calibration }));
 }
 
 // The picture a studio clip was made from: `reference`, or reference.png
@@ -249,6 +268,150 @@ function allViewsOf(request) {
 	return request.views;
 }
 
+// How each joint of `rig` is drawn on a reads sheet: a limb (a joint with a
+// mirror partner, and all below it) shares its pair's colour, the pair's later
+// limb as squares; the middle is white. `legend`: each limb's first joint and
+// its colour, as "#rrggbb".
+function limbMarks(rig) {
+	const J = rig.names.length, pair = new Int32Array(J).fill(-1), later = new Uint8Array(J), roots = [];
+	for (let j = 0; j < J; j++) {
+		const up = rig.parents[j];
+		if (up >= 0 && pair[up] >= 0) { pair[j] = pair[up]; later[j] = later[up]; continue; }
+		const mate = rig.names.indexOf(partner(rig.names[j]));
+		if (mate < 0 || mate === j) continue;
+		const first = Math.min(j, mate);
+		if (!roots.includes(first)) roots.push(first);
+		pair[j] = roots.indexOf(first);
+		later[j] = j > mate ? 1 : 0;
+	}
+	const hue = (h) => [5, 3, 1].map((n) => { const k = (n + h / 60) % 6; return Math.round(255 * (1 - 0.85 * Math.max(0, Math.min(k, 4 - k, 1)))); });
+	const colours = roots.map((_, i) => hue((360 * i) / roots.length));
+	const marks = Array.from({ length: J }, (_, j) => (pair[j] < 0 ? { colour: [255, 255, 255], square: false } : { colour: colours[pair[j]], square: !!later[j] }));
+	const hex = (c) => `#${c.map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+	const legend = {};
+	for (let j = 0; j < J; j++) if (pair[j] >= 0 && (rig.parents[j] < 0 || pair[rig.parents[j]] < 0)) legend[rig.names[j]] = `${hex(colours[pair[j]])}${later[j] ? ' squares' : ' discs'}`;
+	return { marks, legend };
+}
+
+// The frames `draw` asks for of a clip `T` long: that many spread evenly, or
+// the ones listed.
+function drawnFrames(draw, T) {
+	if (Array.isArray(draw)) return draw.map(Number).filter((k) => Number.isInteger(k) && k >= 0 && k < T);
+	const n = Number(draw);
+	if (!Number.isInteger(n) || n < 1) throw bad(`draw: how many frames to draw, or a list of them, got ${JSON.stringify(draw)}`);
+	const m = Math.min(n, T);
+	return Array.from({ length: m }, (_, i) => (m < 2 ? 0 : Math.round((i * (T - 1)) / (m - 1))));
+}
+
+// The reads sheet: each frame of `ks` with its views side by side, the fit and
+// what was read drawn on them (request.js drawReads); null when a view has no
+// frames to draw on (its tracks were given).
+function readsSheet(views, fitted, fit, rig, ks, marks) {
+	if (!ks.length || !views.every((v) => v.frames !== undefined)) return null;
+	const sources = views.map((v) => framesOf(v.frames)), problem = fit.problem;
+	const joints = views.map((_, v) => problem.jointProjections(v));
+	const weight = (s) => Math.min(1, Math.max(0.05, ((s ?? 1) - 0.2) / 0.4));
+	const tiles = ks.filter((k) => sources.every((f) => k < f.count)).map((k) => drawReads(views.map((_, v) => {
+		const tracks = fitted[v].tracks, points = problem.views[v].points, seen = new Set(), reads = [];
+		for (const h of tracks.hypotheses) {
+			const i = h.frames.indexOf(k);
+			if (i < 0) continue;
+			h.tracks[i].forEach((q, p) => {
+				if (!q) return;
+				reads.push({ at: q, joint: points[p].joint, weight: weight(h.scores[i][p]), second: seen.has(p) });
+				seen.add(p);
+			});
+		}
+		return { image: sources[v].image(k), parents: rig.parents, joints: joints[v][k], reads };
+	}), marks));
+	return tiles.length ? sheetPng(tiles, tiles.length > 4 ? 3 : Math.min(2, tiles.length)) : null;
+}
+
+// Where a studio's picture has each of the rig's joints in each view of its
+// clip: { overlap, places: [{ name: [x, y] }] } in the view's own pixels (y
+// down). `places` is null, with a line saying so, when the clip's first frame
+// is not the picture (the figures overlap under `START_OVERLAP`); the whole is
+// null when the layout has no joints' pixels.
+function referencePlaces(layout, views, rig) {
+	const known = referenceJoints(layout);
+	if (!known) { llm.print('  start: the studio.json has no joints\' pixels, so frame 0 is found like the rest'); return null; }
+	// Unmeasured (tracks given, or no picture to hold the frame against) is taken on the caller's word.
+	const measured = (views[0].calibration ?? []).map((c) => Math.max(...c.overlap));
+	const overlap = measured.length ? Math.min(...measured) : null;
+	if (overlap !== null && overlap < START_OVERLAP) {
+		llm.print(`  start: the first frame is not the reference picture (the figures overlap ${overlap.toFixed(2)}), so frame 0 is found like the rest`);
+		return { overlap, places: null };
+	}
+	const places = views.map((view) => {
+		const c = view.camera, s = Math.exp(c.logS), cy = Math.cos(c.yaw), sy = Math.sin(c.yaw), at = {};
+		known.names.forEach((name, k) => {
+			if (!rig.names.includes(name)) return;
+			const [X, Y, Z] = known.positions[k];
+			at[name] = [Math.round((s * (cy * X + sy * Z) + c.shift[0]) * 100) / 100, Math.round(-(s * Y + c.shift[1]) * 100) / 100];
+		});
+		return at;
+	});
+	return { overlap, places };
+}
+
+// The limbs of a studio clip that starts on its picture, followed from there
+// (follow.js): each view the finder read has the picture's joints tracked
+// through its frames, and its limb reads held against them. Per view what
+// came of it, or null for a view not followed.
+async function followFromReference(layout, views, fitted, rig, markers, request, config, step) {
+	if (!fitted.some((v) => v.found)) return null;
+	const start = referencePlaces(layout, views, rig);
+	if (!start?.places) return null;
+	await ensureBackbone(config);
+	const out = [];
+	for (const [i, v] of fitted.entries()) {
+		if (!v.found || !Object.keys(start.places[i]).length) { out.push(null); continue; }
+		const followed = await tracker.track(framesOf(views[i].frames), {
+			labels: { 0: start.places[i] }, width: Number(request.follow_width ?? 1024),
+			onFrame: (k, n) => step?.(i * n + k, fitted.length * n, 'following limbs'),
+		});
+		const report = {};
+		v.tracks = followLimbs(rig, v.tracks, followed, views[i].camera, { markers, report });
+		v.tracks.seconds = Math.round((v.tracks.seconds + followed.seconds) * 10) / 10;
+		llm.print(`  followed: view ${i}, of ${report.reads} limb reads ${report.agreed} as followed, ${report.unfollowed} the finder's alone, ${report.followed} the tracker's alone, ${report.none} none; ${report.taken} first peaks were on another limb`);
+		out.push({ ...report, seconds: followed.seconds });
+	}
+	return out;
+}
+
+// A studio clip that starts on its reference picture has its joints, on frame
+// 0, where studio.json's `pixels` put them: those are that frame's reads in
+// both views, at full score and with no second peak, instead of the finder's.
+// Left alone, with a line saying so, when the first frame is not the picture
+// (the figures overlap under `START_OVERLAP`) or the layout has no pixels.
+const START_OVERLAP = 0.8;
+export function startOnReference(layout, views, fitted, rig) {
+	const start = referencePlaces(layout, views, rig);
+	if (!start?.places) return start && { overlap: start.overlap, joints: 0 };
+	let joints = 0;
+	fitted.forEach((v, i) => {
+		const at = v.tracks.points.map((name) => start.places[i][name] ?? null);
+		joints = Math.max(joints, at.filter(Boolean).length);
+		let first = true;
+		v.tracks = {
+			...v.tracks,
+			hypotheses: v.tracks.hypotheses.map((h) => {
+				const n = h.frames.indexOf(0);
+				if (n < 0) return h;
+				const own = first;
+				first = false;
+				const tracks = h.tracks.slice(), scores = h.scores.slice();
+				tracks[n] = h.tracks[n].map((q, p) => (at[p] ? (own ? at[p] : null) : q));
+				scores[n] = h.scores[n].map((q, p) => (at[p] ? (own ? 1 : null) : q));
+				return { ...h, tracks, scores };
+			}),
+		};
+	});
+	const { overlap } = start;
+	llm.print(`  start: frame 0 is the reference picture${overlap === null ? '' : ` (the figures overlap ${overlap.toFixed(2)})`}: ${joints} joints taken from it`);
+	return { overlap, joints };
+}
+
 // The whole request: tracks (given, or made), the fit, the outputs asked for.
 // Returns { reply (JSON, files in base64), files (name -> bytes) }.
 export async function animate(request, config = {}) {
@@ -258,6 +421,8 @@ export async function animate(request, config = {}) {
 	const rig = readRig(request.rig);
 	if (outputs.has('animated_glb') && !rig.glb) throw bad('outputs: animated_glb needs the rig as a .glb');
 	fitSettings(request);
+	if (request.start !== undefined && request.start !== null && request.start !== 'reference') throw bad(`start: "reference" (the clip's first frame is the studio's picture), or left out; got ${JSON.stringify(request.start)}`);
+	if (request.start === 'reference' && request.studio === undefined) throw bad('start: "reference" needs studio, whose picture it is');
 	const name = String(request.name ?? 'creature');
 	const fps = Number(request.fps ?? 24);
 	const step = stepper();
@@ -282,7 +447,7 @@ export async function animate(request, config = {}) {
 	const fitted = [];
 	for (const [i, view] of views.entries()) {
 		try {
-			let tracks = view.tracks;
+			let tracks = view.tracks, found = false;
 			if (tracks) {
 				if (typeof tracks === 'string') tracks = JSON.parse(tracks.trim().startsWith('{') ? tracks : llm.readText(tracks));
 				if (!Array.isArray(tracks?.hypotheses) || !Array.isArray(tracks.points)) throw bad('tracks: a /track reply\'s tracks ({ points, frames, hypotheses })');
@@ -291,18 +456,22 @@ export async function animate(request, config = {}) {
 			} else if (!view.labels && request.finder) {
 				tracks = withoutPoints((await detect(request, view, config, (k, n, what) => step(i * n + k, views.length * n, what))).tracks, unused);
 				for (const p of tracks.points) if (!rig.names.includes(p) && !(p in markers)) throw bad(`finder: it finds "${p}", which is not one of this rig's joints (trained on another rig?)`);
-				trackSeconds += tracks.seconds;
+				found = true;
 			} else {
 				const { labels } = readLabels({ ...view, markers }, rig.names);
 				tracks = (await track(view, config, (k, n, what) => step(i * n + k, views.length * n, what), labels)).tracks;
 				trackSeconds += tracks.seconds;
 			}
-			fitted.push({ tracks, pitch: Number(view.pitch ?? request.pitch ?? 8), camera: view.camera });
+			fitted.push({ tracks, pitch: Number(view.pitch ?? request.pitch ?? 8), camera: view.camera, found });
 		} catch (e) {
 			if (views.length > 1 && e.status === 400) e.message = `views[${i}]: ${e.message}`;
 			throw e;
 		}
 	}
+	// A clip that starts on its studio's picture: its limbs followed from there.
+	const reference = request.start === 'reference';
+	const followed = reference && request.follow !== false ? await followFromReference(readStudio(request.studio), views, fitted, rig, markers, request, config, step) : null;
+	for (const v of fitted) if (v.found) trackSeconds += v.tracks.seconds;
 	// A studio clip's halves in step: measured, and the front re-timed onto the
 	// side when that brings their heights well closer (sync.js).
 	let sync = null;
@@ -314,6 +483,7 @@ export async function animate(request, config = {}) {
 		if (sync) llm.print(`  sync: heights ${sync.height_gap_px}px apart on average (worst ${sync.worst_gap_px}px), best lag ${sync.best_lag} frames${sync.retimed ? `; front re-timed, up to ${sync.shift_frames} frames (${sync.retime_gap_px}px apart now)` : ''}`);
 		if (sync?.slip) llm.print(`  sync: the ${sync.slip.late} view slipped ${sync.slip.frames} frames at frame ${sync.slip.frame}${sync.slip.put_back ? ', put back' : ''}`);
 	}
+	const start = reference ? startOnReference(readStudio(request.studio), views, fitted, rig) : null;
 	const iterations = Number(request.iterations ?? 1500);
 	const settings = { markers, pitch: Number(request.pitch ?? 8), iterations, ...fitSettings(request) };
 	let fit = await fitRig(rig, fitted, { ...settings, onStep: (done, total) => step(done, total, 'fitting') });
@@ -334,6 +504,8 @@ export async function animate(request, config = {}) {
 	};
 	if (request.studio !== undefined) report.studio = { views: views.map((v) => ({ name: v.name, box: v.box })), calibration: views[0].calibration };
 	if (sync) report.sync = sync;
+	if (start) report.start = start;
+	if (followed) report.follow = followed;
 	const reply = { name, frames: motion.frames, fps, joints: rig.names, report };
 	const files = {};
 	if (outputs.has('glb')) files.glb = clipGlb(motion, name);
@@ -341,6 +513,15 @@ export async function animate(request, config = {}) {
 	if (outputs.has('bvh')) reply.bvh = clipBvh(motion, Number(request.bvh_scale ?? 100));
 	if (outputs.has('animated_glb')) files['animated.glb'] = animatedGlb(motion, rig, name);
 	if (outputs.has('tracks')) reply.tracks = views.length > 1 ? fitted.map((v) => v.tracks) : fitted[0].tracks;
+	if (request.draw !== undefined && request.draw !== null) {
+		const { marks, legend } = limbMarks(rig);
+		const ks = drawnFrames(request.draw, fit.problem.T), sheet = readsSheet(views, fitted, fit, rig, ks, marks);
+		if (sheet) {
+			files['reads.png'] = sheet;
+			reply.reads = llm.base64Encode(sheet);
+			report.drawn = { frames: ks, marks: legend };
+		}
+	}
 	if (files.glb) reply.glb = llm.base64Encode(files.glb);
 	if (files['animated.glb']) reply.animated_glb = llm.base64Encode(files['animated.glb']);
 	if (reply.clip) files['clip.json'] = utf8(JSON.stringify(reply.clip));
@@ -396,6 +577,9 @@ const INFO = {
 		studio: 'Rigsmith render_studio\'s studio.json: frames are a clip of its picture (its two views side by side); the views are cut out by its layout and their cameras known',
 		reference: 'with studio: the picture the clip was made from (reference.png beside the studio.json by default), its first frame laid on it to put the cameras right',
 		calibrate: 'with studio: put the cameras right by the first frame against the reference (true)',
+		start: 'with studio: "reference" when the clip\'s first frame is the studio\'s picture (a video model\'s clip starts on it): frame 0\'s joints are taken from studio.json\'s pixels, not found (found)',
+		follow: 'with start "reference" and a finder: follow the picture\'s joints through the frames and hold each limb\'s reads against them, so two limbs of one shape are not read as one (true; false to take the finder\'s reads as they are)',
+		follow_width: 'the width each view is resized to for following, a multiple of 16; two legs side by side are told apart only when patches are finer than the gap between them (1024)',
 		sync: 'with studio: put a view back in step when it jumped back partway through, and re-time the left view onto the side\'s when their joints\' heights say they are out of step (true; false to only report)',
 		finder: 'a trained joint finder (.safetensors from /train): views without labels or tracks are found with it',
 		max_frames: 'read only the clip\'s first this many frames (all of them)',
@@ -407,6 +591,7 @@ const INFO = {
 		sigma_wide: 'how many times wider the robust scale starts, narrowing to sigma over the fit\'s first half (4)',
 		confidence: 'how a found point\'s score weighs its pull, weight^confidence (2 for a finder\'s tracks, 0 for labels and tracks)',
 		outputs: `any of ${OUTPUTS.join(', ')} (["glb", "clip"])`,
+		draw: 'how many frames to draw the fit and its reads on, or a list of them: `reads`, one PNG (none)',
 	},
 };
 

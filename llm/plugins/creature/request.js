@@ -148,3 +148,65 @@ export function drawTracks(frames, tracks, k) {
 	});
 	return llm.image.encodePng({ width, height, channels: 3, pixels: px });
 }
+
+// One frame of a fit with what was read drawn on it, each view beside the
+// next, as { width, height, pixels } (RGB). Per view { image, parents, joints
+// [J][x, y] (the fitted joints, y up), reads [{ at: [x, y] (y down), joint,
+// weight, second }] }. `marks[j]` is joint j's { colour, square }: a limb pair
+// shares a colour, its right limb drawn as squares. The fit is the bones and
+// a ring at each joint; a read is a filled mark, smaller the less it weighs
+// (a second peak smallest), tied to its fitted joint by a white line when
+// they are over `far` pixels apart.
+export function drawReads(views, marks, { far = 12 } = {}) {
+	const width = views.reduce((s, v) => s + v.image.width, 0), height = Math.max(...views.map((v) => v.image.height));
+	const px = new Uint8Array(width * height * 3);
+	const put = (X, Y, colour) => { if (X >= 0 && Y >= 0 && X < width && Y < height) px.set(colour, (Y * width + X) * 3); };
+	const mark = (x, y, r, colour, { square = false, ring = false } = {}) => {
+		for (let dy = -r; dy <= r; dy++) {
+			for (let dx = -r; dx <= r; dx++) {
+				const d = square ? Math.max(Math.abs(dx), Math.abs(dy)) : Math.hypot(dx, dy);
+				if (d > r || (ring && d < r - 1.5)) continue;
+				put(Math.round(x + dx), Math.round(y + dy), d > r - 1 && !ring ? [0, 0, 0] : colour);
+			}
+		}
+	};
+	const line = (a, b, colour, thick = 1) => {
+		const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1])));
+		for (let i = 0; i <= n; i++) {
+			const x = a[0] + ((b[0] - a[0]) * i) / n, y = a[1] + ((b[1] - a[1]) * i) / n;
+			for (let dy = 0; dy < thick; dy++) for (let dx = 0; dx < thick; dx++) put(Math.round(x) + dx, Math.round(y) + dy, colour);
+		}
+	};
+	let x0 = 0;
+	for (const v of views) {
+		const { image: img } = v, c = img.channels;
+		for (let y = 0; y < img.height; y++) {
+			for (let x = 0; x < img.width; x++) {
+				const o = (y * img.width + x) * c, d = (y * width + x0 + x) * 3;
+				px[d] = img.pixels[o]; px[d + 1] = img.pixels[o + 1]; px[d + 2] = img.pixels[o + 2];
+			}
+		}
+		const r = Math.max(4, Math.round(img.width / 150));
+		const at = (j) => [x0 + v.joints[j][0], -v.joints[j][1]];
+		v.parents.forEach((p, j) => { if (p >= 0) line(at(p), at(j), marks[j].colour, 2); });
+		v.joints.forEach((_, j) => mark(...at(j), r, marks[j].colour, { square: marks[j].square, ring: true }));
+		for (const q of v.reads) {
+			const p = [x0 + q.at[0], q.at[1]], m = marks[q.joint];
+			if (!q.second && Math.hypot(p[0] - at(q.joint)[0], p[1] - at(q.joint)[1]) > far) line(p, at(q.joint), [255, 255, 255]);
+			mark(p[0], p[1], q.second ? 2 : Math.max(2, Math.round(r * (0.4 + 0.6 * q.weight))), m.colour, { square: m.square });
+		}
+		x0 += img.width;
+	}
+	return { width, height, pixels: px };
+}
+
+// Pictures of one size (RGB) tiled `cols` across, as a PNG's bytes.
+export function sheetPng(tiles, cols) {
+	const w = tiles[0].width, h = tiles[0].height, rows = Math.ceil(tiles.length / cols);
+	const px = new Uint8Array(w * cols * h * rows * 3);
+	tiles.forEach((t, i) => {
+		const cx = (i % cols) * w, cy = Math.floor(i / cols) * h;
+		for (let y = 0; y < h; y++) px.set(t.pixels.subarray(y * w * 3, (y + 1) * w * 3), ((cy + y) * w * cols + cx) * 3);
+	});
+	return llm.image.encodePng({ width: w * cols, height: h * rows, channels: 3, pixels: px });
+}

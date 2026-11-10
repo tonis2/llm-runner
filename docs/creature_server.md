@@ -60,6 +60,10 @@ one request at a time; there is one GPU.
 | `sigma_wide` | number | How many times wider the robust scale starts. It narrows to `sigma` over the fit's first half, so a limb that starts far from its points still feels them. Default 4. |
 | `confidence` | number | How a found point's score weighs its pull: its weight to this power. Default 2 for a finder's tracks, 0 (every point pulls fully) for labels and tracked points. |
 | `recheck`    | number | Passes after the fit that swap crossed limbs and let go of reads the other views disagree with, then fit on (studio clips). Default 1; 0 for none. |
+| `start`      | string | With `studio`: `"reference"` when the clip's first frame is the studio's picture, as a video model's clip of it is. Frame 0's joints are then taken from studio.json's `pixels` in both views, at full score, instead of found, so the fit starts from the truth. It is left alone when that frame's figure overlaps the picture's under 0.8, and `report.start` says which (`joints` taken, `overlap`). Default: found like every frame. |
+| `follow`     | bool | With `start: "reference"` and a `finder`: the picture's joints are also followed through each view's frames (the label tracker, from frame 0), and each limb joint's reads are held against where it was followed to. A finder names every joint on its own, so on a body with many limbs of one shape (a spider's legs) it puts two names on one leg and none on the leg beside it once a leg leaves its rest pose. What is followed keeps its name. Per joint and frame: a finder's peak near where the joint was followed to is taken; else the finder's first peak, unless another joint at that depth of an alike limb was followed to there; else where it was followed to, weighing little; else nothing. A read must be within the bone's reach of the joint above. The middle of the body is left as found. About 80% more time on a two-view clip. `report.follow` counts, per view, the reads that went each way and the first peaks that were on another limb. Default true; `false` takes the finder's reads as they are. |
+| `follow_width` | number | The width each view is resized to for following, a multiple of 16. Two legs side by side are told apart only while a patch is finer than the gap between them: on a spider clip 768 took the leg beside the one that lifted, 1024 did not. Default 1024. |
+| `draw`       | number or number[] | How many frames to draw, spread over the clip, or the frames themselves. The reply's `reads` is one PNG of them (`reads.png` in a job). Each frame has its views side by side with the fitted bones, a ring at each fitted joint, and every read as a filled mark: smaller the less it weighs, and tied to its joint by a white line when over 12 px from it. A limb pair shares a colour, one limb in discs and its mirror in squares; the middle is white. `report.drawn` names the frames and each limb's colour. Default none. |
 
 What each output is:
 
@@ -94,6 +98,11 @@ puts it. Points far off in many frames usually mean one of three things: a
 label on a different part of the body than the joint it names (a marker is the
 fix), a track that swapped legs (add a keyframe there), or a rig whose
 proportions differ from the animal's.
+
+`reads` lists every point per view as `[name, weight, miss, over_30]`: the
+median weight of its surest read (0.05 to 1, from its score), its median
+distance from the fit in pixels, and the share of frames over 30 px off. A
+point with a high weight and a high `over_30` is one the fit could not follow.
 
 One view sees nothing along its line of sight, so a side or three-quarter
 view of a walk works best: it shows the legs' swing. Head-on, the fit cannot
