@@ -2,7 +2,7 @@ module llm;
 
 import std::io;
 import std::core::mem;
-import std::core::mem::allocator;
+import std::core::mem::allocators;
 
 fn usz compute_tensor_bytes(GGMLType dtype, ulong[4] shape, uint n_dims) {
     usz n_elements = 1;
