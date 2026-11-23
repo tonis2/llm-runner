@@ -61,9 +61,11 @@ export function conditioningImage(img, { padding = 1.2, size = 518 } = {}) {
 		if (pixels[(y * W + x) * 4 + 3] > 204) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
 	}
 	if (x1 < 0) throw new Error('the image has no foreground (no pixel is more than 80% opaque)');
-	let opaque = 0;
-	for (let i = 3; i < pixels.length; i += 4) if (pixels[i] === 255) opaque++;
-	if (opaque === W * H) throw new Error('the image is fully opaque: LATO.2 needs a cutout whose background is transparent');
+	// Nearly opaque counts as opaque: a generator's alpha can be noise just
+	// under 255, which would make the whole frame the foreground.
+	let clear = 0;
+	for (let i = 3; i < pixels.length; i += 4) if (pixels[i] <= 204) clear++;
+	if (clear === 0) throw new Error('the image is opaque (every pixel is more than 80% opaque): LATO.2 needs a cutout whose background is transparent');
 	const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
 	const side = Math.trunc(Math.max(x1 - x0, y1 - y0) * padding);
 	if (side < 2) throw new Error('the foreground is too small to crop');

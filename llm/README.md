@@ -15,6 +15,7 @@ llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg 
 llm-runner lato2  weights=/models/lato2 input=cutout.png output=model.glb   # an RGBA cutout to a mesh
 llm-runner qwenimage --config qwenimage.json prompt="a neon sign that says OPEN"
 llm-runner run llm/apps/graph/templates/qwenimage-edit.json input0.path=photo.png prompt.prompt="make it winter"
+llm-runner run llm/apps/graph/templates/qwenimage-to-mesh.json prompt.prompt="PNG cutout with an alpha channel: a brass lantern, background removed, everything around it fully transparent (RGBA, alpha 0)"   # text to a mesh
 llm-runner run llm/apps/graph/templates/flux-t2i.json sample.seed=7   # a node graph
 llm-runner graph list=true                                     # the node types there are
 llm-runner tests/matmul_coop.js     # a script: run once as a module
@@ -437,6 +438,16 @@ run on the CPU from the same files:
 | VAE encode and decode, 512² | 62.8 dB |
 | DiT velocity, one step at 256² | relative error 1%, cosine 0.99995 (reference in bf16) |
 | Sigmas, 40 and 4 steps | equal to 6 places |
+
+Its VAE is RGBA, and the DiT draws real transparency when the prompt asks for
+a cutout in so many words: "PNG cutout with an alpha channel: a red ceramic
+teapot, background removed, everything around the teapot fully transparent
+(RGBA, alpha 0)" gave alpha 0 on 66% of the picture and a clean edge. "On a
+transparent background" alone paints a checkerboard instead, and an edit
+asking to remove a photo's background keeps it. An opaque picture's alpha
+decodes to noise just under 1, so `core.vae_decode` keeps the alpha only when
+part of the picture is see-through. An RGBA image is encoded with its own alpha.
+`templates/qwenimage-to-mesh.json` hands such a cutout to LATO.2.
 
 Qwen-Image 2.1 LoRAs were checked in both layouts files come in: PEFT's
 (`transformer.` prefix, `img_mlp.gate_layer` and `proj` folded into the two

@@ -113,7 +113,9 @@ async function previewFor(latent) {
 	}
 	if (previewDecoder.format !== latent.format) return null;
 	const f = FORMATS[latent.format].factor;
-	return image.fromTensor(await decodeLatent(path, latent), latent.w * f, latent.h * f, 3);
+	const w = latent.w * f, h = latent.h * f;
+	const pixels = await decodeLatent(path, latent);
+	return image.fromTensor(pixels, w, h, pixels.length / (w * h));
 }
 
 // Run the graph (or what `targets` need). Results stay cached between runs,

@@ -133,7 +133,7 @@ defineNodes('core', {
 			const factor = FORMATS[latent.format].factor;
 			const width = latent.w * factor, height = latent.h * factor;
 			const pixels = await decodeLatent(vae.path, latent);
-			const img = image.fromTensor(pixels, width, height, 3);
+			const img = image.fromTensor(pixels, width, height, pixels.length / (width * height));
 			llm.print(`  [phase] vae_decode: ${llm.since(t0)}`);
 			return { image: img };
 		},

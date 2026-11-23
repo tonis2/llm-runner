@@ -171,7 +171,7 @@ export class QwenVAEDecoder {
 	}
 
 	// `latent` is [C, h, w] in the VAE's own scale (the DiT's latent times std
-	// plus mean); returns [3, 16h, 16w] floats in [0, 1], the alpha dropped.
+	// plus mean); returns [4, 16h, 16w] floats in [0, 1], RGBA.
 	async decode(latent, h, w) {
 		const { size, save } = this.sizes(h, w);
 		const a = { x: f32(size), t: f32(size), s: f32(size) };
@@ -205,10 +205,10 @@ export class QwenVAEDecoder {
 			const ch = this.convOut.inC;
 			op.channelRmsNorm(a.x, this.normOut, a.t, ch, h * w, true);
 			op.conv2d(this.convOut, a.t, a.x, h, w);
-			// [-1, 1] to [0, 1] on the first three channels (RGB; A is dropped).
-			op.scaleShiftClamp(a.x, a.t, 3 * h * w, 0.5, 0.5);
+			// [-1, 1] to [0, 1] on all four channels, alpha included.
+			op.scaleShiftClamp(a.x, a.t, 4 * h * w, 0.5, 0.5);
 			submit();
-			return new Float32Array(a.t.buffer.readBytes(0, 3 * h * w * 4).buffer);
+			return new Float32Array(a.t.buffer.readBytes(0, 4 * h * w * 4).buffer);
 		} finally {
 			disposeAll([a, kept]);
 		}

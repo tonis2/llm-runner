@@ -1,0 +1,12 @@
+{
+	"nodes": [
+		{"id": "vae", "type": "core.vae", "params": {"path": "/run/media/tonis/extra/AI models/qwen21_vae_stock.safetensors"}},
+		{"id": "text_encoder", "type": "core.text_encoder", "params": {"path": "/run/media/tonis/extra/AI models/Qwen3-VL-8B-Instruct-Q8_0.gguf"}},
+		{"id": "prompt", "type": "qwenimage.text_encode", "params": {"encoder": {"from": "text_encoder.encoder"}, "prompt": "PNG cutout with an alpha channel: a red ceramic teapot, background removed, everything around the teapot fully transparent (RGBA, alpha 0)"}},
+		{"id": "dit", "type": "qwenimage.load", "params": {"path": "/run/media/tonis/extra/AI models/qwen-image-2.1-Q8_0.gguf"}},
+		{"id": "sample", "type": "qwenimage.sample", "params": {"positive": {"from": "prompt.cond"}, "model": {"from": "dit.model"}, "width": 1024, "height": 1024, "steps": 40, "seed": 42, "cfg": 1}},
+		{"id": "decode", "type": "core.vae_decode", "params": {"vae": {"from": "vae.vae"}, "latent": {"from": "sample.latent"}}},
+		{"id": "save", "type": "core.save_image", "params": {"image": {"from": "decode.image"}, "path": "output/qwen-cutout-#.png"}},
+		{"id": "mesh", "type": "lato2.image_to_mesh", "params": {"image": {"from": "decode.image"}, "weights": "/run/media/tonis/extra/AI models/lato2", "path": "output/qwen-mesh-#.glb", "seed": 42, "vertices": 2000}}
+	]
+}

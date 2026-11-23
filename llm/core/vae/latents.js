@@ -121,13 +121,17 @@ async function encodeFlux1(encoder, img) {
 	return makeLatent('flux1', latent, enc.h, enc.w);
 }
 
-// Qwen: RGB with an opaque alpha plane through the encoder, the mean
+// Qwen: RGBA through the encoder (an image without alpha is opaque), the mean
 // normalised per channel.
 async function encodeQwen(encoder, img) {
 	const H = img.height, W = img.width, n = H * W;
 	const pixels = new Float32Array(4 * n);
 	pixels.set(image.toTensor(img).subarray(0, 3 * n));
-	pixels.fill(1, 3 * n);
+	if (img.channels === 4) {
+		for (let i = 0; i < n; i++) pixels[3 * n + i] = img.pixels[i * 4 + 3] / 127.5 - 1;
+	} else {
+		pixels.fill(1, 3 * n);
+	}
 	const enc = await encoder.encode(pixels, H, W);
 	const spatial = enc.h * enc.w;
 	const latent = enc.data;
@@ -146,12 +150,18 @@ async function decodeQwen(vae, latent) {
 		for (let j = 0; j < spatial; j++) data[c * spatial + j] = data[c * spatial + j] * std + mean;
 	}
 	const decoder = new QwenVAEDecoder(vae);
+	let rgba;
 	try {
 		await decoder.load();
-		return await decoder.decode(data, latent.h, latent.w);
+		rgba = await decoder.decode(data, latent.h, latent.w);
 	} finally {
 		decoder.dispose();
 	}
+	// An opaque picture's alpha plane decodes to noise between about 0.95 and
+	// 1, so the alpha is kept only when some of the picture is see-through.
+	const n = rgba.length / 4;
+	for (let i = 3 * n; i < rgba.length; i++) if (rgba[i] < 0.5) return rgba;
+	return rgba.subarray(0, 3 * n);
 }
 
 // An image through a VAE file into its latent format. The image's sides must
@@ -182,7 +192,8 @@ export async function encodeImage(vaePath, img) {
 	}
 }
 
-// A latent through a VAE file to [3, H, W] floats in [0, 1].
+// A latent through a VAE file to [3, H, W] floats in [0, 1], or [4, H, W]
+// (RGBA) from Qwen-Image's VAE when the picture has transparency.
 export async function decodeLatent(vaePath, latent) {
 	const vae = llm.open(vaePath);
 	try {
