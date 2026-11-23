@@ -327,6 +327,8 @@ export function layerNormAffine(x, weight, bias, y, dim, rows, eps = 1e-6) {
 	dispatch('layernorm_affine', [x, weight, bias, y], [rows], pc('ufuu', dim, eps, rows, 0));
 }
 export function geluErf(x, n) { dispatch('gelu_erf', [x], [groups(n, 256)], pc('u', n)); }
+// CLIP's x * sigmoid(1.702 x), in place.
+export function quickGelu(x, n) { dispatch('quick_gelu', [x], [groups(n, 256)], pc('u', n)); }
 // [gh * gw, C] tokens to [(gh/2) * (gw/2), 4C], each 2x2 block's side by side.
 export function merge2x2(x, y, gh, gw, channels) {
 	dispatch('merge_2x2', [x, y], [groups(gh * gw * channels, 256)], pc('uuu', gh, gw, channels));
@@ -440,6 +442,25 @@ export function nafSample(q, k, v, points, y, s, g, count, vd, stride = 4 * vd, 
 // Sparse channel-to-spatial: child rows from their parents' channel chunks (c2s_gather.shady).
 export function c2sGather(x, codes, y, rows, cols, inCols, chunk, rep = 1) {
 	dispatch('c2s_gather', [codes, x, y], [groups(rows * cols, 256)], pc('uuuuu', rows, cols, inCols, chunk, rep));
+}
+// out [rows, C] = a 3^3 conv summed from its per-tap products z (tap_sum.shady).
+export function tapSum(z, table, out, channels, rows) {
+	dispatch('tap_sum', [z, table, out], [groups(rows * channels, 256)], pc('uu', channels, rows));
+}
+// GroupNorm's per-group mean and 1 / std over all rows into stats [2 * groups]
+// (group_stats.shady), for gatherKGroupNorm.
+export function groupStats(x, stats, channels, rows, numGroups, eps = 1e-5) {
+	dispatch('group_stats', [x, stats], [numGroups], pc('uuuf', channels, rows, numGroups, eps));
+}
+// gatherK with GroupNorm (groupStats' stats, per-channel weight and bias) and
+// SiLU applied to each gathered value; zero for 0xFFFFFFFF (gather_k_gn.shady).
+export function gatherKGroupNorm(x, index, stats, weight, bias, out, channels, k, rows, numGroups) {
+	dispatch('gather_k_gn', [x, index, stats, weight, bias, out], [groups(rows * k * channels, 256)], pc('uuuu', channels, k, rows, numGroups));
+}
+// Each parent row [parents, C] the mean of its children's; `kids` [parents, 8],
+// 0xFFFFFFFF past the last; `extra` added to each count (child_mean.shady).
+export function childMean(x, kids, y, channels, parents, extra = 0) {
+	dispatch('child_mean', [x, kids, y], [groups(parents * channels, 256)], pc('uuu', channels, parents, extra));
 }
 // Children's neighbour table from their parents' (child_neighbours.shady).
 export function childNeighbours(parentTable, kids, codes, table, children) {

@@ -1,0 +1,47 @@
+// GroupNorm's statistics over rows [rows, channels] (a sparse tensor's
+// features): per group the mean and 1 / sqrt(variance + eps) over all rows of
+// its channels, into stats[2 * group], stats[2 * group + 1]. Two passes, as
+// group_norm_rows has them; the normalising is left to whoever reads the rows
+// (gather_k_gn). One workgroup per group.
+float input_[];
+float stats[];
+struct Push @pushconstant { uint channels; uint rows; uint num_groups; float eps; }
+Push pc;
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint group = input.gid.x;
+    uint gi = input.lid.x;
+    if (group >= pc.num_groups) return;
+    uint cpg = pc.channels / pc.num_groups;
+    uint c0 = group * cpg;
+    uint n = cpg * pc.rows;
+
+    float sum = 0.0;
+    for (uint i = gi; i < n; i += 256u) sum += input_[(i / cpg) * pc.channels + c0 + i % cpg];
+    red[gi] = sum;
+    barrier;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gi < s) red[gi] += red[gi + s];
+        barrier;
+    }
+    float mean = red[0] / float(n);
+    barrier;
+
+    float var_sum = 0.0;
+    for (uint i = gi; i < n; i += 256u) {
+        float d = input_[(i / cpg) * pc.channels + c0 + i % cpg] - mean;
+        var_sum += d * d;
+    }
+    red[gi] = var_sum;
+    barrier;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gi < s) red[gi] += red[gi + s];
+        barrier;
+    }
+    if (gi == 0u) {
+        stats[2u * group] = mean;
+        stats[2u * group + 1u] = 1.0 / sqrt(red[0] / float(n) + pc.eps);
+    }
+}

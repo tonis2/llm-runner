@@ -1,0 +1,9 @@
+{
+	"nodes": [
+		{"id": "input", "type": "core.load_image", "params": {"path": "cutout.png"}},
+		{"id": "pixal3d", "type": "pixal3d.image_to_mesh", "params": {"image": {"from": "input.image"}, "weights": "/run/media/tonis/extra/AI models/pixal3d", "seed": 42}},
+		{"id": "coarse", "type": "core.save_mesh", "params": {"mesh": {"from": "pixal3d.mesh"}, "path": "output/pixal3d-#.glb"}},
+		{"id": "hi3d", "type": "hi3d.refine_mesh", "params": {"image": {"from": "input.image"}, "mesh": {"from": "pixal3d.mesh"}, "weights": "/run/media/tonis/extra/AI models/hi3d", "seed": 42}},
+		{"id": "refined", "type": "core.save_mesh", "params": {"mesh": {"from": "hi3d.mesh"}, "path": "output/hi3d-#.glb"}}
+	]
+}

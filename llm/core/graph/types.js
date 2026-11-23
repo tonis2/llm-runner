@@ -18,6 +18,9 @@
 //   MOTION        { skeleton { names, parents, offsets }, fps, frames,
 //                 rotations Float32Array [frames, J, 4] parent-local xyzw,
 //                 root Float32Array [frames, 3] metres, y up, contacts?, ... }
+//   MESH          { positions Float32Array [V * 3] (y up), indices Uint32Array
+//                 [F * 3], normals? [V * 3], name?, stats? }  a triangle mesh,
+//                 as a .glb holds it
 //
 // Primitives are node settings - a widget in the editor, a param in a graph
 // file - and can be wired from another node's output too.
@@ -36,7 +39,7 @@
 // or as an object { type, default, optional, options, kind, min, max, multiline, many }.
 
 export const TYPES = [
-	'IMAGE', 'LATENT', 'CONDITIONING', 'MODEL', 'TEXT_ENCODER', 'VAE', 'LORA', 'REFERENCES', 'POSE', 'MOTION',
+	'IMAGE', 'LATENT', 'CONDITIONING', 'MODEL', 'TEXT_ENCODER', 'VAE', 'LORA', 'REFERENCES', 'POSE', 'MOTION', 'MESH',
 	'STRING', 'INT', 'FLOAT', 'BOOL', 'ENUM', 'PATH', 'ANY',
 ];
 

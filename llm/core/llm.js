@@ -245,6 +245,8 @@ export const llm = {
 	meshNative: typeof H.meshSimplify === 'function',
 	meshSimplify(positions, indices, params) { return H.meshSimplify(positions, indices, params); },
 	meshShellSurface(...args) { return H.meshShellSurface(...args); },
+	meshVoxelize(positions, indices, params) { return H.meshVoxelize(positions, indices, params); },
+	meshFlexiCubes(...args) { return H.meshFlexiCubes(...args); },
 
 	// Register the plugin this file is. The runner calls `load(config)` once and
 	// then `generate(config)` — or, as a server, `handle(request)` per request

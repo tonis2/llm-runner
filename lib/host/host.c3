@@ -141,6 +141,8 @@ fn void? install(three::JsRuntime* runtime)
 
 	js.@bind(host, "meshSimplify", &js_mesh_simplify, runtime)!;
 	js.@bind(host, "meshShellSurface", &js_mesh_shell_surface, runtime)!;
+	js.@bind(host, "meshVoxelize", &js_mesh_voxelize, runtime)!;
+	js.@bind(host, "meshFlexiCubes", &js_mesh_flexicubes, runtime)!;
 
 	js.set(js.global(), "__llm", host)!;
 }

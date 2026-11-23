@@ -5,6 +5,7 @@
 import { llm, image } from './llm.js';
 import { defineNodes } from '/core/graph/registry.js';
 import { vaeKind, KIND_FORMAT, FORMATS, encodeImage, decodeLatent } from '/core/vae/latents.js';
+import { readMeshGlb, writeMeshGlb, vertexNormals } from '/core/mesh/glb.js';
 
 // `#` in a file name is the next number not yet taken: out-#.png is out-1.png,
 // then out-2.png.
@@ -70,6 +71,39 @@ defineNodes('core', {
 		inputs: { image: 'IMAGE' },
 		outputs: {},
 		run({ image: img }) { return { image: img, width: img.width, height: img.height }; },
+	},
+
+	'core.load_mesh': {
+		title: 'Load mesh',
+		category: '3d',
+		description: 'A .glb\'s first mesh: its positions and faces.',
+		inputs: { path: 'PATH(mesh)' },
+		outputs: { mesh: 'MESH' },
+		run({ path }) {
+			if (!llm.exists(path)) throw new Error(`no mesh at ${path}`);
+			return { mesh: readMeshGlb(path) };
+		},
+	},
+
+	'core.save_mesh': {
+		title: 'Save mesh',
+		category: '3d',
+		description: 'Writes a .glb. A # in the name becomes the next free number.',
+		output: true,
+		inputs: { mesh: 'MESH', path: 'STRING=output/mesh-#.glb' },
+		outputs: {},
+		run({ mesh, path }) {
+			const out = numbered(path);
+			makeDirFor(out);
+			const { positions, indices } = mesh;
+			writeMeshGlb(out, {
+				name: mesh.name ?? 'mesh', positions, indices, normals: mesh.normals ?? vertexNormals(positions, indices),
+				generator: 'llm-runner', extras: mesh.stats ?? null,
+			});
+			const vertices = positions.length / 3, faces = indices.length / 3;
+			llm.print(`  saved ${out} (${vertices} vertices, ${faces} faces)`);
+			return { output: out, vertices, faces };
+		},
 	},
 
 	'core.text_encoder': {

@@ -125,12 +125,12 @@ export class Pixal3D {
 	}
 
 	// A shape flow's latent on `coords` (n voxels), denormalised: a tensor [n, 32].
-	async shapeLatent(which, coords, global, proj, o, seed) {
+	async shapeLatent(which, coords, global, proj, o, seed, onStep = null) {
 		const n = coords.length / 3, flow = await this.flow(which);
 		const z = upload(llm.randomNormal(n * flow.outC, seed));
 		try {
 			await flow.sample(z, coords, { global, proj }, n, {
-				steps: o.shape_steps, guidance: o.shape_guidance, rescale: o.shape_rescale, interval: [0.6, 1], rescaleT: o.shape_rescale_t,
+				steps: o.shape_steps, guidance: o.shape_guidance, rescale: o.shape_rescale, interval: [0.6, 1], rescaleT: o.shape_rescale_t, onStep,
 			});
 		} catch (e) {
 			z.dispose();
@@ -146,9 +146,15 @@ export class Pixal3D {
 	}
 
 	// An 8-bit RGBA cutout to { positions, indices, normals, stats }.
+	// `options.progress(done, steps)`, if given, is awaited after each flow
+	// step, the three flows' steps counted together (a graph node's
+	// ctx.progress).
 	async generate(img, options = {}) {
 		const o = { ...DEFAULTS, ...options }, t0 = llm.now(), stats = {};
 		if (o.resolution !== 512 && o.resolution !== 1024) throw new Error(`resolution ${o.resolution}: 512 or 1024`);
+		let done = 0;
+		const total = o.ss_steps + o.shape_steps * (o.resolution > 512 ? 2 : 1);
+		const onStep = o.progress ? () => o.progress(++done, total) : null;
 		const pre = preprocess(img);
 		const cam = camera(o.fov);
 		const owned = [];
@@ -168,7 +174,7 @@ export class Pixal3D {
 			const x = own(upload(llm.randomNormal(16 ** 3 * flow.outC, o.seed)));
 			try {
 				await flow.sample(x, gridCoords(16), { global, proj: ssProj }, 16 ** 3, {
-					steps: o.ss_steps, guidance: o.ss_guidance, rescale: o.ss_rescale, interval: [0.6, 1], rescaleT: o.ss_rescale_t,
+					steps: o.ss_steps, guidance: o.ss_guidance, rescale: o.ss_rescale, interval: [0.6, 1], rescaleT: o.ss_rescale_t, onStep,
 				});
 			} finally {
 				flow.dispose();
@@ -187,7 +193,7 @@ export class Pixal3D {
 			const proj = own(cond.proj(pic, 32, cam, coords));
 			cond.disposePicture(pic);
 			pic = null;
-			lat = await this.shapeLatent('shape512', coords, global, proj, o, o.seed + 1);
+			lat = await this.shapeLatent('shape512', coords, global, proj, o, o.seed + 1, onStep);
 			let r = 32;
 
 			if (fine) {
@@ -208,7 +214,7 @@ export class Pixal3D {
 				const fineGlobal = own(cond.global(fine)), fineProj = own(cond.proj(fine, r, cam, coords));
 				cond.disposePicture(fine);
 				fine = null;
-				lat = await this.shapeLatent('shape1024', coords, fineGlobal, fineProj, o, o.seed + 2);
+				lat = await this.shapeLatent('shape1024', coords, fineGlobal, fineProj, o, o.seed + 2, onStep);
 			}
 			disposeAll(owned.splice(0));
 

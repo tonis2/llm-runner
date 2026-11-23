@@ -1,0 +1,31 @@
+// gather_k with GroupNorm and SiLU on the way: out[r, k * C + c] =
+// silu((x[index[r * K + k], c] - mean) * inv_std * weight[c] + bias[c]), the
+// group's statistics from group_stats, and zero where the index is 0xFFFFFFFF
+// (a conv's padding comes after the norm). A sparse conv's patches straight
+// from its un-normalised input, which then needs no normalised copy.
+float x[];
+uint index[];
+float stats[];
+float weight[];
+float bias[];
+float output[];
+struct Push @pushconstant { uint channels; uint k; uint rows; uint num_groups; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint width = pc.k * pc.channels;
+    uint i = input.id.x + input.id.y * 65535u * 256u;
+    if (i >= pc.rows * width) return;
+    uint r = i / width;
+    uint col = i % width;
+    uint c = col % pc.channels;
+    uint src = index[r * pc.k + col / pc.channels];
+    if (src == 4294967295u) {
+        output[i] = 0.0;
+        return;
+    }
+    uint g = c / (pc.channels / pc.num_groups);
+    float y = (x[src * pc.channels + c] - stats[2u * g]) * stats[2u * g + 1u] * weight[c] + bias[c];
+    output[i] = y / (1.0 + exp(-y));
+}

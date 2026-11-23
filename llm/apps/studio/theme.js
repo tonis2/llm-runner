@@ -32,6 +32,7 @@ export const TYPE_COLOR = {
 	REFERENCES: [0.30, 0.82, 0.88],
 	POSE: [0.95, 0.55, 0.25],
 	MOTION: [0.75, 0.45, 0.95],
+	MESH: [0.55, 0.85, 0.75],
 	ANY: [0.8, 0.8, 0.8],
 };
 export const PRIMITIVE_COLOR = [0.60, 0.60, 0.62];

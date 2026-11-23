@@ -1,0 +1,27 @@
+// Each parent row the mean of its children's (a sparse 2x downsample's scatter
+// mean): out[p, c] = sum of x[kids[p * 8 + j], c] over the kids that are not
+// 0xFFFFFFFF, over their count plus `extra` (1 for torch's scatter_reduce
+// mean, which counts the zero it starts from).
+float x[];
+uint kids[];
+float output[];
+struct Push @pushconstant { uint channels; uint parents; uint extra; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x + input.id.y * 65535u * 256u;
+    if (i >= pc.parents * pc.channels) return;
+    uint p = i / pc.channels;
+    uint c = i % pc.channels;
+    float sum = 0.0;
+    uint count = 0u;
+    for (uint j = 0u; j < 8u; j++) {
+        uint k = kids[p * 8u + j];
+        if (k != 4294967295u) {
+            sum += x[k * pc.channels + c];
+            count++;
+        }
+    }
+    output[i] = sum / float(max(count + pc.extra, 1u));
+}

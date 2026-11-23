@@ -312,6 +312,8 @@ export class Chrome extends three.Widget {
 
 const MODEL_MASK = ['*.gguf', '*.safetensors'];
 const IMAGE_MASK = ['*.png', '*.jpg', '*.jpeg'];
+// a PATH's kind to its files; any other kind is a model's weights
+const MASKS = { image: IMAGE_MASK, mesh: ['*.glb'] };
 
 function dirOf(path) {
 	if (typeof path !== 'string') return '';
@@ -373,10 +375,10 @@ export class Dialogs extends three.Widget {
 				pick && new Scroll({ key: `pickScroll:${pick.node}:${pick.input}` },
 					new FileBrowser({
 						key: `pickBrowser:${pick.node}:${pick.input}`, start: pick.start,
-						mask: pick.kind === 'image' ? IMAGE_MASK : MODEL_MASK,
+						mask: MASKS[pick.kind] ?? MODEL_MASK,
 						onChoose: safe((path) => {
 							app.doc.setParam(pick.node, pick.input, path);
-							if (pick.kind !== 'image') app.settings.model_dir = dirOf(path);
+							if (!MASKS[pick.kind]) app.settings.model_dir = dirOf(path);
 							this.pick = null;
 							app.changed();
 						}),

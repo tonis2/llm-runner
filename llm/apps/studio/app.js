@@ -169,7 +169,7 @@ export async function runGraph(graph, { targets = null, label = '', show = true 
 			for (const id of cached) app.nodeState[id] = 'cached';
 			for (const [id, r] of Object.entries(results)) {
 				if (r && r.image && r.image.pixels) setImage(id, r.image);
-				else if (r && typeof r.output === 'string' && llm.exists(r.output)) setImage(id, image.load(r.output));
+				else if (r && typeof r.output === 'string' && /\.(png|jpe?g)$/i.test(r.output) && llm.exists(r.output)) setImage(id, image.load(r.output));
 			}
 		}
 		const outputs = Object.values(results).map((r) => r && r.output).filter((o) => typeof o === 'string');

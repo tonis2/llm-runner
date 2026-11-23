@@ -12,12 +12,16 @@
 // ss_guidance 7.5, ss_rescale 0.7, ss_rescale_t 5, shape_steps 12,
 // shape_guidance 7.5, shape_rescale 0.5, shape_rescale_t 3, linear f16 | q8 | f32,
 // cond (a path: save the squared-up picture there too).
+//
+// refine=hi3d then has Hi3D (plugins/hi3d) regenerate the surface inside the
+// mesh's voxels from the same picture: hi3d= its weights folder, hi3d_steps
+// (25) and hi3d_budget (90000) its settings; faces and seed are shared.
 
 import { llm, image } from '/core/llm.js';
 import { writeMeshGlb } from '/core/mesh/glb.js';
 import { Pixal3D, DEFAULTS } from './pipeline.js';
 
-let pipeline = null;
+let pipeline = null, refiner = null;
 
 function settings(config) {
 	const o = {};
@@ -33,7 +37,21 @@ async function run(config) {
 		pipeline?.dispose();
 		pipeline = new Pixal3D(config.weights, { gguf: config.gguf ?? null, linear: config.linear ?? DEFAULTS.linear });
 	}
-	const r = await pipeline.generate(image.load(config.input), settings(config));
+	const img = image.load(config.input);
+	let r = await pipeline.generate(img, settings(config));
+	if (config.refine === 'hi3d') {
+		if (!config.hi3d) throw new Error('refine=hi3d needs hi3d=: the Hi3D folder (transformer_1024/, vae/, dinov2-large/, clip-vit-large-patch14/)');
+		const { Hi3D } = await import('/plugins/hi3d/pipeline.js');
+		if (!refiner || refiner.w !== config.hi3d) refiner = new Hi3D(config.hi3d);
+		const o = {};
+		if (config.faces !== undefined) o.faces = Number(config.faces);
+		if (config.seed !== undefined) o.seed = Number(config.seed);
+		if (config.hi3d_steps !== undefined) o.steps = Number(config.hi3d_steps);
+		if (config.hi3d_budget !== undefined) o.budget = Number(config.hi3d_budget);
+		const h = await refiner.refine(img, { positions: r.positions, indices: r.indices }, o);
+		const pre = r.pre;
+		r = { ...h, pre, stats: { ...h.stats, pixal3d: r.stats } };
+	}
 	writeMeshGlb(output, {
 		name: 'pixal3d', positions: r.positions, indices: r.indices, normals: r.normals,
 		generator: 'llm-runner pixal3d', extras: { source: config.input, ...r.stats },

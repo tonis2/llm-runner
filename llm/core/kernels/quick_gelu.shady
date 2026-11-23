@@ -1,0 +1,12 @@
+// CLIP's quick_gelu, x * sigmoid(1.702 x), in place.
+float data[];
+struct Push @pushconstant { uint n; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.n) return;
+    float x = data[i];
+    data[i] = x / (1.0 + exp(-1.702 * x));
+}

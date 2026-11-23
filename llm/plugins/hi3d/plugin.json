@@ -1,0 +1,7 @@
+{
+	"name": "hi3d",
+	"version": "0.1",
+	"description": "Hi3D v1.0: a picture and a coarse mesh to a finer mesh (.glb) - DINOv2 and CLIP conditioning, a Sparc3D sparse flow on the mesh's voxels, PTv3 decoder and FlexiCubes.",
+	"nodes": "nodes.js",
+	"main": "main.js"
+}

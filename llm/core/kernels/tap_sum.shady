@@ -1,0 +1,26 @@
+// A submanifold 3^3 conv finished from per-tap products: out[i, o] = the sum
+// over taps t < 27 of z[table[i * 27 + t] * 27 * C + o * 27 + t] (nothing for
+// 0xFFFFFFFF), z [rows of the table's source, C * 27] being the input times the
+// conv's weight [C, 27, in] read as a [C * 27, in] matrix. Cheaper than
+// gathering patches when many rows share their source rows (an upsampled
+// tensor's children share their parent's).
+float z[];
+uint table[];
+float output[];
+struct Push @pushconstant { uint channels; uint rows; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x + input.id.y * 65535u * 256u;
+    if (i >= pc.rows * pc.channels) return;
+    uint r = i / pc.channels;
+    uint o = i % pc.channels;
+    uint width = pc.channels * 27u;
+    float sum = 0.0;
+    for (uint t = 0u; t < 27u; t++) {
+        uint src = table[r * 27u + t];
+        if (src != 4294967295u) sum += z[src * width + o * 27u + t];
+    }
+    output[i] = sum;
+}

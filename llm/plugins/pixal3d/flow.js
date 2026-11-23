@@ -176,7 +176,7 @@ export class Flow {
 	// `rescaleT`. `concat` [n, in - out] (the texture flow's shape latent) is
 	// put beside x as the model's input. `onCall(i, t, v)` sees each model
 	// call's output, for comparing with a reference.
-	async sample(x, coords, cond, n, { steps = 12, guidance = 7.5, rescale = 0.7, interval = [0.6, 1], rescaleT = 5, concat = null, onCall = null } = {}) {
+	async sample(x, coords, cond, n, { steps = 12, guidance = 7.5, rescale = 0.7, interval = [0.6, 1], rescaleT = 5, concat = null, onCall = null, onStep = null } = {}) {
 		const t0 = llm.now(), outN = n * this.outC;
 		const pos = this.context(cond.global, cond.proj, n);
 		const neg = guidance !== 1 ? this.context(null, null, n) : null;
@@ -207,6 +207,7 @@ export class Flow {
 				op.eulerStep(x, v, outN, -(t - tPrev));
 				submit();
 				if (breathing()) await breathe();
+				if (onStep) await onStep(i + 1, steps);
 			}
 		} finally {
 			submit();
