@@ -1,0 +1,25 @@
+// Rotary embedding on adjacent pairs, in place on [tokens, heads * head_dim]:
+// pair p of a head is (x[2p], x[2p + 1]), turned by the angle whose cos and
+// sin are row t's entry p of the tables [tokens, head_dim / 2] - torch's
+// view_as_complex(x) * polar(1, angle), as TRELLIS's and LATO.2's 3D RoPE do it.
+float data[];
+float cos_t[];
+float sin_t[];
+struct Push @pushconstant { uint head_dim; uint heads; uint tokens; uint pad; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(128, 1, 1)
+{
+    uint half_dim = pc.head_dim / 2u;
+    uint i = input.id.x;
+    if (i >= pc.tokens * pc.heads * half_dim) return;
+    uint p = i % half_dim;
+    uint t = i / (half_dim * pc.heads);
+    uint at = (i / half_dim) * pc.head_dim + 2u * p;
+    float c = cos_t[t * half_dim + p];
+    float s = sin_t[t * half_dim + p];
+    float a = data[at];
+    float b = data[at + 1u];
+    data[at] = a * c - b * s;
+    data[at + 1u] = a * s + b * c;
+}

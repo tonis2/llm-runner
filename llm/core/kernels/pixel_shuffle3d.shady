@@ -1,0 +1,24 @@
+// TRELLIS's pixel_shuffle_3d at scale 2 on channel-last grids: input [X, Y, Z,
+// C * 8] to output [2X, 2Y, 2Z, C], out(2x + a, 2y + b, 2z + e)[c] =
+// in(x, y, z)[c * 8 + a * 4 + b * 2 + e].
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint x; uint y; uint z; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint X = 2u * pc.x;
+    uint Y = 2u * pc.y;
+    uint Z = 2u * pc.z;
+    uint i = input.id.x + input.id.y * 65535u * 256u;
+    if (i >= X * Y * Z * pc.channels) return;
+    uint c = i % pc.channels;
+    uint o = i / pc.channels;
+    uint oz = o % Z;
+    uint oy = (o / Z) % Y;
+    uint ox = o / (Z * Y);
+    uint src = ((ox / 2u) * pc.y + oy / 2u) * pc.z + oz / 2u;
+    uint sub = (ox % 2u) * 4u + (oy % 2u) * 2u + oz % 2u;
+    output[i] = input_[src * pc.channels * 8u + c * 8u + sub];
+}

@@ -371,6 +371,65 @@ export function readTorch(path) {
 // as they lie (not contiguous, or of an integer type) are left out of the
 // table; `model.torch` keeps every one, `model.ints(name)` reads an
 // integer tensor's values and `model.pickle` is the whole unpickled value.
+// The shape a tensor table entry is given: at most four dims, a longer one
+// folded to [first, rest].
+export function tableShape(shape) {
+	if (shape.length === 0) return [1];
+	if (shape.length <= 4) return shape;
+	return [shape[0], shape.slice(1).reduce((a, b) => a * b, 1)];
+}
+
+// A safetensors file opened through the same table as a checkpoint, so its
+// tensors of more than four dims are there too (as [out, rest], with `dims`
+// for the whole shape); the host's own safetensors reader takes four.
+export function openSafetensors(path) {
+	const reader = fileReader(path);
+	const head = view(reader.read(0, 8));
+	const length = u64(head, 0);
+	const json = JSON.parse(utf8(reader.read(8, length)));
+	const base = 8 + length;
+	const header = {}, dims = new Map(), metadata = json.__metadata__ ?? {};
+	for (const [name, t] of Object.entries(json)) {
+		if (name === '__metadata__') continue;
+		dims.set(name, t.shape.slice());
+		header[name] = { dtype: t.dtype, shape: tableShape(t.shape), data_offsets: [base + t.data_offsets[0], base + t.data_offsets[1]] };
+	}
+	const ints = new Map();
+	for (const [name, t] of Object.entries(json)) {
+		if (name === '__metadata__' || ['F32', 'F16', 'BF16'].includes(t.dtype)) continue;
+		ints.set(name, t);
+		delete header[name];
+	}
+	const model = new Model(path, H.modelOpen(path, JSON.stringify(header)));
+	model.format = 'torch';
+	model.metadata = metadata;
+	model.dims = (name) => {
+		const d = dims.get(name);
+		if (!d) throw new Error(`${path} has no tensor named ${name}`);
+		return d.slice();
+	};
+	// An integer tensor's values, as numbers (they are not in the table).
+	model.ints = (name) => {
+		const t = ints.get(name);
+		if (!t) throw new Error(`${path} has no integer tensor named ${name}`);
+		const raw = reader.read(base + t.data_offsets[0], t.data_offsets[1] - t.data_offsets[0]);
+		const dv = view(raw), width = { I64: 8, I32: 4, I16: 2, I8: 1, U8: 1, BOOL: 1 }[t.dtype];
+		if (!width) throw new Error(`${name} is ${t.dtype}`);
+		const n = raw.length / width, out = new Array(n);
+		for (let i = 0; i < n; i++) {
+			switch (t.dtype) {
+				case 'I64': out[i] = i64(dv, i * 8); break;
+				case 'I32': out[i] = dv.getInt32(i * 4, true); break;
+				case 'I16': out[i] = dv.getInt16(i * 2, true); break;
+				case 'I8': out[i] = dv.getInt8(i); break;
+				default: out[i] = raw[i];
+			}
+		}
+		return out;
+	};
+	return model;
+}
+
 export function openTorch(path, { select = null } = {}) {
 	const { value, entries, root, reader } = readTorch(path);
 	const holder = select ? select(value) : (value instanceof Map && value.has('state_dict') ? value.get('state_dict') : value);
@@ -386,9 +445,11 @@ export function openTorch(path, { select = null } = {}) {
 	const header = {};
 	const skipped = [];
 	for (const [name, t] of all) {
-		if (!t.contiguous || !['F32', 'F16', 'BF16'].includes(t.dtype) || t.shape.length > 4) { skipped.push(name); continue; }
-		// A 0-d tensor is one element; the table wants a shape.
-		header[name] = { dtype: t.dtype, shape: t.shape.length ? t.shape : [1], data_offsets: where(t) };
+		if (!t.contiguous || !['F32', 'F16', 'BF16'].includes(t.dtype)) { skipped.push(name); continue; }
+		// A 0-d tensor is one element; the table wants a shape. One of more than
+		// four dims (a 3D convolution's weight) is seen as [out, rest]: the table
+		// holds four, and that is the matmul's view of it. `dims` has the shape.
+		header[name] = { dtype: t.dtype, shape: tableShape(t.shape), data_offsets: where(t) };
 	}
 	const model = new Model(path, H.modelOpen(path, JSON.stringify(header)));
 	model.format = 'torch';
@@ -396,6 +457,12 @@ export function openTorch(path, { select = null } = {}) {
 	model.skipped = skipped;
 	// The unpickled value itself, for what is not a tensor (names, settings).
 	model.pickle = value;
+	// A tensor's shape as torch has it, all its dims (`shape` is the table's).
+	model.dims = (name) => {
+		const t = all.get(name);
+		if (!t) throw new Error(`${path} has no tensor named ${name}`);
+		return t.shape.slice();
+	};
 	model.ints = (name) => {
 		const t = all.get(name);
 		if (!t) throw new Error(`${path} has no tensor named ${name}`);

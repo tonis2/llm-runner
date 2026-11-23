@@ -1,0 +1,20 @@
+// Rows gathered by index: out[r, k * C + c] = x[index[r * K + k], c], zero
+// where the index is 0xFFFFFFFF. K = 27 is a sparse 3x3x3 convolution's
+// patches (a neighbour table); K = 1 picks rows (a subdivision's parents, the
+// points a pruning kept).
+float x[];
+uint index[];
+float output[];
+struct Push @pushconstant { uint channels; uint k; uint rows; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint width = pc.k * pc.channels;
+    uint i = input.id.x + input.id.y * 65535u * 256u;
+    if (i >= pc.rows * width) return;
+    uint r = i / width;
+    uint col = i % width;
+    uint src = index[r * pc.k + col / pc.channels];
+    output[i] = src == 4294967295u ? 0.0 : x[src * pc.channels + col % pc.channels];
+}

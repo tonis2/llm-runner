@@ -362,3 +362,53 @@ export function linearBiasRows(w, b, x, y, out, inDim, seq) {
 	matmul(w, x, y, out, inDim, seq);
 	biasAdd(y, b, seq * out, out);
 }
+
+// ---- 3D and sparse: TRELLIS-family models (LATO.2)
+
+// RoPE on adjacent pairs (x[2p], x[2p+1]) of each head, from cos/sin tables
+// [tokens, headDim / 2], on [tokens, heads * headDim] in place.
+export function ropePairs(x, cos, sin, headDim, heads, tokens, independent = false) {
+	dispatch('rope_pairs', [x, cos, sin], [groups(tokens * heads * (headDim / 2), 128)], pc('uuuu', headDim, heads, tokens, 0), independent);
+}
+// Per-head RMSNorm in place with a gamma per head: weight [heads * headDim].
+export function headNormGamma(x, weight, heads, headDim, rows, eps = 1e-12, independent = false) {
+	dispatch('head_norm_gamma', [x, weight], [rows * heads], pc('uuuf', heads, headDim, rows, eps), independent);
+}
+// GroupNorm over rows [rows, channels], then SiLU when `silu`.
+export function groupNormRows(x, weight, bias, y, channels, rows, numGroups, eps = 1e-5, silu = false) {
+	dispatch('group_norm_rows', [x, weight, bias, y], [numGroups], pc('uuufu', channels, rows, numGroups, eps, silu ? 1 : 0));
+}
+// A 3D convolution's patches as rows (im2col3d.shady): `grid` [X, Y, Z] of
+// channel-last input, output rows `first` .. `first + rows` of `outGrid`.
+export function im2col3d(x, out, channels, grid, k, stride, pad, outGrid, first, rows, cMajor) {
+	const n = rows * k * k * k * channels;
+	dispatch('im2col3d', [x, out], [groups(n, 256)],
+		pc('uuuuuuuuuuuuu', channels, grid[0], grid[1], grid[2], k, stride, pad, outGrid[0], outGrid[1], outGrid[2], first, rows, cMajor ? 1 : 0));
+}
+// out[r, k * C + c] = x[index[r * K + k], c] (zero for 0xFFFFFFFF).
+export function gatherK(x, index, out, channels, k, rows) {
+	dispatch('gather_k', [x, index, out], [groups(rows * k * channels, 256)], pc('uuu', channels, k, rows));
+}
+// [X, Y, Z, C * 8] to [2X, 2Y, 2Z, C], TRELLIS's pixel_shuffle_3d.
+export function pixelShuffle3d(x, y, channels, X, Y, Z) {
+	dispatch('pixel_shuffle3d', [x, y], [groups(8 * X * Y * Z * channels, 256)], pc('uuuu', channels, X, Y, Z));
+}
+// Block-diagonal attention over rows grouped by `order`/`span` (attention_window.shady).
+export function attentionWindow(q, k, v, order, span, out, heads, hd, n, scale = 1 / Math.sqrt(hd)) {
+	dispatch('attention_window', [q, k, v, order, span, out], [n, heads], pc('uuuf', heads, hd, n, scale));
+}
+// LATO.2's pair edge MLP over all i < j (pair_edges.shady).
+export function pairEdges(a, b, w2, count, edges, n, hidden, b2, threshold, cap) {
+	dispatch('pair_edges', [a, b, w2, count, edges], [groups(n, 16), groups(n, 16)], pc('uuffu', n, hidden, b2, threshold, cap));
+}
+// Attention of any head width up to 128 on the matrix cores, rows in and
+// rows out: q [qLen, heads * hd] over k, v [kLen, heads * hd] (self-attention
+// when they are the same rows), out [qLen, heads * hd]. Each is padded to
+// width 128 in `pad` { q, k, v, o }, each at least heads * max(qLen, kLen) * 128.
+export function attentionPadded(q, k, v, out, pad, heads, hd, qLen, kLen, scale = 1 / Math.sqrt(hd)) {
+	padHeads(q, pad.q, qLen, heads, hd, 128);
+	padHeads(k, pad.k, kLen, heads, hd, 128);
+	padHeads(v, pad.v, kLen, heads, hd, 128);
+	flashAttentionSplit(pad.q, null, null, pad.k, pad.v, pad.o, heads, qLen, 0, kLen, null, null, scale);
+	copyRows(pad.o, out, qLen * heads, hd, hd, 0, 128);
+}

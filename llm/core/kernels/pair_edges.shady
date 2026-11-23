@@ -1,0 +1,43 @@
+// LATO.2's edge predictor over every pair i < j of n vertices: the pair MLP
+// Linear(2D -> H), GELU (erf), Linear(H -> 1), taken both ways and averaged.
+// Its first layer split by halves: a = W1[:, :D] f + b1 and b = W1[:, D:] f are
+// rows [n, H] here, so a pair's hidden values are a_i + b_j (and a_j + b_i).
+// A pair whose logit passes `threshold` is appended to `edges` [cap, 2] at a
+// slot counted in count[0] (which may pass `cap`: the caller sees it did).
+// Dispatch (ceil(n / 16), ceil(n / 16)).
+float a[];
+float b[];
+float w2[];
+uint count[];
+uint edges[];
+struct Push @pushconstant { uint n; uint hidden; float b2; float threshold; uint cap; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn float gelu_erf(float x)
+{
+    float z = abs(x) * 0.70710678118;
+    float t = 1.0 / (1.0 + 0.3275911 * z);
+    float poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    float e = 1.0 - poly * exp(-z * z);
+    if (x < 0.0) e = -e;
+    return 0.5 * x * (1.0 + e);
+}
+fn void main(ComputeIn input) @compute @threads(16, 16, 1)
+{
+    uint i = input.id.y;
+    uint j = input.id.x;
+    if (i >= pc.n || j >= pc.n || j <= i) return;
+    uint H = pc.hidden;
+    float s = 0.0;
+    for (uint h = 0u; h < H; h++) {
+        s += w2[h] * (gelu_erf(a[i * H + h] + b[j * H + h]) + gelu_erf(a[j * H + h] + b[i * H + h]));
+    }
+    float logit = 0.5 * s + pc.b2;
+    if (logit > pc.threshold) {
+        uint slot = InterlockedAdd(count[0], 1u);
+        if (slot < pc.cap) {
+            edges[2u * slot] = i;
+            edges[2u * slot + 1u] = j;
+        }
+    }
+}

@@ -1,0 +1,6 @@
+{
+	"nodes": [
+		{"id": "input", "type": "core.load_image", "params": {"path": "cutout.png"}},
+		{"id": "mesh", "type": "lato2.image_to_mesh", "params": {"image": {"from": "input.image"}, "weights": "/run/media/tonis/extra/AI models/lato2", "path": "output/lato2-#.glb", "seed": 42, "vertices": 2000}}
+	]
+}

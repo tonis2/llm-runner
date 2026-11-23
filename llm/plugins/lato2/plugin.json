@@ -1,0 +1,7 @@
+{
+	"name": "lato2",
+	"version": "0.1",
+	"description": "LATO.2: an RGBA cutout to a 3D triangle mesh (.glb) - TRELLIS sparse structure, vertex flow, topology flow.",
+	"nodes": "nodes.js",
+	"main": "main.js"
+}

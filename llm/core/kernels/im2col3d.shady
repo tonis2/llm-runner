@@ -1,0 +1,43 @@
+// The patches a 3D convolution reads, as rows for a matmul: input [X, Y, Z, C]
+// (a channel-last grid, row (x * Y + y) * Z + z), output rows `first` ..
+// `first + rows` of the [OX, OY, OZ] grid, each K^3 * C wide. Column k * C + c
+// (`c_major` 0) or c * K^3 + k (`c_major` 1, torch's Conv3d weight flattened
+// [out, in * K^3]); k = (kx * K + ky) * K + kz. Outside the grid reads zero.
+float input_[];
+float output[];
+struct Push @pushconstant {
+    uint channels; uint x; uint y; uint z; uint k; uint stride; uint pad;
+    uint ox; uint oy; uint oz; uint first; uint rows; uint c_major;
+}
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint kk = pc.k * pc.k * pc.k;
+    uint width = kk * pc.channels;
+    uint i = input.id.x + input.id.y * 65535u * 256u;
+    if (i >= pc.rows * width) return;
+    uint r = i / width;
+    uint col = i % width;
+    uint k;
+    uint c;
+    if (pc.c_major != 0u) {
+        c = col / kk;
+        k = col % kk;
+    } else {
+        k = col / pc.channels;
+        c = col % pc.channels;
+    }
+    uint o = pc.first + r;
+    uint oz = o % pc.oz;
+    uint oy = (o / pc.oz) % pc.oy;
+    uint ox = o / (pc.oz * pc.oy);
+    int ix = int(ox * pc.stride + k / (pc.k * pc.k)) - int(pc.pad);
+    int iy = int(oy * pc.stride + (k / pc.k) % pc.k) - int(pc.pad);
+    int iz = int(oz * pc.stride + k % pc.k) - int(pc.pad);
+    float v = 0.0;
+    if (ix >= 0 && iy >= 0 && iz >= 0 && ix < int(pc.x) && iy < int(pc.y) && iz < int(pc.z)) {
+        v = input_[((uint(ix) * pc.y + uint(iy)) * pc.z + uint(iz)) * pc.channels + c];
+    }
+    output[i] = v;
+}

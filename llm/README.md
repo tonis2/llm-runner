@@ -12,6 +12,7 @@ llm-runner flux   --config flux-t2i.json keep_dit=true --server --port 7860
 llm-runner zimage --config zimage-t2i.json
 llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6 taesd=taef1.safetensors
 llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg output=depth.png
+llm-runner lato2  weights=/models/lato2 input=cutout.png output=model.glb   # an RGBA cutout to a mesh
 llm-runner qwenimage --config qwenimage.json prompt="a neon sign that says OPEN"
 llm-runner run llm/apps/graph/templates/qwenimage-edit.json input0.path=photo.png prompt.prompt="make it winter"
 llm-runner run llm/apps/graph/templates/flux-t2i.json sample.seed=7   # a node graph
@@ -37,11 +38,13 @@ llm/
     ops.js             the operations models are written in (matmul, norms, attention, conv ...)
     kernels/*.shady    one kernel per file; common.shady is put in front of each
     weights/           torch.js: PyTorch checkpoints read without torch, mapped like safetensors
+                       (openSafetensors: the same for a safetensors file with 5-D tensors)
                        lora.js: LoRA/LoKr merged into Q8_0 weights; a model supplies its sites
     vae/               latents.js: latent formats ('flux2', 'flux1', 'qwen') and their encode/decode
                        flux.js (Flux 1 and 2), qwen.js (Qwen-Image 2.1, RGBA, 64 ch at /16), taesd.js (taef1)
     models/            shared encoders: qwen3.js (Qwen-family text encoder, Qwen3-VL image rows),
-                       qwen3_vision.js (mmproj vision encoder), t5.js, dinov3.js (ViT features)
+                       qwen3_vision.js (mmproj vision encoder), t5.js, dinov2.js and dinov3.js (ViT features)
+    mesh/              glb.js: a triangle mesh as a .glb
     image/             warp.js: crops warped out of an 8-bit image on the GPU, normalised
     motion/            quaternions, clip cleanup, smoothing, the GLB and BVH writers
     graph/             node registry, port types, the executor, plugin discovery
@@ -62,6 +65,8 @@ llm/
     sam3dbody/         SAM 3D Body: an image to a posed MHR rig; video frames to a motion (GLB, BVH)
     creature/          video frames and a rigged .glb to an animation of that rig: DINOv3 point
                        tracking and a rig fit, as a JSON server or a Rigsmith job
+    lato2/             LATO.2 image-to-mesh: an RGBA cutout to a triangle mesh (.glb) - TRELLIS's
+                       sparse structure, vertex flow and V-VAE, topology flow and T-VAE edges
   tests/               kernel checks against float32, model goldens, benchmarks
 ```
 
