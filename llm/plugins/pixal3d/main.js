@@ -7,7 +7,8 @@
 // The input must be a cutout: an RGBA image whose background is transparent.
 // `gguf` is the flows' file when it is not in weights/ or beside it.
 // Settings, with their defaults: resolution 1024 (512: one stage, about a
-// third of the time, coarser), seed 42, fov 0.2 (radians), ss_steps 12,
+// third of the time, coarser), faces 1000000 (decimated to that; 0 keeps the
+// surface's every face), seed 42, fov 0.2 (radians), ss_steps 12,
 // ss_guidance 7.5, ss_rescale 0.7, ss_rescale_t 5, shape_steps 12,
 // shape_guidance 7.5, shape_rescale 0.5, shape_rescale_t 3, linear f16 | q8 | f32,
 // cond (a path: save the squared-up picture there too).

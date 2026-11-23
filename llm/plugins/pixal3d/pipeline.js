@@ -12,6 +12,9 @@
 //   then
 //   -> shape decoder: FlexiDualGrid fields on the voxels of a 16x finer grid
 //   -> the voxel shell's outer surface (mesh.js): a closed, outward mesh
+//   -> cleaned up and decimated (core/mesh/simplify.js, in native code):
+//      floaters dropped, a thin plate's two sides parted, smoothed a little,
+//      decimated to `faces`, normals split at creases
 //
 // The weights folder holds Pixal3D's ckpts/ (decoders, .json + .safetensors),
 // pipeline.json, dinov3-vitl16/ (Hugging Face format) and naf/naf_release.pth;
@@ -19,14 +22,14 @@
 
 import { llm } from '/core/llm.js';
 import { submit } from '/core/gpu.js';
-import { vertexNormals } from '/core/mesh/glb.js';
 import { SparseStructureDecoder } from '/plugins/lato2/trellis.js';
 import { upload, readFloats, disposeAll } from '/plugins/lato2/nn.js';
 import { preprocess } from './image.js';
 import { Conditioner, camera } from './condition.js';
 import { Flow } from './flow.js';
 import { ShapeDecoder } from './decoder.js';
-import { floodOutside, dualVertices, shellSurface } from './mesh.js';
+import { simplifyMesh } from '/core/mesh/simplify.js';
+import { floodOutside, shellSurfaceNative } from './mesh.js';
 
 export const DEFAULTS = {
 	seed: 42,
@@ -34,6 +37,9 @@ export const DEFAULTS = {
 	// cascade (the same 1024 flow on a 96^3 grid) would need more than 16 GB
 	// in the decoder's last levels.
 	resolution: 1024,
+	// faces in the mesh written (Pixal3D's own export decimates to a million too);
+	// 0 keeps them all (17M at 1024)
+	faces: 1000000,
 	// horizontal field of view, radians (inference.py's --fov; 0.2 is near orthographic)
 	fov: 0.2,
 	ss_steps: 12, ss_guidance: 7.5, ss_rescale: 0.7, ss_rescale_t: 5,
@@ -221,12 +227,17 @@ export class Pixal3D {
 			const t1 = llm.now();
 			const outside = floodOutside(out.coords, out.r);
 			const flooded = llm.since(t1), t2 = llm.now();
-			const surf = shellSurface(out.coords, dualVertices(out.coords, out.fields, out.r), out.r, out.table, outside);
+			const surf = shellSurfaceNative(out.coords, out.fields, out.r, out.table, outside);
 			llm.print(`  surface: outside flooded in ${outside.rounds} rounds, ${flooded}; ${surf.positions.length / 3} vertices, ${surf.faces.length / 3} faces in ${llm.since(t2)}`);
-			stats.vertices = surf.positions.length / 3;
-			stats.faces = surf.faces.length / 3;
+			// floaters beyond about 20 voxels of 1024 go; plate sides part by a quarter voxel
+			const t3 = llm.now();
+			const mesh = simplifyMesh(surf.positions, surf.faces, { faces: o.faces, partGap: 0.02, separate: 0.25 / out.r, smooth: 3, crease: 60 });
+			llm.print(`  cleanup: ${mesh.dropped} of ${mesh.parts} pieces dropped, ${mesh.separated} vertices parted, to ${mesh.indices.length / 3} faces in ${llm.since(t3)}`);
+			stats.surface_faces = surf.faces.length / 3;
+			stats.vertices = mesh.positions.length / 3;
+			stats.faces = mesh.indices.length / 3;
 			stats.seconds = (llm.now() - t0) / 1000;
-			return { positions: surf.positions, indices: surf.faces, normals: vertexNormals(surf.positions, surf.faces), stats, pre };
+			return { positions: mesh.positions, indices: mesh.indices, normals: mesh.normals, stats, pre };
 		} finally {
 			submit();
 			cond.disposePicture(pic);

@@ -7,7 +7,7 @@ import { llm } from '/core/llm.js';
 import { openSafetensors } from '/core/weights/torch.js';
 import { writeMeshGlb, vertexNormals } from '/core/mesh/glb.js';
 import { ShapeDecoder } from '/plugins/pixal3d/decoder.js';
-import { dualGridMesh, floodOutside, dualVertices, shellSurface } from '/plugins/pixal3d/mesh.js';
+import { dualGridMesh, floodOutside, dualVertices, shellSurface, shellSurfaceNative } from '/plugins/pixal3d/mesh.js';
 import { upload } from '/plugins/lato2/nn.js';
 
 const cfg = globalThis.__llm_config;
@@ -50,6 +50,13 @@ if (cfg.out) {
 	const flooded = llm.since(t2), t3 = llm.now();
 	const surf = shellSurface(out.coords, dualVertices(out.coords, out.fields, out.r), out.r, out.table, outside);
 	llm.print(`outside flooded in ${outside.rounds} rounds, ${flooded}; surface ${surf.positions.length / 3} vertices, ${surf.faces.length / 3} faces in ${llm.since(t3)}`);
+	// the native surface nets against the JS ones
+	const t4 = llm.now();
+	const fast = shellSurfaceNative(out.coords, out.fields, out.r, out.table, outside);
+	let same = fast.faces.length === surf.faces.length && fast.positions.length === surf.positions.length;
+	for (let i = 0; same && i < surf.faces.length; i++) same = fast.faces[i] === surf.faces[i];
+	for (let i = 0; same && i < surf.positions.length; i++) same = fast.positions[i] === surf.positions[i];
+	llm.print(`native surface in ${llm.since(t4)}: ${same ? 'identical' : 'DIFFERENT'}`);
 	writeMeshGlb(cfg.out, { name: 'pixal3d', positions: surf.positions, indices: surf.faces, normals: vertexNormals(surf.positions, surf.faces) });
 	llm.print(`wrote ${cfg.out}`);
 }

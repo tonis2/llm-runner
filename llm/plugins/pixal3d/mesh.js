@@ -12,7 +12,7 @@
 // shell's faces toward it (shellSurface): closed, facing out, with vertices
 // from the predicted ones.
 
-import { f32 } from '/core/llm.js';
+import { llm, f32 } from '/core/llm.js';
 import * as op from '/core/ops.js';
 import { submit } from '/core/gpu.js';
 import { CellIndex } from './decoder.js';
@@ -194,4 +194,12 @@ export function shellSurface(coords, vertices, r, table, outside) {
 		}
 	}
 	return { positions: positions.slice(0, 3 * nv), faces: faces.slice(0, nf) };
+}
+
+// shellSurface in native code (lib/host/mesh_simplify.c3), straight from the
+// decoder's fields: the same { positions, faces }, the same order, about 30
+// times faster at 1024.
+export function shellSurfaceNative(coords, fields, r, table, outside) {
+	const s = llm.meshShellSurface(coords, fields, r, table, outside.bits, outside.g, outside.words);
+	return { positions: s.positions, faces: s.indices };
 }

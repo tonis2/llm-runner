@@ -240,6 +240,12 @@ export const llm = {
 	imageCropNearest(...args) { H.imageCropNearest(...args); },
 	imageBackdrop(...args) { H.imageBackdrop(...args); },
 
+	// Dense meshes cleaned up and decimated in native code
+	// (lib/host/mesh_simplify.c3; core/mesh/simplify.js wraps it).
+	meshNative: typeof H.meshSimplify === 'function',
+	meshSimplify(positions, indices, params) { return H.meshSimplify(positions, indices, params); },
+	meshShellSurface(...args) { return H.meshShellSurface(...args); },
+
 	// Register the plugin this file is. The runner calls `load(config)` once and
 	// then `generate(config)` — or, as a server, `handle(request)` per request
 	// (or `generate` with the request's JSON over the config, when there is no

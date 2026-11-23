@@ -139,6 +139,9 @@ fn void? install(three::JsRuntime* runtime)
 	js.@bind(host, "imageCropNearest", &js_image_crop_nearest, runtime)!;
 	js.@bind(host, "imageBackdrop", &js_image_backdrop, runtime)!;
 
+	js.@bind(host, "meshSimplify", &js_mesh_simplify, runtime)!;
+	js.@bind(host, "meshShellSurface", &js_mesh_shell_surface, runtime)!;
+
 	js.set(js.global(), "__llm", host)!;
 }
 

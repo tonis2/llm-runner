@@ -477,8 +477,25 @@ samples a 512 latent, takes its voxels through the decoder's subdivisions to
 plates), so the mesh is the voxel shell's outer surface instead: the outside
 flooded on the GPU, then surface nets through the predicted vertices, closed
 and facing out. Every stage matches Pixal3D's own torch code
-(`tests/pixal3d_*.js`). The example bust takes 148 s on an RX 7800 XT at 1024
-(the 1024 flow is 67 s of it) and 43 s at `resolution=512`.
+(`tests/pixal3d_*.js`).
+
+That surface is 17M faces at 1024, so `core/mesh/simplify.js` (native code in
+`lib/host/mesh_simplify.c3`) cleans it up and decimates it, to a million faces
+by default (`faces=`; Pixal3D's own export does the same). Floaters go: pieces
+with under 1% of the faces and nothing within 2% of the model's size of a
+bigger piece (the strands of hair beside the head stay). A one-voxel plate's
+two sides, which coincide, part by a quarter voxel. Three rounds of Taubin
+smoothing take out the voxels' sub-voxel staircase. Quadric-error edge
+collapses, in meshoptimizer's passes, keep each moved vertex on a neighbour
+and refuse flips, joins and collapses that set faces facing apart (a
+quadric cannot tell a thin plate's sides apart). Normals split where faces
+turn by more than 60 degrees, so rims and edges shade sharp.
+`tests/mesh_simplify.js` runs it on any .glb. The surface nets run natively
+too (`meshShellSurface`, identical to `shellSurface` in `pixal3d/mesh.js`).
+
+The example bust takes 140 s on an RX 7800 XT at 1024: the 1024 flow is 67 s
+of it, the surface 2 s, the cleanup to a million faces 21 s, and the file is
+27 MB. At `resolution=512` it takes 39 s.
 
 Qwen-Image 2.1 LoRAs were checked in both layouts files come in: PEFT's
 (`transformer.` prefix, `img_mlp.gate_layer` and `proj` folded into the two

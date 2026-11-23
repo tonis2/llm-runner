@@ -3,6 +3,7 @@
 // What an image-to-3D model hands back; any glTF reader opens it.
 
 import { llm } from '/core/llm.js';
+import { utf8 as fromUtf8 } from '/core/weights/torch.js';
 
 const FLOAT = 5126, UINT = 5125, ARRAY_BUFFER = 34962, ELEMENT_ARRAY_BUFFER = 34963;
 
@@ -94,4 +95,28 @@ export function meshGlb({ name = 'mesh', positions, indices, normals = null, dou
 
 export function writeMeshGlb(path, mesh) {
 	llm.writeBytes(path, meshGlb(mesh));
+}
+
+// The first primitive of a .glb's first mesh, as writeMeshGlb writes it (float
+// POSITION, 32-bit or smaller unsigned indices): { positions, indices }.
+export function readMeshGlb(path) {
+	const raw = llm.readBytes(path);
+	const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+	const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (bytes.length < 20 || dv.getUint32(0, true) !== 0x46546c67) throw new Error(`${path} is not a .glb`);
+	const jsonLength = dv.getUint32(12, true);
+	const gltf = JSON.parse(fromUtf8(bytes.subarray(20, 20 + jsonLength)));
+	const binAt = 20 + jsonLength + 8;
+	const read = (index) => {
+		const a = gltf.accessors[index], v = gltf.bufferViews[a.bufferView];
+		const size = { 5126: 4, 5125: 4, 5123: 2, 5121: 1 }[a.componentType];
+		const count = a.count * (a.type === 'VEC3' ? 3 : 1);
+		const at = binAt + (v.byteOffset ?? 0) + (a.byteOffset ?? 0);
+		const copy = bytes.slice(at, at + count * size);
+		if (a.componentType === FLOAT) return new Float32Array(copy.buffer);
+		if (a.componentType === UINT) return new Uint32Array(copy.buffer);
+		return Uint32Array.from(size === 2 ? new Uint16Array(copy.buffer) : copy);
+	};
+	const prim = gltf.meshes[0].primitives[0];
+	return { positions: read(prim.attributes.POSITION), indices: read(prim.indices) };
 }
