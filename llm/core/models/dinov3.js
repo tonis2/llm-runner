@@ -13,6 +13,11 @@
 // (SelfAttention, LinearKMaskedBias), `layers/ffn_layers.py` (SwiGLUFFN) and
 // `layers/rope_position_encoding.py`; the depth plugin's DINOv2 is the model
 // this one is written after.
+//
+// The Hugging Face checkpoints (transformers' DINOv3ViTModel, as Pixal3D loads
+// its ViT-L/16) are read too: separate q/k/v projections, a plain GELU (erf)
+// MLP unless the checkpoint has a gate, LayerScale as `lambda1`, and RoPE
+// periods from `rope_theta` (not stored) rather than from a buffer.
 
 import { llm, f32 } from '/core/llm.js';
 import * as op from '/core/ops.js';
@@ -39,6 +44,43 @@ function disposeAll(v) {
 	if (typeof v === 'object') for (const x of Object.values(v)) disposeAll(x);
 }
 
+// cos/sin [gh * gw, head / 2] for rope_neox, DINOv3's axial RoPE (NAF uses
+// it too). A patch's coordinates are its centre over the grid, each side on
+// its own (`normalize_coords="separate"`), mapped to [-1, 1]; angle j turns
+// with the row for j < head / 4 and with the column after, 2 pi * coord /
+// period. Pair j is (j, j + head / 2), DINOv3's rotate-half. In float32, as
+// `pos_embed_rope_dtype="fp32"` has it. `periods` has head / 4 entries.
+export function axialRopeTables(periods, gh, gw) {
+	const quarter = periods.length, half = 2 * quarter;
+	const n = gh * gw;
+	const cos = new Float32Array(n * half), sin = new Float32Array(n * half);
+	const twoPi = Math.fround(2 * Math.PI);
+	for (let t = 0; t < n; t++) {
+		const y = Math.floor(t / gw), x = t % gw;
+		const cy = Math.fround(2 * Math.fround((y + 0.5) / gh) - 1);
+		const cx = Math.fround(2 * Math.fround((x + 0.5) / gw) - 1);
+		for (let j = 0; j < half; j++) {
+			const c = j < quarter ? cy : cx;
+			const angle = Math.fround(Math.fround(twoPi * c) / periods[j % quarter]);
+			cos[t * half + j] = Math.cos(angle);
+			sin[t * half + j] = Math.sin(angle);
+		}
+	}
+	return { cos: upload(cos), sin: upload(sin) };
+}
+
+// Where each tensor is in the two checkpoint layouts (block names after the
+// block prefix).
+const FB_NAMES = {
+	cls: 'cls_token', storage: 'storage_tokens', patch: 'patch_embed.proj.weight', patchBias: 'patch_embed.proj.bias',
+	block: 'blocks.', gate: 'mlp.w1.weight',
+};
+const HF_NAMES = {
+	cls: 'embeddings.cls_token', storage: 'embeddings.register_tokens',
+	patch: 'embeddings.patch_embeddings.weight', patchBias: 'embeddings.patch_embeddings.bias',
+	block: 'layer.', gate: 'mlp.gate_proj.weight', up: 'mlp.up_proj.weight',
+};
+
 export class DinoV3 {
 	// `m` is an open llm.js Model (safetensors or `openTorch`); `prefix` is where
 	// the ViT's tensors are in it. `linear` is how the blocks' matmul weights go
@@ -46,24 +88,35 @@ export class DinoV3 {
 	// 'f32'. `exact` keeps the SwiGLU down-projection in float32, off the
 	// matrix cores (four times slower); otherwise its hidden values go to their
 	// float16 operands divided by FFN_SCALE.
-	constructor(m, { prefix = 'backbone.encoder.', linear = 'q8', exact = false } = {}) {
+	// `ropeTheta` is for a Hugging Face checkpoint, whose periods are computed
+	// (its config.json has it; 100 for the released ViTs).
+	constructor(m, { prefix = 'backbone.encoder.', linear = 'q8', exact = false, ropeTheta = 100 } = {}) {
 		this.m = m;
 		this.p = prefix;
 		this.linear = linear;
 		this.exact = exact;
-		const shape = (name) => m.shape(`${prefix}${name}`); // GGUF order, fastest first
-		this.dim = shape('cls_token')[0];
+		const hf = this.hf = m.has(`${prefix}embeddings.cls_token`);
+		this.names = hf ? HF_NAMES : FB_NAMES;
+		const shape = (name) => m.shape(`${prefix}${this.names[name] ?? name}`); // GGUF order, fastest first
+		this.dim = shape('cls')[0];
 		this.heads = this.dim / HEAD;
-		this.storage = m.has(`${prefix}storage_tokens`) ? shape('storage_tokens')[1] : 0;
+		this.storage = m.has(`${prefix}${this.names.storage}`) ? shape('storage')[1] : 0;
 		this.prefixTokens = 1 + this.storage;
-		this.ffn = shape('blocks.0.mlp.w1.weight')[1];
+		const block0 = (name) => `${prefix}${this.names.block}0.${this.names[name]}`;
+		this.gated = !hf || m.has(block0('gate'));
+		this.ffn = m.shape(block0(this.gated ? 'gate' : 'up'))[1];
 		let n = 0;
-		while (m.has(`${prefix}blocks.${n}.norm1.weight`)) n++;
+		while (m.has(`${prefix}${this.names.block}${n}.norm1.weight`)) n++;
 		this.depth = n;
-		if (shape('patch_embed.proj.weight')[0] !== PATCH) throw new Error(`DINOv3: patch size ${shape('patch_embed.proj.weight')[0]}, expected ${PATCH}`);
-		// Stored in the checkpoint's own type (bf16 in SAM 3D Body's), and used as
-		// stored: the rounded periods are the ones the model was trained with.
-		this.periods = m.floats(`${prefix}rope_embed.periods`);
+		if (shape('patch')[0] !== PATCH) throw new Error(`DINOv3: patch size ${shape('patch')[0]}, expected ${PATCH}`);
+		if (hf) {
+			// transformers: inv_freq = 1 / theta ** (4j / head), in float32.
+			this.periods = Float32Array.from({ length: HEAD / 4 }, (_, j) => ropeTheta ** ((4 * j) / HEAD));
+		} else {
+			// Stored in the checkpoint's own type (bf16 in SAM 3D Body's), and used as
+			// stored: the rounded periods are the ones the model was trained with.
+			this.periods = m.floats(`${prefix}rope_embed.periods`);
+		}
 		if (this.periods.length !== HEAD / 4) throw new Error(`DINOv3: ${this.periods.length} RoPE periods for head width ${HEAD}`);
 	}
 
@@ -72,8 +125,10 @@ export class DinoV3 {
 		const t0 = llm.now();
 		const f = (name) => m.upload(`${P}${name}`, 'f32');
 		const w = (name) => m.upload(`${P}${name}`, this.linear);
+		const N = this.names;
+		if (this.hf) return this.loadHf(t0);
 		// The conv's [out, 3, 16, 16] reordered to patchify's (y, x, c) per patch.
-		const conv = m.floats(`${P}patch_embed.proj.weight`);
+		const conv = m.floats(`${P}${N.patch}`);
 		const pd = 3 * PATCH * PATCH;
 		const patchW = new Float32Array(D * pd);
 		for (let o = 0; o < D; o++) {
@@ -81,14 +136,7 @@ export class DinoV3 {
 				for (let p = 0; p < PATCH * PATCH; p++) patchW[o * pd + p * 3 + c] = conv[(o * 3 + c) * PATCH * PATCH + p];
 			}
 		}
-		const prefixRows = new Float32Array(this.prefixTokens * D);
-		prefixRows.set(m.floats(`${P}cls_token`));
-		if (this.storage) prefixRows.set(m.floats(`${P}storage_tokens`), D);
-		this.g = {
-			patchW: upload(patchW), patchB: f('patch_embed.proj.bias'),
-			prefix: upload(prefixRows),
-			normW: f('norm.weight'), normB: f('norm.bias'),
-		};
+		this.g = this.globals(patchW);
 		this.blocks = [];
 		const ffnScale = this.exact ? 1 : FFN_SCALE;
 		for (let l = 0; l < this.depth; l++) {
@@ -119,7 +167,63 @@ export class DinoV3 {
 				ls2: () => upload(m.floats(`${P}${b}ls2.gamma`).map((v) => v * ffnScale)),
 			}));
 		}
-		llm.print(`  DINOv3: dim ${D}, ${this.depth} blocks, ${this.heads} heads, ${this.storage} storage tokens, ${this.linear} weights, loaded in ${llm.since(t0)}`);
+		this.loaded(t0);
+	}
+
+	// The patch embedding, the prefix rows and the final norm; `patchW` is the
+	// conv already laid out for patchify.
+	globals(patchW) {
+		const m = this.m, D = this.dim, P = this.p, N = this.names;
+		const prefixRows = new Float32Array(this.prefixTokens * D);
+		prefixRows.set(m.floats(`${P}${N.cls}`));
+		if (this.storage) prefixRows.set(m.floats(`${P}${N.storage}`), D);
+		return {
+			patchW: upload(patchW), patchB: m.upload(`${P}${N.patchBias}`, 'f32'),
+			prefix: upload(prefixRows),
+			normW: m.upload(`${P}norm.weight`, 'f32'), normB: m.upload(`${P}norm.bias`, 'f32'),
+		};
+	}
+
+	loaded(t0) {
+		const mlp = this.gated ? 'SwiGLU' : 'GELU';
+		llm.print(`  DINOv3: dim ${this.dim}, ${this.depth} blocks, ${this.heads} heads, ${this.storage} storage tokens, ${mlp} MLP, ${this.linear} weights, loaded in ${llm.since(t0)}`);
+	}
+
+	// A Hugging Face checkpoint: q, k and v each their own matrix (k without a
+	// bias), and the MLP plain unless it has a gate.
+	async loadHf(t0) {
+		const m = this.m, D = this.dim, P = this.p, N = this.names;
+		const f = (name) => m.upload(`${P}${name}`, 'f32');
+		const w = (name) => m.upload(`${P}${name}`, this.linear);
+		const maybe = (name) => (m.has(`${P}${name}`) ? f(name) : null);
+		const conv = m.floats(`${P}${N.patch}`);
+		const pd = 3 * PATCH * PATCH;
+		const patchW = new Float32Array(D * pd);
+		for (let o = 0; o < D; o++) {
+			for (let c = 0; c < 3; c++) {
+				for (let p = 0; p < PATCH * PATCH; p++) patchW[o * pd + p * 3 + c] = conv[(o * 3 + c) * PATCH * PATCH + p];
+			}
+		}
+		this.g = this.globals(patchW);
+		this.blocks = [];
+		for (let l = 0; l < this.depth; l++) {
+			const b = `${N.block}${l}.`;
+			const parts = {
+				n1w: () => f(`${b}norm1.weight`), n1b: () => f(`${b}norm1.bias`),
+				wq: () => w(`${b}attention.q_proj.weight`), qb: () => maybe(`${b}attention.q_proj.bias`),
+				wk: () => w(`${b}attention.k_proj.weight`), kb: () => maybe(`${b}attention.k_proj.bias`),
+				wv: () => w(`${b}attention.v_proj.weight`), vb: () => maybe(`${b}attention.v_proj.bias`),
+				proj: () => w(`${b}attention.o_proj.weight`), projB: () => f(`${b}attention.o_proj.bias`),
+				ls1: () => f(`${b}layer_scale1.lambda1`),
+				n2w: () => f(`${b}norm2.weight`), n2b: () => f(`${b}norm2.bias`),
+				up: () => w(`${b}mlp.up_proj.weight`), upB: () => f(`${b}mlp.up_proj.bias`),
+				down: () => w(`${b}mlp.down_proj.weight`), downB: () => f(`${b}mlp.down_proj.bias`),
+				ls2: () => f(`${b}layer_scale2.lambda1`),
+			};
+			if (this.gated) throw new Error('DINOv3: a gated Hugging Face MLP is not supported yet');
+			this.blocks.push(await uploadEach(parts));
+		}
+		this.loaded(t0);
 	}
 
 	dispose() {
@@ -129,29 +233,8 @@ export class DinoV3 {
 		this.blocks = null;
 	}
 
-	// cos/sin [gh * gw, HEAD / 2] for rope_neox. A patch's coordinates are its
-	// centre over the grid, each side on its own (`normalize_coords="separate"`),
-	// mapped to [-1, 1]; angle j turns with the row for j < HEAD / 4 and with the
-	// column after, 2 pi * coord / period. Pair j is (j, j + HEAD / 2), DINOv3's
-	// rotate-half. In float32, as `pos_embed_rope_dtype="fp32"` has it.
-	ropeTables(gh, gw) {
-		const half = HEAD / 2, quarter = HEAD / 4;
-		const n = gh * gw;
-		const cos = new Float32Array(n * half), sin = new Float32Array(n * half);
-		const twoPi = Math.fround(2 * Math.PI);
-		for (let t = 0; t < n; t++) {
-			const y = Math.floor(t / gw), x = t % gw;
-			const cy = Math.fround(2 * Math.fround((y + 0.5) / gh) - 1);
-			const cx = Math.fround(2 * Math.fround((x + 0.5) / gw) - 1);
-			for (let j = 0; j < half; j++) {
-				const c = j < quarter ? cy : cx;
-				const angle = Math.fround(Math.fround(twoPi * c) / this.periods[j % quarter]);
-				cos[t * half + j] = Math.cos(angle);
-				sin[t * half + j] = Math.sin(angle);
-			}
-		}
-		return { cos: upload(cos), sin: upload(sin) };
-	}
+	// cos/sin [gh * gw, HEAD / 2] for rope_neox (axialRopeTables).
+	ropeTables(gh, gw) { return axialRopeTables(this.periods, gh, gw); }
 
 	// `pixels` is [3, H, W], normalised (ImageNet mean and std), the sides
 	// multiples of 16: a Float32Array, or a Tensor already on the GPU (which
@@ -163,8 +246,10 @@ export class DinoV3 {
 	// (block indices, with `tokens`) lays those blocks' patches beside the last
 	// one's, each through the final norm: rows [gh * gw, dim * (layers + 1)],
 	// the earlier blocks first. A middle block knows better where things are,
-	// the last what they are.
-	async encode(pixels, H, W, { stopAfter = -1, tokens = false, quiet = false, layers = null } = {}) {
+	// the last what they are. `all` returns every token, prefix first, as rows
+	// [prefix + gh * gw, dim]; `norm: 'plain'` makes the final norm one without
+	// the model's weight and bias (Pixal3D's `F.layer_norm`).
+	async encode(pixels, H, W, { stopAfter = -1, tokens = false, quiet = false, layers = null, all = false, norm = 'model' } = {}) {
 		const D = this.dim, F = this.ffn, nh = this.heads, g = this.g;
 		const gh = H / PATCH, gw = W / PATCH, N = gh * gw, pre = this.prefixTokens, n = pre + N;
 		if (!Number.isInteger(gh) || !Number.isInteger(gw)) throw new Error(`DINOv3: ${W}x${H} is not a multiple of ${PATCH}`);
@@ -174,7 +259,7 @@ export class DinoV3 {
 			patches: f32(N * 3 * PATCH * PATCH),
 			h: f32(n * D), x: f32(n * D), q: f32(n * D), k: f32(n * D), v: f32(n * D),
 			qt: f32(n * D), kt: f32(n * D), vt: f32(n * D), o: f32(n * D),
-			gate: f32(n * F), up: f32(n * F),
+			gate: this.gated ? f32(n * F) : null, up: f32(n * F),
 		};
 		// Heads padded to 128 for the matrix cores' attention (op.attention64Padded).
 		const padded = op.matrixCoresOn() && HEAD === 64;
@@ -182,7 +267,10 @@ export class DinoV3 {
 		const rope = this.ropeTables(gh, gw);
 		const rows = (t, first, count) => t.view(first * D * 4, count * D * 4);
 		const extra = tokens && layers?.length ? layers : null, wide = D * ((extra?.length ?? 0) + 1);
-		const out = tokens ? f32(wide * N, [wide, N]) : f32(D * N, [gw, gh, D]);
+		const out = all ? f32(n * D, [D, n]) : tokens ? f32(wide * N, [wide, N]) : f32(D * N, [gw, gh, D]);
+		const finalNorm = norm === 'plain'
+			? () => op.layerNorm(a.h, a.x, D, n, EPS)
+			: () => op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
 		try {
 			// Prefix tokens, then the patches' embeddings after them.
 			copy(g.prefix, a.h, pre * D * 4);
@@ -201,15 +289,16 @@ export class DinoV3 {
 				}
 				const at = extra ? extra.indexOf(l) : -1;
 				if (at >= 0) {
-					op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
+					finalNorm();
 					op.copyRows(rows(a.x, pre, N), out, N, D, wide, at * D);
 				}
 				// Headless, the whole pass is one submission: a wait after every
 				// block left the GPU idle while the next one was recorded.
 				if (breathing()) await breathe(true);
 			}
-			op.layerNormAffine(a.h, g.normW, g.normB, a.x, D, n, EPS);
-			if (extra) op.copyRows(rows(a.x, pre, N), out, N, D, wide, extra.length * D);
+			finalNorm();
+			if (all) copy(a.x, out, n * D * 4);
+			else if (extra) op.copyRows(rows(a.x, pre, N), out, N, D, wide, extra.length * D);
 			else if (tokens) copy(a.x, out, N * D * 4, pre * D * 4);
 			else op.transposeChannelSpatial(rows(a.x, pre, N), out, D, N, 1);
 			submit();
@@ -231,9 +320,15 @@ export class DinoV3 {
 		const D = this.dim, F = this.ffn, nh = this.heads, pre = this.prefixTokens;
 		const rows = (t, first, count) => t.view(first * D * 4, count * D * 4);
 		op.layerNormAffine(a.h, b.n1w, b.n1b, a.x, D, n, EPS);
-		op.matmul(b.qkv, a.x, a.q, D, D, n, 0, true);
-		op.matmul(b.qkv, a.x, a.k, D, D, n, D, true);
-		op.matmul(b.qkv, a.x, a.v, D, D, n, 2 * D);
+		if (b.qkv) {
+			op.matmul(b.qkv, a.x, a.q, D, D, n, 0, true);
+			op.matmul(b.qkv, a.x, a.k, D, D, n, D, true);
+			op.matmul(b.qkv, a.x, a.v, D, D, n, 2 * D);
+		} else {
+			op.matmul(b.wq, a.x, a.q, D, D, n, 0, true);
+			op.matmul(b.wk, a.x, a.k, D, D, n, 0, true);
+			op.matmul(b.wv, a.x, a.v, D, D, n);
+		}
 		if (b.qb) op.biasAdd(a.q, b.qb, n * D, D);
 		if (b.kb) op.biasAdd(a.k, b.kb, n * D, D);
 		if (b.vb) op.biasAdd(a.v, b.vb, n * D, D);
@@ -251,6 +346,13 @@ export class DinoV3 {
 		op.gatedAdd(a.h, b.ls1, a.q, n * D, D, 0);
 
 		op.layerNormAffine(a.h, b.n2w, b.n2b, a.x, D, n, EPS);
+		if (b.up) {
+			op.linearBiasRows(b.up, b.upB, a.x, a.up, F, D, n);
+			op.geluErf(a.up, n * F);
+			op.linearBiasRows(b.down, b.downB, a.up, a.q, D, F, n);
+			op.gatedAdd(a.h, b.ls2, a.q, n * D, D, 0);
+			return;
+		}
 		op.matmul(b.w1, a.x, a.gate, F, D, n, 0, true);
 		op.matmul(b.w2, a.x, a.up, F, D, n);
 		op.biasAdd(a.gate, b.w1b, n * F, F);

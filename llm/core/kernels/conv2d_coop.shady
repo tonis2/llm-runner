@@ -12,7 +12,7 @@
 // subgroup, the bias added and the layout turned back to [out_c, h, w].
 //
 // in_c must be a multiple of 16 (the last chunk of 32 may be half full) and
-// out_c of 4. Half operands: inputs must be
+// out_c of 4. `pad` + 65536 pads by reflection instead of with zeros. Half operands: inputs must be
 // inside +-65504. Same bindings and push block as conv2d.
 // Dispatch: ceil(h*w/128) * ceil(out_c/128).
 float4 weight[];
@@ -96,9 +96,15 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
     coop_load(c33, &Cs[sg * 256u], 16u);
 
     uint taps = pc.kh * pc.kw;
+    int pad = int(pc.pad % 65536u);
+    bool reflect = pc.pad >= 65536u;
     for (uint tap = 0u; tap < taps; tap++) {
-        int sy = py + int(tap / pc.kw) - int(pc.pad);
-        int sx = px + int(tap % pc.kw) - int(pc.pad);
+        int sy = py + int(tap / pc.kw) - pad;
+        int sx = px + int(tap % pc.kw) - pad;
+        if (reflect) {
+            sy = sy < 0 ? -sy : (sy >= int(H) ? 2 * int(H) - 2 - sy : sy);
+            sx = sx < 0 ? -sx : (sx >= int(W) ? 2 * int(W) - 2 - sx : sx);
+        }
         bool inside = p_live && sy >= 0 && sy < int(H) && sx >= 0 && sx < int(W);
         uint src = inside ? uint(sy) * W + uint(sx) : 0u;
         for (uint ic0 = 0u; ic0 < pc.in_c; ic0 += 32u) {

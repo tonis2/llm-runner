@@ -1,7 +1,8 @@
 // 3x3 convolution, stride 1, pad 1, groups 1 - the VAE's everyday conv.
 // A 16x16 output tile and 4 output channels per workgroup; input channels in
 // chunks of 4 through a shared tile with a one-pixel halo, so every staged input
-// is reused 9 x 4 times. Same bindings and push block as conv2d.
+// is reused 9 x 4 times. Same bindings and push block as conv2d; `pad` +
+// 65536 pads by reflection instead of with zeros.
 // Dispatch: (ceil(out_w/16), ceil(out_h/16), ceil(out_c/4)).
 float weight[];
 float bias[];
@@ -39,6 +40,10 @@ fn void main(ComputeIn input) @compute @threads(256, 1, 1)
                 uint col = rem % 18u;
                 int ih = y0 + int(r);
                 int iw = x0 + int(col);
+                if (pc.pad >= 65536u) {
+                    ih = ih < 0 ? -ih : (ih >= int(pc.in_h) ? 2 * int(pc.in_h) - 2 - ih : ih);
+                    iw = iw < 0 ? -iw : (iw >= int(pc.in_w) ? 2 * int(pc.in_w) - 2 - iw : iw);
+                }
                 uint ic = ic0 + c;
                 float v = 0.0;
                 if (ic < pc.in_c && ih >= 0 && ih < int(pc.in_h) && iw >= 0 && iw < int(pc.in_w)) {

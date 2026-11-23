@@ -13,6 +13,7 @@ llm-runner zimage --config zimage-t2i.json
 llm-runner zimage --config zimage-t2i.json input=photo.png strength=0.6 taesd=taef1.safetensors
 llm-runner depth  model=depth_anything_v2_vits_fp32.safetensors input=photo.jpg output=depth.png
 llm-runner lato2  weights=/models/lato2 input=cutout.png output=model.glb   # an RGBA cutout to a mesh
+llm-runner pixal3d weights=/models/pixal3d input=cutout.png output=model.glb  # the same, dense (1024^3)
 llm-runner qwenimage --config qwenimage.json prompt="a neon sign that says OPEN"
 llm-runner run llm/apps/graph/templates/qwenimage-edit.json input0.path=photo.png prompt.prompt="make it winter"
 llm-runner run llm/apps/graph/templates/qwenimage-to-mesh.json prompt.prompt="PNG cutout with an alpha channel: a brass lantern, background removed, everything around it fully transparent (RGBA, alpha 0)"   # text to a mesh
@@ -69,6 +70,8 @@ llm/
     lato2/             LATO.2 image-to-mesh: an RGBA cutout to a triangle mesh (.glb) - TRELLIS's
                        sparse structure, vertex flow and V-VAE, topology flow and T-VAE edges,
                        then cleanup.js (crowded edges, folds, specks, holes; `smooth=` optional)
+    pixal3d/           Pixal3D image-to-mesh: an RGBA cutout to a dense mesh - DINOv3 and NAF features
+                       under each voxel's projection, TRELLIS.2's flows and decoders, 512 then 1024
   tests/               kernel checks against float32, model goldens, benchmarks
 ```
 
@@ -462,6 +465,20 @@ existing edge. Open edges fell from 4.6% to 0.6% on the teapot, 25% to 12% on
 the lantern and 16% to 14% on the armour, and no edge keeps a third face.
 `smooth=5` helps rounded shapes but shrinks thin hard-surface parts, so it is
 off by default.
+
+Pixal3D (github.com/TencentARC/Pixal3D) is TRELLIS.2 conditioned on where the
+camera sees each voxel: DINOv3 patch features and NAF-upsampled ones sampled
+under the voxel's projection. Its four flows come from one GGUF
+(`pixal3d-base-flow-f16.gguf`), whose F16 weights feed the matrix cores as
+they are (`matmul_f16_coop`): float32's accuracy at q8's speed. The cascade
+samples a 512 latent, takes its voxels through the decoder's subdivisions to
+64^3 tokens, samples again at 1024 on a 1024 picture, and decodes to about
+4.7M voxels of 1024^3. The decoder's quads cannot be wound consistently (thin
+plates), so the mesh is the voxel shell's outer surface instead: the outside
+flooded on the GPU, then surface nets through the predicted vertices, closed
+and facing out. Every stage matches Pixal3D's own torch code
+(`tests/pixal3d_*.js`). The example bust takes 148 s on an RX 7800 XT at 1024
+(the 1024 flow is 67 s of it) and 43 s at `resolution=512`.
 
 Qwen-Image 2.1 LoRAs were checked in both layouts files come in: PEFT's
 (`transformer.` prefix, `img_mlp.gate_layer` and `proj` folded into the two

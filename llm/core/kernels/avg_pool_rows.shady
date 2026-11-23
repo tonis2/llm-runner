@@ -1,0 +1,25 @@
+// Average pooling over a map stored as rows: [h * w, C] (row y * w + x) to
+// [(h / f) * (w / f), C], each output row the mean of an f x f block -
+// adaptive_avg_pool2d when the sides divide evenly.
+// Dispatch: ceil((h / f) * (w / f) * C / 256).
+float input_[];
+float output[];
+struct Push @pushconstant { uint channels; uint h; uint w; uint f; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint ow = pc.w / pc.f;
+    uint oh = pc.h / pc.f;
+    uint i = input.id.x;
+    if (i >= oh * ow * pc.channels) return;
+    uint c = i % pc.channels;
+    uint r = i / pc.channels;
+    uint y0 = (r / ow) * pc.f;
+    uint x0 = (r % ow) * pc.f;
+    float sum = 0.0;
+    for (uint y = 0u; y < pc.f; y++) {
+        for (uint x = 0u; x < pc.f; x++) sum += input_[((y0 + y) * pc.w + x0 + x) * pc.channels + c];
+    }
+    output[i] = sum / float(pc.f * pc.f);
+}

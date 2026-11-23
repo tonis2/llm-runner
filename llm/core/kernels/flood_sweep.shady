@@ -1,0 +1,82 @@
+// One sweep of the outside flood over the packed grid (flood_init.shady's
+// layout; `shell` the same layout's voxels): every grid line along `axis`
+// walked one way (`dir` 0 up, 1 down), outside carried on through cells
+// until the shell stops it. Sweeps in all six directions, repeated until
+// nothing changes, reach every cell the border can reach. Along x and y
+// each invocation walks 32 lines at once (one word's bits); along z, one
+// line, filling within each word. Any change sets changed[0] to 1 (a plain
+// store: every writer writes the same).
+// Dispatch: ceil(g * words / 64) for axis 0 and 1, ceil(g * g / 64) for 2.
+uint shell[];
+uint outside[];
+uint changed[];
+struct Push @pushconstant { uint g; uint words; uint axis; uint dir; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+
+// The bits of x spread toward higher (or lower) bits through the bits of m.
+fn uint fill_up(uint seeds, uint m)
+{
+    uint x = seeds & m;
+    uint p = m;
+    x = x | (p & (x << 1u)); p = p & (p << 1u);
+    x = x | (p & (x << 2u)); p = p & (p << 2u);
+    x = x | (p & (x << 4u)); p = p & (p << 4u);
+    x = x | (p & (x << 8u)); p = p & (p << 8u);
+    x = x | (p & (x << 16u));
+    return x;
+}
+fn uint fill_down(uint seeds, uint m)
+{
+    uint x = seeds & m;
+    uint p = m;
+    x = x | (p & (x >> 1u)); p = p & (p >> 1u);
+    x = x | (p & (x >> 2u)); p = p & (p >> 2u);
+    x = x | (p & (x >> 4u)); p = p & (p >> 4u);
+    x = x | (p & (x >> 8u)); p = p & (p >> 8u);
+    x = x | (p & (x >> 16u));
+    return x;
+}
+
+fn void main(ComputeIn input) @compute @threads(64, 1, 1)
+{
+    uint g = pc.g;
+    uint words = pc.words;
+    uint t = input.id.x;
+    bool any = false;
+    if (pc.axis == 2u) {
+        if (t >= g * g) return;
+        uint carry = 0u;
+        for (uint s = 0u; s < words; s++) {
+            uint w = pc.dir == 0u ? s : words - 1u - s;
+            uint i = t * words + w;
+            uint count = min(32u, g - 32u * w);
+            uint valid = count == 32u ? 4294967295u : (1u << count) - 1u;
+            uint m = valid & (shell[i] ^ 4294967295u);
+            uint o = outside[i];
+            uint f = pc.dir == 0u ? fill_up(o | carry, m) : fill_down(o | (carry << 31u), m);
+            if (f != o) {
+                outside[i] = f;
+                any = true;
+            }
+            carry = pc.dir == 0u ? (f >> 31u) & 1u : f & 1u;
+        }
+    } else {
+        if (t >= g * words) return;
+        uint u = t / words;
+        uint w = t % words;
+        uint c = 0u;
+        for (uint s = 0u; s < g; s++) {
+            uint p = pc.dir == 0u ? s : g - 1u - s;
+            uint i = pc.axis == 0u ? (p * g + u) * words + w : (u * g + p) * words + w;
+            uint o = outside[i];
+            uint f = (o | c) & (shell[i] ^ 4294967295u);
+            if (f != o) {
+                outside[i] = f;
+                any = true;
+            }
+            c = f;
+        }
+    }
+    if (any) changed[0] = 1u;
+}

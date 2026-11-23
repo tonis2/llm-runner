@@ -1,0 +1,26 @@
+// The outside flood's start, on a g^3 grid packed 32 cells to a word along z
+// (word (x g + y) words + z / 32, bit z % 32): the border cells outside, the
+// rest not yet. Dispatch: ceil(g * g * words / 256).
+uint outside[];
+struct Push @pushconstant { uint g; uint words; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint g = pc.g;
+    uint i = input.id.x;
+    if (i >= g * g * pc.words) return;
+    uint w = i % pc.words;
+    uint x = (i / pc.words) / g;
+    uint y = (i / pc.words) % g;
+    uint count = min(32u, g - 32u * w);
+    uint valid = count == 32u ? 4294967295u : (1u << count) - 1u;
+    uint word = 0u;
+    if (x == 0u || y == 0u || x == g - 1u || y == g - 1u) {
+        word = valid;
+    } else {
+        if (w == 0u) word = 1u;
+        if ((g - 1u) / 32u == w) word = word | (1u << ((g - 1u) % 32u));
+    }
+    outside[i] = word;
+}

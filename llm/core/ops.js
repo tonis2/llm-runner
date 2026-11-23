@@ -52,6 +52,16 @@ export function matmul(w, x, y, out, inDim, seq, rowOffset = 0, independent = fa
 				dispatch('matmul_f8', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
 			}
 			break;
+		case GGML.F16:
+			// The weight as stored (a GGUF's F16), its halves straight into the
+			// matrix cores' operands; a handful of rows, or no matrix cores, take
+			// the one-output-a-workgroup kernel.
+			if (matrixCores && !exact && seq >= 16 && inDim % 32 === 0) {
+				dispatch('matmul_f16_coop', [w, x, y], [groups(seq, 128) * groups(out, 128)], push, independent);
+			} else {
+				dispatch('matmul_f16_rows', [w, x, y], [seq, out], push, independent);
+			}
+			break;
 		case GGML.F32:
 			if (seq <= 4) dispatch('matmul_f32_rows', [w, x, y], [seq, out], push, independent);
 			else dispatch('matmul_f32', [w, x, y], [groups(seq, 64) * groups(out, 64)], push, independent);
@@ -277,14 +287,15 @@ export function scaleShiftClamp(x, y, n, scale, shift) {
 // A conv with no bias has `bias` null.
 // `out` overrides the output size: a stride-2 downsample with diffusers'
 // pad-bottom-right is pad 0 and exactly half the input, the missing row and
-// column read as zeros.
-export function conv2d(conv, x, y, h, w, stride = 1, pad = null, out = null) {
+// column read as zeros. `reflect` pads by reflection (torch's
+// padding_mode="reflect") instead of with zeros.
+export function conv2d(conv, x, y, h, w, stride = 1, pad = null, out = null, reflect = false) {
 	const k = conv.k;
 	const p = pad ?? (k === 3 ? 1 : 0);
 	const oh = out ? out.h : Math.floor((h + 2 * p - k) / stride) + 1;
 	const ow = out ? out.w : Math.floor((w + 2 * p - k) / stride) + 1;
 	const bias = conv.bias ?? conv.weight;
-	const push = pc('uuuuuuuuuuuu', conv.inC, conv.outC, h, w, k, k, stride, p, 1, oh, ow, conv.bias ? 1 : 0);
+	const push = pc('uuuuuuuuuuuu', conv.inC, conv.outC, h, w, k, k, stride, p + (reflect && p > 0 ? 65536 : 0), 1, oh, ow, conv.bias ? 1 : 0);
 	// A narrow input that is not a multiple of 32 (144) runs a half-empty last chunk.
 	const coopIn = conv.inC % 32 === 0 || (conv.inC % 16 === 0 && conv.inC >= 128);
 	if (stride === 1 && 2 * p === k - 1 && matrixCores && coopIn && conv.outC % 4 === 0) {
@@ -411,4 +422,32 @@ export function attentionPadded(q, k, v, out, pad, heads, hd, qLen, kLen, scale 
 	padHeads(v, pad.v, kLen, heads, hd, 128);
 	flashAttentionSplit(pad.q, null, null, pad.k, pad.v, pad.o, heads, qLen, 0, kLen, null, null, scale);
 	copyRows(pad.o, out, qLen * heads, hd, hd, 0, 128);
+}
+
+// Pixal3D's projection conditioning (plugins/pixal3d).
+// [h * w, C] rows average-pooled by f x f blocks (avg_pool_rows.shady).
+export function avgPoolRows(x, y, channels, h, w, f) {
+	dispatch('avg_pool_rows', [x, y], [groups((h / f) * (w / f) * channels, 256)], pc('uuuu', channels, h, w, f));
+}
+// Bilinear samples of a [h * w, C] rows map at float2 points (bilinear_rows.shady).
+export function bilinearRows(x, points, y, channels, h, w, count, stride = channels, col = 0) {
+	dispatch('bilinear_rows', [x, points, y], [groups(channels, 256), count], pc('uuuuuu', channels, h, w, count, stride, col));
+}
+// NAF's upsampled features at float2 points of the s x s map (naf_sample.shady).
+export function nafSample(q, k, v, points, y, s, g, count, vd, stride = 4 * vd, col = 0, scale = 1 / 8) {
+	dispatch('naf_sample', [q, k, v, points, y], [count], pc('uuuuuuf', s, g, count, stride, col, vd, scale));
+}
+// Sparse channel-to-spatial: child rows from their parents' channel chunks (c2s_gather.shady).
+export function c2sGather(x, codes, y, rows, cols, inCols, chunk, rep = 1) {
+	dispatch('c2s_gather', [codes, x, y], [groups(rows * cols, 256)], pc('uuuuu', rows, cols, inCols, chunk, rep));
+}
+// Children's neighbour table from their parents' (child_neighbours.shady).
+export function childNeighbours(parentTable, kids, codes, table, children) {
+	dispatch('child_neighbours', [parentTable, kids, codes, table], [groups(children * 27, 256)], pc('u', children));
+}
+// The outside of a voxel shell, flooded from the border of a g^3 grid packed
+// 32 cells to a word along z (flood_*.shady); `words` = ceil(g / 32).
+export function floodInit(outside, g, words) { dispatch('flood_init', [outside], [groups(g * g * words, 256)], pc('uu', g, words)); }
+export function floodSweep(shell, outside, changed, g, words, axis, dir) {
+	dispatch('flood_sweep', [shell, outside, changed], [groups(axis === 2 ? g * g : g * words, 64)], pc('uuuu', g, words, axis, dir));
 }

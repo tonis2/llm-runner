@@ -1,0 +1,32 @@
+// y[seq, out_dim] = x @ W^T with W in F16 (two halves a word; in_dim even),
+// one workgroup per output element: for a handful of rows (a timestep MLP, a
+// modulation, a few context tokens), and the slow path without matrix cores.
+// Dispatch 2D: (seq, out_dim).
+uint w[];
+float x[];
+float y[];
+struct Push @pushconstant { uint out_dim; uint in_dim; uint seq_len; uint row_offset; }
+Push pc;
+shared float red[256];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint pos = input.gid.x;
+    uint out_idx = input.gid.y;
+    uint gi = input.lid.x;
+    if (pos >= pc.seq_len) return;
+    uint wrow = (pc.row_offset + out_idx) * (pc.in_dim / 2u);
+    uint xrow = pos * pc.in_dim;
+    float partial = 0.0;
+    for (uint j = gi; j < pc.in_dim / 2u; j += 256u) {
+        uint word = w[wrow + j];
+        partial += unpack_f16(word & 65535u) * x[xrow + 2u * j] + unpack_f16(word >> 16u) * x[xrow + 2u * j + 1u];
+    }
+    red[gi] = partial;
+    barrier;
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (gi < s) red[gi] += red[gi + s];
+        barrier;
+    }
+    if (gi == 0u) y[pos * pc.out_dim + out_idx] = red[0];
+}

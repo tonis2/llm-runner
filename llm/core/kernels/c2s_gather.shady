@@ -1,0 +1,20 @@
+// Channel-to-spatial for sparse voxels (TRELLIS.2's SparseChannel2Spatial):
+// child j of parent p, sub-cell s, takes `chunk` channels of the parent's row
+// from s * chunk, each repeated `rep` times (the C2S block's skip,
+// repeat_interleave); codes[j] = p * 8 + s. out [children, cols].
+// Dispatch: ceil(children * cols / 256).
+uint codes[];
+float input_[];
+float output[];
+struct Push @pushconstant { uint rows; uint cols; uint in_cols; uint chunk; uint rep; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.rows * pc.cols) return;
+    uint j = i / pc.cols;
+    uint c = i % pc.cols;
+    uint code = codes[j];
+    output[i] = input_[(code / 8u) * pc.in_cols + (code % 8u) * pc.chunk + c / pc.rep];
+}

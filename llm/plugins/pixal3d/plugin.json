@@ -1,0 +1,6 @@
+{
+	"name": "pixal3d",
+	"version": "0.1",
+	"description": "Pixal3D: an RGBA cutout to a dense 3D triangle mesh (.glb) - DINOv3 and NAF projection conditioning, TRELLIS.2 flows and FlexiDualGrid decoder.",
+	"main": "main.js"
+}

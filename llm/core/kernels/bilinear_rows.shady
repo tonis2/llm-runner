@@ -1,0 +1,30 @@
+// Bilinear samples of a map stored as rows, [h * w, C] (row y * w + x), at
+// points given in the map's pixel units (pixel centres at integers, already
+// clamped to [0, w - 1] x [0, h - 1]: grid_sample with align_corners=False
+// and padding_mode="border"). Point p's C values go to
+// output[p * stride + col ..]. Dispatch: (ceil(C / 256), points).
+float input_[];
+float2 points[];
+float output[];
+struct Push @pushconstant { uint channels; uint h; uint w; uint count; uint stride; uint col; }
+Push pc;
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint p = input.gid.y;
+    uint c = input.gid.x * 256u + input.lid.x;
+    if (p >= pc.count || c >= pc.channels) return;
+    float2 at = points[p];
+    uint x0 = uint(floor(at.x));
+    uint y0 = uint(floor(at.y));
+    uint x1 = min(x0 + 1u, pc.w - 1u);
+    uint y1 = min(y0 + 1u, pc.h - 1u);
+    float dx = at.x - float(x0);
+    float dy = at.y - float(y0);
+    uint C = pc.channels;
+    float v00 = input_[(y0 * pc.w + x0) * C + c];
+    float v01 = input_[(y0 * pc.w + x1) * C + c];
+    float v10 = input_[(y1 * pc.w + x0) * C + c];
+    float v11 = input_[(y1 * pc.w + x1) * C + c];
+    output[p * pc.stride + pc.col + c] = (v00 * (1.0 - dx) + v01 * dx) * (1.0 - dy) + (v10 * (1.0 - dx) + v11 * dx) * dy;
+}

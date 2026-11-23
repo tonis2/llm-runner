@@ -1,0 +1,38 @@
+// A submanifold conv's neighbour table for voxels made by subdivision, from
+// their parents' table: child j (codes[j] = parent * 8 + sub-cell, the x
+// offset in bit 0, y in bit 1, z in bit 2) has as neighbour at offset d the
+// child of its parent's neighbour at floor((s + d) / 2) in sub-cell
+// (s + d) mod 2. `kids` [parents * 8] is each parent's child per sub-cell
+// (NONE where it has none); tables [rows * 27], offsets -1..1, x slowest.
+// Dispatch: ceil(children * 27 / 256).
+uint parent_table[];
+uint kids[];
+uint codes[];
+uint table[];
+struct Push @pushconstant { uint children; }
+Push pc;
+struct ComputeIn { uint3 id @builtin(global_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint i = input.id.x;
+    if (i >= pc.children * 27u) return;
+    uint j = i / 27u;
+    uint k = i % 27u;
+    uint code = codes[j];
+    uint p = code / 8u;
+    uint s = code % 8u;
+    // this child's sub-cell plus the offset, per axis, in -1..2
+    int tx = int(s & 1u) + int(k / 9u) - 1;
+    int ty = int((s >> 1u) & 1u) + int((k / 3u) % 3u) - 1;
+    int tz = int((s >> 2u) & 1u) + int(k % 3u) - 1;
+    int ox = tx < 0 ? -1 : (tx > 1 ? 1 : 0);
+    int oy = ty < 0 ? -1 : (ty > 1 ? 1 : 0);
+    int oz = tz < 0 ? -1 : (tz > 1 ? 1 : 0);
+    uint q = parent_table[p * 27u + uint((ox + 1) * 9 + (oy + 1) * 3 + oz + 1)];
+    uint found = 4294967295u;
+    if (q != 4294967295u) {
+        uint sub = uint(tx - 2 * ox) + 2u * uint(ty - 2 * oy) + 4u * uint(tz - 2 * oz);
+        found = kids[q * 8u + sub];
+    }
+    table[i] = found;
+}

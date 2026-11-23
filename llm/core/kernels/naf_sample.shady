@@ -1,0 +1,105 @@
+// NAF's upsampled features (valeoai/NAF), only where they are sampled: at each
+// point, the bilinear mix (grid_sample, align_corners=False, border) of the
+// four high-resolution pixels around it, each pixel's features being its
+// neighbourhood cross-attention over the low-resolution grid.
+//
+// NAF resizes the keys and values from g x g to the s x s of the queries
+// (nearest-exact) and runs 9x9 neighbourhood attention with dilation s / g:
+// a pixel's window is then 9 x 9 cells of the g x g grid around the cell it
+// lies in, moved inward at the borders. So no s x s map of 1024 channels is
+// ever made: queries q [s * s, 4 * 64] (RoPE applied), keys k [g * g, 4 * 64]
+// (q average-pooled), values v [g * g, 4 * VD] (the DINO patches, head h its
+// channels h * VD ..). Point p's 4 * VD values go to output[p * stride + col ..].
+// Points are in the s x s map's pixel units, clamped to [0, s - 1].
+// Dispatch: (points).
+float q[];
+float k[];
+float v[];
+float2 points[];
+float output[];
+struct Push @pushconstant { uint s; uint g; uint count; uint stride; uint col; uint vd; float scale; }
+Push pc;
+shared float qs[1024];      // [4 corners][4 heads * 64]
+shared float wts[1296];     // [4 corners][4 heads][81]
+shared uint cells[324];     // [4 corners][81]: the key cell of each window slot
+shared float bw[4];
+struct ComputeIn { uint3 gid @builtin(workgroup_id); uint3 lid @builtin(local_invocation_id); }
+fn void main(ComputeIn input) @compute @threads(256, 1, 1)
+{
+    uint p = input.gid.x;
+    uint gi = input.lid.x;
+    if (p >= pc.count) return;
+    uint s = pc.s;
+    uint g = pc.g;
+    uint dil = s / g;
+    float2 at = points[p];
+    uint x0 = uint(floor(at.x));
+    uint y0 = uint(floor(at.y));
+    float dx = at.x - float(x0);
+    float dy = at.y - float(y0);
+
+    // Corner c: (x0 + c % 2, y0 + c / 2), clamped (its weight is 0 then).
+    if (gi < 4u) {
+        float wx = (gi % 2u) == 0u ? 1.0 - dx : dx;
+        float wy = (gi / 2u) == 0u ? 1.0 - dy : dy;
+        bw[gi] = wx * wy;
+    }
+    for (uint i = gi; i < 1024u; i += 256u) {
+        uint c = i / 256u;
+        uint px = min(x0 + c % 2u, s - 1u);
+        uint py = min(y0 + c / 2u, s - 1u);
+        qs[i] = q[(py * s + px) * 256u + i % 256u];
+    }
+    for (uint i = gi; i < 324u; i += 256u) {
+        uint c = i / 81u;
+        uint slot = i % 81u;
+        uint px = min(x0 + c % 2u, s - 1u);
+        uint py = min(y0 + c / 2u, s - 1u);
+        int cx = int(px / dil) - 4;
+        int cy = int(py / dil) - 4;
+        uint sx = uint(clamp(cx, 0, int(g) - 9));
+        uint sy = uint(clamp(cy, 0, int(g) - 9));
+        cells[i] = (sy + slot / 9u) * g + sx + slot % 9u;
+    }
+    barrier;
+
+    // Scores: (corner, head, slot), a 64-wide dot each.
+    for (uint i = gi; i < 1296u; i += 256u) {
+        uint c = i / 324u;
+        uint h = (i / 81u) % 4u;
+        uint slot = i % 81u;
+        uint kr = cells[c * 81u + slot] * 256u + h * 64u;
+        uint qr = c * 256u + h * 64u;
+        float dot = 0.0;
+        for (uint d = 0u; d < 64u; d++) dot += qs[qr + d] * k[kr + d];
+        wts[i] = dot * pc.scale;
+    }
+    barrier;
+
+    // Softmax over each (corner, head)'s 81, times the corner's bilinear weight.
+    if (gi < 16u) {
+        uint base = gi * 81u;
+        float mx = -1.0e30;
+        for (uint j = 0u; j < 81u; j++) mx = max(mx, wts[base + j]);
+        float sum = 0.0;
+        for (uint j = 0u; j < 81u; j++) {
+            float e = exp(wts[base + j] - mx);
+            wts[base + j] = e;
+            sum += e;
+        }
+        float f = bw[gi / 4u] / sum;
+        for (uint j = 0u; j < 81u; j++) wts[base + j] *= f;
+    }
+    barrier;
+
+    uint width = 4u * pc.vd;
+    for (uint ch = gi; ch < width; ch += 256u) {
+        uint h = ch / pc.vd;
+        float acc = 0.0;
+        for (uint c = 0u; c < 4u; c++) {
+            uint wb = (c * 4u + h) * 81u;
+            for (uint j = 0u; j < 81u; j++) acc += wts[wb + j] * v[cells[c * 81u + j] * width + ch];
+        }
+        output[p * pc.stride + pc.col + ch] = acc;
+    }
+}
