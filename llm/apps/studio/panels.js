@@ -332,12 +332,46 @@ export class Dialogs extends three.Widget {
 		this.plugins = false;
 		this.settingsText = '';
 		this.pick = null;   // { node, input, kind, start }
+		this.pickDir = '';  // where the picker is, for a folder input
 	}
 
 	pickFile(node, input) {
 		const current = app.doc.node(node)?.params[input.name];
-		const start = dirOf(current) || app.settings.model_dir || globalThis.__llm.homeDir();
-		this.pick = { node, input: input.name, kind: input.kind ?? '', start };
+		const kind = input.kind ?? '';
+		// a folder input opens in the folder it names
+		const here = kind === 'dir' && typeof current === 'string' && llm.exists(current) ? current : dirOf(current);
+		const start = here || app.settings.model_dir || globalThis.__llm.homeDir();
+		this.pickDir = start;
+		this.pick = { node, input: input.name, kind, start };
+	}
+
+	// A PATH input's picker: a file, or for PATH(dir) the folder it is in
+	// (Use this folder, or a file chosen inside it).
+	picker(pick) {
+		const choose = (path) => {
+			app.doc.setParam(pick.node, pick.input, path);
+			if (!MASKS[pick.kind]) app.settings.model_dir = dirOf(path);
+			this.pick = null;
+			app.changed();
+		};
+		const folder = pick.kind === 'dir';
+		const props = {
+			key: `pickBrowser:${pick.node}:${pick.input}`, start: pick.start,
+			mask: folder ? [] : MASKS[pick.kind] ?? MODEL_MASK,
+			onChoose: safe((path) => choose(folder ? dirOf(path) : path)),
+		};
+		if (folder) props.onChange = safe((dir) => { this.pickDir = dir; });
+		const browser = new FileBrowser(props);
+		const key = `pickScroll:${pick.node}:${pick.input}`;
+		if (!folder) return new Scroll({ key }, browser);
+		return new Column({ gap: 8 },
+			new Label(this.pickDir, { color: THEME.dim, textSize: 11 }),
+			new Scroll({ key, size: [496, 300] }, browser),
+			new Row({ gap: 8 },
+				new Button('Cancel', safe(() => { this.pick = null; })),
+				new Button('Use this folder', safe(() => choose(this.pickDir))),
+			),
+		);
 	}
 
 	render() {
@@ -368,21 +402,11 @@ export class Dialogs extends three.Widget {
 				),
 			),
 			new Dialog({
-				key: 'pickDialog', title: pick ? `Choose ${pick.input}` : 'Choose a file', open: !!pick,
+				key: 'pickDialog', title: pick ? `Choose ${pick.input}${pick.kind === 'dir' ? ' (a folder)' : ''}` : 'Choose a file', open: !!pick,
 				modal: true, closeOutside: true, size: [520, 420],
 				onDismiss: safe(() => { this.pick = null; }),
 			},
-				pick && new Scroll({ key: `pickScroll:${pick.node}:${pick.input}` },
-					new FileBrowser({
-						key: `pickBrowser:${pick.node}:${pick.input}`, start: pick.start,
-						mask: MASKS[pick.kind] ?? MODEL_MASK,
-						onChoose: safe((path) => {
-							app.doc.setParam(pick.node, pick.input, path);
-							if (!MASKS[pick.kind]) app.settings.model_dir = dirOf(path);
-							this.pick = null;
-							app.changed();
-						}),
-					})),
+				pick && this.picker(pick),
 			),
 			new Dialog({
 				key: 'pluginsDialog', title: 'Plugins and settings', open: this.plugins,

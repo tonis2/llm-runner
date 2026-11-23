@@ -16,7 +16,7 @@ import * as op from '/core/ops.js';
 import { setBreather } from '/core/gpu.js';
 import { loadPlugins, readSettings, writeText } from '/core/graph/plugins.js';
 import { app, run, cancel, dropImages } from './app.js';
-import { Doc, refreshTypes } from './doc.js';
+import { Doc, refreshTypes, defOf } from './doc.js';
 import { GraphCanvas } from './canvas.js';
 import { Palette, Inspector, StatusBar, Chrome, Dialogs, safe, removeSelected } from './panels.js';
 import { QueuePanel, addToQueue } from './queue.js';
@@ -133,13 +133,20 @@ async function boot() {
 	}));
 
 	// For checks without a person at the window: `shot=file.png` writes the
-	// interface once it has drawn, and `run=true` runs the graph first.
+	// interface once it has drawn, and `run=true` runs the graph first;
+	// `pick=node.input` opens that setting's file picker.
 	if (config.shot) {
 		(async () => {
 			for (let i = 0; i < 3; i++) await three.nextFrame();
 			if (config.drop) app.widgets.canvas.dropFiles(String(config.drop).split(','));
 			if (config.run) await run();
 			if (config.select) app.select(config.select);
+			if (config.pick) {
+				const [id, name] = String(config.pick).split('.');
+				const input = defOf(app.doc.node(id)?.type).inputs.find((i) => i.name === name);
+				if (input) app.widgets.dialogs.pickFile(id, input);
+				else app.say(`pick: no setting ${config.pick}`, true);
+			}
 			for (let i = 0; i < 3; i++) await three.nextFrame();
 			three.ui.flush();
 			const s = three.screenshot(config.shot);

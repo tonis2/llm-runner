@@ -1,6 +1,7 @@
 // Pixal3D's node: an RGBA cutout to a dense mesh (MESH), for Save mesh or
 // Hi3D's refiner.
 
+import { llm } from '/core/llm.js';
 import { defineNodes } from '/core/graph/registry.js';
 import { Pixal3D } from './pipeline.js';
 
@@ -21,6 +22,9 @@ defineNodes('pixal3d', {
 		},
 		outputs: { mesh: 'MESH' },
 		async run({ image: img, weights, gguf, linear, resolution, ...settings }, ctx) {
+			if (!weights || !llm.exists(`${weights}/pipeline.json`)) {
+				throw new Error(`weights: ${weights ? `${weights} is not the Pixal3D folder (no pipeline.json in it)` : 'not set'}; choose the folder with ckpts/, dinov3-vitl16/, naf/ and pipeline.json`);
+			}
 			if (!pipeline || pipeline.w !== weights || pipeline.linear !== linear || (gguf && pipeline.gguf !== gguf)) {
 				pipeline?.dispose();
 				pipeline = new Pixal3D(weights, { gguf: gguf || null, linear });
