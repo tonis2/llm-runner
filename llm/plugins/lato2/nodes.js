@@ -26,13 +26,14 @@ defineNodes('lato2', {
 		category: '3d',
 		description: 'An RGBA cutout (transparent background) to a triangle mesh, saved as a .glb. '
 			+ '`weights` is the folder with LATO.2\'s .pt files, trellis/ and dinov2_vitl14_reg4_pretrain.pth. '
-			+ 'A # in the name becomes the next free number.',
+			+ '`cleanup` removes crowded edges, folds and loose specks and fills holes; `smooth` adds Taubin steps (good on rounded shapes, shrinks thin parts). '
+				+ 'A # in the name becomes the next free number.',
 		output: true,
 		inputs: {
 			image: 'IMAGE', weights: 'PATH(dir)', path: 'STRING=output/lato2-#.glb',
 			seed: 'INT=42', vertices: 'INT=2000',
 			ss_steps: 'INT=25', ss_cfg: 'FLOAT=5', vflow_steps: 'INT=24', cfg: 'FLOAT=3', tflow_steps: 'INT=50',
-			fill_holes: 'BOOL=true',
+			fill_holes: 'BOOL=true', cleanup: 'BOOL=true', smooth: 'INT=0',
 		},
 		outputs: {},
 		async run({ image: img, weights, path, ...settings }) {

@@ -98,8 +98,10 @@ function chordless(ring, nbr) {
 
 // Minimum-area triangulation of a closed 3D ring (O(n^3)): the cost is (the
 // number of zero-area triangles, the total area), so collinear vertices give
-// degenerate faces only when nothing else can.
-function minAreaTriangulation(ring, verts) {
+// degenerate faces only when nothing else can. `forbidden(a, b)`, when given,
+// rules out a chord between ring vertices a and b; with every triangulation
+// ruled out there are none ([]).
+export function minAreaTriangulation(ring, verts, forbidden = null) {
 	const n = ring.length, p = ring.map((r) => [verts[3 * r], verts[3 * r + 1], verts[3 * r + 2]]);
 	let ext = 0;
 	for (let d = 0; d < 3; d++) { const vals = p.map((q) => q[d]); ext += (Math.max(...vals) - Math.min(...vals)) ** 2; }
@@ -112,11 +114,13 @@ function minAreaTriangulation(ring, verts) {
 	const zeros = Array.from({ length: n }, () => new Array(n).fill(0));
 	const sums = Array.from({ length: n }, () => new Array(n).fill(0));
 	const split = Array.from({ length: n }, () => new Array(n).fill(-1));
+	const bad = forbidden ? (x, y) => y - x >= 2 && !(x === 0 && y === n - 1) && forbidden(ring[x], ring[y]) : () => false;
 	for (let span = 2; span < n; span++) {
 		for (let i = 0; i + span < n; i++) {
 			const j = i + span;
 			let bz = Infinity, bs = Infinity;
 			for (let k = i + 1; k < j; k++) {
+				if (bad(i, k) || bad(k, j)) continue;
 				const a = area(i, k, j);
 				const z = zeros[i][k] + zeros[k][j] + (a <= eps ? 1 : 0), s = sums[i][k] + sums[k][j] + a;
 				if (z < bz || (z === bz && s < bs)) { bz = z; bs = s; split[i][j] = k; }
@@ -125,6 +129,7 @@ function minAreaTriangulation(ring, verts) {
 			sums[i][j] = bs;
 		}
 	}
+	if (zeros[0][n - 1] === Infinity) return [];
 	const tris = [], stack = [[0, n - 1]];
 	while (stack.length) {
 		const [i, j] = stack.pop();

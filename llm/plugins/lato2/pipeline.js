@@ -25,6 +25,7 @@ import { VertexFlow } from './vflow.js';
 import { VertexDecoder } from './vvae.js';
 import { VoxelEncoder, TopologyFlow, TopologyDecoder } from './topology.js';
 import { edgesToFaces, orientFaces } from './faces.js';
+import { cleanMesh } from './cleanup.js';
 
 export const DEFAULTS = {
 	seed: 42,
@@ -35,6 +36,9 @@ export const DEFAULTS = {
 	tflow_steps: 50, edge_threshold: 0.0,
 	fill_holes: true, max_ring: 12,
 	orient: true,
+	// cleanup.js after the faces; `smooth` Taubin steps on top (rounded shapes
+	// gain, thin hard-surface parts shrink, so it is off by default)
+	cleanup: true, smooth: 0,
 	linear: 'f32',
 };
 
@@ -93,6 +97,25 @@ export class Lato2 {
 		this.models = {};
 	}
 
+	// TRELLIS's sparse-structure flow and decoder: occupied 64^3 voxels.
+	async sparseStructure(c, u, L, seed, o) {
+		const ss = await this.model('ss');
+		const x = upload(llm.randomNormal(ss.R ** 3 * ss.inC, seed));
+		try {
+			await ss.sample(x, c, u, L, { steps: o.ss_steps, cfg: o.ss_cfg, rescale: o.ss_rescale });
+			this.release('ss');
+			const ssdec = await this.model('ssdec');
+			const { logits, R } = ssdec.run(x, ss.R);
+			const voxels = occupiedVoxels(readFloats(logits, R ** 3), R);
+			logits.dispose();
+			this.release('ssdec');
+			return voxels;
+		} finally {
+			submit();
+			x.dispose();
+		}
+	}
+
 	// An RGBA cutout -> { positions Float32Array [V * 3] (y up, in -0.5 .. 0.5),
 	// indices Uint32Array [F * 3], normals, cond (the picture), stats }.
 	async generate(img, options = {}) {
@@ -111,21 +134,13 @@ export class Lato2 {
 			submit();
 			this.release('dino');
 
-			// sparse structure
-			const ss = await this.model('ss');
-			const x = upload(llm.randomNormal(ss.R ** 3 * ss.inC, o.seed));
-			keep.push(x);
-			await ss.sample(x, c, u, L, { steps: o.ss_steps, cfg: o.ss_cfg, rescale: o.ss_rescale });
-			this.release('ss');
-			const ssdec = await this.model('ssdec');
-			const { logits, R } = ssdec.run(x, ss.R);
-			const voxels = occupiedVoxels(readFloats(logits, R ** 3), R);
-			logits.dispose();
-			this.release('ssdec');
+			// sparse structure, unless the caller has one: `voxels` [n * 3] of
+			// 64^3 in LATO.2's frame, sorted (a real mesh's, as in its mesh-to-mesh)
+			const voxels = o.voxels ?? await this.sparseStructure(c, u, L, o.seed, o);
 			const nv = voxels.length / 3;
 			stats.voxels = nv;
 			if (nv === 0) throw new Error('the sparse structure came out empty');
-			llm.print(`  sparse structure: ${nv} voxels of ${R}^3`);
+			llm.print(`  sparse structure: ${nv} voxels of 64^3${o.voxels ? ' (given)' : ''}`);
 
 			// vertices
 			const vflow = await this.model('vflow');
@@ -161,9 +176,19 @@ export class Lato2 {
 			let faces = edgesToFaces(edges, V, verts.coords, { fill: o.fill_holes, maxRing: o.max_ring });
 			llm.print(`  topology: ${stats.edges} edges, ${faces.length / 3} faces in ${llm.since(t1)}`);
 
-			const res = verts.resolution, positions = new Float32Array(V * 3);
+			const res = verts.resolution;
+			let positions = new Float32Array(V * 3);
 			for (let i = 0; i < V * 3; i++) positions[i] = verts.coords[i] / res - 0.5 + verts.offsets[i] / (2 * res);
-			if (o.orient) faces = orientFaces(faces, positions);
+			if (o.cleanup) {
+				const c = cleanMesh(positions, faces, { smooth: o.smooth });
+				({ positions, faces } = c);
+				const { faces_in, vertices, faces: _, ...removed } = c.stats;
+				stats.cleanup = removed;
+				stats.vertices = vertices;
+				llm.print(`  cleanup: ${JSON.stringify(removed)}`);
+			} else if (o.orient) {
+				faces = orientFaces(faces, positions);
+			}
 			stats.faces = faces.length / 3;
 			stats.seconds = (llm.now() - t0) / 1000;
 			const indices = Uint32Array.from(faces);

@@ -67,7 +67,8 @@ llm/
     creature/          video frames and a rigged .glb to an animation of that rig: DINOv3 point
                        tracking and a rig fit, as a JSON server or a Rigsmith job
     lato2/             LATO.2 image-to-mesh: an RGBA cutout to a triangle mesh (.glb) - TRELLIS's
-                       sparse structure, vertex flow and V-VAE, topology flow and T-VAE edges
+                       sparse structure, vertex flow and V-VAE, topology flow and T-VAE edges,
+                       then cleanup.js (crowded edges, folds, specks, holes; `smooth=` optional)
   tests/               kernel checks against float32, model goldens, benchmarks
 ```
 
@@ -448,6 +449,19 @@ asking to remove a photo's background keeps it. An opaque picture's alpha
 decodes to noise just under 1, so `core.vae_decode` keeps the alpha only when
 part of the picture is see-through. An RGBA image is encoded with its own alpha.
 `templates/qwenimage-to-mesh.json` hands such a cutout to LATO.2.
+
+LATO.2 matches its own torch code stage by stage (`tests/lato2_*.js`), and
+its meshes come out crumpled and holed, as its readme warns. The topology
+stage is not why: given a real mesh's vertices it finds 83% of that mesh's
+edges (the bundled dragon, `tests/lato2_gt_topology.js`). Vertices generated
+even on a real mesh's own voxels are what crumple (`tests/lato2_scaffold.js`).
+`plugins/lato2/cleanup.js` runs after the faces: edges with three or more
+faces keep two, faces folded back on their neighbours go, so do loose specks,
+and rings of open edges up to 150 long are filled without crossing an
+existing edge. Open edges fell from 4.6% to 0.6% on the teapot, 25% to 12% on
+the lantern and 16% to 14% on the armour, and no edge keeps a third face.
+`smooth=5` helps rounded shapes but shrinks thin hard-surface parts, so it is
+off by default.
 
 Qwen-Image 2.1 LoRAs were checked in both layouts files come in: PEFT's
 (`transformer.` prefix, `img_mlp.gate_layer` and `proj` folded into the two
